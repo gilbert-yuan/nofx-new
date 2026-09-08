@@ -347,6 +347,8 @@ onMounted(() => {
     loadPerformance();
   } else if (activeTab.value === 'statistics') {
     loadStatistics();
+  } else if (activeTab.value === 'replay') {
+    loadBatchReplay({ result: 'loss', limit: 20 });
   }
 });
 </script>
