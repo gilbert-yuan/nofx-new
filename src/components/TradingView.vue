@@ -18,7 +18,7 @@ const orderInput = ref({ recordId: '', symbol: '', margin: 100, leverage: 2 });
 const showOrderForm = ref(false);
 const selectedOrder = ref(null);
 const orderPage = ref(1);
-const orderPageSize = ref(50);
+const orderPageSize = ref(20);
 
 // 策略表现相关
 const date = ref('');
