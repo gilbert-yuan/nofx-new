@@ -91,9 +91,9 @@ onBeforeUnmount(() => { disposed = true; clearInterval(timer); });
 .paper-table small { display: block; margin-top: 6px; max-width: 220px; }
 .paper-method { line-height: 1.8; }
 .automation-jobs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
-.automation-jobs article { border: 1px solid #d9e1ea; padding: 18px; border-radius: 8px; }
+.automation-jobs article { border: 1px solid var(--border-primary); padding: 18px; border-radius: 8px; }
 .automation-jobs small, .review-entry small { display: block; margin: 7px 0; }
-.review-entry { border-bottom: 1px solid #d9e1ea; padding: 14px 0; }
+.review-entry { border-bottom: 1px solid var(--border-primary); padding: 14px 0; }
 @media(max-width: 700px) { .automation-jobs { grid-template-columns: 1fr; } }
 @media(max-width: 1000px) { .paper-metrics, .paper-order-form .model-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media(max-width: 600px) { .paper-order-form .model-grid { grid-template-columns: 1fr; } }

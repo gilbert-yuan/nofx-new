@@ -164,8 +164,8 @@ function marketCap(value) {
 <style scoped>
 .symbol-pagination {
   padding: 12px 16px;
-  background: #1a1a1a;
-  border-top: 1px solid #2a2a2a;
+  background: var(--bg-card);
+  border-top: 1px solid var(--border-secondary);
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -173,7 +173,7 @@ function marketCap(value) {
 
 .pagination-info {
   text-align: center;
-  color: #888;
+  color: var(--text-tertiary);
   font-size: 12px;
 }
 
@@ -186,17 +186,17 @@ function marketCap(value) {
 .page-btn {
   padding: 4px 12px;
   font-size: 13px;
-  background: #2a2a2a;
-  border: 1px solid #3a3a3a;
-  color: #fff;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-primary);
+  color: var(--text-primary);
   border-radius: 4px;
   cursor: pointer;
   transition: all 0.2s;
 }
 
 .page-btn:hover:not(:disabled) {
-  background: #3a3a3a;
-  border-color: #4a4a4a;
+  background: var(--btn-secondary-hover);
+  border-color: var(--border-hover);
 }
 
 .page-btn:disabled {
@@ -210,9 +210,9 @@ function marketCap(value) {
 }
 
 .pagination-size select {
-  background: #0f0f0f;
-  border: 1px solid #2a2a2a;
-  color: #fff;
+  background: var(--bg-card);
+  border: 1px solid var(--border-secondary);
+  color: var(--text-primary);
   padding: 4px 8px;
   border-radius: 4px;
   font-size: 12px;
@@ -220,6 +220,6 @@ function marketCap(value) {
 }
 
 .pagination-size select:hover {
-  border-color: #3a3a3a;
+  border-color: var(--border-primary);
 }
 </style>

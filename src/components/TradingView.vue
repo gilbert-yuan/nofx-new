@@ -1311,7 +1311,7 @@ onMounted(() => {
   display: flex;
   gap: 8px;
   margin-bottom: 24px;
-  border-bottom: 1px solid #2a2a2a;
+  border-bottom: 1px solid var(--border-primary);
   padding-bottom: 0;
 }
 
@@ -1320,7 +1320,7 @@ onMounted(() => {
   background: transparent;
   border: none;
   border-bottom: 2px solid transparent;
-  color: #888;
+  color: var(--text-tertiary);
   cursor: pointer;
   font-size: 14px;
   font-weight: 500;
@@ -1328,12 +1328,12 @@ onMounted(() => {
 }
 
 .tab-switcher button:hover {
-  color: #fff;
+  color: var(--text-primary);
 }
 
 .tab-switcher button.active {
-  color: #fff;
-  border-bottom-color: #15966a;
+  color: var(--text-primary);
+  border-bottom-color: var(--long);
 }
 
 .stats-cards {
@@ -1344,15 +1344,15 @@ onMounted(() => {
 }
 
 .stat-card {
-  background: #1a1a1a;
-  border: 1px solid #2a2a2a;
+  background: var(--bg-card);
+  border: 1px solid var(--border-primary);
   border-radius: 8px;
   padding: 16px;
   text-align: center;
 }
 
 .stat-label {
-  color: #888;
+  color: var(--text-tertiary);
   font-size: 12px;
   text-transform: uppercase;
   margin-bottom: 8px;
@@ -1365,7 +1365,7 @@ onMounted(() => {
 }
 
 .stat-detail {
-  color: #888;
+  color: var(--text-tertiary);
   font-size: 12px;
 }
 
@@ -1375,7 +1375,7 @@ onMounted(() => {
   align-items: center;
   margin: 16px 0;
   padding: 16px;
-  background: #1a1a1a;
+  background: var(--bg-card);
   border-radius: 8px;
 }
 
@@ -1384,20 +1384,20 @@ onMounted(() => {
   flex-direction: column;
   gap: 4px;
   font-size: 12px;
-  color: #888;
+  color: var(--text-tertiary);
 }
 
 .filter-row select {
-  background: #0f0f0f;
-  border: 1px solid #2a2a2a;
-  color: #fff;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-primary);
+  color: var(--text-primary);
   padding: 6px 12px;
   border-radius: 4px;
 }
 
 .filter-result {
   margin-left: auto;
-  color: #888;
+  color: var(--text-tertiary);
   font-size: 14px;
 }
 
@@ -1460,14 +1460,14 @@ onMounted(() => {
 }
 
 .detail-section {
-  background: #1a1a1a;
+  background: var(--bg-card);
   padding: 16px;
   border-radius: 8px;
 }
 
 .detail-section h3 {
   font-size: 14px;
-  color: #888;
+  color: var(--text-tertiary);
   text-transform: uppercase;
   margin-bottom: 12px;
 }
@@ -1480,16 +1480,16 @@ onMounted(() => {
 }
 
 .detail-section dt {
-  color: #888;
+  color: var(--text-tertiary);
 }
 
 .detail-section dd {
-  color: #fff;
+  color: var(--text-primary);
   margin: 0;
 }
 
 .detail-section code {
-  background: #0f0f0f;
+  background: var(--bg-elevated);
   padding: 2px 6px;
   border-radius: 3px;
   font-family: monospace;
@@ -1555,7 +1555,7 @@ onMounted(() => {
 }
 
 .diagnosis-score.score-medium {
-  background: var(--warning)20;
+  background: var(--warning-bg);
   border: 2px solid var(--warning);
 }
 
@@ -1587,7 +1587,7 @@ onMounted(() => {
 }
 
 .diagnosis-summary .strengths {
-  color: #15966a;
+  color: var(--long);
   font-size: 14px;
 }
 
@@ -1597,29 +1597,29 @@ onMounted(() => {
 
 .issues-list h4 {
   font-size: 14px;
-  color: #888;
+  color: var(--text-tertiary);
   text-transform: uppercase;
   margin-bottom: 12px;
 }
 
 .issue-item {
-  background: #0f0f0f;
-  border-left: 3px solid #2a2a2a;
+  background: var(--bg-elevated);
+  border-left: 3px solid var(--border-primary);
   padding: 12px 16px;
   margin-bottom: 12px;
   border-radius: 4px;
 }
 
 .issue-item.severity-high {
-  border-left-color: #d15b4b;
+  border-left-color: var(--short);
 }
 
 .issue-item.severity-medium {
-  border-left-color: #ffc107;
+  border-left-color: var(--warning);
 }
 
 .issue-item.severity-low {
-  border-left-color: #888;
+  border-left-color: var(--text-tertiary);
 }
 
 .issue-header {
@@ -1631,7 +1631,7 @@ onMounted(() => {
 
 .issue-type {
   font-weight: 600;
-  color: #fff;
+  color: var(--text-primary);
   text-transform: capitalize;
 }
 
@@ -1639,17 +1639,17 @@ onMounted(() => {
   font-size: 11px;
   padding: 2px 8px;
   border-radius: 4px;
-  background: #2a2a2a;
+  background: var(--border-primary);
 }
 
 .issue-description {
-  color: #fff;
+  color: var(--text-primary);
   margin: 4px 0;
   font-size: 14px;
 }
 
 .issue-detail {
-  color: #888;
+  color: var(--text-tertiary);
   margin: 4px 0;
   font-size: 13px;
 }
@@ -1660,7 +1660,7 @@ onMounted(() => {
 
 .recommendations h4 {
   font-size: 14px;
-  color: #888;
+  color: var(--text-tertiary);
   text-transform: uppercase;
   margin-bottom: 12px;
 }
@@ -1712,22 +1712,22 @@ onMounted(() => {
   justify-content: space-between;
   align-items: center;
   padding: 6px 0;
-  border-bottom: 1px solid #1a1a1a;
+  border-bottom: 1px solid var(--border-secondary);
 }
 
 .dimension-row span {
-  color: #888;
+  color: var(--text-tertiary);
 }
 
 .dimension-row strong {
-  color: #fff;
+  color: var(--text-primary);
 }
 
 .dimension-summary {
   margin-top: 12px;
   padding-top: 12px;
-  border-top: 1px solid #2a2a2a;
-  color: #888;
+  border-top: 1px solid var(--border-primary);
+  color: var(--text-tertiary);
   font-size: 13px;
   line-height: 1.5;
 }

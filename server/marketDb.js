@@ -385,6 +385,48 @@ export class MarketDb {
     `);
     return result.rows.map(normalizePgRow);
   }
+
+  /**
+   * 清理未下单币种的旧K线数据
+   * @param {Array} symbolsWithOrders - 有订单的币种列表
+   * @param {number} daysToKeep - 保留最近几天的数据，默认3天
+   * @returns {Object} 清理统计信息
+   */
+  async cleanOldKlines(symbolsWithOrders = [], daysToKeep = 3) {
+    const cutoffTime = Date.now() - daysToKeep * 24 * 60 * 60 * 1000;
+
+    let deletedCount = 0;
+    let symbolsCleaned = [];
+
+    if (symbolsWithOrders.length === 0) {
+      // 如果没有任何订单，清理所有币种的旧数据
+      const result = await this.pool.query(
+        `DELETE FROM market_klines WHERE open_time < $1`,
+        [cutoffTime]
+      );
+      deletedCount = result.rowCount;
+    } else {
+      // 清理未下单币种的旧数据
+      const result = await this.pool.query(
+        `
+        DELETE FROM market_klines
+        WHERE open_time < $1
+          AND symbol NOT IN (${symbolsWithOrders.map((_, i) => `$${i + 2}`).join(',')})
+        RETURNING DISTINCT symbol
+        `,
+        [cutoffTime, ...symbolsWithOrders]
+      );
+      deletedCount = result.rowCount;
+      symbolsCleaned = [...new Set(result.rows.map(r => r.symbol))];
+    }
+
+    return {
+      deletedCount,
+      symbolsCleaned,
+      cutoffTime,
+      cutoffDate: new Date(cutoffTime).toISOString()
+    };
+  }
 }
 
 export function normalizeBinanceKline(row) {

@@ -537,8 +537,8 @@ onMounted(() => load());
 }
 
 .stat-box {
-  background: #1a1a1a;
-  border: 1px solid #2a2a2a;
+  background: var(--bg-card);
+  border: 1px solid var(--border-primary);
   border-radius: 6px;
   padding: 12px;
   text-align: center;
@@ -546,7 +546,7 @@ onMounted(() => load());
 
 .stat-label {
   font-size: 11px;
-  color: #888;
+  color: var(--text-tertiary);
   text-transform: uppercase;
   margin-bottom: 6px;
 }
@@ -554,7 +554,7 @@ onMounted(() => load());
 .stat-value {
   font-size: 18px;
   font-weight: 600;
-  color: #fff;
+  color: var(--text-primary);
 }
 
 .filter-bar {
@@ -562,7 +562,7 @@ onMounted(() => load());
   gap: 12px;
   align-items: center;
   padding: 12px;
-  background: #1a1a1a;
+  background: var(--bg-card);
   border-radius: 6px;
   margin-bottom: 16px;
   flex-wrap: wrap;
@@ -573,14 +573,14 @@ onMounted(() => load());
   flex-direction: column;
   gap: 4px;
   font-size: 11px;
-  color: #888;
+  color: var(--text-tertiary);
   text-transform: uppercase;
 }
 
 .filter-bar select {
-  background: #0f0f0f;
-  border: 1px solid #2a2a2a;
-  color: #fff;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-primary);
+  color: var(--text-primary);
   padding: 6px 10px;
   border-radius: 4px;
   font-size: 13px;
@@ -588,13 +588,13 @@ onMounted(() => load());
 
 .filter-count {
   margin-left: auto;
-  color: #888;
+  color: var(--text-tertiary);
   font-size: 13px;
 }
 
 .badge-long {
-  background: rgba(21, 150, 106, 0.2);
-  color: #15966a;
+  background: var(--long-bg);
+  color: var(--long);
   padding: 2px 8px;
   border-radius: 4px;
   font-size: 11px;
@@ -603,8 +603,8 @@ onMounted(() => load());
 }
 
 .badge-short {
-  background: rgba(209, 91, 75, 0.2);
-  color: #d15b4b;
+  background: var(--short-bg);
+  color: var(--short);
   padding: 2px 8px;
   border-radius: 4px;
   font-size: 11px;
@@ -613,11 +613,11 @@ onMounted(() => load());
 }
 
 .profit {
-  color: #15966a;
+  color: var(--success);
 }
 
 .loss {
-  color: #d15b4b;
+  color: var(--danger);
 }
 
 .performance-subtitle {

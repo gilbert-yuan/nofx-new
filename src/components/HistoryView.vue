@@ -164,24 +164,24 @@ watch(() => props.records, () => {
   gap: 8px;
   margin-top: 24px;
   padding: 16px;
-  background: #1a1a1a;
+  background: var(--bg-card);
   border-radius: 8px;
 }
 
 .btn-small {
   padding: 6px 12px;
   font-size: 13px;
-  background: #2a2a2a;
-  border: 1px solid #3a3a3a;
-  color: #fff;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-primary);
+  color: var(--text-primary);
   border-radius: 4px;
   cursor: pointer;
   transition: all 0.2s;
 }
 
 .btn-small:hover:not(:disabled) {
-  background: #3a3a3a;
-  border-color: #4a4a4a;
+  background: var(--bg-card);
+  border-color: var(--border-secondary);
 }
 
 .btn-small:disabled {
@@ -190,7 +190,7 @@ watch(() => props.records, () => {
 }
 
 .page-info {
-  color: #888;
+  color: var(--text-tertiary);
   font-size: 13px;
   margin: 0 8px;
 }
@@ -199,14 +199,14 @@ watch(() => props.records, () => {
   display: flex;
   align-items: center;
   gap: 8px;
-  color: #888;
+  color: var(--text-tertiary);
   font-size: 13px;
 }
 
 .pagination select {
-  background: #0f0f0f;
-  border: 1px solid #2a2a2a;
-  color: #fff;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-primary);
+  color: var(--text-primary);
   padding: 4px 8px;
   border-radius: 4px;
   font-size: 13px;

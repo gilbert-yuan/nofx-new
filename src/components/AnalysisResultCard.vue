@@ -66,8 +66,8 @@ function trendIcon(trend) { return trend === 'long' ? '↑' : trend === 'short' 
 <style scoped>
 .mtf-analysis {
   margin: 12px 0;
-  background: #1a1a1a;
-  border: 1px solid #2a2a2a;
+  background: var(--bg-card);
+  border: 1px solid var(--border-primary);
   border-radius: 6px;
   padding: 12px;
 }
@@ -76,12 +76,13 @@ function trendIcon(trend) { return trend === 'long' ? '↑' : trend === 'short' 
   cursor: pointer;
   font-weight: 600;
   font-size: 13px;
-  color: #15966a;
+  color: var(--success);
   user-select: none;
 }
 
 .mtf-analysis summary:hover {
-  color: #1bbd84;
+  color: var(--success);
+  opacity: 0.85;
 }
 
 .mtf-grid {
@@ -92,8 +93,8 @@ function trendIcon(trend) { return trend === 'long' ? '↑' : trend === 'short' 
 }
 
 .mtf-item {
-  background: #0f0f0f;
-  border: 1px solid #2a2a2a;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-primary);
   border-radius: 4px;
   padding: 8px;
 }
@@ -108,7 +109,7 @@ function trendIcon(trend) { return trend === 'long' ? '↑' : trend === 'short' 
 .mtf-interval {
   font-weight: 600;
   font-size: 12px;
-  color: #888;
+  color: var(--text-tertiary);
   text-transform: uppercase;
 }
 
@@ -118,15 +119,15 @@ function trendIcon(trend) { return trend === 'long' ? '↑' : trend === 'short' 
 }
 
 .mtf-trend.long {
-  color: #15966a;
+  color: var(--long);
 }
 
 .mtf-trend.short {
-  color: #d15b4b;
+  color: var(--short);
 }
 
 .mtf-trend.unknown {
-  color: #888;
+  color: var(--text-tertiary);
 }
 
 .mtf-detail {
@@ -137,7 +138,7 @@ function trendIcon(trend) { return trend === 'long' ? '↑' : trend === 'short' 
 
 .mtf-detail small {
   font-size: 11px;
-  color: #888;
+  color: var(--text-tertiary);
   line-height: 1.4;
 }
 </style>

@@ -175,6 +175,59 @@ setTimeout(() => {
 
 console.log('[GlobalAutomation] 系统就绪，将在5秒后自动启动');
 
+// 定时清理旧K线数据（每天凌晨2点执行）
+async function cleanOldKlinesTask() {
+  try {
+    // 获取所有有订单的币种
+    const simulation = researchInstances.simulation;
+    const state = await simulation.read();
+    const symbolsWithOrders = [...new Set(state.orders.map(o => o.symbol))];
+
+    console.log('[KlineCleanup] 开始清理旧K线数据...');
+    console.log(`[KlineCleanup] 有订单的币种: ${symbolsWithOrders.join(', ')}`);
+
+    const result = await marketDb.cleanOldKlines(symbolsWithOrders, 3);
+
+    console.log(`[KlineCleanup] 清理完成: 删除了 ${result.deletedCount} 条K线记录`);
+    console.log(`[KlineCleanup] 清理的币种: ${result.symbolsCleaned.join(', ') || '无'}`);
+    console.log(`[KlineCleanup] 截止时间: ${result.cutoffDate}`);
+  } catch (error) {
+    console.error('[KlineCleanup] 清理失败:', error.message);
+  }
+}
+
+// 计算下次凌晨2点的时间
+function getNextCleanupTime() {
+  const now = new Date();
+  const next = new Date(now);
+  next.setHours(2, 0, 0, 0);
+
+  // 如果今天2点已经过了，设置为明天2点
+  if (next <= now) {
+    next.setDate(next.getDate() + 1);
+  }
+
+  return next.getTime() - now.getTime();
+}
+
+// 启动定时任务
+function scheduleKlineCleanup() {
+  const delay = getNextCleanupTime();
+  console.log(`[KlineCleanup] 将在 ${new Date(Date.now() + delay).toLocaleString('zh-CN')} 执行清理任务`);
+
+  setTimeout(async () => {
+    await cleanOldKlinesTask();
+    // 执行完后安排下一次清理
+    scheduleKlineCleanup();
+  }, delay);
+}
+
+// 启动清理任务调度（延迟10秒，确保系统初始化完成）
+setTimeout(() => {
+  scheduleKlineCleanup();
+  console.log('[KlineCleanup] 定时清理任务已启动');
+}, 10000);
+
 app.post('/api/history/fetch', async (req, res, next) => {
   try {
     const source = marketData.provider;

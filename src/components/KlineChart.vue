@@ -26,17 +26,21 @@ function step(amount) { selected.value = Math.max(0, Math.min(props.rows.length 
     <div v-if="loading" class="chart-loading" role="status"><span class="spinner"></span>正在加载 K 线…</div>
     <div v-else-if="chart.candles.length" class="chart-plot">
       <svg :viewBox="'0 0 ' + chart.width + ' ' + chart.height" tabindex="0" role="img" aria-label="K 线与成交量图，左右方向键查看每根 K 线" @pointermove="point" @pointerdown="point" @keydown.left.prevent="step(-1)" @keydown.right.prevent="step(1)">
-        <g v-for="tick in ticks" :key="tick.y"><line x1="18" :y1="tick.y" x2="942" :y2="tick.y" stroke="#e5eaf2" stroke-dasharray="3 5" /></g>
-        <line x1="18" y1="312" x2="942" y2="312" stroke="#dce3ed" />
+        <!-- 网格线 - 使用主题变量 -->
+        <g v-for="tick in ticks" :key="tick.y"><line x1="18" :y1="tick.y" x2="942" :y2="tick.y" stroke="var(--chart-grid)" stroke-dasharray="3 5" /></g>
+        <line x1="18" y1="312" x2="942" y2="312" stroke="var(--chart-grid-dash)" />
+        <!-- K 线 -->
         <g v-for="(candle, index) in chart.candles" :key="index"><line :x1="candle.x" :x2="candle.x" :y1="candle.wickY1" :y2="candle.wickY2" :stroke="candle.color" stroke-width="1.3" /><rect :x="candle.bodyX" :y="candle.bodyY" :width="candle.bodyWidth" :height="candle.bodyHeight" :fill="candle.color" /></g>
-        <g v-for="(bar, index) in chart.volumes" :key="index"><rect :x="bar.x" :y="bar.y" :width="bar.width" :height="bar.height" :fill="bar.color" opacity=".35" /></g>
-        <line v-if="selected !== null && chart.candles[selected]" :x1="chart.candles[selected].x" :x2="chart.candles[selected].x" y1="18" y2="407" stroke="#68778d" stroke-dasharray="4 4" />
-        <line v-if="selected !== null" x1="18" x2="942" :y1="selectedY" :y2="selectedY" stroke="#68778d" stroke-dasharray="4 4" />
+        <!-- 成交量 -->
+        <g v-for="(bar, index) in chart.volumes" :key="index"><rect :x="bar.x" :y="bar.y" :width="bar.width" :height="bar.height" :fill="bar.color" /></g>
+        <!-- 十字准星 - 使用主题变量 -->
+        <line v-if="selected !== null && chart.candles[selected]" :x1="chart.candles[selected].x" :x2="chart.candles[selected].x" y1="18" y2="407" stroke="var(--chart-crosshair)" stroke-dasharray="4 4" />
+        <line v-if="selected !== null" x1="18" x2="942" :y1="selectedY" :y2="selectedY" stroke="var(--chart-crosshair)" stroke-dasharray="4 4" />
       </svg>
       <div class="price-axis" aria-hidden="true"><span v-for="tick in ticks" :key="tick.y" :style="{ top: tick.y / chart.height * 100 + '%' }">{{ price(tick.value) }}</span><small>成交量</small></div>
       <div class="time-axis"><span>{{ time(rows[0].openTime) }}</span><span>{{ time(rows.at(-1).openTime) }}</span></div>
     </div>
-    <div v-else class="research-empty"><h3>暂未获取 K 线</h3><p>点击“刷新当前 K 线”重新获取行情。</p></div>
+    <div v-else class="research-empty"><h3>暂未获取 K 线</h3><p>点击"刷新当前 K 线"重新获取行情。</p></div>
     <div v-if="rows.length && !loading" class="candle-picker"><label>逐根查看 · {{ (selected ?? rows.length - 1) + 1 }} / {{ rows.length }}<input type="range" min="0" :max="rows.length - 1" :value="selected ?? rows.length - 1" @input="selected = Number($event.target.value)" /></label><p>{{ row ? time(row.openTime) : '' }} · 收盘价 {{ row ? price(row.close) : '—' }} USDT</p><small>时区：{{ zone }}</small></div>
     <div class="chart-footnote"><span><i class="legend-up"></i>上涨 <i class="legend-down"></i>下跌</span><span>悬停或使用 ← → 查看单根数据</span></div>
   </section>
