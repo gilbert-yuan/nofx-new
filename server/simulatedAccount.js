@@ -1,0 +1,648 @@
+import { randomUUID } from 'node:crypto';
+import { candleOpenAt, nextOpenTime, validCandle, PAPER_COSTS } from './research.js';
+import { recommendedLeverage } from './localAnalysis.js';
+import { createAccountSimulator } from './tradingSimulator.js';
+import { analyzeClosedOrders, generateStrategyAdjustments } from './strategyOptimizer.js';
+import { SimulatedAccountRepository } from './simulatedAccountRepository.js';
+import { getOrderReplayData, batchAnalyzeOrders } from './orderReplay.js';
+
+const active = order => ['pending', 'open'].includes(order.status);
+const fail = message => { throw Object.assign(new Error(message), { status: 422 }); };
+export const initialPaperAccount = () => ({ initialBalance: 10000, orders: [] });
+
+export function accountSummary(state) {
+  const orders = state.orders;
+  const realized = orders.filter(o => o.status === 'closed').reduce((sum, o) => sum + o.net, 0);
+  const entryFees = orders.filter(o => o.status === 'open').reduce((sum, o) => sum + o.entryFee, 0);
+  const usedMargin = orders.filter(active).reduce((sum, o) => sum + o.margin, 0);
+  const feeReserve = orders.filter(o => o.status === 'pending').reduce((sum, o) => sum + o.notional * o.costs.feeBps / 10000, 0);
+  const floating = orders.filter(o => o.status === 'open').reduce((sum, o) => sum + (o.unrealized || 0), 0);
+  const balance = state.initialBalance + realized - entryFees;
+  const investedMargin = orders.filter(o => o.entry).reduce((sum, o) => sum + o.margin, 0);
+  const closedMargin = orders.filter(o => o.status === 'closed').reduce((sum, o) => sum + o.margin, 0);
+  return { unlimitedCapital: !!state.unlimitedCapital, investedMargin, closedMargin, realizedReturn: closedMargin ? realized / closedMargin : null,
+    initialBalance: state.initialBalance, balance: state.unlimitedCapital ? null : balance, available: state.unlimitedCapital ? null : balance - usedMargin - feeReserve,
+    equity: state.unlimitedCapital ? null : balance + floating, usedMargin, realized, unrealized: floating,
+    net: realized - entryFees + floating, openCount: orders.filter(active).length };
+}
+
+export function submitPaperOrder(state, record, input, now = Date.now()) {
+  const signal = record?.analyses?.find(s => s.symbol === input.symbol);
+  const existing = state.orders.find(o => o.recordId === record?.id && o.symbol === input.symbol);
+  if (existing) return existing;
+  if (!signal?.eligible || !signal.plan || !['OPEN_LONG', 'OPEN_SHORT'].includes(signal.positionRecommendation)) fail('该分析为观望或没有有效开仓计划，不能模拟下单。');
+  if ((signal.marketProvider || record.marketProvider) !== 'okx') fail('请使用当前 OKX 行情重新分析后模拟下单。');
+  const first = Math.max(Date.parse(signal.firstEntryAt), nextOpenTime(candleOpenAt(now, signal.interval), signal.interval));
+  if (!Number.isFinite(first) || !Number.isFinite(Date.parse(signal.expiresAt)) || first >= Date.parse(signal.expiresAt)) fail('分析计划已过期或已无未来入场窗口，请重新分析。');
+  const margin = Number(input.margin ?? 100), leverage = Number(input.leverage ?? signal.recommendedLeverage ?? recommendedLeverage(signal.plan, signal.positionRecommendation));
+  if (!Number.isFinite(margin) || margin < 1 || margin > 100000 || !Number.isInteger(leverage) || leverage < 1 || leverage > 5) fail('保证金须为 1～100000 USDT，杠杆须为 1～5 的整数。');
+  if (!state.unlimitedCapital && state.orders.filter(active).length >= 20) fail('最多同时持有 20 个模拟挂单或持仓。');
+  if (!state.unlimitedCapital && state.orders.some(o => active(o) && o.symbol === input.symbol)) fail('该币种已有模拟挂单或持仓。');
+  const plan = { ...signal.plan, stopLoss: Number(input.stopLoss ?? signal.plan.stopLoss), takeProfit: Number(input.takeProfit ?? signal.plan.takeProfit) };
+  const long = signal.positionRecommendation === 'OPEN_LONG';
+  if (![plan.stopLoss, plan.takeProfit].every(v => Number.isFinite(v) && v > 0) || (long ? !(plan.stopLoss < plan.entryMin && plan.takeProfit > plan.entryMax) : !(plan.takeProfit < plan.entryMin && plan.stopLoss > plan.entryMax))) fail('止盈止损必须位于入场区间两侧，且符合多空方向。');
+  const notional = margin * leverage;
+  if (!state.unlimitedCapital && margin + notional * PAPER_COSTS.feeBps / 10000 > accountSummary(state).available) fail('模拟可用余额不足。');
+
+  // 保存完整的分析上下文，用于后续策略优化
+  const analysisContext = {
+    signal: { ...signal }, // 完整的分析信号
+    strategyVersion: record.strategyVersion, // 策略版本哈希
+    analysisEngine: record.analysisEngine || signal.analysisEngine, // 分析引擎类型
+    scope: record.scope, // 分析参数（limit, interval等）
+    confidence: signal.confidence,
+    confidenceType: signal.confidenceType,
+    reason: signal.reason, // 开仓理由
+    risk: signal.risk, // 风险提示
+    validationIssues: signal.validationIssues || [],
+    automationRunId: record.automationRunId, // 自动化运行ID
+    dataAsOf: signal.dataAsOf // 行情时间戳
+  };
+
+  const order = { id: randomUUID(), recordId: record.id, symbol: signal.symbol, interval: signal.interval, marketProvider: 'okx',
+    direction: signal.positionRecommendation, status: 'pending', margin, leverage, notional, plan, initialPlan: { ...plan }, costs: { ...PAPER_COSTS },
+    automatic: input.automatic === true, protectionRevisions: [], reviewHistory: [],
+    analysisContext, // 新增：完整分析上下文
+    createdAt: new Date(now).toISOString(), nextTime: first, expiresAt: signal.expiresAt, heldBars: 0, error: '' };
+  state.orders.unshift(order);
+  return order;
+}
+
+export function settlePaperOrder(order, price, reason, time, ambiguousBar = false) {
+  const direction = order.direction === 'OPEN_LONG' ? 1 : -1;
+  const exit = price * (1 - direction * order.costs.slippageBps / 10000);
+  const gross = direction * (exit - order.entry) * order.quantity;
+  const exitFee = exit * order.quantity * order.costs.feeBps / 10000;
+  const funding = order.notional * order.costs.fundingBpsPer8h / 10000 * Math.max(0, time - Date.parse(order.entryAt)) / 28800000;
+  const rawNet = gross - order.entryFee - exitFee - funding;
+  // Isolated simulated collateral: never debit more than reserved margin + entry fee.
+  const net = Math.max(-order.margin - order.entryFee, rawNet);
+  Object.assign(order, { status: 'closed', exit, exitAt: new Date(time).toISOString(), reason, gross,
+    fees: order.entryFee + exitFee, funding, net, roi: net / order.margin,
+    isolatedLossAdjustment: net - rawNet, ambiguousBar, unrealized: 0, error: '' });
+
+  // 标记需要进行复盘分析
+  order.needsReplayAnalysis = true;
+}
+
+export function advancePaperOrder(order, rows, now = Date.now()) {
+  if (!active(order)) return order;
+
+  // 使用统一的账户模拟器
+  const simulator = createAccountSimulator({
+    enableLiquidation: true,
+    enableIsolatedMargin: true,
+    enableDynamicProtection: true
+  });
+
+  // 执行模拟
+  const result = simulator.evaluate(order, rows, now);
+
+  // 只保存引擎实际处理的连续已收盘K线进度，包括缺口之前和同根平仓时的入场。
+  for (const key of ['nextTime', 'entry', 'entryAt', 'heldBars', 'quantity', 'entryFee',
+    'liquidationPrice', 'markPrice', 'markAt', 'unrealized']) {
+    if (result[key] !== undefined && result[key] !== null) order[key] = result[key];
+  }
+
+  // 更新订单状态
+  if (result.status === 'data_gap') {
+    if (order.entry) order.status = 'open';
+    order.error = `缺少 ${result.missingAt} 的已收盘 K 线，等待补齐后继续。`;
+    return order;
+  }
+
+  if (result.status === 'expired') {
+    order.status = 'expired';
+    order.nextTime = Math.max(order.nextTime, Date.parse(order.expiresAt));
+    order.error = '';
+    return order;
+  }
+
+  if (result.status === 'pending' || result.status === 'open') {
+    order.status = result.status;
+    order.error = '';
+    return order;
+  }
+
+  if (result.status === 'closed') {
+    // 平仓
+    Object.assign(order, {
+      status: 'closed',
+      exit: result.exit,
+      exitAt: result.exitAt,
+      reason: result.reason,
+      gross: result.gross,
+      fees: result.fees,
+      funding: result.funding,
+      net: result.net,
+      roi: result.roi,
+      isolatedLossAdjustment: result.isolatedLossAdjustment,
+      ambiguousBar: result.ambiguousBar,
+      unrealized: 0,
+      error: ''
+    });
+
+    return order;
+  }
+
+  return order;
+}
+
+export class SimulatedAccount {
+  constructor({ pool, market, archive, marketDb }) {
+    Object.assign(this, { pool, market, archive, marketDb, busy: false, lastError: '', lastRunAt: null });
+    this.repository = new SimulatedAccountRepository(pool);
+    this.pendingAnalysis = []; // 待分析的订单队列
+    this.activeOrderAnalysis = new Map(); // 活跃订单的分析记录 orderId -> { lastAnalyzedAt, analysisCount }
+  }
+  async init() {
+    await this.repository.init();
+  }
+  async read() { return this.repository.read(); }
+  async mutate(fn) {
+    return this.repository.mutate(fn);
+  }
+  async status() { const state = await this.read(); return { ...accountSummary(state), automation: state.automation, orders: state.orders, busy: this.busy, lastRunAt: this.lastRunAt, error: this.lastError }; }
+  async submit(input) { const record = await this.archive.get(String(input.recordId || '')); return this.mutate(state => submitPaperOrder(state, record, input)); }
+  async refresh() {
+    if (this.busy) return this.status();
+    this.busy = true;
+    try {
+      const state = await this.read(), now = Date.now();
+      const updates = [];
+      const cache = new Map();
+      for (const order of state.orders.filter(active).sort((a, b) => a.nextTime - b.nextTime)) {
+        try {
+          const end = candleOpenAt(now, order.interval);
+          const key = `${order.symbol}:${order.interval}`;
+          if (!cache.has(key)) {
+            const rows = order.nextTime >= end ? [] : this.marketDb && order.interval === '1m'
+              ? await this.archive.candles(order.symbol, order.interval, order.nextTime, end, order.marketProvider)
+              : await this.market.klines({ symbol: order.symbol, interval: order.interval, startTime: order.nextTime, endTime: end - 1, limit: 200 });
+            cache.set(key, rows);
+          }
+          const rows = cache.get(key);
+          updates.push({ id: order.id, cursor: order.nextTime, rows });
+        } catch (error) { updates.push({ id: order.id, cursor: order.nextTime, error: error.message }); }
+      }
+
+      const newlyClosedOrders = [];
+
+      await this.mutate(current => {
+        for (const update of updates) {
+          const order = current.orders.find(o => o.id === update.id);
+          if (!order || !active(order) || order.nextTime !== update.cursor) continue;
+
+          const wasActive = order.status === 'open' || order.status === 'pending';
+
+          if (update.error) order.error = update.error;
+          else advancePaperOrder(order, update.rows, now);
+
+          // 检测订单是否刚刚平仓
+          if (wasActive && order.status === 'closed') {
+            newlyClosedOrders.push(order);
+          }
+        }
+      });
+
+      // 对新平仓的订单安排多次延迟分析（15分钟、30分钟、4小时）
+      if (newlyClosedOrders.length > 0) {
+        for (const order of newlyClosedOrders) {
+          // 安排3次分析
+          const analysisSchedule = [
+            { delay: 15 * 60 * 1000, label: '15分钟' },   // 15分钟
+            { delay: 30 * 60 * 1000, label: '30分钟' },   // 30分钟
+            { delay: 4 * 60 * 60 * 1000, label: '4小时' } // 4小时
+          ];
+
+          for (const schedule of analysisSchedule) {
+            this.pendingAnalysis.push({
+              orderId: order.id,
+              symbol: order.symbol,
+              direction: order.direction,
+              scheduledAt: now + schedule.delay,
+              closedAt: now,
+              analysisLabel: schedule.label
+            });
+          }
+
+          console.log(`[AutoReplay] 订单 ${order.symbol} ${order.direction} 已平仓，安排 15分钟、30分钟、4小时 后进行深度分析`);
+        }
+      }
+
+      // 执行到期的分析任务
+      await this.processScheduledAnalysis(now);
+
+      // 对活跃订单进行定期分析（每小时一次）
+      await this.analyzeActiveOrders(now);
+
+      this.lastRunAt = new Date().toISOString(); this.lastError = '';
+    } catch (error) { this.lastError = error.message; throw error; }
+    finally { this.busy = false; }
+    return this.status();
+  }
+
+  async analyzeActiveOrders(now) {
+    const state = await this.read();
+    const activeOrders = state.orders.filter(o => o.status === 'open' && o.entry);
+
+    if (activeOrders.length === 0) return;
+
+    const ordersToAnalyze = [];
+
+    for (const order of activeOrders) {
+      const record = this.activeOrderAnalysis.get(order.id);
+
+      if (!record) {
+        // 首次分析：入场后10分钟
+        const entryTime = Date.parse(order.entryAt);
+        if (now - entryTime >= 10 * 60 * 1000) {
+          ordersToAnalyze.push(order);
+          this.activeOrderAnalysis.set(order.id, {
+            lastAnalyzedAt: now,
+            analysisCount: 0
+          });
+        }
+      } else {
+        // 后续分析：每小时一次
+        const timeSinceLastAnalysis = now - record.lastAnalyzedAt;
+        if (timeSinceLastAnalysis >= 60 * 60 * 1000) {
+          ordersToAnalyze.push(order);
+          record.lastAnalyzedAt = now;
+          record.analysisCount++;
+        }
+      }
+    }
+
+    if (ordersToAnalyze.length === 0) return;
+
+    console.log(`[ActiveAnalysis] 开始分析 ${ordersToAnalyze.length} 个活跃订单`);
+
+    for (const order of ordersToAnalyze) {
+      try {
+        const record = this.activeOrderAnalysis.get(order.id);
+        const analysisCount = record ? record.analysisCount + 1 : 1;
+
+        // 执行实时复盘分析
+        const replayData = await getOrderReplayData(order, this.market, this.marketDb);
+
+        if (replayData.error) {
+          console.log(`[ActiveAnalysis] 订单 ${order.symbol} 分析失败: ${replayData.error}`);
+          continue;
+        }
+
+        // 保存分析结果到订单的实时分析数组
+        await this.mutate(currentState => {
+          const targetOrder = currentState.orders.find(o => o.id === order.id);
+          if (targetOrder) {
+            if (!targetOrder.liveAnalysis) {
+              targetOrder.liveAnalysis = [];
+            }
+
+            targetOrder.liveAnalysis.push({
+              sequence: analysisCount,
+              score: replayData.diagnosis.score,
+              primaryIssue: replayData.diagnosis.primaryIssue,
+              summary: replayData.diagnosis.summary,
+              direction: {
+                correct: replayData.analysis.direction.correct,
+                favorableMove: replayData.analysis.direction.favorableMove,
+                adverseMove: replayData.analysis.direction.adverseMove
+              },
+              stopLoss: {
+                optimal: replayData.analysis.stopLoss.optimal,
+                minDistanceToSL: replayData.analysis.stopLoss.minDistanceToSL
+              },
+              takeProfit: {
+                optimal: replayData.analysis.takeProfit.optimal,
+                minDistanceToTP: replayData.analysis.takeProfit.minDistanceToTP
+              },
+              analyzedAt: new Date().toISOString(),
+              heldBars: targetOrder.heldBars,
+              unrealized: targetOrder.unrealized
+            });
+
+            // 只保留最近5次分析记录
+            if (targetOrder.liveAnalysis.length > 5) {
+              targetOrder.liveAnalysis.shift();
+            }
+          }
+        });
+
+        console.log(`[ActiveAnalysis] ✓ 订单 ${order.symbol} ${order.direction} 第${analysisCount}次分析 - 评分: ${replayData.diagnosis.score}, 浮盈: ${order.unrealized?.toFixed(2) || 0}`);
+
+      } catch (error) {
+        console.error(`[ActiveAnalysis] 订单 ${order.id} 分析异常:`, error.message);
+      }
+    }
+
+    console.log(`[ActiveAnalysis] 完成活跃订单分析`);
+  }
+
+  async processScheduledAnalysis(now) {
+    // 找出所有到期的分析任务
+    const dueAnalysis = this.pendingAnalysis.filter(task => task.scheduledAt <= now);
+
+    if (dueAnalysis.length === 0) return;
+
+    console.log(`[AutoReplay] 开始执行 ${dueAnalysis.length} 个到期的复盘分析任务`);
+
+    // 从待处理队列中移除
+    this.pendingAnalysis = this.pendingAnalysis.filter(task => task.scheduledAt > now);
+
+    const state = await this.read();
+
+    for (const task of dueAnalysis) {
+      try {
+        const order = state.orders.find(o => o.id === task.orderId);
+
+        if (!order || order.status !== 'closed') {
+          console.log(`[AutoReplay] 订单 ${task.orderId} 未找到或状态异常，跳过分析`);
+          continue;
+        }
+
+        // 执行复盘分析
+        const replayData = await getOrderReplayData(order, this.market, this.marketDb);
+
+        if (replayData.error) {
+          console.log(`[AutoReplay] 订单 ${task.symbol} 分析失败: ${replayData.error}`);
+          continue;
+        }
+
+        // 保存复盘分析结果到订单
+        await this.mutate(currentState => {
+          const targetOrder = currentState.orders.find(o => o.id === task.orderId);
+          if (targetOrder) {
+            targetOrder.replayAnalysis = {
+              score: replayData.diagnosis.score,
+              primaryIssue: replayData.diagnosis.primaryIssue,
+              summary: replayData.diagnosis.summary,
+              issues: replayData.diagnosis.issues,
+              recommendations: replayData.diagnosis.recommendations,
+              analysis: {
+                direction: {
+                  correct: replayData.analysis.direction.correct,
+                  favorableMove: replayData.analysis.direction.favorableMove,
+                  adverseMove: replayData.analysis.direction.adverseMove,
+                  summary: replayData.analysis.direction.summary
+                },
+                stopLoss: {
+                  optimal: replayData.analysis.stopLoss.optimal,
+                  distance: replayData.analysis.stopLoss.distance,
+                  touched: replayData.analysis.stopLoss.touched,
+                  assessment: replayData.analysis.stopLoss.assessment
+                },
+                takeProfit: {
+                  optimal: replayData.analysis.takeProfit.optimal,
+                  distance: replayData.analysis.takeProfit.distance,
+                  touched: replayData.analysis.takeProfit.touched,
+                  assessment: replayData.analysis.takeProfit.assessment
+                },
+                entry: {
+                  optimal: replayData.analysis.entry.optimal,
+                  timing: replayData.analysis.entry.timing
+                }
+              },
+              analyzedAt: new Date().toISOString()
+            };
+            targetOrder.needsReplayAnalysis = false;
+          }
+        });
+
+        console.log(`[AutoReplay] ✓ 订单 ${task.symbol} ${task.direction} - 评分: ${replayData.diagnosis.score}, 主要问题: ${replayData.diagnosis.primaryIssue}`);
+
+      } catch (error) {
+        console.error(`[AutoReplay] 订单 ${task.orderId} 分析异常:`, error.message);
+      }
+    }
+
+    console.log(`[AutoReplay] 完成 ${dueAnalysis.length} 个订单的深度分析`);
+  }
+  async close(id) {
+    await this.refresh();
+    return this.mutate(state => {
+      const order = state.orders.find(o => o.id === id);
+      if (!order) fail('模拟订单不存在。');
+      if (order.status === 'pending') { order.status = 'cancelled'; return order; }
+      if (order.status !== 'open') return order;
+      if (order.error || Date.parse(order.markAt) !== candleOpenAt(Date.now(), order.interval)) fail('行情未更新，不能用过期价格模拟平仓，请先刷新。');
+      settlePaperOrder(order, order.markPrice, 'manual', Date.now());
+      return order;
+    });
+  }
+  start() { this.timer = setInterval(() => this.refresh().catch(() => {}), 30000); this.timer.unref(); this.refresh().catch(() => {}); }
+}
+
+export function registerSimulationRoutes(app, simulation) {
+  const route = fn => async (req, res, next) => { try { res.json(await fn(req)); } catch (error) { next(error); } };
+  app.get('/api/paper/account', route(() => simulation.status()));
+  app.get('/api/paper/plans', route(async () => (await simulation.archive.list({ limit: 100 })).flatMap(record => (record.analyses || [])
+    .filter(s => s.eligible && s.marketProvider === 'okx' && Date.parse(s.expiresAt) > Date.now())
+    .map(s => ({ ...s, recordId: record.id, at: record.at })))));
+  app.post('/api/paper/orders', route(req => simulation.submit(req.body || {})));
+  app.post('/api/paper/refresh', route(() => simulation.refresh()));
+  app.post('/api/paper/orders/:id/close', route(req => simulation.close(req.params.id)));
+
+  // 策略优化接口
+  app.get('/api/paper/optimize', route(async () => {
+    const state = await simulation.read();
+    const analysis = analyzeClosedOrders(state.orders);
+    if (analysis.error) return analysis;
+
+    const adjustments = generateStrategyAdjustments(analysis.suggestions, {});
+    return {
+      ...analysis,
+      adjustments,
+      timestamp: new Date().toISOString()
+    };
+  }));
+
+  // 获取订单详情（包含完整分析上下文）
+  app.get('/api/paper/orders/:id', route(async (req) => {
+    const state = await simulation.read();
+    const order = state.orders.find(o => o.id === req.params.id);
+    if (!order) fail('订单不存在');
+    return order;
+  }));
+
+  // 统计分析端点
+  app.get('/api/paper/statistics', route(async () => {
+    const state = await simulation.read();
+    const orders = state.orders || [];
+
+    // 基础统计
+    const closedOrders = orders.filter(o => o.status === 'closed');
+    const activeOrders = orders.filter(o => ['pending', 'open'].includes(o.status));
+
+    // 按币种统计
+    const bySymbol = {};
+    for (const order of closedOrders) {
+      if (!bySymbol[order.symbol]) {
+        bySymbol[order.symbol] = { symbol: order.symbol, count: 0, wins: 0, totalNet: 0, totalGross: 0 };
+      }
+      bySymbol[order.symbol].count++;
+      if (order.net > 0) bySymbol[order.symbol].wins++;
+      bySymbol[order.symbol].totalNet += order.net;
+      bySymbol[order.symbol].totalGross += order.gross || 0;
+    }
+
+    const symbolStats = Object.values(bySymbol).map(s => ({
+      ...s,
+      winRate: s.count > 0 ? s.wins / s.count : 0,
+      avgNet: s.count > 0 ? s.totalNet / s.count : 0
+    })).sort((a, b) => b.count - a.count);
+
+    // 按策略版本统计
+    const byStrategy = {};
+    for (const order of closedOrders) {
+      const version = order.analysisContext?.strategyVersion || 'unknown';
+      if (!byStrategy[version]) {
+        byStrategy[version] = { version, count: 0, wins: 0, totalNet: 0 };
+      }
+      byStrategy[version].count++;
+      if (order.net > 0) byStrategy[version].wins++;
+      byStrategy[version].totalNet += order.net;
+    }
+
+    const strategyStats = Object.values(byStrategy).map(s => ({
+      ...s,
+      winRate: s.count > 0 ? s.wins / s.count : 0,
+      avgNet: s.count > 0 ? s.totalNet / s.count : 0
+    })).sort((a, b) => b.count - a.count);
+
+    // 按分析引擎统计
+    const byEngine = {};
+    for (const order of closedOrders) {
+      const engine = order.analysisContext?.analysisEngine || 'unknown';
+      if (!byEngine[engine]) {
+        byEngine[engine] = { engine, count: 0, wins: 0, totalNet: 0 };
+      }
+      byEngine[engine].count++;
+      if (order.net > 0) byEngine[engine].wins++;
+      byEngine[engine].totalNet += order.net;
+    }
+
+    const engineStats = Object.values(byEngine).map(e => ({
+      ...e,
+      winRate: e.count > 0 ? e.wins / e.count : 0,
+      avgNet: e.count > 0 ? e.totalNet / e.count : 0
+    })).sort((a, b) => b.count - a.count);
+
+    // 时间分布统计
+    const byHour = Array(24).fill(0).map((_, i) => ({ hour: i, count: 0, wins: 0, totalNet: 0 }));
+    for (const order of closedOrders) {
+      if (!order.createdAt) continue;
+      const hour = new Date(order.createdAt).getUTCHours();
+      byHour[hour].count++;
+      if (order.net > 0) byHour[hour].wins++;
+      byHour[hour].totalNet += order.net;
+    }
+
+    const hourStats = byHour.filter(h => h.count > 0).map(h => ({
+      ...h,
+      winRate: h.count > 0 ? h.wins / h.count : 0,
+      avgNet: h.count > 0 ? h.totalNet / h.count : 0
+    }));
+
+    // 持仓时长统计
+    const holdingBarsDistribution = {};
+    for (const order of closedOrders) {
+      if (!order.heldBars) continue;
+      const bucket = Math.floor(order.heldBars / 5) * 5;
+      if (!holdingBarsDistribution[bucket]) {
+        holdingBarsDistribution[bucket] = { bars: bucket, count: 0, wins: 0, totalNet: 0 };
+      }
+      holdingBarsDistribution[bucket].count++;
+      if (order.net > 0) holdingBarsDistribution[bucket].wins++;
+      holdingBarsDistribution[bucket].totalNet += order.net;
+    }
+
+    const holdingStats = Object.values(holdingBarsDistribution).map(h => ({
+      ...h,
+      winRate: h.count > 0 ? h.wins / h.count : 0,
+      avgNet: h.count > 0 ? h.totalNet / h.count : 0
+    })).sort((a, b) => a.bars - b.bars);
+
+    return {
+      summary: {
+        totalOrders: orders.length,
+        closedOrders: closedOrders.length,
+        activeOrders: activeOrders.length
+      },
+      bySymbol: symbolStats,
+      byStrategy: strategyStats,
+      byEngine: engineStats,
+      byHour: hourStats,
+      byHoldingBars: holdingStats
+    };
+  }));
+
+  // 订单复盘分析 - 单个订单
+  app.get('/api/paper/orders/:id/replay', route(async (req) => {
+    const state = await simulation.read();
+    const order = state.orders.find(o => o.id === req.params.id);
+    if (!order) fail('订单不存在');
+    if (order.status !== 'closed') fail('仅支持已平仓订单复盘分析');
+
+    const market = simulation.market;
+    if (!market) fail('市场数据源不可用');
+
+    const marketDb = simulation.marketDb;
+    const replayData = await getOrderReplayData(order, market, marketDb);
+
+    return replayData;
+  }));
+
+  // 批量订单复盘分析
+  app.post('/api/paper/orders/replay-batch', route(async (req) => {
+    const state = await simulation.read();
+    const { orderIds, filters } = req.body || {};
+
+    let ordersToAnalyze = [];
+
+    if (orderIds && Array.isArray(orderIds)) {
+      // 分析指定订单
+      ordersToAnalyze = state.orders.filter(o => orderIds.includes(o.id) && o.status === 'closed');
+    } else {
+      // 根据过滤条件分析
+      ordersToAnalyze = state.orders.filter(o => o.status === 'closed');
+
+      if (filters) {
+        if (filters.symbol) {
+          ordersToAnalyze = ordersToAnalyze.filter(o => o.symbol === filters.symbol);
+        }
+        if (filters.direction) {
+          ordersToAnalyze = ordersToAnalyze.filter(o => o.direction === filters.direction);
+        }
+        if (filters.result) {
+          if (filters.result === 'win') {
+            ordersToAnalyze = ordersToAnalyze.filter(o => o.net > 0);
+          } else if (filters.result === 'loss') {
+            ordersToAnalyze = ordersToAnalyze.filter(o => o.net < 0);
+          }
+        }
+        if (filters.minNet !== undefined) {
+          ordersToAnalyze = ordersToAnalyze.filter(o => o.net >= filters.minNet);
+        }
+        if (filters.maxNet !== undefined) {
+          ordersToAnalyze = ordersToAnalyze.filter(o => o.net <= filters.maxNet);
+        }
+        if (filters.limit) {
+          ordersToAnalyze = ordersToAnalyze.slice(0, filters.limit);
+        }
+      }
+    }
+
+    if (ordersToAnalyze.length === 0) {
+      return { error: '没有符合条件的已平仓订单' };
+    }
+
+    const market = simulation.market;
+    if (!market) fail('市场数据源不可用');
+
+    const marketDb = simulation.marketDb;
+    const batchResult = await batchAnalyzeOrders(ordersToAnalyze, market, marketDb);
+
+    return batchResult;
+  }));
+}

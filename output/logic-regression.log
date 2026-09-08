@@ -1,0 +1,57 @@
+多周期数据获取失败 BTCUSDT: No external fetch required with fresh cache
+多周期数据获取失败 ETHUSDT: No external fetch required with fresh cache
+✔ durable 2-hour and 5-minute schedules lease once and resume the same run after a crash (1.8353ms)
+✔ unlimited capital accepts over 20 orders and over initial balance, but retries do not duplicate signals (5.7936ms)
+✔ protection revision applies only to a future unopened candle, preserving already observed ranges (2.4203ms)
+✔ review refuses wider stops, stale data, bad levels and weak AI proposals (0.36ms)
+✔ complete key-free scan uses cached minute data, archives every symbol and automatically submits fixed 100 margin (9.865ms)
+✔ closed candles exclude current bar and repair incorrect provider close times (1.8009ms)
+✔ stale, insufficient, broken and invalid data are refused (0.8045ms)
+✔ calendar months and weeks use UTC boundaries (0.1999ms)
+✔ validated plans start strictly after generation (0.1311ms)
+✔ invalid scores, reversed exits, thin reward and noninteger horizons become WAIT (0.4261ms)
+✔ crossing a candle boundary during model response invalidates the signal (0.2727ms)
+✔ position-unaware close signals are not executable recommendations (0.284ms)
+✔ snapshot version changes with strategy, omits credentials and covers provider identity (1.304ms)
+✔ no look-ahead: pre-generation and unfinished candles cannot close a trade (0.6645ms)
+✔ intrabar touch cannot enter when opening price is outside entry range (0.3973ms)
+✔ both exits in one bar select stop loss (0.5582ms)
+✔ stop gap uses opening price instead of optimistic stop fill (0.2955ms)
+✔ missing intermediate data cannot produce a profitable outcome (0.2332ms)
+✔ timeout exits at close and all scenario costs reduce returns (0.4511ms)
+✔ short direction reverses profit and slippage correctly (0.2578ms)
+✔ win rate denominator includes only closed net outcomes (0.3953ms)
+✔ unknown account or positions and invalid numbers fail closed (0.5786ms)
+✔ existing positions and total exposure prevent accumulated entries (0.1894ms)
+✔ reduce-only short close bypasses entry confidence and notional limits (0.1429ms)
+✔ runner derives short closing side from position and never changes leverage to exit (0.5012ms)
+✔ live entries cannot bypass missing protective order infrastructure (0.2749ms)
+✔ paper reservation is funded, idempotent and refuses stale or invalid plans without credentials (3.5527ms)
+✔ no retroactive or unfinished-bar fills; pending reserves are released on expiry (1.0678ms)
+✔ 3x changes position size once; long TP books exact gross, fees, funding and margin ROI (0.687ms)
+✔ short TP profits and simultaneous TP/SL stops conservatively (0.4208ms)
+✔ gaps freeze checkpoints; restart resumes once and gap-through stops use worse opening price (0.5117ms)
+✔ isolated liquidation caps collateral loss and cannot spend another order margin (0.3795ms)
+✔ timeout, mark-to-market and manual close update ledger without double fees (0.536ms)
+✔ key-free local analysis emits transparent trend/ATR plans, flat markets WAIT, leverage is capped (0.5126ms)
+﹣ PostgreSQL simulation ledger persists changes atomically and survives a service restart (0.143ms) # SKIP
+﹣ key-free HTTP order submit, duplicate retry, cancel and refresh preserve the isolated test ledger (0.1958ms) # SKIP
+[GlobalAutomation] 开始行情分析，使用 super 模式...
+[GlobalAutomation] 预筛选: 0个币种被过滤
+[GlobalAutomation] BTCUSDT 已提交 BUY 订单，杠杆 1x
+✔ unfinished and out-of-order rows never advance the checkpoint or mark price (3.9ms)
+✔ entry before a data gap persists and restart produces the same settlement as uninterrupted evaluation (1.0032ms)
+✔ same-bar entry and exit retain ledger fields and invested margin (0.4136ms)
+✔ a candle cached before its close is a gap, even after wall time passes (0.258ms)
+✔ funding estimate uses full holding bars regardless of generation time within the candle (0.5583ms)
+✔ analysis windows respect small requested limits and tolerate at most two missing leading bars (2.0494ms)
+[GlobalAutomation] 分析完成: 已分析 4, 合格 1, 已下单 1, 失败 0
+✔ global automation archives all signals and only submits normalized, fresh plans (206.1625ms)
+ℹ tests 43
+ℹ suites 0
+ℹ pass 41
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 2
+ℹ todo 0
+ℹ duration_ms 509.8217

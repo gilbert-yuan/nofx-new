@@ -1,0 +1,167 @@
+
+> nofx-new@0.1.0 test
+> node --test tests/*.test.js
+
+✔ API merges headers and rejects malformed JSON instead of returning an empty success (43.6006ms)
+✔ API timeout releases waiting UI and caller cancellation remains silent AbortError (32.4251ms)
+✔ API preserves structured server errors and successful payloads (5.3276ms)
+﹣ PostgreSQL archive migration, immutable snapshots, pagination and candle windows (1.1378ms) # SKIP
+✔ symbols use exchangeInfo only; cache coalesces refreshes and candles do not depend on symbol API (6.5929ms)
+✔ Binance request signing uses the selected environment and correct algo/close parameters (1.9043ms)
+✔ base-asset quantities and TP/SL obey Binance filters; invalid numbers never pass (0.5499ms)
+✔ automation is disabled without explicit Binance activation and refuses hedge accounts (1.1932ms)
+✔ one candle claim survives a new monitor instance (0.5319ms)
+✔ replacement failure preserves the old stop and never cancels it first (1.2731ms)
+✔ dry-run entry makes no mutation and cumulative exposure blocks a second proposal (1.3927ms)
+✔ multi-page catch-up starts at the old checkpoint, includes overlap, reaches frozen close boundary (13.2147ms)
+✔ initial fetch uses the requested closed window; no forming candle is persisted (0.6019ms)
+✔ a missing candle or empty page is an error, never a successful checkpoint advance (2.2292ms)
+✔ failed second page retains the first committed checkpoint and retries from it (5.2071ms)
+✔ database resume uses earliest existing gap before the latest row (0.5679ms)
+
+🎉 增强版分析引擎测试全部通过！
+✓ 增强版分析 - 多头趋势识别通过
+  评分: 80.14285714285714/100
+  置信度: 90.0%
+  风险收益比: 1.33:1
+✓ 增强版分析 - 空头趋势识别通过
+  评分: 75.14285714285714/100
+  置信度: 90.0%
+✓ 增强版分析 - 横盘市场观望通过
+  原因: 均线纠缠，趋势不明确，等待突破方向。
+✓ 增强版分析 - 多级止盈设置通过
+  止损: 55675.00
+  止盈1: 56325.00
+  止盈2: 56585.00
+  止盈3: 56845.00
+✓ 增强版复核 - 移动止损通过
+  原止损: 49500.00
+  新止损: 51660.00
+  盈利: 3.56%
+✔ 增强版分析 - 多头趋势识别 (5.9645ms)
+✔ 增强版分析 - 空头趋势识别 (1.1548ms)
+✔ 增强版分析 - 横盘市场观望 (1.55ms)
+✔ 增强版分析 - 多级止盈设置 (2.9197ms)
+✔ 增强版复核 - 移动止损 (1.5052ms)
+✓ GlobalAutomation 测试通过
+[GlobalAutomation] klineSync 已禁用
+[GlobalAutomation] klineSync 已启用
+[GlobalAutomation] analysis 间隔已更新为 300000ms
+✔ GlobalAutomation - 初始化 (2.233ms)
+✔ GlobalAutomation - 任务配置 (0.7632ms)
+✔ GlobalAutomation - 本地规则复核 (0.6261ms)
+✔ public symbols coalesce, require no Binance client, and candles normalize base volume independently (4.798ms)
+✔ OKX exclusive reverse pagination preserves inclusive start/end over multiple pages (1.3874ms)
+✔ continuous catch-up honours public provider page size and resumes entire 705-candle gap (4.2199ms)
+✔ sync and archive use independent provider namespaces without overwriting Binance history (1.4115ms)
+✔ source is frozen into analysis and strategy version, while execution venue stays Binance (1.6459ms)
+✔ position review obtains reference candles only from public provider and rejects divergent execution prices (0.7168ms)
+✔ provider pagination cannot loop forever on repeated boundaries (1.7221ms)
+﹣ bulk candle persistence is atomic, updates overlaps and detects old gaps (1.1444ms) # SKIP
+✔ OKX order requests keep position protection attached to a new entry (3.3965ms)
+✔ OKX protection changes use tagged conditional close orders only (1.5086ms)
+✔ OKX position review is fail-closed until automation is explicitly enabled (3.1614ms)
+多周期数据获取失败 BTCUSDT: No external fetch required with fresh cache
+多周期数据获取失败 ETHUSDT: No external fetch required with fresh cache
+✔ durable 2-hour and 5-minute schedules lease once and resume the same run after a crash (1.7695ms)
+✔ unlimited capital accepts over 20 orders and over initial balance, but retries do not duplicate signals (5.307ms)
+✔ protection revision applies only to a future unopened candle, preserving already observed ranges (2.1197ms)
+✔ review refuses wider stops, stale data, bad levels and weak AI proposals (0.3905ms)
+✔ complete key-free scan uses cached minute data, archives every symbol and automatically submits fixed 100 margin (7.1681ms)
+🧪 开始测试公开API集成...
+
+📊 测试1: CoinGecko API
+[CoinGecko] 获取市场数据失败: connect EACCES 69.63.190.26:443
+⚠️  CoinGecko返回空数据
+
+😨 测试2: Fear & Greed Index
+[FearGreed] 获取指数失败: connect EACCES 54.39.131.114:443
+✅ Fear & Greed测试通过
+  - 当前指数: 50/100
+  - 情绪分类: Neutral
+  - 信号: NEUTRAL
+  - 描述: 数据获取失败，使用默认中性值
+
+🌐 测试3: 全球市场数据
+[CoinGecko] 获取全球数据失败: connect EACCES 69.63.190.26:443
+
+🔥 测试4: 热门趋势币种
+[CoinGecko] 获取趋势币种失败: connect EACCES 69.63.190.26:443
+
+📈 测试5: Fear & Greed历史数据
+[FearGreed] 获取历史数据失败: connect EACCES 54.39.131.114:443
+
+📊 测试6: Fear & Greed统计信息
+[FearGreed] 获取历史数据失败: connect EACCES 54.39.131.114:443
+
+📐 测试7: Alpha Vantage API
+⚠️  Alpha Vantage需要API Key才能测试
+  - 如需使用，请在配置中设置 alphaVantage.apiKey
+  - 注册地址: https://www.alphavantage.co/support/#api-key
+ℹ️  Alpha Vantage未配置（可选）
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📋 测试总结：
+
+✅ CoinGecko API - 正常工作
+   - 市场数据、全球统计、热门趋势
+   - 完全免费，无需API Key
+   - 限制: 50次/分钟
+
+✅ Fear & Greed Index - 正常工作
+   - 当前指数、历史数据、统计分析
+   - 完全免费，无需API Key，无限制
+   - 每天更新1-2次
+
+ℹ️  Alpha Vantage - 需要配置
+   - 50+技术指标、新闻情绪
+   - 免费版: 500次/天
+   - 可选，不影响系统运行
+
+🎉 公开API集成测试完成！
+
+💡 使用建议：
+  1. CoinGecko + Fear & Greed 已足够使用（无需任何Key）
+  2. 如需更多技术指标，可注册Alpha Vantage
+  3. 系统已默认集成，无需额外配置
+✔ tests\publicApiIntegration.test.js (2738.9564ms)
+✔ closed candles exclude current bar and repair incorrect provider close times (1.0573ms)
+✔ stale, insufficient, broken and invalid data are refused (0.6559ms)
+✔ calendar months and weeks use UTC boundaries (0.1594ms)
+✔ validated plans start strictly after generation (0.1238ms)
+✔ invalid scores, reversed exits, thin reward and noninteger horizons become WAIT (0.3983ms)
+✔ crossing a candle boundary during model response invalidates the signal (0.1736ms)
+✔ position-unaware close signals are not executable recommendations (0.2609ms)
+✔ snapshot version changes with strategy, omits credentials and covers provider identity (1.5354ms)
+✔ no look-ahead: pre-generation and unfinished candles cannot close a trade (0.7209ms)
+✔ intrabar touch cannot enter when opening price is outside entry range (0.4642ms)
+✔ both exits in one bar select stop loss (0.5383ms)
+✔ stop gap uses opening price instead of optimistic stop fill (0.2105ms)
+✔ missing intermediate data cannot produce a profitable outcome (0.1409ms)
+✔ timeout exits at close and all scenario costs reduce returns (0.3523ms)
+✔ short direction reverses profit and slippage correctly (0.2436ms)
+✔ win rate denominator includes only closed net outcomes (0.3099ms)
+✔ unknown account or positions and invalid numbers fail closed (1.2094ms)
+✔ existing positions and total exposure prevent accumulated entries (0.1426ms)
+✔ reduce-only short close bypasses entry confidence and notional limits (0.1358ms)
+✔ runner derives short closing side from position and never changes leverage to exit (0.33ms)
+✔ live entries cannot bypass missing protective order infrastructure (0.1223ms)
+✔ paper reservation is funded, idempotent and refuses stale or invalid plans without credentials (3.5363ms)
+✔ no retroactive or unfinished-bar fills; pending reserves are released on expiry (1.0054ms)
+✔ 3x changes position size once; long TP books exact gross, fees, funding and margin ROI (0.6496ms)
+✔ short TP profits and simultaneous TP/SL stops conservatively (0.3851ms)
+✔ gaps freeze checkpoints; restart resumes once and gap-through stops use worse opening price (0.5182ms)
+✔ isolated liquidation caps collateral loss and cannot spend another order margin (0.3863ms)
+✔ timeout, mark-to-market and manual close update ledger without double fees (0.5781ms)
+✔ key-free local analysis emits transparent trend/ATR plans, flat markets WAIT, leverage is capped (0.5786ms)
+﹣ PostgreSQL simulation ledger persists changes atomically and survives a service restart (0.1712ms) # SKIP
+﹣ key-free HTTP order submit, duplicate retry, cancel and refresh preserve the isolated test ledger (0.2894ms) # SKIP
+ℹ tests 72
+ℹ suites 0
+ℹ pass 68
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 4
+ℹ todo 0
+ℹ duration_ms 2960.4683

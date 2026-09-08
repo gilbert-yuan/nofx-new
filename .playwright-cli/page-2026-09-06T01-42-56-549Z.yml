@@ -1,0 +1,108 @@
+- generic [ref=f1e3]:
+  - banner [ref=f1e4]:
+    - generic [ref=f1e5]:
+      - generic [ref=f1e6]: "N"
+      - generic [ref=f1e7]:
+        - generic [ref=f1e8]: NOFX / BINANCE
+        - heading "合约工作台" [level=1] [ref=f1e9]
+    - navigation [ref=f1e10]:
+      - button "行情工作台" [ref=f1e11] [cursor=pointer]
+      - button "币安交易" [active] [ref=f1e12] [cursor=pointer]
+      - button "当天总结" [ref=f1e13] [cursor=pointer]
+      - button "历史分析" [ref=f1e14] [cursor=pointer]
+      - button "策略表现" [ref=f1e15] [cursor=pointer]
+      - button "模型设置" [ref=f1e16] [cursor=pointer]
+    - generic [ref=f1e17]: 自动交易关闭
+  - main [ref=f1e2135]:
+    - generic [ref=f1e2517]:
+      - generic [ref=f1e2518]:
+        - generic [ref=f1e2519]:
+          - generic [ref=f1e2520]:
+            - generic [ref=f1e2521]: BINANCE · USDⓈ-M
+            - heading "币安交易配置" [level=2] [ref=f1e2522]
+            - paragraph [ref=f1e2523]: 配置账户连接、执行范围和仓位上限。
+          - generic [ref=f1e2524]: 自动交易关闭
+        - group "账户连接" [ref=f1e2525]:
+          - generic [ref=f1e2527]:
+            - generic [ref=f1e2528]:
+              - text: API Key
+              - textbox "API Key" [ref=f1e2529]:
+                - /placeholder: 输入币安 API Key
+                - text: QoPR...tf81
+            - generic [ref=f1e2530]:
+              - text: Secret Key
+              - textbox "Secret Key" [ref=f1e2531]:
+                - /placeholder: 输入币安 Secret Key
+                - text: jMu5...GPoM
+            - generic [ref=f1e2532]:
+              - text: 交易环境
+              - combobox "交易环境" [ref=f1e2533]:
+                - option "币安合约测试网"
+                - option "币安合约实盘" [selected]
+          - paragraph [ref=f1e2534]: 仅需 API Key 和 Secret Key，支持单向持仓。公开行情始终独立获取；测试网持仓使用测试网行情复核。
+        - group "自动执行" [ref=f1e2535]:
+          - generic [ref=f1e2537]:
+            - generic [ref=f1e2538]:
+              - checkbox "启用定时复核 15 分钟行情同步后检查持仓" [ref=f1e2539]
+              - generic [ref=f1e2540]:
+                - text: 启用定时复核
+                - generic [ref=f1e2541]: 15 分钟行情同步后检查持仓
+            - generic [ref=f1e2542]:
+              - checkbox "仅生成模拟指令 记录建议，不提交订单" [checked] [ref=f1e2543]
+              - generic [ref=f1e2544]:
+                - text: 仅生成模拟指令
+                - generic [ref=f1e2545]: 记录建议，不提交订单
+            - generic [ref=f1e2546]:
+              - checkbox "自动开仓 只分析下方指定的候选币种" [ref=f1e2547]
+              - generic [ref=f1e2548]:
+                - text: 自动开仓
+                - generic [ref=f1e2549]: 只分析下方指定的候选币种
+            - generic [ref=f1e2550]:
+              - checkbox "止盈止损管理 复核并更新本系统的保护单" [checked] [ref=f1e2551]
+              - generic [ref=f1e2552]:
+                - text: 止盈止损管理
+                - generic [ref=f1e2553]: 复核并更新本系统的保护单
+            - generic [ref=f1e2554]:
+              - checkbox "自动平仓 策略退出时提交只减仓订单" [ref=f1e2555]
+              - generic [ref=f1e2556]:
+                - text: 自动平仓
+                - generic [ref=f1e2557]: 策略退出时提交只减仓订单
+        - group "开仓与风控" [ref=f1e2558]:
+          - generic [ref=f1e2560]:
+            - text: 开仓候选币种
+            - textbox "开仓候选币种" [ref=f1e2561]:
+              - /placeholder: BTCUSDT,ETHUSDT
+          - generic [ref=f1e2562]:
+            - generic [ref=f1e2563]:
+              - text: 每轮最多开仓
+              - spinbutton "每轮最多开仓" [ref=f1e2564]: "1"
+            - generic [ref=f1e2565]:
+              - text: 最大杠杆
+              - spinbutton "最大杠杆" [ref=f1e2566]: "10"
+            - generic [ref=f1e2567]:
+              - text: 最低模型置信度
+              - spinbutton "最低模型置信度" [ref=f1e2568]: "0.65"
+            - generic [ref=f1e2569]:
+              - text: 单仓名义价值 / 权益
+              - spinbutton "单仓名义价值 / 权益" [ref=f1e2570]: "0.17"
+            - generic [ref=f1e2571]:
+              - text: 总仓名义价值 / 权益
+              - spinbutton "总仓名义价值 / 权益" [ref=f1e2572]: "0.3"
+            - generic [ref=f1e2573]:
+              - text: 保护价最小调整幅度（基点）
+              - spinbutton "保护价最小调整幅度（基点）" [ref=f1e2574]: "25"
+          - paragraph [ref=f1e2575]: 比例 0.2 表示账户权益的 20%；置信度是模型自评，不代表实际胜率。实盘发单需要关闭“仅生成模拟指令”。
+        - generic [ref=f1e2576]:
+          - button "保存币安配置" [ref=f1e2577] [cursor=pointer]
+          - button "测试已保存的连接" [ref=f1e2578] [cursor=pointer]
+      - complementary [ref=f1e2579]:
+        - generic [ref=f1e2580]: POSITION REVIEW
+        - heading "持仓复核" [level=2] [ref=f1e2581]
+        - generic [ref=f1e2582]:
+          - generic [ref=f1e2583]: 未启用
+          - paragraph [ref=f1e2584]: 2026/9/6 09:39:28
+        - paragraph [ref=f1e2585]: 币安自动交易未启用。
+        - button "按已保存配置立即复核" [ref=f1e2586] [cursor=pointer]
+        - generic [ref=f1e2587]:
+          - heading "最近执行记录" [level=3] [ref=f1e2588]
+          - paragraph [ref=f1e2589]: 暂无记录。复核结果、拦截原因和执行状态会显示在这里。

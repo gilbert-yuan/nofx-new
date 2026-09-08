@@ -1,0 +1,108 @@
+- generic [ref=e3]:
+  - banner [ref=e4]:
+    - generic [ref=e5]:
+      - generic [ref=e6]: "N"
+      - generic [ref=e7]:
+        - generic [ref=e8]: NOFX / BINANCE
+        - heading "合约工作台" [level=1] [ref=e9]
+    - navigation [ref=e10]:
+      - button "行情工作台" [ref=e11] [cursor=pointer]
+      - button "币安交易" [active] [ref=e12] [cursor=pointer]
+      - button "当天总结" [ref=e13] [cursor=pointer]
+      - button "历史分析" [ref=e14] [cursor=pointer]
+      - button "策略表现" [ref=e15] [cursor=pointer]
+      - button "模型设置" [ref=e16] [cursor=pointer]
+    - generic [ref=e17]: 自动交易关闭
+  - main [ref=e2137]:
+    - generic [ref=e2187]:
+      - generic [ref=e2188]:
+        - generic [ref=e2189]:
+          - generic [ref=e2190]:
+            - generic [ref=e2191]: BINANCE · USDⓈ-M
+            - heading "币安交易配置" [level=2] [ref=e2192]
+            - paragraph [ref=e2193]: 配置账户连接、执行范围和仓位上限。
+          - generic [ref=e2194]: 自动交易关闭
+        - group "账户连接" [ref=e2195]:
+          - generic [ref=e2197]:
+            - generic [ref=e2198]:
+              - text: API Key
+              - textbox "API Key" [ref=e2199]:
+                - /placeholder: 输入币安 API Key
+                - text: QoPR...tf81
+            - generic [ref=e2200]:
+              - text: Secret Key
+              - textbox "Secret Key" [ref=e2201]:
+                - /placeholder: 输入币安 Secret Key
+                - text: jMu5...GPoM
+            - generic [ref=e2202]:
+              - text: 交易环境
+              - combobox "交易环境" [ref=e2203]:
+                - option "币安合约测试网"
+                - option "币安合约实盘" [selected]
+          - paragraph [ref=e2204]: 仅需 API Key 和 Secret Key，支持单向持仓。公开行情始终独立获取；测试网持仓使用测试网行情复核。
+        - group "自动执行" [ref=e2205]:
+          - generic [ref=e2207]:
+            - generic [ref=e2208]:
+              - checkbox "启用定时复核 15 分钟行情同步后检查持仓" [ref=e2209]
+              - generic [ref=e2210]:
+                - text: 启用定时复核
+                - generic [ref=e2211]: 15 分钟行情同步后检查持仓
+            - generic [ref=e2212]:
+              - checkbox "仅生成模拟指令 记录建议，不提交订单" [checked] [ref=e2213]
+              - generic [ref=e2214]:
+                - text: 仅生成模拟指令
+                - generic [ref=e2215]: 记录建议，不提交订单
+            - generic [ref=e2216]:
+              - checkbox "自动开仓 只分析下方指定的候选币种" [ref=e2217]
+              - generic [ref=e2218]:
+                - text: 自动开仓
+                - generic [ref=e2219]: 只分析下方指定的候选币种
+            - generic [ref=e2220]:
+              - checkbox "止盈止损管理 复核并更新本系统的保护单" [checked] [ref=e2221]
+              - generic [ref=e2222]:
+                - text: 止盈止损管理
+                - generic [ref=e2223]: 复核并更新本系统的保护单
+            - generic [ref=e2224]:
+              - checkbox "自动平仓 策略退出时提交只减仓订单" [ref=e2225]
+              - generic [ref=e2226]:
+                - text: 自动平仓
+                - generic [ref=e2227]: 策略退出时提交只减仓订单
+        - group "开仓与风控" [ref=e2228]:
+          - generic [ref=e2230]:
+            - text: 开仓候选币种
+            - textbox "开仓候选币种" [ref=e2231]:
+              - /placeholder: BTCUSDT,ETHUSDT
+          - generic [ref=e2232]:
+            - generic [ref=e2233]:
+              - text: 每轮最多开仓
+              - spinbutton "每轮最多开仓" [ref=e2234]: "1"
+            - generic [ref=e2235]:
+              - text: 最大杠杆
+              - spinbutton "最大杠杆" [ref=e2236]: "10"
+            - generic [ref=e2237]:
+              - text: 最低模型置信度
+              - spinbutton "最低模型置信度" [ref=e2238]: "0.65"
+            - generic [ref=e2239]:
+              - text: 单仓名义价值 / 权益
+              - spinbutton "单仓名义价值 / 权益" [ref=e2240]: "0.17"
+            - generic [ref=e2241]:
+              - text: 总仓名义价值 / 权益
+              - spinbutton "总仓名义价值 / 权益" [ref=e2242]: "0.3"
+            - generic [ref=e2243]:
+              - text: 保护价最小调整幅度（基点）
+              - spinbutton "保护价最小调整幅度（基点）" [ref=e2244]: "25"
+          - paragraph [ref=e2245]: 比例 0.2 表示账户权益的 20%；置信度是模型自评，不代表实际胜率。实盘发单需要关闭“仅生成模拟指令”。
+        - generic [ref=e2246]:
+          - button "保存币安配置" [ref=e2247] [cursor=pointer]
+          - button "测试已保存的连接" [ref=e2248] [cursor=pointer]
+      - complementary [ref=e2249]:
+        - generic [ref=e2250]: POSITION REVIEW
+        - heading "持仓复核" [level=2] [ref=e2251]
+        - generic [ref=e2252]:
+          - generic [ref=e2253]: 未启用
+          - paragraph [ref=e2254]: 2026/9/6 09:39:28
+        - paragraph [ref=e2255]: 币安自动交易未启用。
+        - button "按已保存配置立即复核" [ref=e2256] [cursor=pointer]
+        - generic [ref=e2257]:
+          - heading "最近执行记录" [level=3] [ref=e2258]
+          - paragraph [ref=e2259]: 暂无记录。复核结果、拦截原因和执行状态会显示在这里。
