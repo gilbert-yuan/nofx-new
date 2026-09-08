@@ -14,11 +14,11 @@ export const themes = {
       '--bg-tertiary': '#1e2423',
       '--bg-elevated': '#252b2a',
 
-      // 文本色
-      '--text-primary': '#e8eef0',
-      '--text-secondary': '#a8b5b9',
-      '--text-tertiary': '#6b7b7f',
-      '--text-muted': '#4a5558',
+      // 文本色 - 提高对比度
+      '--text-primary': '#f0f5f2',
+      '--text-secondary': '#c2ccc7',
+      '--text-tertiary': '#8a9792',
+      '--text-muted': '#5a6662',
 
       // 边框色
       '--border-primary': '#2a3332',
@@ -32,21 +32,21 @@ export const themes = {
 
       // 功能色
       '--success': '#00d9a3',
-      '--danger': '#ff5c5c',
-      '--warning': '#ffb800',
-      '--info': '#4da6ff',
+      '--danger': '#ff6b6b',
+      '--warning': '#ffc107',
+      '--info': '#5eb8ff',
 
       // 交易色
       '--long': '#00d9a3',
       '--long-bg': '#00d9a320',
-      '--short': '#ff5c5c',
-      '--short-bg': '#ff5c5c20',
+      '--short': '#ff6b6b',
+      '--short-bg': '#ff6b6b20',
 
       // 按钮
       '--btn-primary-bg': '#00d9a3',
       '--btn-primary-text': '#0a0e0d',
-      '--btn-secondary-bg': '#252b2a',
-      '--btn-secondary-text': '#e8eef0',
+      '--btn-secondary-bg': '#2d3533',
+      '--btn-secondary-text': '#f0f5f2',
     }
   },
 
@@ -59,10 +59,11 @@ export const themes = {
       '--bg-tertiary': '#21262d',
       '--bg-elevated': '#2d333b',
 
-      '--text-primary': '#e6edf3',
-      '--text-secondary': '#8b949e',
-      '--text-tertiary': '#6e7681',
-      '--text-muted': '#484f58',
+      // 文本色 - 提高对比度
+      '--text-primary': '#f0f6fc',
+      '--text-secondary': '#c9d1d9',
+      '--text-tertiary': '#8b949e',
+      '--text-muted': '#6e7681',
 
       '--border-primary': '#30363d',
       '--border-secondary': '#21262d',
@@ -85,7 +86,7 @@ export const themes = {
       '--btn-primary-bg': '#58a6ff',
       '--btn-primary-text': '#0d1117',
       '--btn-secondary-bg': '#21262d',
-      '--btn-secondary-text': '#e6edf3',
+      '--btn-secondary-text': '#f0f6fc',
     }
   },
 
@@ -98,10 +99,11 @@ export const themes = {
       '--bg-tertiary': '#261940',
       '--bg-elevated': '#33235a',
 
-      '--text-primary': '#f0e6ff',
-      '--text-secondary': '#c8b3e6',
-      '--text-tertiary': '#9d82c4',
-      '--text-muted': '#6d5a8f',
+      // 文本色 - 提高对比度
+      '--text-primary': '#f5f0ff',
+      '--text-secondary': '#ddd0f0',
+      '--text-tertiary': '#b8a0d8',
+      '--text-muted': '#8a6fb0',
 
       '--border-primary': '#3d2d5f',
       '--border-secondary': '#2d1f4a',
@@ -112,19 +114,19 @@ export const themes = {
       '--brand-tertiary': '#7c3aed',
 
       '--success': '#10b981',
-      '--danger': '#ef4444',
-      '--warning': '#f59e0b',
-      '--info': '#8b5cf6',
+      '--danger': '#f87171',
+      '--warning': '#fbbf24',
+      '--info': '#a78bfa',
 
       '--long': '#10b981',
       '--long-bg': '#10b98120',
-      '--short': '#ef4444',
-      '--short-bg': '#ef444420',
+      '--short': '#f87171',
+      '--short-bg': '#f8717120',
 
       '--btn-primary-bg': '#a78bfa',
       '--btn-primary-text': '#0f0718',
       '--btn-secondary-bg': '#261940',
-      '--btn-secondary-text': '#f0e6ff',
+      '--btn-secondary-text': '#f5f0ff',
     }
   },
 
@@ -137,14 +139,15 @@ export const themes = {
       '--bg-tertiary': '#e9ecef',
       '--bg-elevated': '#ffffff',
 
-      '--text-primary': '#212529',
-      '--text-secondary': '#495057',
+      // 文本色 - 确保高对比度
+      '--text-primary': '#1a1a1a',
+      '--text-secondary': '#4a4a4a',
       '--text-tertiary': '#6c757d',
-      '--text-muted': '#adb5bd',
+      '--text-muted': '#9ca3af',
 
       '--border-primary': '#dee2e6',
       '--border-secondary': '#e9ecef',
-      '--border-hover': '#ced4da',
+      '--border-hover': '#adb5bd',
 
       '--brand-primary': '#0d6efd',
       '--brand-secondary': '#0a58ca',
@@ -152,7 +155,7 @@ export const themes = {
 
       '--success': '#198754',
       '--danger': '#dc3545',
-      '--warning': '#ffc107',
+      '--warning': '#fd7e14',
       '--info': '#0dcaf0',
 
       '--long': '#198754',
@@ -176,12 +179,13 @@ export const themes = {
       '--bg-tertiary': '#eef5f0',
       '--bg-elevated': '#ffffff',
 
-      '--text-primary': '#15281f',
-      '--text-secondary': '#40584b',
-      '--text-tertiary': '#61776a',
-      '--text-muted': '#91a398',
+      // 文本色 - 确保高对比度
+      '--text-primary': '#0f1c14',
+      '--text-secondary': '#2d4438',
+      '--text-tertiary': '#556b5e',
+      '--text-muted': '#7a8c82',
 
-      '--border-primary': '#dce5df',
+      '--border-primary': '#d0ddd4',
       '--border-secondary': '#e7eee9',
       '--border-hover': '#a8d0b5',
 
@@ -191,13 +195,13 @@ export const themes = {
 
       '--success': '#168558',
       '--danger': '#ba3b2d',
-      '--warning': '#806b2a',
-      '--info': '#2b5fa5',
+      '--warning': '#d97706',
+      '--info': '#2563eb',
 
       '--long': '#08753d',
-      '--long-bg': '#e2f6e9',
+      '--long-bg': '#d1f4e0',
       '--short': '#ba3b2d',
-      '--short-bg': '#fff0ed',
+      '--short-bg': '#fde8e5',
 
       '--btn-primary-bg': '#168558',
       '--btn-primary-text': '#ffffff',

@@ -10,12 +10,23 @@ const showThemeMenu = ref(false);
 
 onMounted(() => {
   currentTheme.value = getCurrentTheme();
+
+  // 点击外部关闭菜单
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('.theme-switcher')) {
+      showThemeMenu.value = false;
+    }
+  });
 });
 
 function switchTheme(themeName) {
   applyTheme(themeName);
   currentTheme.value = themeName;
   showThemeMenu.value = false;
+}
+
+function toggleThemeMenu() {
+  showThemeMenu.value = !showThemeMenu.value;
 }
 </script>
 
@@ -33,15 +44,19 @@ function switchTheme(themeName) {
       <button :class="{ active: activeView === 'settings' }" @click="$emit('change-view', 'settings')">模型设置</button>
     </nav>
     <div class="theme-switcher">
-      <button
-        v-for="(theme, key) in themes"
-        :key="key"
-        :class="['theme-btn', { active: currentTheme === key }]"
-        @click="switchTheme(key)"
-        :title="theme.name"
-      >
-        {{ theme.name }}
+      <button class="theme-toggle" @click="toggleThemeMenu">
+        {{ themes[currentTheme]?.name || '主题' }}
       </button>
+      <div v-if="showThemeMenu" class="theme-menu">
+        <button
+          v-for="(theme, key) in themes"
+          :key="key"
+          :class="{ active: currentTheme === key }"
+          @click="switchTheme(key)"
+        >
+          {{ theme.name }}
+        </button>
+      </div>
     </div>
     <div class="top-status"><span class="dot"></span>{{ mode }}</div>
   </header>

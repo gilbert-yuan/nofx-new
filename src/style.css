@@ -67,10 +67,15 @@ h2 { font-size: 20px; letter-spacing: 0; }
 .top-status { font-size: 13px; color: var(--text-secondary); display: flex; align-items: center; gap: 8px; margin-left: 12px; white-space: nowrap; }
 .top-status i { color: var(--text-tertiary); font-style: normal; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--success); flex: 0 0 auto; }
-.theme-switcher { display: flex; align-items: center; gap: 8px; margin-left: 12px; }
-.theme-btn { border: 1px solid var(--border-primary); background: var(--bg-tertiary); color: var(--text-secondary); padding: 6px 10px; border-radius: 4px; font-size: 12px; font-weight: 600; white-space: nowrap; }
-.theme-btn:hover { background: var(--bg-elevated); color: var(--text-primary); border-color: var(--border-hover); }
-.theme-btn.active { background: var(--brand-primary); color: var(--btn-primary-text); border-color: var(--brand-primary); }
+.theme-switcher { position: relative; display: flex; align-items: center; margin-left: 12px; }
+.theme-toggle { border: 1px solid var(--border-primary); background: var(--bg-tertiary); color: var(--text-primary); padding: 6px 12px; border-radius: 4px; font-size: 12px; font-weight: 600; white-space: nowrap; display: flex; align-items: center; gap: 6px; }
+.theme-toggle:hover { background: var(--bg-elevated); border-color: var(--border-hover); }
+.theme-toggle::after { content: '▼'; font-size: 10px; opacity: 0.7; }
+.theme-menu { position: absolute; top: 100%; right: 0; margin-top: 8px; min-width: 160px; background: var(--bg-elevated); border: 1px solid var(--border-primary); border-radius: 6px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3); z-index: 100; overflow: hidden; }
+.theme-menu button { width: 100%; border: 0; background: transparent; color: var(--text-primary); padding: 10px 14px; text-align: left; font-size: 13px; font-weight: 500; transition: background 0.15s; }
+.theme-menu button:hover { background: var(--bg-tertiary); }
+.theme-menu button.active { background: var(--brand-primary); color: var(--btn-primary-text); font-weight: 600; }
+.theme-menu button.active::before { content: '✓ '; font-weight: 700; }
 .global-progress { min-height: 30px; display: flex; align-items: center; justify-content: center; gap: 8px; padding: 6px 12px; background: var(--success)18; color: var(--success); font-size: 12px; }
 .global-progress span { width: 7px; height: 7px; border-radius: 50%; background: var(--success); animation: pulse 1.1s ease-in-out infinite; }
 .workspace { display: grid; grid-template-columns: 290px minmax(0, 1fr); min-height: calc(100vh - 78px); }
