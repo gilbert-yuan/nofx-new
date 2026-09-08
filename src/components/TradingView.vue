@@ -28,7 +28,7 @@ const page = ref(1);
 const appliedFilter = ref('全部日期 / 全部币种');
 
 // 筛选器
-const statusFilter = ref('all'); // all, active, closed
+const statusFilter = ref('all'); // all, pending, open, closed, expired, cancelled
 const directionFilter = ref('all'); // all, long, short
 const sortBy = ref('createdAt'); // createdAt, net, roi
 const sortOrder = ref('desc'); // asc, desc
@@ -45,10 +45,16 @@ const filteredOrders = computed(() => {
   let orders = accountData.value.orders;
 
   // 状态筛选
-  if (statusFilter.value === 'active') {
-    orders = orders.filter(o => ['pending', 'open'].includes(o.status));
+  if (statusFilter.value === 'pending') {
+    orders = orders.filter(o => o.status === 'pending');
+  } else if (statusFilter.value === 'open') {
+    orders = orders.filter(o => o.status === 'open');
   } else if (statusFilter.value === 'closed') {
     orders = orders.filter(o => o.status === 'closed');
+  } else if (statusFilter.value === 'expired') {
+    orders = orders.filter(o => o.status === 'expired');
+  } else if (statusFilter.value === 'cancelled') {
+    orders = orders.filter(o => o.status === 'cancelled');
   }
 
   // 方向筛选
@@ -464,8 +470,11 @@ onMounted(() => {
           状态
           <select v-model="statusFilter">
             <option value="all">全部</option>
-            <option value="active">活跃</option>
+            <option value="pending">等待入场</option>
+            <option value="open">模拟持仓</option>
             <option value="closed">已平仓</option>
+            <option value="expired">到期未入场</option>
+            <option value="cancelled">已取消</option>
           </select>
         </label>
 
@@ -618,7 +627,7 @@ onMounted(() => {
             <tr v-for="stat in reasonStats" :key="stat.reason">
               <td>{{ reason(stat.reason) }}</td>
               <td>{{ stat.count }}</td>
-              <td>{{ pct(stat.winRate) }}</td>
+              <td :class="stat.winRate >= 0.5 ? 'profit' : 'loss'">{{ pct(stat.winRate) }}</td>
               <td :class="stat.avgNet > 0 ? 'profit' : stat.avgNet < 0 ? 'loss' : ''">
                 {{ fmt(stat.avgNet) }}
               </td>
@@ -674,12 +683,12 @@ onMounted(() => {
           </article>
           <article class="summary-metric">
             <span>估算净胜率</span>
-            <strong>{{ pct(performanceData.summary.winRate) }}</strong>
+            <strong :class="performanceData.summary.winRate >= 0.5 ? 'profit' : 'loss'">{{ pct(performanceData.summary.winRate) }}</strong>
             <small>盈利 {{ performanceData.summary.wins }} · 亏损 {{ performanceData.summary.losses }}</small>
           </article>
           <article class="summary-metric">
             <span>平均估算净收益</span>
-            <strong>{{ fmt(performanceData.summary.averageNet) }}</strong>
+            <strong :class="performanceData.summary.averageNet > 0 ? 'profit' : performanceData.summary.averageNet < 0 ? 'loss' : ''">{{ fmt(performanceData.summary.averageNet) }}</strong>
             <small>USDT / 已平仓信号</small>
           </article>
           <article class="summary-metric">
@@ -731,10 +740,10 @@ onMounted(() => {
               <tr v-for="group in groups" :key="group.key">
                 <td>{{ group.key }}</td>
                 <td>{{ group.closed }}</td>
-                <td>{{ pct(group.winRate) }}</td>
-                <td>{{ fmt(group.averageNet) }}</td>
-                <td>{{ fmt(group.averageWin) }}</td>
-                <td>{{ fmt(group.averageLoss) }}</td>
+                <td :class="group.winRate >= 0.5 ? 'profit' : 'loss'">{{ pct(group.winRate) }}</td>
+                <td :class="group.averageNet > 0 ? 'profit' : group.averageNet < 0 ? 'loss' : ''">{{ fmt(group.averageNet) }}</td>
+                <td class="profit">{{ fmt(group.averageWin) }}</td>
+                <td class="loss">{{ fmt(group.averageLoss) }}</td>
               </tr>
             </tbody>
           </table>
@@ -759,7 +768,11 @@ onMounted(() => {
               <tr v-for="item in visible" :key="item.id">
                 <td>{{ item.symbol }} / {{ item.interval }}</td>
                 <td>{{ new Date(item.at).toLocaleString() }}</td>
-                <td>{{ item.direction === 'OPEN_LONG' ? '多' : '空' }}</td>
+                <td>
+                  <span :class="item.direction === 'OPEN_LONG' ? 'badge-long' : 'badge-short'">
+                    {{ item.direction === 'OPEN_LONG' ? '多' : '空' }}
+                  </span>
+                </td>
                 <td>{{ status(item.evaluation.status) }}</td>
                 <td :class="item.evaluation.net > 0 ? 'profit' : item.evaluation.net < 0 ? 'loss' : ''">
                   {{ fmt(item.evaluation.net) }}
@@ -837,7 +850,7 @@ onMounted(() => {
             <div class="stat-label">{{ stat.engine === 'local' ? '本地规则' : stat.engine === 'local-mtf' ? '多周期规则' : stat.engine === 'ai' ? 'AI模型' : stat.engine }}</div>
             <div class="stat-value">{{ stat.count }} 单</div>
             <div class="stat-detail">
-              胜率 {{ pct(stat.winRate) }} · 平均 {{ fmt(stat.avgNet) }}
+              胜率 <span :class="stat.winRate >= 0.5 ? 'profit' : 'loss'">{{ pct(stat.winRate) }}</span> · 平均 <span :class="stat.avgNet > 0 ? 'profit' : stat.avgNet < 0 ? 'loss' : ''">{{ fmt(stat.avgNet) }}</span>
             </div>
           </div>
         </div>
@@ -1008,7 +1021,11 @@ onMounted(() => {
             <tbody>
               <tr v-for="result in batchReplayData.results.filter(r => !r.error)" :key="result.order.id">
                 <td><strong>{{ result.order.symbol }}</strong></td>
-                <td>{{ result.order.direction === 'OPEN_LONG' ? '做多' : '做空' }}</td>
+                <td>
+                  <span :class="result.order.direction === 'OPEN_LONG' ? 'badge-long' : 'badge-short'">
+                    {{ result.order.direction === 'OPEN_LONG' ? '多' : '空' }}
+                  </span>
+                </td>
                 <td :class="result.order.net > 0 ? 'profit' : 'loss'">
                   {{ fmt(result.order.net) }}
                 </td>
@@ -1087,9 +1104,9 @@ onMounted(() => {
               <dt>毛收益</dt>
               <dd :class="selectedOrder.gross > 0 ? 'profit' : 'loss'">{{ fmt(selectedOrder.gross) }} USDT</dd>
               <dt>总手续费</dt>
-              <dd>{{ fmt(selectedOrder.fees) }} USDT</dd>
+              <dd class="loss">{{ fmt(selectedOrder.fees) }} USDT</dd>
               <dt>资金费用</dt>
-              <dd>{{ fmt(selectedOrder.funding) }} USDT</dd>
+              <dd :class="selectedOrder.funding > 0 ? 'loss' : selectedOrder.funding < 0 ? 'profit' : ''">{{ fmt(selectedOrder.funding) }} USDT</dd>
               <dt>净收益</dt>
               <dd :class="selectedOrder.net > 0 ? 'profit' : 'loss'">{{ fmt(selectedOrder.net) }} USDT</dd>
               <dt>ROI</dt>
