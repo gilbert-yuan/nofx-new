@@ -36,12 +36,17 @@ export async function getOrderReplayData(order, market, marketDb) {
   try {
     // 从市场数据库或API获取K线
     if (marketDb) {
-      klines = await marketDb.getKlines({
-        symbol: market.storageSymbol(symbol),
+      // 使用listKlines获取所有K线，然后根据时间范围筛选
+      const allKlines = await marketDb.listKlines({
+        symbol: symbol,
         interval,
-        startTime: beforeEntryStart,
-        endTime: afterExitEnd
+        limit: 1000
       });
+
+      // 筛选出需要的时间范围
+      klines = allKlines.filter(k =>
+        k.openTime >= beforeEntryStart && k.openTime <= afterExitEnd
+      );
     } else {
       klines = await market.klines({
         symbol,
