@@ -46,6 +46,8 @@ ul.signal-warning { padding-left: 28px; }
 .performance-table table { width: 100%; border-collapse: collapse; font-size: 13px; white-space: nowrap; }
 .performance-table th, .performance-table td { padding: 12px; border-bottom: 1px solid var(--border-primary); text-align: left; font-variant-numeric: tabular-nums; }
 .performance-table th { background: var(--bg-tertiary); color: var(--text-tertiary); font-weight: 600; }
+.performance-table td { color: var(--text-primary); }
+.performance-table td strong { color: var(--text-primary); font-weight: 650; }
 * { box-sizing: border-box; }
 body { margin: 0; }
 button, input, select { font: inherit; }

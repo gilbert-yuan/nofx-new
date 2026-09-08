@@ -1400,8 +1400,8 @@ onMounted(() => {
 }
 
 .badge-long {
-  background: rgba(21, 150, 106, 0.2);
-  color: #15966a;
+  background: var(--long-bg);
+  color: var(--long);
   padding: 2px 8px;
   border-radius: 4px;
   font-size: 12px;
@@ -1409,8 +1409,8 @@ onMounted(() => {
 }
 
 .badge-short {
-  background: rgba(209, 91, 75, 0.2);
-  color: #d15b4b;
+  background: var(--short-bg);
+  color: var(--short);
   padding: 2px 8px;
   border-radius: 4px;
   font-size: 12px;
@@ -1420,26 +1420,28 @@ onMounted(() => {
 .btn-small {
   padding: 4px 8px;
   font-size: 12px;
-  background: #2a2a2a;
-  border: 1px solid #3a3a3a;
-  color: #fff;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-primary);
+  color: var(--text-primary);
   border-radius: 4px;
   cursor: pointer;
   margin-right: 4px;
 }
 
 .btn-small:hover {
-  background: #3a3a3a;
+  background: var(--bg-elevated);
+  border-color: var(--border-hover);
 }
 
 .btn-danger {
-  background: rgba(209, 91, 75, 0.2);
-  border-color: #d15b4b;
-  color: #d15b4b;
+  background: var(--short-bg);
+  border-color: var(--short);
+  color: var(--short);
 }
 
 .btn-danger:hover {
-  background: rgba(209, 91, 75, 0.3);
+  background: var(--short-bg);
+  opacity: 0.8;
 }
 
 .modal-wide {
@@ -1493,17 +1495,19 @@ onMounted(() => {
 }
 
 .profit {
-  color: #15966a;
+  color: var(--long);
+  font-weight: 600;
 }
 
 .loss {
-  color: #d15b4b;
+  color: var(--short);
+  font-weight: 600;
 }
 
 /* 复盘分析样式 */
 .issue-badge {
-  background: rgba(209, 91, 75, 0.2);
-  color: #d15b4b;
+  background: var(--short-bg);
+  color: var(--short);
   padding: 2px 8px;
   border-radius: 4px;
   font-size: 11px;
@@ -1511,17 +1515,17 @@ onMounted(() => {
 }
 
 .alert-info {
-  background: rgba(21, 150, 106, 0.1);
-  border-left: 3px solid #15966a;
+  background: var(--long-bg);
+  border-left: 3px solid var(--long);
   padding: 12px 16px;
   margin: 16px 0;
   border-radius: 4px;
-  color: #fff;
+  color: var(--text-primary);
 }
 
 .replay-diagnosis {
-  background: #1a1a1a;
-  border: 1px solid #2a2a2a;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-primary);
   border-radius: 8px;
   padding: 20px;
   margin: 16px 0;
@@ -1533,7 +1537,7 @@ onMounted(() => {
   align-items: center;
   margin-bottom: 20px;
   padding-bottom: 20px;
-  border-bottom: 1px solid #2a2a2a;
+  border-bottom: 1px solid var(--border-primary);
 }
 
 .diagnosis-score {
@@ -1544,24 +1548,24 @@ onMounted(() => {
 }
 
 .diagnosis-score.score-good {
-  background: rgba(21, 150, 106, 0.2);
-  border: 2px solid #15966a;
+  background: var(--long-bg);
+  border: 2px solid var(--long);
 }
 
 .diagnosis-score.score-medium {
-  background: rgba(255, 193, 7, 0.2);
-  border: 2px solid #ffc107;
+  background: var(--warning)20;
+  border: 2px solid var(--warning);
 }
 
 .diagnosis-score.score-poor {
-  background: rgba(209, 91, 75, 0.2);
-  border: 2px solid #d15b4b;
+  background: var(--short-bg);
+  border: 2px solid var(--short);
 }
 
 .score-label {
   display: block;
   font-size: 12px;
-  color: #888;
+  color: var(--text-tertiary);
   margin-bottom: 8px;
 }
 
@@ -1569,7 +1573,7 @@ onMounted(() => {
   display: block;
   font-size: 32px;
   font-weight: 700;
-  color: #fff;
+  color: var(--text-primary);
 }
 
 .diagnosis-summary {
@@ -1668,10 +1672,10 @@ onMounted(() => {
 .recommendations li {
   padding: 8px 12px;
   margin-bottom: 8px;
-  background: rgba(21, 150, 106, 0.1);
-  border-left: 3px solid #15966a;
+  background: var(--long-bg);
+  border-left: 3px solid var(--long);
   border-radius: 4px;
-  color: #fff;
+  color: var(--text-primary);
 }
 
 .analysis-dimensions {
@@ -1682,19 +1686,19 @@ onMounted(() => {
 }
 
 .dimension-card {
-  background: #0f0f0f;
-  border: 1px solid #2a2a2a;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-primary);
   border-radius: 8px;
   padding: 16px;
 }
 
 .dimension-card h4 {
   font-size: 14px;
-  color: #888;
+  color: var(--text-tertiary);
   text-transform: uppercase;
   margin-bottom: 12px;
   padding-bottom: 8px;
-  border-bottom: 1px solid #2a2a2a;
+  border-bottom: 1px solid var(--border-primary);
 }
 
 .dimension-content {
