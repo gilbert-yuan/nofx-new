@@ -408,7 +408,7 @@ onMounted(() => {
           <strong :class="accountData.realized > 0 ? 'profit' : accountData.realized < 0 ? 'loss' : ''">
             {{ fmt(accountData.realized) }}
           </strong>
-          <small>未实现 {{ fmt(accountData.unrealized) }}</small>
+          <small>未实现 <span :class="accountData.unrealized > 0 ? 'profit' : accountData.unrealized < 0 ? 'loss' : ''">{{ fmt(accountData.unrealized) }}</span></small>
         </article>
         <article class="summary-metric">
           <span>持仓数量</span>
@@ -418,7 +418,7 @@ onMounted(() => {
         <article class="summary-metric">
           <span>可用余额</span>
           <strong>{{ fmt(accountData.available) }}</strong>
-          <small>净收益 {{ fmt(accountData.net) }}</small>
+          <small>净收益 <span :class="accountData.net > 0 ? 'profit' : accountData.net < 0 ? 'loss' : ''">{{ fmt(accountData.net) }}</span></small>
         </article>
       </div>
 
@@ -435,7 +435,7 @@ onMounted(() => {
         <div class="stat-card">
           <div class="stat-label">盈亏比</div>
           <div class="stat-value">{{ orderStats.profitFactor ? fmt(orderStats.profitFactor) : '—' }}</div>
-          <div class="stat-detail">平均盈利 {{ fmt(orderStats.avgWin) }}</div>
+          <div class="stat-detail">平均盈利 <span class="profit">{{ fmt(orderStats.avgWin) }}</span></div>
         </div>
 
         <div class="stat-card">
@@ -1497,12 +1497,12 @@ onMounted(() => {
 }
 
 .profit {
-  color: var(--long);
+  color: var(--profit);
   font-weight: 600;
 }
 
 .loss {
-  color: var(--short);
+  color: var(--loss);
   font-weight: 600;
 }
 
@@ -1517,8 +1517,8 @@ onMounted(() => {
 }
 
 .alert-info {
-  background: var(--long-bg);
-  border-left: 3px solid var(--long);
+  background: var(--info-bg);
+  border-left: 3px solid var(--info);
   padding: 12px 16px;
   margin: 16px 0;
   border-radius: 4px;
@@ -1674,8 +1674,8 @@ onMounted(() => {
 .recommendations li {
   padding: 8px 12px;
   margin-bottom: 8px;
-  background: var(--long-bg);
-  border-left: 3px solid var(--long);
+  background: var(--info-bg);
+  border-left: 3px solid var(--info);
   border-radius: 4px;
   color: var(--text-primary);
 }

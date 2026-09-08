@@ -228,6 +228,42 @@ setTimeout(() => {
   console.log('[KlineCleanup] 定时清理任务已启动');
 }, 10000);
 
+// 定时清理未下单的旧分析记录（每小时执行一次）
+async function cleanOldAnalysisRecordsTask() {
+  try {
+    const simulation = researchInstances.simulation;
+    const archive = researchInstances.archive;
+    const state = await simulation.read();
+
+    // 获取所有有订单的分析记录ID
+    const recordIdsWithOrders = [...new Set(state.orders.map(o => o.recordId).filter(Boolean))];
+
+    console.log('[AnalysisCleanup] 开始清理旧分析记录...');
+    console.log(`[AnalysisCleanup] 有订单的记录数: ${recordIdsWithOrders.length}`);
+
+    const result = await archive.cleanOldRecords(recordIdsWithOrders, 30);
+
+    console.log(`[AnalysisCleanup] 清理完成: 删除了 ${result.deletedCount} 条分析记录`);
+    console.log(`[AnalysisCleanup] 保护的记录: ${result.protectedRecords} 条`);
+    console.log(`[AnalysisCleanup] 截止时间: ${result.cutoffTime}`);
+  } catch (error) {
+    console.error('[AnalysisCleanup] 清理失败:', error.message);
+  }
+}
+
+// 启动分析记录清理任务（每小时执行一次）
+setTimeout(() => {
+  // 立即执行一次
+  cleanOldAnalysisRecordsTask();
+
+  // 然后每小时执行一次
+  setInterval(() => {
+    cleanOldAnalysisRecordsTask();
+  }, 60 * 60 * 1000); // 1小时
+
+  console.log('[AnalysisCleanup] 定时清理任务已启动（每小时执行一次）');
+}, 15000); // 延迟15秒启动
+
 app.post('/api/history/fetch', async (req, res, next) => {
   try {
     const source = marketData.provider;

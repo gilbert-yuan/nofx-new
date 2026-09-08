@@ -27,4 +27,41 @@ export class ResearchStore {
     [marketStorageSymbol(symbol, provider), interval, start, end]);
     return result.rows.map(row => ({ ...row, openTime: Number(row.openTime) }));
   }
+  /**
+   * 清理未下单的旧分析记录
+   * @param {Array} recordIdsWithOrders - 有订单的分析记录ID列表
+   * @param {number} minutesToKeep - 保留最近几分钟的记录，默认30分钟
+   * @returns {Object} 清理统计信息
+   */
+  async cleanOldRecords(recordIdsWithOrders = [], minutesToKeep = 30) {
+    const cutoffTime = new Date(Date.now() - minutesToKeep * 60 * 1000);
+
+    let deletedCount = 0;
+
+    if (recordIdsWithOrders.length === 0) {
+      // 如果没有任何订单，清理所有旧记录
+      const result = await this.pool.query(
+        `DELETE FROM research_records WHERE created_at < $1`,
+        [cutoffTime]
+      );
+      deletedCount = result.rowCount;
+    } else {
+      // 清理未下单的旧记录
+      const result = await this.pool.query(
+        `
+        DELETE FROM research_records
+        WHERE created_at < $1
+          AND id NOT IN (${recordIdsWithOrders.map((_, i) => `$${i + 2}`).join(',')})
+        `,
+        [cutoffTime, ...recordIdsWithOrders]
+      );
+      deletedCount = result.rowCount;
+    }
+
+    return {
+      deletedCount,
+      cutoffTime: cutoffTime.toISOString(),
+      protectedRecords: recordIdsWithOrders.length
+    };
+  }
 }

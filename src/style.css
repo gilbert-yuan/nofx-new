@@ -48,6 +48,12 @@
   --short: #ff6b6b;
   --short-bg: rgba(255, 107, 107, 0.15);
 
+  /* ===== 盈亏色 ===== */
+  --profit: #00e0a8;
+  --profit-bg: rgba(0, 224, 168, 0.15);
+  --loss: #ff6b6b;
+  --loss-bg: rgba(255, 107, 107, 0.15);
+
   /* ===== 按钮 ===== */
   --btn-primary-bg: #00e0a8;
   --btn-primary-text: #0d1110;

@@ -64,6 +64,12 @@ export const themes = {
       '--short': '#ff6b6b',
       '--short-bg': 'rgba(255, 107, 107, 0.15)',
 
+      // ---- 盈亏色 ----
+      '--profit': '#00e0a8',
+      '--profit-bg': 'rgba(0, 224, 168, 0.15)',
+      '--loss': '#ff6b6b',
+      '--loss-bg': 'rgba(255, 107, 107, 0.15)',
+
       // ---- 按钮 ----
       '--btn-primary-bg': '#00e0a8',
       '--btn-primary-text': '#0d1110',
@@ -146,6 +152,12 @@ export const themes = {
       '--long-bg': 'rgba(63, 185, 80, 0.15)',
       '--short': '#f85149',
       '--short-bg': 'rgba(248, 81, 73, 0.15)',
+
+      // ---- 盈亏色 ----
+      '--profit': '#3fb950',
+      '--profit-bg': 'rgba(63, 185, 80, 0.15)',
+      '--loss': '#f85149',
+      '--loss-bg': 'rgba(248, 81, 73, 0.15)',
 
       // ---- 按钮 ----
       '--btn-primary-bg': '#58a6ff',
@@ -230,6 +242,12 @@ export const themes = {
       '--short': '#f87171',
       '--short-bg': 'rgba(248, 113, 113, 0.15)',
 
+      // ---- 盈亏色 ----
+      '--profit': '#34d399',
+      '--profit-bg': 'rgba(52, 211, 153, 0.15)',
+      '--loss': '#f87171',
+      '--loss-bg': 'rgba(248, 113, 113, 0.15)',
+
       // ---- 按钮 ----
       '--btn-primary-bg': '#a78bfa',
       '--btn-primary-text': '#0f0820',
@@ -313,6 +331,12 @@ export const themes = {
       '--short': '#dc2626',
       '--short-bg': 'rgba(220, 38, 38, 0.1)',
 
+      // ---- 盈亏色 ----
+      '--profit': '#059669',
+      '--profit-bg': 'rgba(5, 150, 105, 0.1)',
+      '--loss': '#dc2626',
+      '--loss-bg': 'rgba(220, 38, 38, 0.1)',
+
       // ---- 按钮 ----
       '--btn-primary-bg': '#2563eb',
       '--btn-primary-text': '#ffffff',
@@ -395,6 +419,12 @@ export const themes = {
       '--long-bg': 'rgba(8, 117, 61, 0.1)',
       '--short': '#ba3b2d',
       '--short-bg': 'rgba(186, 59, 45, 0.1)',
+
+      // ---- 盈亏色 ----
+      '--profit': '#08753d',
+      '--profit-bg': 'rgba(8, 117, 61, 0.1)',
+      '--loss': '#ba3b2d',
+      '--loss-bg': 'rgba(186, 59, 45, 0.1)',
 
       // ---- 按钮 ----
       '--btn-primary-bg': '#168558',
