@@ -1,6 +1,22 @@
 <script setup>
+import { ref, onMounted } from 'vue';
+import { themes, applyTheme, getCurrentTheme } from '../themes.js';
+
 defineProps({ activeView: { type: String, required: true }, mode: String });
 defineEmits(['change-view']);
+
+const currentTheme = ref('dark');
+const showThemeMenu = ref(false);
+
+onMounted(() => {
+  currentTheme.value = getCurrentTheme();
+});
+
+function switchTheme(themeName) {
+  applyTheme(themeName);
+  currentTheme.value = themeName;
+  showThemeMenu.value = false;
+}
 </script>
 
 <template>
@@ -16,6 +32,17 @@ defineEmits(['change-view']);
       <button :class="{ active: activeView === 'history' }" @click="$emit('change-view', 'history')">历史分析</button>
       <button :class="{ active: activeView === 'settings' }" @click="$emit('change-view', 'settings')">模型设置</button>
     </nav>
+    <div class="theme-switcher">
+      <button
+        v-for="(theme, key) in themes"
+        :key="key"
+        :class="['theme-btn', { active: currentTheme === key }]"
+        @click="switchTheme(key)"
+        :title="theme.name"
+      >
+        {{ theme.name }}
+      </button>
+    </div>
     <div class="top-status"><span class="dot"></span>{{ mode }}</div>
   </header>
 </template>
