@@ -333,6 +333,13 @@ export class GlobalAutomation {
             analysis = result.analyses?.[0];
           }
 
+          // 让出事件循环（2026-09-10 性能优化）：enhancedAnalysis 是重 CPU 计算
+          // （MA/RSI/MACD/Ichimoku/DMI/Supertrend/OBV + 评分），20 个币的批在 Promise.all
+          // 里会把事件循环占满数秒，导致 /api/health 都要 2s+、静态文件 5s+。
+          // 每个币算完 setImmediate 一次，让 Express 能插队处理 HTTP 请求。
+          // 纯协作式调度，不改变任何结果，只影响时序。
+          await new Promise(resolve => setImmediate(resolve));
+
           analyzed++;
 
           // All engines use the same timing, price and cost validation as manual analysis.

@@ -175,7 +175,15 @@ export class SimulatedAccount {
   async mutateLight(fn) {
     return this.repository.mutate(fn, { light: true });
   }
-  async status({ summary = false } = {}) { const state = summary ? await this.repository.read({ summary: true }) : await this.read(); return { ...accountSummary(state), automation: state.automation, orders: state.orders, busy: this.busy, lastRunAt: this.lastRunAt, error: this.lastError }; }
+  async status({ summary = false } = {}) {
+    // 默认走 light read：只给活跃订单加载明细子表（plans/costs/reviews/extensions），
+    // 已平仓订单只取主行字段。accountSummary 与历史成交表都用主行字段（symbol/entry/exit/net/
+    // reason/margin/leverage/...），不需要已平仓订单的 plan/reviewHistory，故 light 完全够用。
+    // 收益：跳过 ~9 万行 simulated_order_extensions 的拉取与 hydrate，把每次轮询从 3-8s 压到亚秒级。
+    // 想要某笔已平仓订单的完整明细，用 GET /api/paper/orders/:id（走 read({orderId})）。
+    const state = summary ? await this.repository.read({ summary: true }) : await this.readLight();
+    return { ...accountSummary(state), automation: state.automation, orders: state.orders, busy: this.busy, lastRunAt: this.lastRunAt, error: this.lastError };
+  }
   async getOrder(id) { return (await this.repository.read({ orderId: id })).orders[0]; }
   // 开仓只新增一个订单，不依赖历史订单明细
   async submit(input) { const record = await this.archive.get(String(input.recordId || '')); return this.mutateLight(state => submitPaperOrder(state, record, input)); }
@@ -478,13 +486,60 @@ export class SimulatedAccount {
 
 export function registerSimulationRoutes(app, simulation) {
   const route = fn => async (req, res, next) => { try { res.json(await fn(req)); } catch (error) { next(error); } };
-  app.get('/api/paper/account', route(req => simulation.status({ summary: req.query.view === 'summary' })));
+
+  // ── stale-while-revalidate 缓存（2026-09-10 性能优化）───────────────────────
+  // 症状：/api/health 要 2.4s、静态文件 5.4s —— 后台同步/分析把单进程事件循环占满
+  // （nofx-api CPU 105%），而前端每 10s 轮询的两个重端点又火上浇油：
+  //   · /statistics 每次把全部 2691+ 已平仓订单读出来跑 6 遍 O(N) 统计（6.5s/次）
+  //   · /account   每 10s 把 2691 单 + reviewHistory 全量拉（3-8s / 65KB）
+  // 两者数据只在订单平仓时变化（分钟级），远低于轮询频率。
+  // 用 stale-while-revalidate：首次加载照常等（冷），之后**永远返回上次缓存值（毫秒级），
+  // 同时在后台异步刷新**。这样高频轮询不再被冷加载阻塞，事件循环也被解放。
+  // 写操作（submit/close/refresh）主动失效，确保动作后能看到最新状态。
+  const memo = (loader, ttlMs, staleMs = ttlMs * 12) => {
+    const slot = { value: undefined, at: 0, pending: null };
+    const refresh = req => {
+      if (slot.pending) return slot.pending; // 防惊群：并发只触发一次底层加载
+      slot.pending = (async () => {
+        try { const v = await loader(req); slot.value = v; slot.at = Date.now(); return v; }
+        finally { slot.pending = null; }
+      })();
+      return slot.pending;
+    };
+    const fn = async (req) => {
+      const now = Date.now();
+      if (slot.value !== undefined) {
+        if (now - slot.at < ttlMs) return slot.value;        // 新鲜：直接返回
+        if (now - slot.at < staleMs) { refresh(req); return slot.value; } // 陈旧：先返回旧值，后台刷新
+      }
+      return refresh(req); // 首次：必须等冷加载
+    };
+    fn.invalidate = () => { slot.at = 0; slot.value = undefined; };
+    return fn;
+  };
+
+  // account：fresh 30s / stale 180s（10s 轮询下永远命中新鲜缓存，冷加载只在首次/invalidate 后发生）
+  const accountHandlers = new Map();
+  const accountHandler = req => {
+    const view = req.query.view;
+    let h = accountHandlers.get(view);
+    if (!h) { h = memo(() => simulation.status({ summary: view === 'summary' }), 30000, 180000); accountHandlers.set(view, h); }
+    return h(req);
+  };
+  // statistics：fresh 60s / stale 600s
+  const statisticsCache = { at: 0, value: undefined, pending: null };
+  const invalidateReadCaches = () => {
+    for (const h of accountHandlers.values()) h.invalidate();
+    statisticsCache.at = 0; statisticsCache.value = undefined;
+  };
+
+  app.get('/api/paper/account', route(accountHandler));
   app.get('/api/paper/plans', route(async () => (await simulation.archive.list({ limit: 100 })).flatMap(record => (record.analyses || [])
     .filter(s => s.eligible && s.marketProvider === 'okx' && Date.parse(s.expiresAt) > Date.now())
     .map(s => ({ ...s, recordId: record.id, at: record.at })))));
-  app.post('/api/paper/orders', route(req => simulation.submit(req.body || {})));
-  app.post('/api/paper/refresh', route(() => simulation.refresh()));
-  app.post('/api/paper/orders/:id/close', route(req => simulation.close(req.params.id)));
+  app.post('/api/paper/orders', route(async req => { const r = await simulation.submit(req.body || {}); invalidateReadCaches(); return r; }));
+  app.post('/api/paper/refresh', route(async () => { const r = await simulation.refresh(); invalidateReadCaches(); return r; }));
+  app.post('/api/paper/orders/:id/close', route(async req => { const r = await simulation.close(req.params.id); invalidateReadCaches(); return r; }));
 
   // 策略优化接口
   app.get('/api/paper/optimize', route(async () => {
@@ -509,6 +564,30 @@ export function registerSimulationRoutes(app, simulation) {
 
   // 统计分析端点
   app.get('/api/paper/statistics', route(async () => {
+    // stale-while-revalidate：新鲜直接返回；陈旧先返回旧值再后台刷新；首次才等冷加载。
+    // statistics 冷加载要跑 6 遍 O(N) 统计（~6s），高频轮询绝不能每次都等。
+    const now = Date.now();
+    if (statisticsCache.value !== undefined) {
+      if (now - statisticsCache.at < 60000) return statisticsCache.value;        // 新鲜
+      if (now - statisticsCache.at < 600000) {                                   // 陈旧：后台刷新
+        if (!statisticsCache.pending) {
+          statisticsCache.pending = (async () => {
+            try { statisticsCache.value = await computeStatistics(simulation); statisticsCache.at = Date.now(); }
+            finally { statisticsCache.pending = null; }
+          })();
+        }
+        return statisticsCache.value;
+      }
+    }
+    if (statisticsCache.pending) return statisticsCache.pending; // 防惊群
+    return statisticsCache.pending = (async () => {
+      try { statisticsCache.value = await computeStatistics(simulation); statisticsCache.at = Date.now(); return statisticsCache.value; }
+      finally { statisticsCache.pending = null; }
+    })();
+  }));
+
+  // 统计计算抽离（供上面的缓存与未来的预计算复用）
+  async function computeStatistics(simulation) {
     const state = await simulation.read();
     const orders = state.orders || [];
 
@@ -706,7 +785,7 @@ export function registerSimulationRoutes(app, simulation) {
       byDay: dayStats,
       ambiguousBar: ambiguousStats
     };
-  }));
+  }
 
   // 订单复盘分析 - 单个订单
   app.get('/api/paper/orders/:id/replay', route(async (req) => {
