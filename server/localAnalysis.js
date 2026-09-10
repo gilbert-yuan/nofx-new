@@ -1,6 +1,6 @@
 // Deterministic reference strategy; scores are rule strength, never win probabilities.
 // 优化调整：基于2081笔历史订单分析（整体胜率22.1%，最优区间45-49根胜率100%）
-import { LONG_ONLY } from './shared/strategyGuards.js';
+import { LONG_ONLY, RISK_RULE, planRefEntry, planRiskUnit } from './shared/strategyGuards.js';
 import { computeEntryLimit, trendProxyToScore, ENTRY_NO_EXPIRY } from './shared/entryModel.js';
 
 export const LOCAL_STRATEGY = Object.freeze({
@@ -44,6 +44,8 @@ export function localAnalysis(market) {
     plan: { entryMin, entryMax, entryLimit,
       stopLoss: long ? entryMin - atr * LOCAL_STRATEGY.stopLossAtr : entryMax + atr * LOCAL_STRATEGY.stopLossAtr,
       takeProfit: long ? entryMax + atr * LOCAL_STRATEGY.takeProfitAtr : entryMin - atr * LOCAL_STRATEGY.takeProfitAtr,
+      // R 口径基准（实际成交锚点 → 初始止损），供移动止损 / 复核统一换算浮盈。
+      riskUnit: Math.abs(entryLimit - (long ? entryMin - atr * LOCAL_STRATEGY.stopLossAtr : entryMax + atr * LOCAL_STRATEGY.stopLossAtr)),
       // validForBars: 0 = GTC（取消下单有效期限制，老板 2026-09-10 要求）；
       // 置 NOFX_ENTRY_NO_EXPIRY=false 可回退到 LOCAL_STRATEGY.validForBars（6 根）。
       validForBars: ENTRY_NO_EXPIRY ? 0 : LOCAL_STRATEGY.validForBars, maxHoldBars: LOCAL_STRATEGY.maxHoldBars } };
@@ -178,6 +180,8 @@ export function localAnalysisMultiTimeframe(market, auxMarkets = {}, adaptivePar
       entryLimit,
       stopLoss: long ? entryMin - atr * stopLossATR : entryMax + atr * stopLossATR,
       takeProfit: long ? entryMax + atr * takeProfitATR : entryMin - atr * takeProfitATR,
+      // R 口径基准（实际成交锚点 → 初始止损）
+      riskUnit: Math.abs(entryLimit - (long ? entryMin - atr * stopLossATR : entryMax + atr * stopLossATR)),
       // validForBars: 0 = GTC（取消下单有效期限制，可经 NOFX_ENTRY_NO_EXPIRY 回退）
       validForBars: ENTRY_NO_EXPIRY ? 0 : LOCAL_STRATEGY.validForBars,
       maxHoldBars
@@ -185,13 +189,42 @@ export function localAnalysisMultiTimeframe(market, auxMarkets = {}, adaptivePar
   };
 }
 
+/**
+ * 计划的风险单位 R（价格单位）。统一委托给 strategyGuards.planRiskUnit，
+ * 保证本地引擎 / enhanced / 复核侧对「R」的定义完全一致。
+ */
+export function planRisk(plan, direction) {
+  return planRiskUnit(plan, direction);
+}
+
+/**
+ * 推荐杠杆：以 RISK_RULE.riskBudgetPct（目标保证金风险预算）反推，硬上限 RISK_RULE.maxLeverage。
+ *
+ * 修复要点（Task #5，2026-09-10）：
+ *   旧实现 `Math.min(5, floor(0.1/distance))` 里的 0.1 与 5 是散落魔数，
+ *   且 research.js 会用本函数**覆盖所有引擎**（含 enhanced）自算的杠杆，
+ *   于是 enhanced 里那套基于 riskDistance 的推荐被静默丢弃，两处口径长期不一致。
+ *   现在预算/上限都来自 strategyGuards 单一事实源，且入参口径与计划一致
+ *   （优先 entryLimit = 实际成交锚点）。置 NOFX_MAX_LEVERAGE / NOFX_RISK_BUDGET_PCT 可调。
+ */
 export function recommendedLeverage(plan, direction) {
   if (!plan) return 1;
-  // 优先用限价 entryLimit（实际成交价）；旧计划回退到入场区间边沿。
-  const entry = Number.isFinite(plan.entryLimit)
-    ? plan.entryLimit
-    : (direction === 'OPEN_SHORT' ? plan.entryMin : plan.entryMax);
+  const entry = planRefEntry(plan, direction);
   const distance = Math.abs(entry - plan.stopLoss) / entry;
-  // Target a <=10% margin loss at the planned stop before costs, capped at 5x.
-  return Number.isFinite(distance) && distance > 0 ? Math.max(1, Math.min(5, Math.floor(0.1 / distance))) : 1;
+  return Number.isFinite(distance) && distance > 0
+    ? Math.max(1, Math.min(RISK_RULE.maxLeverage, Math.floor(RISK_RULE.riskBudgetPct / distance)))
+    : 1;
+}
+
+/**
+ * 真实保证金风险（占保证金比例）= 杠杆 × 止损距离。
+ * 用于替代「暗示 10% 预算已被用满」的模糊表述：实际值几乎总被 maxLeverage 截断而上不满。
+ * @returns {number} 例如 0.043 = 4.3%
+ */
+export function plannedMarginRiskPct(plan, direction, leverage) {
+  const lev = Number(leverage);
+  if (!plan || !Number.isFinite(lev) || lev <= 0) return 0;
+  const entry = planRefEntry(plan, direction);
+  if (!Number.isFinite(entry) || entry <= 0) return 0;
+  return lev * Math.abs(entry - plan.stopLoss) / entry;
 }

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { recommendedLeverage } from './localAnalysis.js';
+import { recommendedLeverage, plannedMarginRiskPct } from './localAnalysis.js';
 import { ENTRY_EVAL_BARS } from './shared/entryModel.js';
 
 export const RESEARCH_VERSION = 'closed-candle-plan-v1';
@@ -128,8 +128,23 @@ export function normalizePlan(raw, market, now, costs = PAPER_COSTS) {
         const risk = Math.abs(entry - stopLoss) + cost;
         const netRewardRisk = reward / risk;
         if (netRewardRisk < 1) issues.push('按最不利入场价估算，成本后盈亏比低于1');
+        // ⚠️ 2026-09-10 修复：normalized 此前只重建了 6 个「核心」字段，
+        //   enhancedAnalysis 新增的 riskUnit / smartExit（根级智能退出配置）/ takeProfit1-3
+        //   会被**静默丢弃**，导致下游 tradingSimulator 拿不到 R 基准与根级退出开关。
+        //   现把可选字段一并透传（仅在有限数时才带上，避免用 undefined 覆盖默认行为）。
+        const optNum = v => (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
+        const riskUnit = optNum(plan.riskUnit);
+        const takeProfit1 = optNum(plan.takeProfit1);
+        const takeProfit2 = optNum(plan.takeProfit2);
+        const takeProfit3 = optNum(plan.takeProfit3);
         normalized = { entryMin, entryMax, entryLimit, stopLoss, takeProfit, validForBars, maxHoldBars, netRewardRisk,
-          entryRule: validForBars === 0 ? 'limit_pullback' : 'next_candle_open_in_range' };
+          entryRule: validForBars === 0 ? 'limit_pullback' : 'next_candle_open_in_range',
+          ...(riskUnit !== undefined ? { riskUnit } : {}),
+          ...(takeProfit1 !== undefined ? { takeProfit1 } : {}),
+          ...(takeProfit2 !== undefined ? { takeProfit2 } : {}),
+          ...(takeProfit3 !== undefined ? { takeProfit3 } : {}),
+          ...(plan.smartExit ? { smartExit: plan.smartExit } : {}),
+          ...(optNum(plan.marginRiskPct) !== undefined ? { marginRiskPct: optNum(plan.marginRiskPct) } : {}) };
       }
     }
   }
@@ -139,12 +154,17 @@ export function normalizePlan(raw, market, now, costs = PAPER_COSTS) {
   // GTC（validForBars===0）：回测用有界窗口 ENTRY_EVAL_BARS 收敛；实盘由 tradingSimulator 忽略过期真正等待。
   const evalBars = normalized?.validForBars === 0 ? ENTRY_EVAL_BARS : (normalized?.validForBars || 1);
   for (let i = 0; i < evalBars; i++) expiresAt = nextOpenTime(expiresAt, market.interval);
+  // 推荐杠杆 + 真实保证金风险（Task #5）：杠杆由共享的 RISK_RULE 反推，
+  // marginRiskPct = 杠杆 × 止损距离，用于替代「10% 预算已用满」的模糊暗示。
+  const leverage = issues.length ? 1 : recommendedLeverage(normalized, action);
+  const marginRiskPct = issues.length ? 0 : plannedMarginRiskPct(normalized, action, leverage);
   return {
     symbol: market.symbol, exchange: 'binance', marketProvider: market.marketProvider || 'binance', interval: market.interval, dataAsOf: market.dataAsOf,
     generatedAt: new Date(now).toISOString(), firstEntryAt: new Date(firstEntryAt).toISOString(), expiresAt: new Date(expiresAt).toISOString(),
     positionRecommendation: action, action: action === 'OPEN_LONG' ? 'BUY' : action === 'OPEN_SHORT' ? 'SELL' : 'HOLD',
     confidence, confidenceType: 'model_self_assessment', reason: String(raw?.reason || ''), risk: String(raw?.risk || ''), suggestion: String(raw?.suggestion || ''),
-    recommendedLeverage: issues.length ? 1 : recommendedLeverage(normalized, action),
+    recommendedLeverage: leverage,
+    marginRiskPct,
     validationIssues: issues, eligible: !issues.length && !!normalized, plan: issues.length ? null : normalized
   };
 }

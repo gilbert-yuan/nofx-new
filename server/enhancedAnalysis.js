@@ -24,7 +24,17 @@ import {
   calculateSupertrend,
   calculateOBV
 } from './advancedIndicators.js';
-import { LONG_ONLY, TRAILING_RULE } from './shared/strategyGuards.js';
+import {
+  LONG_ONLY,
+  TRAILING_RULE,
+  SMART_EXIT,
+  RISK_RULE,
+  ENHANCED_RR_FLOOR,
+  computeTrailStop,
+  planRiskUnit,
+  profitRFrom,
+  reachedR
+} from './shared/strategyGuards.js';
 import { computeEntryLimit, ENTRY_NO_EXPIRY } from './shared/entryModel.js';
 
 // ==================== P3 盈利改造：可调参数集中区（单点回滚） ====================
@@ -50,9 +60,30 @@ const numFromEnv = (name, fallback, min, max) => {
 };
 
 // 主止盈风险倍数（R = riskUnit = 止损距离）。原主止盈取 2R（净盈亏比仅 1.24），
-// 现提升到 3.5R。注意：止盈拉远会压低胜率，必须与 MIN_TREND_SCORE 一起观察；
-// 若胜率跌破 ~18%，应先把此值回调到 3.0 再评估。
-const MAIN_TP_R_MULTIPLE = numFromEnv('NOFX_MAIN_TP_R', 3.5, 1, 10);
+// 一度提升到 3.5R。
+//
+// ⚠️ 2026-09-10 回调 3.5R → 3.0R（让「主止盈结构」更可达，同时不破坏入场闸门）。
+//
+// 先说清一个**不可逾越的硬约束**（本轮踩过的坑，务必保留此推导）：
+//   止损/止盈都以「现价」为基准 —— 分母 = 0.5·ATR + R，分子 = 0.5·ATR + k·R，其中
+//   m = R/ATR（R 被 0.8% 下限托底，1m 上 m ∈ [2, ~5]）。于是
+//       RR(k) = (0.5 + k·m) / (0.5 + m)
+//   入门闸门要求 RR ≥ MIN_RISK_REWARD_RATIO（默认 2.5），故
+//       **k ≥ MIN_RR + 0.5·(MIN_RR − 1) / m**
+//   m 取最坏下界 2（高波动币，R 刚好等于 2 ATR）→ k ≥ 2.5 + 0.375 = **2.875**。
+//   实测把 k 设成 2.5 时，全市场信号几乎全被"风险收益比不足(2.2:1)"挡死（系统停摆）——
+//   这就是「主止盈」与「RR 闸门」必须联动的证据。3.0 在 m ≥ 2 的全部情形下都留有余量
+//   （m=2 → RR=2.60；m=4 → RR=2.78），且比 3.5R 近 14%，兑现概率明显更高。
+//
+// 为什么不能靠「继续下调 k」提升可达性：
+//   可达到性受**平均最大浮盈（MFE ≈ 1.9R）**限制，而 k 的下限受 RR 闸门限制（≈2.9R）。
+//   两者几乎顶在一起，说明靠单一止盈价已到极限。真正的出口是**分批止盈**
+//   （TP1 1R / TP2 2R 各平一部分，剩余仓位奔 k·R）。
+//
+// 后续可选（需改结算层，本次未做）：分批止盈需要 tradingSimulator._settle 支持
+//   部分平仓（新增 fills[] 记账、剩余数量/保证金跟踪、simulated_orders 扩展字段），
+//   属结算层重构，风险高于本轮出场逻辑调整，故先以「下调单笔止盈倍数 + 一致性校验」达成。
+const MAIN_TP_R_MULTIPLE = numFromEnv('NOFX_MAIN_TP_R', 3.0, 1, 10);
 // 分级止盈前两档（仅随 plan 透出做展示，实际下单只用 plan.takeProfit）
 const TP1_R_MULTIPLE = 1.0;
 const TP2_R_MULTIPLE = 2.0;
@@ -61,6 +92,23 @@ const TP2_R_MULTIPLE = 2.0;
 const SR_NARROW_MIN_RR = 2.5;
 // 入场最低风险收益比（按"现价→主止盈 ÷ 现价→主止损"计算）。原门槛 1.2 过低，放行大量劣质单。
 const MIN_RISK_REWARD_RATIO = numFromEnv('NOFX_MIN_RR', 2.5, 0, 10);
+
+// ── 一致性守卫（2026-09-10）：主止盈倍数与 RR 闸门必须联动，否则系统会静默停摆 ──
+// 推导见上方 MAIN_TP_R_MULTIPLE 注释：k ≥ MIN_RR + 0.5·(MIN_RR − 1)/m，m = R/ATR 下界 = RISK_RULE.stopAtr。
+// 若 k 低于该下界，全市场信号都会被"风险收益比不足"挡死（实测 k=2.5 时命中 ~87/100）。
+// 这里在模块加载时就告警，避免以后有人单独调 NOFX_MAIN_TP_R 而不知情。
+(() => {
+  const mFloor = Math.max(0.5, RISK_RULE.stopAtr);
+  const kMin = MIN_RISK_REWARD_RATIO + 0.5 * (MIN_RISK_REWARD_RATIO - 1) / mFloor;
+  if (MAIN_TP_R_MULTIPLE + 1e-9 < kMin) {
+    console.warn(
+      `[enhancedAnalysis] ⚠️ 配置冲突：主止盈 ${MAIN_TP_R_MULTIPLE}R 低于 RR 闸门所要求的下界 ${kMin.toFixed(3)}R`
+      + `（NOFX_MIN_RR=${MIN_RISK_REWARD_RATIO}，m 下界=${mFloor}）——`
+      + ` 大多数信号会被"风险收益比不足"拒绝，系统可能停摆。`
+      + ` 请同时下调 NOFX_MIN_RR 或上调 NOFX_MAIN_TP_R。`
+    );
+  }
+})();
 // 入场区间半宽（单位 ATR）。区间越宽，最不利入场价离止损越远 → 净盈亏比越低。
 // 保持 0.5 不动（改小可继续抬高净盈亏比，但会明显降低成交率），留作单点调优旋钮。
 const ENTRY_BAND_ATR = numFromEnv('NOFX_ENTRY_BAND_ATR', 0.5, 0, 2);
@@ -137,42 +185,41 @@ const MAX_RSI_SHORT = numFromEnv('NOFX_MAX_RSI_SHORT', 55, 0, 100);
 //   触发 0.2R：训练胜率 62.8% / 测试 63.3%（胜率更高但均单更差，因过早离场吃不到趋势）
 // 0.4R 在「胜率」与「均单净盈亏」之间取得平衡（训练 -0.581 / 测试 -0.271，均优于基准）。
 // 注意：0.4R 触发的前提是 2ATR 止损；若改 stopR 需同步重标该值。
-const TRAIL_PROFIT_TRIGGER = 0.02;          // 保留：仅作为「已明显盈利」的兜底语义（见下）
-const TRAIL_TRIGGER_R = numFromEnv('NOFX_TRAIL_TRIGGER_R', 0.4, 0.05, 3.0);
+// 触发口径已统一到 server/shared/strategyGuards.js → TRAILING_RULE（R 口径单一事实源）。
+// 这里不再保留本地副本 —— 曾经的 TRAIL_TRIGGER_R 与 TRAILING_RULE.triggerR 同值不同源，
+// 一旦在 guards 里调参就会出现「复核用旧值、护栏用新值」的静默漂移。
 
 /**
  * 判断是否应该启动移动止损（提前保护）。
  *
  * 双通道，任一满足即触发：
- *   1. R 通道（主）：浮盈 >= TRAIL_TRIGGER_R × R，R = 入场价到初始止损的距离。
- *      这是 P5 新增的主力通道，让保护在「小而快的反转」前生效。
- *   2. 百分比通道（兼容）：浮盈 > 2%，保留原语义，避免在 R 极小（止损很近）时过于敏感。
+ *   1. R 通道（主）：浮盈 >= TRAILING_RULE.triggerR × R，R = 入场基准价到初始止损的距离。
+ *   2. 百分比通道（兼容）：浮盈 > TRAILING_RULE.profitTriggerPct，避免在 R 极小（止损很近）时过于敏感。
  *
- * @returns {{fire: boolean, detail: string}}
+ * @returns {{fire: boolean, detail: string, profitR: number, riskUnit: number}}
  */
 function shouldFireTrailing(order, close, long) {
   const entry = Number(order.entry);
-  const stop = Number(order.plan?.stopLoss);
+  const riskUnit = planRiskUnit(order.plan, order.direction);
   const profit = long ? (close - entry) / entry : (entry - close) / entry;
-  const pctFire = profit > TRAIL_PROFIT_TRIGGER;
+  const pctFire = profit > TRAILING_RULE.profitTriggerPct;
 
-  let rFire = false, rDetail = 'R未知';
-  if (Number.isFinite(entry) && Number.isFinite(stop)) {
-    const riskDist = Math.abs(entry - stop);
-    if (riskDist > 0) {
-      const r = (long ? close - entry : entry - close) / riskDist;
-      rFire = r >= TRAIL_TRIGGER_R;
-      rDetail = `浮盈 ${r.toFixed(2)}R（触发线 ${TRAIL_TRIGGER_R}R）`;
-    }
+  let rFire = false, rDetail = 'R未知', rValue = NaN;
+  if (Number.isFinite(riskUnit) && riskUnit > 0) {
+    const r = profitRFrom({ long, entry, close, riskUnit });
+    rValue = r;
+    rFire = reachedR(r, TRAILING_RULE.triggerR);
+    rDetail = `浮盈 ${Number.isFinite(r) ? r.toFixed(2) : '—'}R（触发线 ${TRAILING_RULE.triggerR}R）`;
   }
   return {
     fire: rFire || pctFire,
-    detail: `${rDetail}${pctFire ? ' / 已超 2% 兜底线' : ''}`
+    detail: `${rDetail}${pctFire ? ` / 已超 ${(TRAILING_RULE.profitTriggerPct * 100).toFixed(1)}% 兜底线` : ''}`,
+    profitR: rValue,
+    riskUnit
   };
 }
-// 移动止损 / 顺势扩展止盈 / 盈亏平衡位参数 — 跨引擎共享常量（见 server/shared/strategyGuards.js）。
-// 局部分解便于阅读：TRAIL_STOP_ATR=TRAILING_RULE.stopAtr, TRAIL_TP_ATR=TRAILING_RULE.extendTpAtr。
-const TRAIL_STOP_ATR = TRAILING_RULE.stopAtr;
+// 顺势扩展止盈距离（ATR 倍数），跨引擎共享（见 server/shared/strategyGuards.js）。
+// 移动止损距离不再用 ATR —— 已改为 R 口径阶梯（TRAILING_RULE.ladder），故此处不再保留 TRAIL_STOP_ATR。
 const TRAIL_TP_ATR = TRAILING_RULE.extendTpAtr;
 // ==================== P3 可调参数集中区结束 ====================
 
@@ -677,10 +724,14 @@ export function enhancedAnalysis(market) {
   // 动态止损止盈（基于ATR和支撑阻力）
   let stopLoss, takeProfit1, takeProfit2, takeProfit3;
 
-  // 噪声保护：止损距离取 2倍ATR 与 0.8% 价格距离的较大值。
+  // 噪声保护：止损距离取 RISK_RULE.stopAtr×ATR 与 RISK_RULE.minStopPct×价格 的较大值。
   // 历史复盘（2143笔已平仓）显示旧方案平均止损距离仅0.57%（1m ATR级别），
   // 88.7%订单被止损、其中55%在入场几分钟内0次修改即被噪声扫出，胜率仅22.6%。
-  const riskUnit = Math.max(atr * 2.0, close * 0.008);
+  //
+  // 2026-09-10 复核：曾怀疑 0.8% 下限「过宽」，把 R 压到 1.6 ATR(≈0.32%)。重算后**否决**：
+  // 往返成本约 22bps；R 从 ~0.8% 缩小到 0.32% 会让「成本/R」从 0.31R 恶化到 0.69R，
+  // 每笔必须先赚 2/3 个 R 才回本。故保留 0.008，只把它抽成 RISK_RULE.minStopPct 便于灰度。
+  const riskUnit = Math.max(atr * RISK_RULE.stopAtr, close * RISK_RULE.minStopPct);
 
   // 以现价为基准的盈亏比：|现价→目标| ÷ |现价→止损|
   //
@@ -745,8 +796,19 @@ export function enhancedAnalysis(market) {
     );
   }
 
-  // 推荐杠杆（保守）
-  const recommendedLeverage = Math.max(1, Math.min(5, Math.floor(0.08 / riskDistance)));
+  // 实际风险单位 R：以限价挂单价 entryLimit（实际成交锚点）到止损的距离为准。
+  // 这是 R 口径触发线 / 移动止损阶梯 / 复核 计算浮盈 R 的共同基准，必须随计划固化。
+  const actualRiskUnit = Math.abs(entryLimit - stopLoss);
+  const actualRiskDistance = actualRiskUnit / entryLimit;
+
+  // 推荐杠杆：以 RISK_RULE.riskBudgetPct（目标保证金风险预算）反推，硬上限 RISK_RULE.maxLeverage。
+  // 修复要点（Task #5）：旧式 `Math.min(5, floor(0.08/distance))` 里的 0.08 与 5 都是散落的魔数，
+  // 且用了「最不利入场价」的 distance（偏大）→ 杠杆被系统性压低。现统一用实际成交价口径 + 共享常量，
+  // 并把**真实**保证金风险写成 plan.marginRiskPct 显式透出（= 杠杆 × 实际止损距离）。
+  const recommendedLeverage = Number.isFinite(actualRiskDistance) && actualRiskDistance > 0
+    ? Math.max(1, Math.min(RISK_RULE.maxLeverage, Math.floor(RISK_RULE.riskBudgetPct / actualRiskDistance)))
+    : 1;
+  const marginRiskPct = recommendedLeverage * actualRiskDistance;
 
   // 置信度（基于综合评分）
   const confidence = Math.min(0.90, 0.60 + trendStrength.score / 250);
@@ -761,19 +823,32 @@ export function enhancedAnalysis(market) {
       rsiWarning,
       `波动率${(volatility * 100).toFixed(2)}%`,
       `风险收益比${riskRewardRatio.toFixed(2)}:1`,
-      `推荐杠杆${recommendedLeverage}x`
+      `推荐杠杆${recommendedLeverage}x（保证金风险约${(marginRiskPct * 100).toFixed(2)}%）`
     ].filter(Boolean).join('；'),
     plan: {
       entryMin,
       entryMax,
       entryLimit,
       stopLoss,
-      // 主止盈改用 3.5R 档（原为 2R 档）。2R 时净盈亏比仅 1.24，在 22.7% 胜率下
-      // 期望值为负；3.5R 是"胜率不至于崩塌"与"盈亏比足够"之间的折中。
+      // 主止盈取 MAIN_TP_R_MULTIPLE（当前默认 2.5R）。历史教训：曾抬到 3.5R，
+      // 但样本平均最大浮盈仅 ~1.9R，主止盈几乎从不兑现，属「账面盈亏比」。
       takeProfit: takeProfit3,
       takeProfit1,
       takeProfit2,
       takeProfit3,
+      // R 口径的唯一事实源：实际成交锚点(entryLimit)到初始止损的距离（价格单位）。
+      // 复核/移动止损/智能退出全部以它为基准换算浮盈 R，避免用「当前已移动过的止损」反推 R。
+      riskUnit: actualRiskUnit,
+      // 真实保证金风险（= 杠杆 × 止损距离），替代此前「暗示 10% 预算已被用满」的模糊表述。
+      marginRiskPct,
+      // 智能退出在**逐根K线**层面生效所需的配置快照（见 tradingSimulator 根级均线失守）。
+      // 复核周期（≥120s）只是兜底；真正的趋势失效判定下沉到根级，降低离场延迟。
+      smartExit: {
+        barLevel: SMART_EXIT.barLevelMaExit,
+        maPeriod: 20,
+        maBreakAtr: SMART_EXIT.maBreakAtr,
+        maExitMaxProfitR: SMART_EXIT.maExitMaxProfitR
+      },
       // 1m 主周期：下单后 6 根（6 分钟）内可成交，最多持仓 120 根（2 小时）。
       // P5 修正：周期回退 1m 后，这两个值必须同步回退（此前被改成 15m 口径的 1/8，
       // 换算成 1m 只有 1 分钟有效、8 分钟最大持仓 —— 订单几乎来不及走完就被超时平掉，
@@ -830,39 +905,61 @@ export function enhancedProtectionReview(order, market) {
   const trendValid = long ? (close > ma20) : (close < ma20);
   const profit = long ? (close - order.entry) / order.entry : (order.entry - close) / order.entry;
 
+  // R 口径：初始风险单位（优先用计划固化的 riskUnit），以及当前浮盈 R。
+  // 用 R 而不是百分比的三个好处：与移动止损阶梯同基准、与止损距离自适应、
+  // 不会出现「R 变了但阈值没变」的错配。
+  const riskUnit = planRiskUnit(order.plan, order.direction);
+  const profitR = profitRFrom({ long, entry: Number(order.entry), close, riskUnit });
+  const profitLabel = Number.isFinite(profitR) ? `${profitR.toFixed(2)}R` : 'R未知';
+
   // 检查是否应该提前退出
   let shouldExit = false;
   let exitReason = '';
 
-  // 1. 趋势反转（更严格的条件）
-  if (!trendValid && Math.abs(close - ma20) > atr * 1.0 && profit < 0.05) {
+  // 智能退出三条规则的**统一口径**（Task #2，2026-09-10 修正）。
+  //   旧实现条件互不对称 —— 均线失守要求 profit<5%，RSI/MACD 却要求 profit>5%，
+  //   且 5% 是硬编码百分比、与移动止损的 R 口径混用。结果是
+  //   「微利单与浮亏单被优先砍掉、真正走出来的趋势单反而砍不掉」，
+  //   与「盈利需要持仓时间（30-59 根胜率 58-60%，<5 根仅 5%）」的历史结论正好相反。
+  //   现按职责拆分：
+  //     · 均线失守 → 只处理「入场失败」：浮盈 < SMART_EXIT.maExitMaxProfitR（默认=跟踪触发线）
+  //       才算趋势被证伪；越过该线后，保护权交给 R 口径移动止损阶梯。
+  //     · RSI 极值 / MACD 背离 → 只处理「趋势力竭」的获利了结：浮盈 ≥ SMART_EXIT.tpMinR。
+  const protectionLine = SMART_EXIT.maExitMaxProfitR;
+  const belowProtectionLine = !Number.isFinite(profitR) || profitR < protectionLine;
+
+  // 1. 均线失守（仅当还没走出保护空间时生效）
+  if (!trendValid && Math.abs(close - ma20) > atr * SMART_EXIT.maBreakAtr && belowProtectionLine) {
     shouldExit = true;
-    exitReason = '均线失守且未盈利超过5%，趋势可能反转';
+    exitReason = `均线失守（偏离${(Math.abs(close - ma20) / atr).toFixed(2)}ATR）且浮盈仅 ${profitLabel}（< ${protectionLine}R），趋势证伪，主动离场`;
   }
 
-  // 2. RSI极值（更严格）
-  if (rsi !== null) {
-    if (long && rsi > 80 && profit > 0.05) {
+  // 2. RSI 极值（趋势力竭止盈，R 口径取代硬编码 5%）
+  if (rsi !== null && reachedR(profitR, SMART_EXIT.tpMinR)) {
+    if (long && rsi > 80) {
       shouldExit = true;
-      exitReason = `RSI严重超买(${rsi.toFixed(1)})且已盈利5%+，建议获利了结`;
+      exitReason = `RSI严重超买(${rsi.toFixed(1)})且浮盈 ${profitLabel}（≥ ${SMART_EXIT.tpMinR}R），建议获利了结`;
     }
-    if (!long && rsi < 20 && profit > 0.05) {
+    if (!long && rsi < 20) {
       shouldExit = true;
-      exitReason = `RSI严重超卖(${rsi.toFixed(1)})且已盈利5%+，建议获利了结`;
+      exitReason = `RSI严重超卖(${rsi.toFixed(1)})且浮盈 ${profitLabel}（≥ ${SMART_EXIT.tpMinR}R），建议获利了结`;
     }
   }
 
-  // 3. MACD背离（需要更多盈利）
-  if (macd && profit > 0.05) {
-    if (long && macd.histogram < 0 && close > order.entry * 1.05) {
+  // 3. MACD 背离（同样 R 口径）
+  if (macd && reachedR(profitR, SMART_EXIT.tpMinR)) {
+    if (long && macd.histogram < 0) {
       shouldExit = true;
-      exitReason = 'MACD死叉，盈利5%+，建议止盈';
+      exitReason = `MACD死叉且浮盈 ${profitLabel}（≥ ${SMART_EXIT.tpMinR}R），建议止盈`;
     }
-    if (!long && macd.histogram > 0 && close < order.entry * 0.95) {
+    if (!long && macd.histogram > 0) {
       shouldExit = true;
-      exitReason = 'MACD金叉，盈利5%+，建议止盈';
+      exitReason = `MACD金叉且浮盈 ${profitLabel}（≥ ${SMART_EXIT.tpMinR}R），建议止盈`;
     }
   }
+
+  // 总开关：NOFX_SMART_EXIT=false 时三条规则全部停用（只保留移动止损）。
+  if (!SMART_EXIT.enabled) { shouldExit = false; exitReason = ''; }
 
   // 如果应该退出，返回市价平仓建议
   if (shouldExit) {
@@ -870,39 +967,23 @@ export function enhancedProtectionReview(order, market) {
       action: 'CLOSE',
       reason: exitReason,
       closePrice: close,
-      confidence: 0.80
+      confidence: 0.80,
+      profitR: Number.isFinite(profitR) ? profitR : undefined
     };
   }
 
-  // 动态止损（移动止损）
-  let newStopLoss = order.plan.stopLoss;
-  let newTakeProfit = order.plan.takeProfit;
+  // 波动率无效时不动保护价（无法计算跟踪距离）
+  if (!(atr > 0)) {
+    return { action: 'HOLD', reason: '波动率无效，保留当前保护价格。', trendScore: trendStrength.score };
+  }
 
+  // 动态止损（R 口径渐进式移动止损阶梯，Task #1）
   const fireTrail = shouldFireTrailing(order, close, long);
 
-  if (fireTrail.fire) {
-    // 达到「提前保护」触发条件，启用移动止损（距离参数化，见文件顶部 P3 参数区）
-    if (long) {
-      // 多头：止损移至成本或盈利保护位
-      const breakEvenStop = order.entry + atr * TRAILING_RULE.breakEvenFloorAtr;
-      const trailingStop = close - atr * TRAIL_STOP_ATR;  // P0-1 一致性：移动止损距离放宽到 2.5 ATR
-      newStopLoss = Math.max(order.plan.stopLoss, breakEvenStop, trailingStop);
-
-      // 动态扩展止盈（只放宽不收紧：主止盈已是 3.5R，close+3ATR 通常低于它，取 max 后保持不变）
-      newTakeProfit = Math.max(order.plan.takeProfit, close + atr * TRAIL_TP_ATR);
-    } else {
-      // 空头：止损移至成本或盈利保护位
-      const breakEvenStop = order.entry - atr * TRAILING_RULE.breakEvenFloorAtr;
-      const trailingStop = close + atr * TRAIL_STOP_ATR;  // P0-1 一致性：移动止损距离放宽到 2.5 ATR
-      newStopLoss = Math.min(order.plan.stopLoss, breakEvenStop, trailingStop);
-
-      // 动态扩展止盈
-      newTakeProfit = Math.min(order.plan.takeProfit, close - atr * TRAIL_TP_ATR);
-    }
-  } else {
-    // 未达到提前保护触发条件：保持初始保护价格，不再收紧止损。
+  if (!fireTrail.fire) {
+    // 未达触发线：保持初始保护价，不做任何收紧。
     // 历史复盘显示旧逻辑在未盈利时按 close±1.8ATR 持续收紧止损，
-    // 会把初始止损棘轮式推向现价，入场几分钟内即被1m噪声扫出。
+    // 会把初始止损棘轮式推向现价，入场几分钟内即被 1m 噪声扫出。
     return {
       action: 'HOLD',
       reason: `浮盈未达保护触发位（${fireTrail.detail}），保持初始保护价格，避免噪声止损。`,
@@ -910,25 +991,61 @@ export function enhancedProtectionReview(order, market) {
     };
   }
 
-  // 验证止损是否收紧
-  const stopTightened = long ? newStopLoss > order.plan.stopLoss : newStopLoss < order.plan.stopLoss;
+  // ⚠️ 保本跳变修复（Task #1）：
+  //   旧实现 `newStop = max(原止损, entry±0.2ATR, close∓2.5ATR)`。
+  //   首次触发时浮盈仅 ~0.4R，`close∓2.5ATR` 恒小于 `entry±0.2ATR`，于是保本项必然胜出
+  //   → 止损从距成交价 ~3.6 ATR **一步跳** 到 entry+0.2ATR（距现价仅 ~1.24ATR），
+  //   而 2.5ATR 的跟踪要等浮盈 > 2.7ATR 才接管。后果：
+  //     (1) 止损越过当前盈利能支撑的位置，极易被 1m 噪声扫出；
+  //     (2) entry+0.2ATR 远低于真实净保本线（往返成本 22bps ≈ 1.1ATR）——「保本单」实际仍净亏。
+  //   现改为 R 口径的**渐进式阶梯**（TRAILING_RULE.ladder）：实现多少浮盈，才允许把止损
+  //   抬到对应档位；跟踪距离随浮盈收窄；锁盈位不得低于成本保本线；并保证单调只紧不松。
+  const baseStop = Number(order.plan?.stopLoss);
+  const trail = computeTrailStop({
+    long,
+    entry: Number(order.entry),
+    close,
+    atr,
+    riskUnit,
+    profitR: Number.isFinite(profitR) ? profitR : 0,
+    baseStop,
+    costs: order.costs
+  });
+
+  // 算出的止损若已越过现价（异常几何），判为无效、保持原值，绝不把仓位锁死。
+  if (!Number.isFinite(trail.stop) || trail.reversed) {
+    return {
+      action: 'HOLD',
+      reason: `保护计算异常（止损${Number.isFinite(trail.stop) ? trail.stop.toFixed(4) : 'NaN'} vs 现价${close}），保持原保护价格。`,
+      trendScore: trendStrength.score
+    };
+  }
+
+  const newStopLoss = trail.stop;
+  // 顺势扩展止盈：只放宽不收窄（主止盈被 SR 收窄过时，给趋势留出走完的空间）。
+  const newTakeProfit = long
+    ? Math.max(Number(order.plan?.takeProfit) || 0, close + atr * TRAIL_TP_ATR)
+    : Math.min(Number(order.plan?.takeProfit) || Infinity, close - atr * TRAIL_TP_ATR);
+
+  // 验证止损是否收紧（单调只紧不松）
+  const stopTightened = long ? newStopLoss > baseStop : newStopLoss < baseStop;
 
   if (!stopTightened) {
     return {
       action: 'HOLD',
-      reason: '当前位置无需调整，保持原保护价格。',
+      reason: `止损已处于 ${profitLabel} 档位对应的最紧位置（${baseStop.toFixed(4)}），无需调整。`,
       trendScore: trendStrength.score
     };
   }
+
+  const stepLabel = `阶梯 ${trail.step.atR}R 档（跟踪 ${trail.step.trailR}R${trail.lockStop ? ` / 锁盈 ${trail.step.lockR}R` : ' / 锁盈未生效'}）`;
 
   return {
     action: 'UPDATE_PROTECTION',
     stopLoss: newStopLoss,
     takeProfit: newTakeProfit,
     confidence: 0.75,
-    reason: profit > 0.02
-      ? `已盈利${(profit * 100).toFixed(2)}%，启用移动止损保护盈利`
-      : `按最新ATR(${atr.toFixed(2)})调整，趋势评分${trendStrength.score}/100`,
+    reason: `浮盈 ${profitLabel} 启用移动止损（${stepLabel}）`,
     trendScore: trendStrength.score,
     profitPercent: profit * 100
   };

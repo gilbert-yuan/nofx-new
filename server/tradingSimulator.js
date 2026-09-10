@@ -112,6 +112,40 @@ export class TradingSimulator {
       markAt: order.markAt, unrealized: order.unrealized
     });
 
+    // ── 根级智能退出（Task #8）：把「均线失守」下沉到逐根判定 ──────────────────
+    // 此前均线失守只在复核周期（GlobalAutomation 配置 120s、实测约 160s）才检查，
+    // 1m 周期下平均要晚 2~3 根才动作，趋势已反转的浮亏单被多扛了几分钟。
+    // 现按计划里固化的 smartExit 配置，在每根已收盘 K 线上判定；复核周期仅作兜底。
+    // 只看**已收盘** K 线，不使用未来数据，回测/实盘口径一致。
+    const smartExit = plan?.smartExit;
+    const barLevelMaExit = !!smartExit && smartExit.barLevel !== false && Number.isFinite(smartExit.maBreakAtr);
+    let maSeries = null;
+    let atrSeries = null;
+    if (barLevelMaExit) {
+      maSeries = new Map();
+      atrSeries = new Map();
+      const ordered = rows.slice().sort((a, b) => Number(a.openTime) - Number(b.openTime));
+      const seq = ordered.map(r => r.close);
+      const maPeriod = Number.isInteger(smartExit.maPeriod) && smartExit.maPeriod > 1 ? smartExit.maPeriod : 20;
+      const atrPeriod = 14;
+      for (let i = 0; i < ordered.length; i++) {
+        const t = Number(ordered[i].openTime);
+        if (i + 1 >= maPeriod) {
+          let sum = 0;
+          for (let k = i + 1 - maPeriod; k <= i; k++) sum += seq[k];
+          maSeries.set(t, sum / maPeriod);
+        }
+        if (i >= atrPeriod) {
+          let sum = 0;
+          for (let k = i + 1 - atrPeriod; k <= i; k++) {
+            const previous = seq[k - 1];
+            sum += Math.max(ordered[k].high - ordered[k].low, Math.abs(ordered[k].high - previous), Math.abs(ordered[k].low - previous));
+          }
+          atrSeries.set(t, sum / atrPeriod);
+        }
+      }
+    }
+
     // 逐根K线推进
     while (nextOpenTime(time, order.interval) <= now) {
       // 检查过期（未入场）。GTC（validForBars===0）在实盘账户模式下永不退市，仅回测走有界窗口。
@@ -189,6 +223,38 @@ export class TradingSimulator {
           );
           time = nextOpenTime(time, order.interval);
           return { ...checkpoint(), ...settled };
+        }
+
+        // 根级智能退出（Task #8）：止损/止盈未触发时，逐根检查「均线失守」。
+        // 仅对「尚未走出保护空间」的持仓生效（浮盈 < maExitMaxProfitR），
+        // 与 enhancedProtectionReview 的口径完全一致；越过保护线后交给移动止损阶梯。
+        if (barLevelMaExit) {
+          const ma = maSeries.get(time);
+          const atrNow = atrSeries.get(time);
+          if (Number.isFinite(ma) && Number.isFinite(atrNow) && atrNow > 0) {
+            const invalidated = long ? row.close < ma : row.close > ma;
+            const deviated = Math.abs(row.close - ma) > atrNow * smartExit.maBreakAtr;
+            const riskUnit = Number(order.plan?.riskUnit);
+            const profitR = Number.isFinite(riskUnit) && riskUnit > 0
+              ? (long ? row.close - entry : entry - row.close) / riskUnit
+              : NaN;
+            const maxR = Number.isFinite(smartExit.maExitMaxProfitR) ? smartExit.maExitMaxProfitR : 0.4;
+            const belowLine = !Number.isFinite(profitR) || profitR < maxR;
+            if (invalidated && deviated && belowLine) {
+              const settled = this._settle(
+                order,
+                { reason: 'smart_exit_ma', price: row.close, ambiguous: false },
+                entry,
+                entryTime,
+                nextOpenTime(time, order.interval),
+                held,
+                direction,
+                adverse
+              );
+              time = nextOpenTime(time, order.interval);
+              return { ...checkpoint(), ...settled };
+            }
+          }
         }
       }
 
