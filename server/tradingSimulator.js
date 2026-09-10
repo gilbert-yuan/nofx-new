@@ -360,9 +360,24 @@ export class TradingSimulator {
       }
     }
 
-    // 2. 止损检查
+    // 2. 止损 / 止盈检查（同根K线可能双触发）
     const hitStop = long ? row.low <= stopLoss : row.high >= stopLoss;
     const hitTarget = long ? row.high >= takeProfit : row.low <= takeProfit;
+
+    if (hitStop && hitTarget) {
+      // P1-1：同根K线双触发时，若当根开盘已越过止盈，按更优价以止盈结算
+      // （"先止盈后回踩"的单不应被记成止损，避免系统性压低胜率）
+      const openedBeyondTarget = long ? row.open >= takeProfit : row.open <= takeProfit;
+      if (openedBeyondTarget) {
+        return {
+          reason: 'take_profit',
+          price: long ? Math.max(row.open, takeProfit) : Math.min(row.open, takeProfit),
+          ambiguous: true
+        };
+      }
+      const stopPrice = long ? Math.min(row.open, stopLoss) : Math.max(row.open, stopLoss);
+      return { reason: 'stop_loss', price: stopPrice, ambiguous: true };
+    }
 
     if (hitStop) {
       // 止损价格：开盘价和止损价的较优值
@@ -373,7 +388,7 @@ export class TradingSimulator {
       return {
         reason: 'stop_loss',
         price: stopPrice,
-        ambiguous: hitTarget  // 同根K线双触发
+        ambiguous: false
       };
     }
 

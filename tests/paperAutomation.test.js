@@ -2,13 +2,15 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { automationDefaults, claimAutomationJob, applyPaperProtectionReview, PaperAutomation } from '../server/paperAutomation.js';
 import { initialPaperAccount, submitPaperOrder, accountSummary, advancePaperOrder } from '../server/simulatedAccount.js';
-import { candleOpenAt, PAPER_COSTS } from '../server/research.js';
+import { candleOpenAt, PAPER_COSTS, MAIN_INTERVAL, nextOpenTime } from '../server/research.js';
+import { LOCAL_STRATEGY } from '../server/localAnalysis.js';
 
 const minute = 60000;
 const candle = (time, extra = {}) => ({ openTime: time, open: 105, high: 110, low: 100, close: 105, volume: 10, confirmed: true, ...extra });
-const currentWindow = () => {
-  const end = candleOpenAt(Date.now(), '1m');
-  return Array.from({ length: 80 }, (_, i) => candle(end - (80 - i) * minute, { open: 100 + i * 0.5, close: 100 + i * 0.5, high: 101 + i * 0.5, low: 99 + i * 0.5 }));
+const currentWindow = (interval = '1m') => {
+  const end = candleOpenAt(Date.now(), interval);
+  const duration = nextOpenTime(0, interval);
+  return Array.from({ length: 80 }, (_, i) => candle(end - (80 - i) * duration, { open: 100 + i * 0.2, close: 100 + i * 0.2, high: 101 + i * 0.2, low: 99 + i * 0.2 }));
 };
 function openOrder(end = candleOpenAt(Date.now(), '1m')) {
   return { id: 'held-1', symbol: 'BTCUSDT', marketProvider: 'okx', interval: '1m', status: 'open', direction: 'OPEN_LONG',
@@ -16,6 +18,28 @@ function openOrder(end = candleOpenAt(Date.now(), '1m')) {
     markPrice: 105, markAt: new Date(end).toISOString(), nextTime: end, heldBars: 1, liquidationPrice: 67.2,
     plan: { entryMin: 99, entryMax: 101, stopLoss: 90, takeProfit: 150, maxHoldBars: 120 }, costs: { ...PAPER_COSTS }, protectionRevisions: [] };
 }
+
+test('auxiliary fetch failure archives WAIT without falling back to single timeframe entries', async () => {
+  const state = initialPaperAccount(), records = [];
+  const simulation = { mutate: async fn => fn(state), read: async () => structuredClone(state) };
+  const automation = new PaperAutomation({
+    simulation,
+    store: { getConfig: async () => ({ model: {} }), getStrategy: async () => ({ rules: '' }) },
+    market: { provider: 'okx', perpetualUsdtContracts: async () => [{ symbol: 'BTCUSDT' }] },
+    archive: { get: async () => null, save: async r => records.push(r) },
+    marketDb: {}
+  });
+  automation.fresh = async (symbol, interval = '1m') => {
+    if (interval !== '1m') throw Error('Auxiliary feed unavailable');
+    return { symbol, interval, marketProvider: 'okx', klines: currentWindow() };
+  };
+  await automation.init();
+  await automation.run('scan');
+  assert.equal(state.orders.length, 0);
+  assert.equal(records.length, 1);
+  assert.equal(records[0].analyses[0].eligible, false);
+  assert.equal(state.automation.scan.held, 1);
+});
 
 test('durable 2-hour and 5-minute schedules lease once and resume the same run after a crash', () => {
   const state = { automation: automationDefaults(100000) };
@@ -69,19 +93,33 @@ test('review refuses wider stops, stale data, bad levels and weak AI proposals',
   assert.equal(applyPaperProtectionReview(order, { action: 'UPDATE_PROTECTION', stopLoss: 98, takeProfit: 140 }, end + minute).action, 'held');
 });
 
-test('complete key-free scan uses cached minute data, archives every symbol and automatically submits fixed 100 margin', async () => {
+test('complete key-free scan uses cached data, archives every symbol and automatically submits fixed 100 margin', async () => {
   const state = initialPaperAccount(), records = new Map();
   const simulation = { mutate: async fn => fn(state), read: async () => structuredClone(state), refresh: async () => {} };
   const market = { provider: 'okx', storageSymbol: symbol => `OKX_PUBLIC_${symbol}`, perpetualUsdtContracts: async () => ['BTCUSDT', 'ETHUSDT'].map(symbol => ({ symbol })), klines: async () => { throw new Error('No external fetch required with fresh cache'); } };
   const archive = { get: async id => records.get(id), save: async record => records.set(record.id, record) };
-  const automation = new PaperAutomation({ simulation, market, archive, store: { getConfig: async () => ({ model: {} }), getStrategy: async () => ({ interval: '1m' }) }, marketDb: { listKlines: async () => currentWindow() }, analyze: async () => { throw Error('No model key is used'); } });
+  const automation = new PaperAutomation({ simulation, market, archive, store: { getConfig: async () => ({ model: {} }), getStrategy: async () => ({ interval: '1m' }) }, marketDb: { listKlines: async ({ interval }) => currentWindow(interval) }, analyze: async () => { throw Error('No model key is used'); } });
   await automation.init(); await automation.run('scan');
   assert.equal(records.size, 2); assert.equal(state.orders.length, 2);
-  assert.ok(state.orders.every(o => o.margin === 100 && o.automatic && o.interval === '1m'));
+  assert.ok(state.orders.every(o => o.margin === 100 && o.automatic && o.interval === MAIN_INTERVAL));
+  assert.ok(state.orders.every(o => o.plan.maxHoldBars === LOCAL_STRATEGY.maxHoldBars));
+  assert.ok(state.orders.every(o => o.analysisContext.strategyModel === LOCAL_STRATEGY.modelId));
   assert.equal(state.automation.scan.submitted, 2); assert.equal(state.automation.scan.failed, 0); assert.equal(state.automation.scan.running, false);
   await automation.run('scan'); assert.equal(state.orders.length, 2);
   const order = openOrder(); order.markPrice = currentWindow().at(-1).close; state.orders = [order];
   await automation.run('review', true);
   assert.equal(state.automation.review.total, 1); assert.equal(state.automation.review.updated, 1);
   assert.equal(state.orders[0].reviewHistory.at(-1).action, 'updated');
+});
+
+test('saved adaptive overrides are applied to newly generated paper plans', async () => {
+  const state = initialPaperAccount(), records = new Map();
+  state.adaptiveOverrides = { maxHoldBars: 77 };
+  const simulation = { mutate: async fn => fn(state), read: async () => structuredClone(state), refresh: async () => {} };
+  const market = { provider: 'okx', storageSymbol: symbol => `OKX_PUBLIC_${symbol}`, perpetualUsdtContracts: async () => [{ symbol: 'BTCUSDT' }], klines: async () => { throw new Error('cached data expected'); } };
+  const archive = { get: async id => records.get(id), save: async record => records.set(record.id, record) };
+  const automation = new PaperAutomation({ simulation, market, archive, store: { getConfig: async () => ({ model: {} }), getStrategy: async () => ({}) }, marketDb: { listKlines: async ({ interval }) => currentWindow(interval) } });
+  await automation.init(); await automation.run('scan');
+  assert.equal(state.orders.length, 1);
+  assert.equal(state.orders[0].plan.maxHoldBars, 77);
 });

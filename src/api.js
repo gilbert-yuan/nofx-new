@@ -8,7 +8,9 @@ export async function api(path, options = {}) {
   else externalSignal?.addEventListener('abort', abort, { once: true });
   const timer = setTimeout(() => controller.abort(new DOMException('请求超时', 'TimeoutError')), timeoutMs);
   try {
-    const res = await fetch(`${API_BASE}${path}`, {
+    // 契约路径已带 /api/ 前缀（如 /api/binance/status），不再重复拼接；旧调用（如 /paper/...）才补前缀
+    const url = /^\/api\//.test(path) ? path : `${API_BASE}${path}`;
+    const res = await fetch(url, {
       ...request,
       headers: { Accept: 'application/json', 'Content-Type': 'application/json', ...headers },
       signal: controller.signal,

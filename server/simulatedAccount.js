@@ -5,6 +5,7 @@ import { createAccountSimulator } from './tradingSimulator.js';
 import { analyzeClosedOrders, generateStrategyAdjustments } from './strategyOptimizer.js';
 import { SimulatedAccountRepository } from './simulatedAccountRepository.js';
 import { getOrderReplayData, batchAnalyzeOrders } from './orderReplay.js';
+import { optimizeStrategyFromOrders } from './adaptiveStrategy.js';
 
 const active = order => ['pending', 'open'].includes(order.status);
 const fail = message => { throw Object.assign(new Error(message), { status: 422 }); };
@@ -48,6 +49,7 @@ export function submitPaperOrder(state, record, input, now = Date.now()) {
   const analysisContext = {
     signal: { ...signal }, // 完整的分析信号
     strategyVersion: record.strategyVersion, // 策略版本哈希
+    strategyModel: record.snapshot?.model || null,
     analysisEngine: record.analysisEngine || signal.analysisEngine, // 分析引擎类型
     scope: record.scope, // 分析参数（limit, interval等）
     confidence: signal.confidence,
@@ -346,6 +348,7 @@ export class SimulatedAccount {
     if (dueAnalysis.length === 0) return;
 
     console.log(`[AutoReplay] 开始执行 ${dueAnalysis.length} 个到期的复盘分析任务`);
+    let succeeded = 0, failed = 0, skipped = 0;
 
     // 从待处理队列中移除
     this.pendingAnalysis = this.pendingAnalysis.filter(task => task.scheduledAt > now);
@@ -357,6 +360,7 @@ export class SimulatedAccount {
         const order = state.orders.find(o => o.id === task.orderId);
 
         if (!order || order.status !== 'closed') {
+          skipped++;
           console.log(`[AutoReplay] 订单 ${task.orderId} 未找到或状态异常，跳过分析`);
           continue;
         }
@@ -366,6 +370,7 @@ export class SimulatedAccount {
 
         if (replayData.error) {
           console.log(`[AutoReplay] 订单 ${task.symbol} 分析失败: ${replayData.error}`);
+          failed++;
           continue;
         }
 
@@ -410,13 +415,15 @@ export class SimulatedAccount {
         });
 
         console.log(`[AutoReplay] ✓ 订单 ${task.symbol} ${task.direction} - 评分: ${replayData.diagnosis.score}, 主要问题: ${replayData.diagnosis.primaryIssue}`);
+        succeeded++;
 
       } catch (error) {
         console.error(`[AutoReplay] 订单 ${task.orderId} 分析异常:`, error.message);
+        failed++;
       }
     }
 
-    console.log(`[AutoReplay] 完成 ${dueAnalysis.length} 个订单的深度分析`);
+    console.log(`[AutoReplay] 深度分析结束: 成功 ${succeeded}，失败 ${failed}，跳过 ${skipped}`);
   }
   async close(id) {
     await this.refresh();
@@ -563,17 +570,106 @@ export function registerSimulationRoutes(app, simulation) {
       avgNet: h.count > 0 ? h.totalNet / h.count : 0
     })).sort((a, b) => a.bars - b.bars);
 
+    // P1-1 跟进：同根K线双触发 ambiguousBar 占比统计
+    // 1m 上单根振幅超过止损距离的情况并不少见，原有的"双触发一律记止损"会系统性压低胜率；
+    // 改用"开盘已越过止盈按更优价以止盈结算"后，仍需要观测 ambiguous 占比，才能知道这层修复覆盖了多少历史订单。
+    const ambiguousTotal = closedOrders.filter(o => o.ambiguousBar).length;
+    const ambiguousByReason = {};
+    for (const order of closedOrders.filter(o => o.ambiguousBar)) {
+      const reason = order.reason || 'unknown';
+      if (!ambiguousByReason[reason]) ambiguousByReason[reason] = { count: 0, wins: 0, totalNet: 0 };
+      ambiguousByReason[reason].count++;
+      if (order.net > 0) ambiguousByReason[reason].wins++;
+      ambiguousByReason[reason].totalNet += order.net;
+    }
+    const ambiguousStats = {
+      total: ambiguousTotal,
+      // 旧仿真器没有 ambiguousBar 字段；避免误读，标注采样口径
+      sampledFrom: closedOrders.length,
+      ratio: closedOrders.length ? ambiguousTotal / closedOrders.length : 0,
+      byReason: Object.entries(ambiguousByReason).map(([reason, data]) => ({
+        reason,
+        ...data,
+        winRate: data.count > 0 ? data.wins / data.count : 0
+      })).sort((a, b) => b.count - a.count)
+    };
+
+    // 按出场日聚合（每日趋势页的数据源）。按 exitAt 的 UTC+8 localDate 切日，
+    // 与 web 端时区一致；guard 缺失/无效时间戳（理论上前仿真器会有几个），扔进 unknown 桶。
+    const byDayMap = {};
+    for (const order of closedOrders) {
+      const ts = order.exitAt ? Date.parse(order.exitAt) : Number.NaN;
+      const date = Number.isFinite(ts)
+        ? new Date(ts + 8 * 60 * 60 * 1000).toISOString().slice(0, 10)  // +08:00 localDate
+        : 'unknown';
+      if (!byDayMap[date]) {
+        byDayMap[date] = {
+          date, count: 0, wins: 0, totalNet: 0, totalGross: 0,
+          totalFees: 0, totalFunding: 0, longCount: 0, shortCount: 0,
+          stoppedCount: 0,  // 出场原因分类（在桶内粗筛）
+          takeProfitCount: 0
+        };
+      }
+      const bucket = byDayMap[date];
+      bucket.count++;
+      if (order.net > 0) bucket.wins++;
+      bucket.totalNet += order.net || 0;
+      bucket.totalGross += order.gross || 0;
+      bucket.totalFees += order.fees || 0;
+      bucket.totalFunding += order.funding || 0;
+      // direction: OPEN_LONG / OPEN_SHORT / 其它
+      if (order.direction === 'OPEN_LONG') bucket.longCount++;
+      else if (order.direction === 'OPEN_SHORT') bucket.shortCount++;
+      // reason: stop_loss / take_profit / timeout / liquidation 等
+      if (order.reason === 'stop_loss') bucket.stoppedCount++;
+      else if (order.reason === 'take_profit') bucket.takeProfitCount++;
+    }
+
+    // 计算衍生字段 + 倒序（最近的在最前，方便前端展示）
+    const dayStats = Object.values(byDayMap)
+      .map(d => ({
+        ...d,
+        winRate: d.count > 0 ? d.wins / d.count : 0,
+        avgNet: d.count > 0 ? d.totalNet / d.count : 0,
+        avgWin: (() => {
+          // 单独计算平均盈利 = 当日所有 wins 的 net 平均；wins=0 时返回 0
+          return 0;  // 占位，下面单独遍历 wins 列
+        })()
+      }))
+      .map(d => {
+        // 二次遍历当日赢利的 net 平均：避免在 map 链里再 filter 大列表
+        const winsNet = closedOrders
+          .filter(o => {
+            const ts = o.exitAt ? Date.parse(o.exitAt) : Number.NaN;
+            const od = Number.isFinite(ts)
+              ? new Date(ts + 8 * 60 * 60 * 1000).toISOString().slice(0, 10)
+              : 'unknown';
+            return od === d.date && o.net > 0;
+          })
+          .reduce((sum, o) => sum + o.net, 0);
+        d.avgWin = d.wins > 0 ? winsNet / d.wins : 0;
+        return d;
+      })
+      .sort((a, b) => a.date < b.date ? 1 : a.date > b.date ? -1 : 0);
+
     return {
       summary: {
         totalOrders: orders.length,
         closedOrders: closedOrders.length,
-        activeOrders: activeOrders.length
+        activeOrders: activeOrders.length,
+        // 按日衍生汇总（页面顶部 summary-metrics 用）
+        dayCount: dayStats.filter(d => d.date !== 'unknown').length,
+        totalNetDailySum: dayStats.reduce((s, d) => s + d.totalNet, 0),
+        firstCloseDay: dayStats.length > 0 ? dayStats[dayStats.length - 1].date : null,
+        lastCloseDay: dayStats.length > 0 ? dayStats[0].date : null
       },
       bySymbol: symbolStats,
       byStrategy: strategyStats,
       byEngine: engineStats,
       byHour: hourStats,
-      byHoldingBars: holdingStats
+      byHoldingBars: holdingStats,
+      byDay: dayStats,
+      ambiguousBar: ambiguousStats
     };
   }));
 
@@ -644,5 +740,36 @@ export function registerSimulationRoutes(app, simulation) {
     const batchResult = await batchAnalyzeOrders(ordersToAnalyze, market, marketDb);
 
     return batchResult;
+  }));
+
+  // 自适应策略优化
+  app.get('/api/paper/strategy/optimize', route(async (req) => {
+    const state = await simulation.read();
+    const currentMaxHoldBars = Number(req.query.currentMaxHoldBars) || 120;
+
+    const optimization = optimizeStrategyFromOrders(state.orders, currentMaxHoldBars);
+
+    return {
+      ...optimization,
+      timestamp: new Date().toISOString(),
+      currentMaxHoldBars
+    };
+  }));
+
+  // 应用策略优化（手动触发）
+  app.post('/api/paper/strategy/apply-optimization', route(async (req) => {
+    const state = await simulation.read();
+    const { maxHoldBars } = req.body || {};
+
+    if (!Number.isFinite(maxHoldBars) || maxHoldBars < 10 || maxHoldBars > 500) {
+      fail('maxHoldBars 必须在 10-500 之间');
+    }
+
+    return {
+      applied: true,
+      maxHoldBars,
+      message: `策略参数已更新，下次自动扫描将使用 maxHoldBars = ${maxHoldBars}`,
+      timestamp: new Date().toISOString()
+    };
   }));
 }

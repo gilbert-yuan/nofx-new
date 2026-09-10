@@ -90,10 +90,12 @@ curl http://127.0.0.1:3100/api/automation/status | jq
 
 ```powershell
 npm install
-npm run dev
+npm run build    # 构建前端（dist/ 一次性产物）
+npm run dev      # 单进程：自动 build 后启动后端，访问 http://127.0.0.1:3100
+npm run dev:hot  # 双进程：同时启 vite HMR (5173) + nodemon 后端 (3100)，适合频繁改前端的场景
 ```
 
-前端：http://127.0.0.1:5173；API：http://127.0.0.1:3100/api/health。API 使用 3100 端口以避免本机其他项目占用 3000；已有 .env 也需设置 PORT=3100。自定义 API 端口时同步设置 NOFX_API_TARGET。
+**单服务访问：http://127.0.0.1:3100**（API 与前端页面均在 3100 端口）。后端会静态托管 `dist/` 资源并提供 SPA fallback；未构建时首页会给出"请运行 `npm run dev`"的提示，`/api/*` 仍可用。`npm run pm2:start` 同样会自动 build 后再启动进程。API 使用 3100 端口以避免本机其他项目占用 3000；已有 .env 也需设置 `PORT=3100`。
 
 Windows 后台运行使用项目内 PM2，避免与上面的开发启动重复运行：
 
@@ -105,7 +107,7 @@ npm run pm2:logs
 npm run pm2:stop
 ```
 
-PM2 配置在 `ecosystem.config.cjs`。网络代理改变后检查该文件中的代理地址并重启。生产静态页面先运行 `npm run build`，再用 `npm start` 启动 API；Express 会提供构建产物。
+PM2 配置在 `ecosystem.config.cjs`。网络代理改变后检查该文件中的代理地址并重启。
 
 ## 行情同步与交互
 

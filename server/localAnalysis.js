@@ -1,21 +1,36 @@
 // Deterministic reference strategy; scores are rule strength, never win probabilities.
+// 优化调整：基于2081笔历史订单分析（整体胜率22.1%，最优区间45-49根胜率100%）
+import { LONG_ONLY } from './shared/strategyGuards.js';
+
+export const LOCAL_STRATEGY = Object.freeze({
+  modelId: 'local-mtf-trend-atr-v2',
+  maxEntryDistanceAtr: 1.0,  // 从1.5收紧至1.0，避免追高
+  maxHoldBars: 30,           // 回退至30：原50基于"45-49根100%胜率"的幸存者偏差（报告P1-2）
+  stopLossAtr: 2.5,
+  takeProfitAtr: 4.0,
+  validForBars: 3
+});
+const MIN_REWARD_TO_RISK = 1.25;
+const validRows = rows => Array.isArray(rows) && rows.length >= 50 && rows.every(r =>
+  [r.open, r.high, r.low, r.close].every(v => Number.isFinite(v) && v > 0)
+  && r.low <= Math.min(r.open, r.close) && r.high >= Math.max(r.open, r.close));
 export function localAnalysis(market) {
   const rows = market.klines;
   const wait = reason => ({ symbol: market.symbol, action: 'WAIT', confidence: 0, reason, risk: '本地规则仅使用均线和波动率，不代表盈利保证。', plan: null });
-  if (rows.length < 50) return wait('本地规则需要至少 50 根已收盘 K 线，请将数量设为 80 或更多。');
+  if (!validRows(rows)) return wait('本地规则需要至少 50 根有效的已收盘 K 线。');
   const mean = n => rows.slice(-n).reduce((sum, r) => sum + r.close, 0) / n;
   const fast = mean(20), slow = mean(50), close = rows.at(-1).close;
   const atr = rows.slice(-14).reduce((sum, r, i) => {
     const previous = rows[rows.length - 15 + i].close;
     return sum + Math.max(r.high - r.low, Math.abs(r.high - previous), Math.abs(r.low - previous));
   }, 0) / 14;
-  if (!(atr > 0) || atr / close > 0.08 || Math.abs(fast - slow) < atr * 0.3) return wait('趋势不清晰或波动过大，暂不生成开仓计划。');
+  // P0-2：加波动率下限，死水行情（ATR/close < 0.05%）被成本磨死，直接 WAIT
+  if (!(atr > 0) || atr / close > 0.08 || atr / close < 0.0005 || Math.abs(fast - slow) < atr * 0.3) return wait('趋势不清晰或波动异常（过大或过小），暂不生成开仓计划。');
   const long = fast > slow;
   if (long ? close < fast : close > fast) return wait('价格与均线趋势不一致，等待确认。');
 
-  // 优化调整：基于历史数据分析
-  // 1. 做空表现差（0%胜率），暂时禁用做空
-  if (!long) return wait('做空信号暂时禁用，历史表现不佳。');
+  if (LONG_ONLY.enabled && !long) return wait(LONG_ONLY.reason);
+  if (Math.abs(close - fast) / atr > LOCAL_STRATEGY.maxEntryDistanceAtr) return wait(`价格偏离20均线超过${LOCAL_STRATEGY.maxEntryDistanceAtr} ATR，等待回归确认，避免追涨杀跌。`);
 
   const entryMin = close - atr * 0.35, entryMax = close + atr * 0.35;
   return { symbol: market.symbol, action: long ? 'BUY' : 'SELL', confidence: Math.min(0.85, 0.65 + Math.abs(fast - slow) / atr * 0.03),
@@ -25,17 +40,17 @@ export function localAnalysis(market) {
     // 2. 止损从 1.5 ATR 放宽到 2.5 ATR（减少过早止损）
     // 3. 止盈从 3 ATR 扩大到 4 ATR（匹配更大止损的盈亏比）
     // 4. maxHoldBars 从 12 缩短到 30（实际平均持仓17根，给予适当缓冲）
-    plan: { entryMin, entryMax, stopLoss: long ? entryMin - atr * 2.5 : entryMax + atr * 2.5,
-      takeProfit: long ? entryMax + atr * 4 : entryMin - atr * 4, validForBars: 3, maxHoldBars: 30 } };
+    plan: { entryMin, entryMax, stopLoss: long ? entryMin - atr * LOCAL_STRATEGY.stopLossAtr : entryMax + atr * LOCAL_STRATEGY.stopLossAtr,
+      takeProfit: long ? entryMax + atr * LOCAL_STRATEGY.takeProfitAtr : entryMin - atr * LOCAL_STRATEGY.takeProfitAtr, validForBars: LOCAL_STRATEGY.validForBars, maxHoldBars: LOCAL_STRATEGY.maxHoldBars } };
 }
 
 // 多周期分析版本：引入15分钟、1小时、4小时辅助判断
-export function localAnalysisMultiTimeframe(market, auxMarkets = {}) {
+export function localAnalysisMultiTimeframe(market, auxMarkets = {}, adaptiveParams = {}) {
   const rows = market.klines;
   const wait = reason => ({ symbol: market.symbol, action: 'WAIT', confidence: 0, reason, risk: '多周期规则使用均线和波动率，不代表盈利保证。', plan: null });
 
   // 主周期检查
-  if (rows.length < 50) return wait('主周期需要至少 50 根已收盘 K 线。');
+  if (!validRows(rows)) return wait('主周期需要至少 50 根有效的已收盘 K 线。');
 
   const mean = (data, n) => data.slice(-n).reduce((sum, r) => sum + r.close, 0) / n;
   const calcATR = (data, periods = 14) => {
@@ -50,23 +65,26 @@ export function localAnalysisMultiTimeframe(market, auxMarkets = {}) {
   const fast = mean(rows, 20), slow = mean(rows, 50), close = rows.at(-1).close;
   const atr = calcATR(rows);
 
-  if (!(atr > 0) || atr / close > 0.08) return wait('主周期波动过大或ATR计算失败。');
+  // P0-2：波动率下限，死水行情直接 WAIT（避免被成本磨死）
+  if (!(atr > 0) || atr / close > 0.08 || atr / close < 0.0005) return wait('主周期波动异常（过大或过小），ATR计算失败或死水行情。');
   if (Math.abs(fast - slow) < atr * 0.3) return wait('主周期趋势不清晰。');
 
   const mainTrend = fast > slow ? 'long' : 'short';
   if (mainTrend === 'long' ? close < fast : close > fast) return wait('主周期价格与均线趋势不一致。');
+  if (Math.abs(close - fast) / atr > LOCAL_STRATEGY.maxEntryDistanceAtr) return wait(`价格偏离20均线超过${LOCAL_STRATEGY.maxEntryDistanceAtr} ATR，等待回落确认，避免追涨。`);
 
   // 辅助周期分析
   const auxAnalysis = {};
   const intervals = ['15m', '1h', '4h'];
 
   for (const interval of intervals) {
-    if (!auxMarkets[interval] || !auxMarkets[interval].klines || auxMarkets[interval].klines.length < 50) {
+    const auxiliary = market.interval === interval ? market : auxMarkets[interval];
+    if (!validRows(auxiliary?.klines)) {
       auxAnalysis[interval] = { trend: 'unknown', reason: '数据不足' };
       continue;
     }
 
-    const auxRows = auxMarkets[interval].klines;
+    const auxRows = auxiliary.klines;
     const auxFast = mean(auxRows, 20);
     const auxSlow = mean(auxRows, 50);
     const auxClose = auxRows.at(-1).close;
@@ -99,12 +117,13 @@ export function localAnalysisMultiTimeframe(market, auxMarkets = {}) {
   ).length;
 
   // 趋势过滤规则
-  if (alignedCount === 0) {
-    return wait(`主周期${mainTrend === 'long' ? '多头' : '空头'}，但1小时和4小时周期均不支持，等待多周期共振。`);
+  if (strongAligned !== 2) {
+    return wait('需要1小时和4小时均同向、价格与趋势一致且趋势强度超过0.5 ATR；数据不足或冲突时等待。');
   }
+  if (auxAnalysis['15m']?.trend !== mainTrend || !auxAnalysis['15m']?.aligned || auxAnalysis['15m']?.strength <= 0.3) return wait('15分钟趋势未确认或数据不足，等待。');
 
-  // 做空仍然禁用
-  if (mainTrend === 'short') return wait('做空信号暂时禁用，历史表现不佳。');
+  // 优化调整：跨引擎共享禁空政策（同一事实源 LONG_ONLY，禁止单边文本漂移）
+  if (LONG_ONLY.enabled && mainTrend === 'short') return wait(LONG_ONLY.reason);
 
   // 计算置信度：基于多周期共振
   let baseConfidence = 0.65;
@@ -117,6 +136,13 @@ export function localAnalysisMultiTimeframe(market, auxMarkets = {}) {
   const entryMin = close - atr * 0.35, entryMax = close + atr * 0.35;
   const long = mainTrend === 'long';
 
+  // 自适应参数必须保留最低 1.25:1 的计划风险收益比（从最坏入场价计算）。
+  const stopLossATR = Math.min(3.5, Math.max(1, Number(adaptiveParams.stopLossATR ?? LOCAL_STRATEGY.stopLossAtr)));
+  const requestedTargetATR = Math.min(6, Math.max(1.5, Number(adaptiveParams.takeProfitATR ?? LOCAL_STRATEGY.takeProfitAtr)));
+  const takeProfitATR = Math.max(requestedTargetATR, Number((MIN_REWARD_TO_RISK * (stopLossATR + 0.7)).toFixed(2)));
+  const maxHoldBars = Math.min(200, Math.max(10, Math.round(Number(adaptiveParams.maxHoldBars ?? LOCAL_STRATEGY.maxHoldBars))));
+  const adaptiveReason = adaptiveParams.reason || '';
+
   const reasonDetail = [
     `主周期：20MA${long ? '>' : '<'}50MA`,
     `15分钟：${auxAnalysis['15m']?.reason || '无数据'}`,
@@ -125,20 +151,26 @@ export function localAnalysisMultiTimeframe(market, auxMarkets = {}) {
     `共振度：${alignedCount}/2个高级周期一致`
   ].join('；');
 
+  const fullReason = adaptiveReason
+    ? `多周期分析：${reasonDetail}\n自适应调整：${adaptiveReason}`
+    : `多周期分析：${reasonDetail}`;
+
   return {
     symbol: market.symbol,
     action: long ? 'BUY' : 'SELL',
     confidence,
-    reason: `多周期分析：${reasonDetail}`,
-    risk: '多周期共振可提高胜率但不保证盈利；止损止盈基于主周期ATR设置。',
+    reason: fullReason,
+    risk: '多周期过滤效果需要独立验证；止损止盈基于主周期ATR设置，规则分数不是胜率。',
     multiTimeframeAnalysis: auxAnalysis,
+    adaptiveParamsUsed: { stopLossATR, takeProfitATR, maxHoldBars, confidence: adaptiveParams.confidence || 0,
+      targetAdjustedForRisk: takeProfitATR !== requestedTargetATR },
     plan: {
       entryMin,
       entryMax,
-      stopLoss: long ? entryMin - atr * 2.5 : entryMax + atr * 2.5,
-      takeProfit: long ? entryMax + atr * 4 : entryMin - atr * 4,
-      validForBars: 3,
-      maxHoldBars: 30
+      stopLoss: long ? entryMin - atr * stopLossATR : entryMax + atr * stopLossATR,
+      takeProfit: long ? entryMax + atr * takeProfitATR : entryMin - atr * takeProfitATR,
+      validForBars: LOCAL_STRATEGY.validForBars,
+      maxHoldBars
     }
   };
 }

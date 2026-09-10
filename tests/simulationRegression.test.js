@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { advancePaperOrder, submitPaperOrder, initialPaperAccount, accountSummary } from '../server/simulatedAccount.js';
-import { candleOpenAt, normalizePlan, prepareMarket, PAPER_COSTS } from '../server/research.js';
+import { candleOpenAt, normalizePlan, prepareMarket, PAPER_COSTS, MAIN_INTERVAL, nextOpenTime } from '../server/research.js';
 import { GlobalAutomation } from '../server/globalAutomation.js';
 
 const bar = 60000;
@@ -83,29 +83,30 @@ test('global automation archives all signals and only submits normalized, fresh 
   const records = new Map(), submitted = [];
   const automation = new GlobalAutomation({
     store: { getConfig: async () => ({ model: {}, analysis: { useSuperEnhanced: true } }), getStrategy: async () => ({ interval: '15m', rules: 'test' }) },
-    market: { perpetualUsdtContracts: async () => ['BTCUSDT', 'BADUSDT', 'OLDUSDT', 'WAITUSDT'].map(symbol => ({ symbol })) },
+    market: { perpetualUsdtContracts: async () => ['BTCUSDT', 'SHORTUSDT', 'BADUSDT', 'OLDUSDT', 'WAITUSDT'].map(symbol => ({ symbol })) },
     marketDb: {}, archive: { save: async record => records.set(record.id, record) },
     simulation: { submit: async input => {
       const record = records.get(input.recordId);
       submitted.push(submitPaperOrder(initialPaperAccount(), record, input));
     } }
   });
-  automation.getFreshMarket = async symbol => ({ symbol, interval: '1m', marketProvider: 'okx',
-    dataAsOf: new Date(candleOpenAt(Date.now(), '1m') - (symbol === 'OLDUSDT' ? bar : 0)).toISOString(), klines: [candle(0)] });
+  automation.getFreshMarket = async symbol => ({ symbol, interval: MAIN_INTERVAL, marketProvider: 'okx',
+    dataAsOf: new Date(candleOpenAt(Date.now(), MAIN_INTERVAL) - (symbol === 'OLDUSDT' ? nextOpenTime(0, MAIN_INTERVAL) : 0)).toISOString(), klines: [candle(0)] });
   automation.superAnalysis = {
     preFilter: async symbols => ({ filtered: symbols, removed: 0 }),
-    analyze: async market => ({ symbol: market.symbol, action: market.symbol === 'WAITUSDT' ? 'WAIT' : 'BUY', confidence: 0.8,
-      plan: market.symbol === 'BADUSDT' ? { ...plan, stopLoss: 110 } : plan })
+    analyze: async market => ({ symbol: market.symbol, action: market.symbol === 'WAITUSDT' ? 'WAIT' : market.symbol === 'SHORTUSDT' ? 'SELL' : 'BUY', confidence: 0.8,
+      plan: market.symbol === 'BADUSDT' ? { ...plan, stopLoss: 110 } : market.symbol === 'SHORTUSDT' ? { ...plan, stopLoss: 110, takeProfit: 80 } : plan })
   };
   await automation.runAnalysis();
-  assert.equal(records.size, 4);
-  assert.equal(submitted.length, 1);
+  assert.equal(records.size, 5);
+  assert.equal(submitted.length, 2);
   assert.equal(submitted[0].symbol, 'BTCUSDT');
+  assert.equal(submitted.find(order => order.symbol === 'SHORTUSDT').direction, 'OPEN_SHORT');
   for (const record of records.values()) {
     assert.ok(record.snapshot && record.strategyVersion);
-    assert.equal(record.interval, '1m');
+    assert.equal(record.interval, MAIN_INTERVAL);
     assert.equal(record.marketProvider, 'okx');
     assert.ok(record.symbols.includes(record.symbol));
-    if (record.symbol !== 'BTCUSDT') assert.equal(record.analyses[0].eligible, false);
+    if (!['BTCUSDT', 'SHORTUSDT'].includes(record.symbol)) assert.equal(record.analyses[0].eligible, false);
   }
 });

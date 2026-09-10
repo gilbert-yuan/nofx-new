@@ -115,7 +115,7 @@ export class MarketDb {
     }
   }
 
-  async listKlines({ symbol, interval, limit = 300 }) {
+  async listKlines({ symbol, interval, limit = 300, startTime = null, endTime = null }) {
     const result = await this.pool.query(
       `
         SELECT
@@ -132,10 +132,12 @@ export class MarketDb {
           trade_count AS "tradeCount"
         FROM market_klines
         WHERE symbol = $1 AND interval = $2
+          AND ($4::bigint IS NULL OR open_time >= $4)
+          AND ($5::bigint IS NULL OR open_time <= $5)
         ORDER BY open_time DESC
         LIMIT $3
       `,
-      [symbol, interval, limit]
+      [symbol, interval, limit, startTime, endTime]
     );
 
     return result.rows.reverse().map(normalizePgRow);

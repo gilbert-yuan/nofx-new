@@ -93,7 +93,7 @@ test('timeout, mark-to-market and manual close update ledger without double fees
 });
 
 test('key-free local analysis emits transparent trend/ATR plans, flat markets WAIT, leverage is capped', () => {
-  const rows = Array.from({ length: 80 }, (_, i) => candle(i * bar, { open: 100 + i, close: 100 + i, high: 101 + i, low: 99 + i }));
+  const rows = Array.from({ length: 80 }, (_, i) => candle(i * bar, { open: 100 + i * 0.2, close: 100 + i * 0.2, high: 101 + i * 0.2, low: 99 + i * 0.2 }));
   const result = localAnalysis({ symbol: 'BTCUSDT', klines: rows });
   assert.equal(result.action, 'BUY'); assert.ok(result.plan.stopLoss < result.plan.entryMin && result.plan.takeProfit > result.plan.entryMax);
   assert.equal(localAnalysis({ symbol: 'BTCUSDT', klines: rows.map(r => candle(r.openTime)) }).action, 'WAIT');

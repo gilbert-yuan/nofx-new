@@ -1,14 +1,18 @@
 /**
  * 主题系统
- * 预制多种经典配色方案
- * 
+ * 预制多种经典配色方案（oklch + color-mix 现代色彩工程）
+ *
+ * 交易色规约：A 股红涨绿跌（涨=红 hue 27、跌=绿 hue 145）
+ * 中性色：tinted neutral（chroma 0.008-0.014，跟随主题 hue）
+ * 衍生色：color-mix(in oklch, ...) 派生，减少手维护
+ *
  * 变量命名规范：
  * - bg-*       背景色
  * - text-*     文字色
  * - border-*   边框色
  * - brand-*    品牌色
  * - success/danger/warning/info  功能色
- * - long/short 交易方向色
+ * - long/short 交易方向色（A 股红涨绿跌）
  * - btn-*      按钮色
  * - chart-*    图表专用色
  * - shadow-*   阴影
@@ -16,448 +20,448 @@
  */
 
 export const themes = {
-  // ========== 深色专业版 - 经典交易终端风格 ==========
+  // ========== 深色专业版 - 冷峻交易终端风格（hue 200 冷调） ==========
   dark: {
     name: '深色专业版',
     colors: {
-      // ---- 背景色 ----
-      '--bg-primary': '#0d1110',
-      '--bg-secondary': '#141a19',
-      '--bg-tertiary': '#1c2322',
-      '--bg-elevated': '#232b2a',
-      '--bg-card': '#1a2120',
-      '--bg-input': '#1c2322',
-      '--bg-overlay': 'rgba(0, 0, 0, 0.6)',
+      // ---- 背景色（深色 oklch 15-22%，冷色调 hue 200）----
+      '--bg-primary': 'oklch(15% 0.012 200)',
+      '--bg-secondary': 'oklch(17.5% 0.012 200)',
+      '--bg-tertiary': 'oklch(20% 0.014 200)',
+      '--bg-elevated': 'oklch(22% 0.014 200)',
+      '--bg-card': 'oklch(19% 0.014 200)',
+      '--bg-input': 'oklch(20% 0.014 200)',
+      '--bg-overlay': 'oklch(12% 0.012 200 / 0.72)',
 
-      // ---- 文字色 ----
-      '--text-primary': '#e8f0ed',
-      '--text-secondary': '#b8c4c0',
-      '--text-tertiary': '#8a9a95',
-      '--text-muted': '#66736e',
-      '--text-inverse': '#0d1110',
+      // ---- 文字色（亮色，冷调）----
+      '--text-primary': 'oklch(93% 0.008 200)',
+      '--text-secondary': 'oklch(80% 0.008 200)',
+      '--text-tertiary': 'oklch(65% 0.008 200)',
+      '--text-muted': 'oklch(50% 0.008 200)',
+      '--text-inverse': 'oklch(15% 0.012 200)',
 
       // ---- 边框色 ----
-      '--border-primary': '#2d3836',
-      '--border-secondary': '#222c2a',
-      '--border-tertiary': '#1a2321',
-      '--border-hover': '#3d4a48',
+      '--border-primary': 'oklch(28% 0.014 200)',
+      '--border-secondary': 'oklch(24% 0.014 200)',
+      '--border-tertiary': 'oklch(21% 0.014 200)',
+      '--border-hover': 'oklch(34% 0.014 200)',
 
-      // ---- 品牌色 ----
-      '--brand-primary': '#00e0a8',
-      '--brand-secondary': '#00bd8d',
-      '--brand-tertiary': '#009a72',
-      '--brand-bg': 'rgba(0, 224, 168, 0.12)',
+      // ---- 品牌色（NOFX 青绿 hue 165）----
+      '--brand-primary': 'oklch(72% 0.15 165)',
+      '--brand-secondary': 'oklch(65% 0.14 165)',
+      '--brand-tertiary': 'oklch(58% 0.13 165)',
+      '--brand-bg': 'color-mix(in oklch, var(--brand-primary) 12%, transparent)',
 
       // ---- 功能色 ----
-      '--success': '#00e0a8',
-      '--success-bg': 'rgba(0, 224, 168, 0.12)',
-      '--danger': '#ff6b6b',
-      '--danger-bg': 'rgba(255, 107, 107, 0.12)',
-      '--warning': '#f5a623',
-      '--warning-bg': 'rgba(245, 166, 35, 0.12)',
-      '--info': '#5eb8ff',
-      '--info-bg': 'rgba(94, 184, 255, 0.12)',
+      '--success': 'oklch(72% 0.15 165)',
+      '--success-bg': 'color-mix(in oklch, var(--success) 12%, transparent)',
+      '--danger': 'oklch(64% 0.21 27)',
+      '--danger-bg': 'color-mix(in oklch, var(--danger) 12%, transparent)',
+      '--warning': 'oklch(75% 0.15 75)',
+      '--warning-bg': 'color-mix(in oklch, var(--warning) 12%, transparent)',
+      '--info': 'oklch(70% 0.12 240)',
+      '--info-bg': 'color-mix(in oklch, var(--info) 12%, transparent)',
 
-      // ---- 交易色 ----
-      '--long': '#00e0a8',
-      '--long-bg': 'rgba(0, 224, 168, 0.15)',
-      '--short': '#ff6b6b',
-      '--short-bg': 'rgba(255, 107, 107, 0.15)',
+      // ---- 交易色（A 股红涨绿跌：涨=红、跌=绿）----
+      '--long': 'oklch(64% 0.21 27)',
+      '--long-bg': 'color-mix(in oklch, var(--long) 15%, transparent)',
+      '--short': 'oklch(62% 0.16 145)',
+      '--short-bg': 'color-mix(in oklch, var(--short) 15%, transparent)',
 
-      // ---- 盈亏色 ----
-      '--profit': '#00e0a8',
-      '--profit-bg': 'rgba(0, 224, 168, 0.15)',
-      '--loss': '#ff6b6b',
-      '--loss-bg': 'rgba(255, 107, 107, 0.15)',
+      // ---- 盈亏色（盈=红涨、亏=绿跌）----
+      '--profit': 'oklch(64% 0.21 27)',
+      '--profit-bg': 'color-mix(in oklch, var(--profit) 15%, transparent)',
+      '--loss': 'oklch(62% 0.16 145)',
+      '--loss-bg': 'color-mix(in oklch, var(--loss) 15%, transparent)',
 
       // ---- 按钮 ----
-      '--btn-primary-bg': '#00e0a8',
-      '--btn-primary-text': '#0d1110',
-      '--btn-primary-hover': '#1aebbd',
-      '--btn-secondary-bg': '#252f2d',
-      '--btn-secondary-text': '#e8f0ed',
-      '--btn-secondary-hover': '#2f3b39',
+      '--btn-primary-bg': 'oklch(72% 0.15 165)',
+      '--btn-primary-text': 'oklch(15% 0.012 200)',
+      '--btn-primary-hover': 'oklch(78% 0.14 165)',
+      '--btn-secondary-bg': 'oklch(26% 0.014 200)',
+      '--btn-secondary-text': 'oklch(93% 0.008 200)',
+      '--btn-secondary-hover': 'oklch(30% 0.014 200)',
       '--btn-ghost-bg': 'transparent',
-      '--btn-ghost-text': '#e8f0ed',
-      '--btn-ghost-hover': '#252f2d',
+      '--btn-ghost-text': 'oklch(93% 0.008 200)',
+      '--btn-ghost-hover': 'oklch(26% 0.014 200)',
 
       // ---- 状态色 ----
-      '--state-hover': 'rgba(255, 255, 255, 0.05)',
-      '--state-active': 'rgba(255, 255, 255, 0.08)',
-      '--state-focus': 'rgba(0, 224, 168, 0.3)',
-      '--state-selected': 'rgba(0, 224, 168, 0.1)',
+      '--state-hover': 'color-mix(in oklch, white 5%, transparent)',
+      '--state-active': 'color-mix(in oklch, white 8%, transparent)',
+      '--state-focus': 'color-mix(in oklch, var(--brand-primary) 30%, transparent)',
+      '--state-selected': 'color-mix(in oklch, var(--brand-primary) 10%, transparent)',
 
-      // ---- 图表色 ----
-      '--chart-grid': '#2a3533',
-      '--chart-grid-dash': '#222c2a',
-      '--chart-axis': '#66736e',
-      '--chart-crosshair': '#5a6662',
-      '--chart-up': '#00e0a8',
-      '--chart-down': '#ff6b6b',
-      '--chart-volume-up': 'rgba(0, 224, 168, 0.4)',
-      '--chart-volume-down': 'rgba(255, 107, 107, 0.4)',
+      // ---- 图表色（A 股红涨绿跌）----
+      '--chart-grid': 'oklch(30% 0.014 200)',
+      '--chart-grid-dash': 'oklch(24% 0.014 200)',
+      '--chart-axis': 'oklch(50% 0.008 200)',
+      '--chart-crosshair': 'oklch(55% 0.008 200)',
+      '--chart-up': 'oklch(64% 0.21 27)',
+      '--chart-down': 'oklch(62% 0.16 145)',
+      '--chart-volume-up': 'color-mix(in oklch, var(--chart-up) 40%, transparent)',
+      '--chart-volume-down': 'color-mix(in oklch, var(--chart-down) 40%, transparent)',
 
-      // ---- 阴影 ----
-      '--shadow-sm': '0 1px 2px rgba(0, 0, 0, 0.3)',
-      '--shadow-md': '0 4px 12px rgba(0, 0, 0, 0.4)',
-      '--shadow-lg': '0 8px 24px rgba(0, 0, 0, 0.5)',
-      '--shadow-glow': '0 0 20px rgba(0, 224, 168, 0.2)',
+      // ---- 阴影（深色模式极简，不用发光）----
+      '--shadow-sm': '0 1px 2px oklch(0% 0 0 / 0.3)',
+      '--shadow-md': '0 4px 12px oklch(0% 0 0 / 0.4)',
+      '--shadow-lg': '0 8px 24px oklch(0% 0 0 / 0.5)',
+      '--shadow-glow': '0 0 20px color-mix(in oklch, var(--brand-primary) 20%, transparent)',
     }
   },
 
-  // ========== 蓝色现代版 - 现代简约风格 ==========
+  // ========== 蓝色现代版 - 现代简约风格（hue 240 蓝调） ==========
   blue: {
     name: '蓝色现代版',
     colors: {
-      // ---- 背景色 ----
-      '--bg-primary': '#0d1117',
-      '--bg-secondary': '#161b22',
-      '--bg-tertiary': '#21262d',
-      '--bg-elevated': '#2d333b',
-      '--bg-card': '#1a2028',
-      '--bg-input': '#21262d',
-      '--bg-overlay': 'rgba(0, 0, 0, 0.6)',
+      // ---- 背景色（深色，蓝调 hue 240）----
+      '--bg-primary': 'oklch(15% 0.012 240)',
+      '--bg-secondary': 'oklch(17.5% 0.012 240)',
+      '--bg-tertiary': 'oklch(20% 0.014 240)',
+      '--bg-elevated': 'oklch(22% 0.014 240)',
+      '--bg-card': 'oklch(19% 0.014 240)',
+      '--bg-input': 'oklch(20% 0.014 240)',
+      '--bg-overlay': 'oklch(12% 0.012 240 / 0.72)',
 
       // ---- 文字色 ----
-      '--text-primary': '#f0f6fc',
-      '--text-secondary': '#c9d1d9',
-      '--text-tertiary': '#8b949e',
-      '--text-muted': '#6e7681',
-      '--text-inverse': '#0d1117',
+      '--text-primary': 'oklch(93% 0.008 240)',
+      '--text-secondary': 'oklch(80% 0.008 240)',
+      '--text-tertiary': 'oklch(65% 0.008 240)',
+      '--text-muted': 'oklch(50% 0.008 240)',
+      '--text-inverse': 'oklch(15% 0.012 240)',
 
       // ---- 边框色 ----
-      '--border-primary': '#30363d',
-      '--border-secondary': '#21262d',
-      '--border-tertiary': '#161b22',
-      '--border-hover': '#3d444d',
+      '--border-primary': 'oklch(28% 0.014 240)',
+      '--border-secondary': 'oklch(24% 0.014 240)',
+      '--border-tertiary': 'oklch(21% 0.014 240)',
+      '--border-hover': 'oklch(34% 0.014 240)',
 
-      // ---- 品牌色 ----
-      '--brand-primary': '#58a6ff',
-      '--brand-secondary': '#4184e4',
-      '--brand-tertiary': '#316dca',
-      '--brand-bg': 'rgba(88, 166, 255, 0.12)',
+      // ---- 品牌色（蓝 hue 250）----
+      '--brand-primary': 'oklch(70% 0.13 250)',
+      '--brand-secondary': 'oklch(63% 0.14 250)',
+      '--brand-tertiary': 'oklch(56% 0.13 250)',
+      '--brand-bg': 'color-mix(in oklch, var(--brand-primary) 12%, transparent)',
 
       // ---- 功能色 ----
-      '--success': '#3fb950',
-      '--success-bg': 'rgba(63, 185, 80, 0.12)',
-      '--danger': '#f85149',
-      '--danger-bg': 'rgba(248, 81, 73, 0.12)',
-      '--warning': '#d29922',
-      '--warning-bg': 'rgba(210, 153, 34, 0.12)',
-      '--info': '#58a6ff',
-      '--info-bg': 'rgba(88, 166, 255, 0.12)',
+      '--success': 'oklch(72% 0.15 165)',
+      '--success-bg': 'color-mix(in oklch, var(--success) 12%, transparent)',
+      '--danger': 'oklch(64% 0.21 27)',
+      '--danger-bg': 'color-mix(in oklch, var(--danger) 12%, transparent)',
+      '--warning': 'oklch(75% 0.15 75)',
+      '--warning-bg': 'color-mix(in oklch, var(--warning) 12%, transparent)',
+      '--info': 'oklch(70% 0.12 240)',
+      '--info-bg': 'color-mix(in oklch, var(--info) 12%, transparent)',
 
-      // ---- 交易色 ----
-      '--long': '#3fb950',
-      '--long-bg': 'rgba(63, 185, 80, 0.15)',
-      '--short': '#f85149',
-      '--short-bg': 'rgba(248, 81, 73, 0.15)',
+      // ---- 交易色（A 股红涨绿跌）----
+      '--long': 'oklch(64% 0.21 27)',
+      '--long-bg': 'color-mix(in oklch, var(--long) 15%, transparent)',
+      '--short': 'oklch(62% 0.16 145)',
+      '--short-bg': 'color-mix(in oklch, var(--short) 15%, transparent)',
 
       // ---- 盈亏色 ----
-      '--profit': '#3fb950',
-      '--profit-bg': 'rgba(63, 185, 80, 0.15)',
-      '--loss': '#f85149',
-      '--loss-bg': 'rgba(248, 81, 73, 0.15)',
+      '--profit': 'oklch(64% 0.21 27)',
+      '--profit-bg': 'color-mix(in oklch, var(--profit) 15%, transparent)',
+      '--loss': 'oklch(62% 0.16 145)',
+      '--loss-bg': 'color-mix(in oklch, var(--loss) 15%, transparent)',
 
       // ---- 按钮 ----
-      '--btn-primary-bg': '#58a6ff',
-      '--btn-primary-text': '#0d1117',
-      '--btn-primary-hover': '#79b8ff',
-      '--btn-secondary-bg': '#21262d',
-      '--btn-secondary-text': '#f0f6fc',
-      '--btn-secondary-hover': '#30363d',
+      '--btn-primary-bg': 'oklch(70% 0.13 250)',
+      '--btn-primary-text': 'oklch(15% 0.012 240)',
+      '--btn-primary-hover': 'oklch(76% 0.12 250)',
+      '--btn-secondary-bg': 'oklch(26% 0.014 240)',
+      '--btn-secondary-text': 'oklch(93% 0.008 240)',
+      '--btn-secondary-hover': 'oklch(30% 0.014 240)',
       '--btn-ghost-bg': 'transparent',
-      '--btn-ghost-text': '#f0f6fc',
-      '--btn-ghost-hover': '#21262d',
+      '--btn-ghost-text': 'oklch(93% 0.008 240)',
+      '--btn-ghost-hover': 'oklch(26% 0.014 240)',
 
       // ---- 状态色 ----
-      '--state-hover': 'rgba(255, 255, 255, 0.05)',
-      '--state-active': 'rgba(255, 255, 255, 0.08)',
-      '--state-focus': 'rgba(88, 166, 255, 0.3)',
-      '--state-selected': 'rgba(88, 166, 255, 0.1)',
+      '--state-hover': 'color-mix(in oklch, white 5%, transparent)',
+      '--state-active': 'color-mix(in oklch, white 8%, transparent)',
+      '--state-focus': 'color-mix(in oklch, var(--brand-primary) 30%, transparent)',
+      '--state-selected': 'color-mix(in oklch, var(--brand-primary) 10%, transparent)',
 
-      // ---- 图表色 ----
-      '--chart-grid': '#2a313c',
-      '--chart-grid-dash': '#21262d',
-      '--chart-axis': '#6e7681',
-      '--chart-crosshair': '#5a6662',
-      '--chart-up': '#3fb950',
-      '--chart-down': '#f85149',
-      '--chart-volume-up': 'rgba(63, 185, 80, 0.4)',
-      '--chart-volume-down': 'rgba(248, 81, 73, 0.4)',
+      // ---- 图表色（A 股红涨绿跌）----
+      '--chart-grid': 'oklch(30% 0.014 240)',
+      '--chart-grid-dash': 'oklch(24% 0.014 240)',
+      '--chart-axis': 'oklch(50% 0.008 240)',
+      '--chart-crosshair': 'oklch(55% 0.008 240)',
+      '--chart-up': 'oklch(64% 0.21 27)',
+      '--chart-down': 'oklch(62% 0.16 145)',
+      '--chart-volume-up': 'color-mix(in oklch, var(--chart-up) 40%, transparent)',
+      '--chart-volume-down': 'color-mix(in oklch, var(--chart-down) 40%, transparent)',
 
       // ---- 阴影 ----
-      '--shadow-sm': '0 1px 2px rgba(0, 0, 0, 0.3)',
-      '--shadow-md': '0 4px 12px rgba(0, 0, 0, 0.4)',
-      '--shadow-lg': '0 8px 24px rgba(0, 0, 0, 0.5)',
-      '--shadow-glow': '0 0 20px rgba(88, 166, 255, 0.2)',
+      '--shadow-sm': '0 1px 2px oklch(0% 0 0 / 0.3)',
+      '--shadow-md': '0 4px 12px oklch(0% 0 0 / 0.4)',
+      '--shadow-lg': '0 8px 24px oklch(0% 0 0 / 0.5)',
+      '--shadow-glow': '0 0 20px color-mix(in oklch, var(--brand-primary) 20%, transparent)',
     }
   },
 
-  // ========== 紫色优雅版 - 优雅高端风格 ==========
+  // ========== 紫色优雅版 - 优雅高端风格（hue 280 紫调） ==========
   purple: {
     name: '紫色优雅版',
     colors: {
-      // ---- 背景色 ----
-      '--bg-primary': '#0f0820',
-      '--bg-secondary': '#18102e',
-      '--bg-tertiary': '#221840',
-      '--bg-elevated': '#2e2052',
-      '--bg-card': '#1c1236',
-      '--bg-input': '#221840',
-      '--bg-overlay': 'rgba(0, 0, 0, 0.6)',
+      // ---- 背景色（深色，紫调 hue 290）----
+      '--bg-primary': 'oklch(14% 0.018 290)',
+      '--bg-secondary': 'oklch(17% 0.018 290)',
+      '--bg-tertiary': 'oklch(20% 0.02 290)',
+      '--bg-elevated': 'oklch(23% 0.02 290)',
+      '--bg-card': 'oklch(19% 0.02 290)',
+      '--bg-input': 'oklch(20% 0.02 290)',
+      '--bg-overlay': 'oklch(11% 0.018 290 / 0.72)',
 
       // ---- 文字色 ----
-      '--text-primary': '#f5f0ff',
-      '--text-secondary': '#d8cff0',
-      '--text-tertiary': '#b0a0d4',
-      '--text-muted': '#8a7ab0',
-      '--text-inverse': '#0f0820',
+      '--text-primary': 'oklch(93% 0.012 290)',
+      '--text-secondary': 'oklch(80% 0.012 290)',
+      '--text-tertiary': 'oklch(65% 0.012 290)',
+      '--text-muted': 'oklch(50% 0.01 290)',
+      '--text-inverse': 'oklch(14% 0.018 290)',
 
       // ---- 边框色 ----
-      '--border-primary': '#3d2e5f',
-      '--border-secondary': '#2d1f4a',
-      '--border-tertiary': '#221840',
-      '--border-hover': '#4d3d7f',
+      '--border-primary': 'oklch(30% 0.02 290)',
+      '--border-secondary': 'oklch(25% 0.02 290)',
+      '--border-tertiary': 'oklch(21% 0.02 290)',
+      '--border-hover': 'oklch(36% 0.02 290)',
 
-      // ---- 品牌色 ----
-      '--brand-primary': '#a78bfa',
-      '--brand-secondary': '#8b5cf6',
-      '--brand-tertiary': '#7c3aed',
-      '--brand-bg': 'rgba(167, 139, 250, 0.12)',
+      // ---- 品牌色（紫 hue 295）----
+      '--brand-primary': 'oklch(70% 0.14 295)',
+      '--brand-secondary': 'oklch(63% 0.15 295)',
+      '--brand-tertiary': 'oklch(56% 0.14 295)',
+      '--brand-bg': 'color-mix(in oklch, var(--brand-primary) 12%, transparent)',
 
       // ---- 功能色 ----
-      '--success': '#34d399',
-      '--success-bg': 'rgba(52, 211, 153, 0.12)',
-      '--danger': '#f87171',
-      '--danger-bg': 'rgba(248, 113, 113, 0.12)',
-      '--warning': '#fbbf24',
-      '--warning-bg': 'rgba(251, 191, 36, 0.12)',
-      '--info': '#a78bfa',
-      '--info-bg': 'rgba(167, 139, 250, 0.12)',
+      '--success': 'oklch(72% 0.15 165)',
+      '--success-bg': 'color-mix(in oklch, var(--success) 12%, transparent)',
+      '--danger': 'oklch(64% 0.21 27)',
+      '--danger-bg': 'color-mix(in oklch, var(--danger) 12%, transparent)',
+      '--warning': 'oklch(75% 0.15 75)',
+      '--warning-bg': 'color-mix(in oklch, var(--warning) 12%, transparent)',
+      '--info': 'oklch(70% 0.12 240)',
+      '--info-bg': 'color-mix(in oklch, var(--info) 12%, transparent)',
 
-      // ---- 交易色 ----
-      '--long': '#34d399',
-      '--long-bg': 'rgba(52, 211, 153, 0.15)',
-      '--short': '#f87171',
-      '--short-bg': 'rgba(248, 113, 113, 0.15)',
+      // ---- 交易色（A 股红涨绿跌）----
+      '--long': 'oklch(64% 0.21 27)',
+      '--long-bg': 'color-mix(in oklch, var(--long) 15%, transparent)',
+      '--short': 'oklch(62% 0.16 145)',
+      '--short-bg': 'color-mix(in oklch, var(--short) 15%, transparent)',
 
       // ---- 盈亏色 ----
-      '--profit': '#34d399',
-      '--profit-bg': 'rgba(52, 211, 153, 0.15)',
-      '--loss': '#f87171',
-      '--loss-bg': 'rgba(248, 113, 113, 0.15)',
+      '--profit': 'oklch(64% 0.21 27)',
+      '--profit-bg': 'color-mix(in oklch, var(--profit) 15%, transparent)',
+      '--loss': 'oklch(62% 0.16 145)',
+      '--loss-bg': 'color-mix(in oklch, var(--loss) 15%, transparent)',
 
       // ---- 按钮 ----
-      '--btn-primary-bg': '#a78bfa',
-      '--btn-primary-text': '#0f0820',
-      '--btn-primary-hover': '#c4b5fd',
-      '--btn-secondary-bg': '#221840',
-      '--btn-secondary-text': '#f5f0ff',
-      '--btn-secondary-hover': '#2e2052',
+      '--btn-primary-bg': 'oklch(70% 0.14 295)',
+      '--btn-primary-text': 'oklch(14% 0.018 290)',
+      '--btn-primary-hover': 'oklch(76% 0.13 295)',
+      '--btn-secondary-bg': 'oklch(28% 0.02 290)',
+      '--btn-secondary-text': 'oklch(93% 0.012 290)',
+      '--btn-secondary-hover': 'oklch(32% 0.02 290)',
       '--btn-ghost-bg': 'transparent',
-      '--btn-ghost-text': '#f5f0ff',
-      '--btn-ghost-hover': '#221840',
+      '--btn-ghost-text': 'oklch(93% 0.012 290)',
+      '--btn-ghost-hover': 'oklch(28% 0.02 290)',
 
       // ---- 状态色 ----
-      '--state-hover': 'rgba(255, 255, 255, 0.04)',
-      '--state-active': 'rgba(255, 255, 255, 0.07)',
-      '--state-focus': 'rgba(167, 139, 250, 0.3)',
-      '--state-selected': 'rgba(167, 139, 250, 0.1)',
+      '--state-hover': 'color-mix(in oklch, white 5%, transparent)',
+      '--state-active': 'color-mix(in oklch, white 8%, transparent)',
+      '--state-focus': 'color-mix(in oklch, var(--brand-primary) 30%, transparent)',
+      '--state-selected': 'color-mix(in oklch, var(--brand-primary) 10%, transparent)',
 
-      // ---- 图表色 ----
-      '--chart-grid': '#352550',
-      '--chart-grid-dash': '#2d1f4a',
-      '--chart-axis': '#8a7ab0',
-      '--chart-crosshair': '#7060a0',
-      '--chart-up': '#34d399',
-      '--chart-down': '#f87171',
-      '--chart-volume-up': 'rgba(52, 211, 153, 0.4)',
-      '--chart-volume-down': 'rgba(248, 113, 113, 0.4)',
+      // ---- 图表色（A 股红涨绿跌）----
+      '--chart-grid': 'oklch(32% 0.02 290)',
+      '--chart-grid-dash': 'oklch(25% 0.02 290)',
+      '--chart-axis': 'oklch(50% 0.012 290)',
+      '--chart-crosshair': 'oklch(55% 0.012 290)',
+      '--chart-up': 'oklch(64% 0.21 27)',
+      '--chart-down': 'oklch(62% 0.16 145)',
+      '--chart-volume-up': 'color-mix(in oklch, var(--chart-up) 40%, transparent)',
+      '--chart-volume-down': 'color-mix(in oklch, var(--chart-down) 40%, transparent)',
 
       // ---- 阴影 ----
-      '--shadow-sm': '0 1px 2px rgba(0, 0, 0, 0.35)',
-      '--shadow-md': '0 4px 12px rgba(0, 0, 0, 0.45)',
-      '--shadow-lg': '0 8px 24px rgba(0, 0, 0, 0.55)',
-      '--shadow-glow': '0 0 20px rgba(167, 139, 250, 0.25)',
+      '--shadow-sm': '0 1px 2px oklch(0% 0 0 / 0.35)',
+      '--shadow-md': '0 4px 12px oklch(0% 0 0 / 0.45)',
+      '--shadow-lg': '0 8px 24px oklch(0% 0 0 / 0.55)',
+      '--shadow-glow': '0 0 20px color-mix(in oklch, var(--brand-primary) 22%, transparent)',
     }
   },
 
-  // ========== 浅色简约版 - 清爽明亮风格 ==========
+  // ========== 浅色简约版 - 清爽明亮风格（hue 200 冷调，亮色） ==========
   light: {
     name: '浅色简约版',
     colors: {
-      // ---- 背景色 ----
-      '--bg-primary': '#ffffff',
-      '--bg-secondary': '#f8f9fa',
-      '--bg-tertiary': '#f1f3f5',
-      '--bg-elevated': '#ffffff',
-      '--bg-card': '#ffffff',
-      '--bg-input': '#ffffff',
-      '--bg-overlay': 'rgba(0, 0, 0, 0.4)',
+      // ---- 背景色（亮色 oklch 95-99%，冷调 hue 200）----
+      '--bg-primary': 'oklch(99% 0.003 200)',
+      '--bg-secondary': 'oklch(97% 0.004 200)',
+      '--bg-tertiary': 'oklch(95% 0.005 200)',
+      '--bg-elevated': 'oklch(99% 0.003 200)',
+      '--bg-card': 'oklch(99% 0.003 200)',
+      '--bg-input': 'oklch(99% 0.003 200)',
+      '--bg-overlay': 'oklch(20% 0.012 200 / 0.5)',
 
-      // ---- 文字色 ----
-      '--text-primary': '#1a1a2e',
-      '--text-secondary': '#4a4a68',
-      '--text-tertiary': '#6b7280',
-      '--text-muted': '#9ca3af',
-      '--text-inverse': '#ffffff',
+      // ---- 文字色（深色文字，冷调）----
+      '--text-primary': 'oklch(22% 0.02 200)',
+      '--text-secondary': 'oklch(38% 0.015 200)',
+      '--text-tertiary': 'oklch(50% 0.012 200)',
+      '--text-muted': 'oklch(60% 0.01 200)',
+      '--text-inverse': 'oklch(99% 0.003 200)',
 
       // ---- 边框色 ----
-      '--border-primary': '#e5e7eb',
-      '--border-secondary': '#f1f3f5',
-      '--border-tertiary': '#f8f9fa',
-      '--border-hover': '#d1d5db',
+      '--border-primary': 'oklch(90% 0.005 200)',
+      '--border-secondary': 'oklch(94% 0.004 200)',
+      '--border-tertiary': 'oklch(96% 0.003 200)',
+      '--border-hover': 'oklch(85% 0.008 200)',
 
-      // ---- 品牌色 ----
-      '--brand-primary': '#2563eb',
-      '--brand-secondary': '#1d4ed8',
-      '--brand-tertiary': '#1e40af',
-      '--brand-bg': 'rgba(37, 99, 235, 0.08)',
+      // ---- 品牌色（蓝 hue 250，浅色背景需更深 chroma）----
+      '--brand-primary': 'oklch(55% 0.22 250)',
+      '--brand-secondary': 'oklch(50% 0.2 250)',
+      '--brand-tertiary': 'oklch(45% 0.18 250)',
+      '--brand-bg': 'color-mix(in oklch, var(--brand-primary) 10%, transparent)',
 
-      // ---- 功能色 ----
-      '--success': '#059669',
-      '--success-bg': 'rgba(5, 150, 105, 0.08)',
-      '--danger': '#dc2626',
-      '--danger-bg': 'rgba(220, 38, 38, 0.08)',
-      '--warning': '#d97706',
-      '--warning-bg': 'rgba(217, 119, 6, 0.08)',
-      '--info': '#2563eb',
-      '--info-bg': 'rgba(37, 99, 235, 0.08)',
+      // ---- 功能色（浅色背景需更深，保证对比度）----
+      '--success': 'oklch(52% 0.15 165)',
+      '--success-bg': 'color-mix(in oklch, var(--success) 10%, transparent)',
+      '--danger': 'oklch(55% 0.22 27)',
+      '--danger-bg': 'color-mix(in oklch, var(--danger) 10%, transparent)',
+      '--warning': 'oklch(60% 0.16 75)',
+      '--warning-bg': 'color-mix(in oklch, var(--warning) 12%, transparent)',
+      '--info': 'oklch(52% 0.2 240)',
+      '--info-bg': 'color-mix(in oklch, var(--info) 10%, transparent)',
 
-      // ---- 交易色 ----
-      '--long': '#059669',
-      '--long-bg': 'rgba(5, 150, 105, 0.1)',
-      '--short': '#dc2626',
-      '--short-bg': 'rgba(220, 38, 38, 0.1)',
+      // ---- 交易色（A 股红涨绿跌，浅色背景加深）----
+      '--long': 'oklch(55% 0.22 27)',
+      '--long-bg': 'color-mix(in oklch, var(--long) 12%, transparent)',
+      '--short': 'oklch(48% 0.15 145)',
+      '--short-bg': 'color-mix(in oklch, var(--short) 12%, transparent)',
 
       // ---- 盈亏色 ----
-      '--profit': '#059669',
-      '--profit-bg': 'rgba(5, 150, 105, 0.1)',
-      '--loss': '#dc2626',
-      '--loss-bg': 'rgba(220, 38, 38, 0.1)',
+      '--profit': 'oklch(55% 0.22 27)',
+      '--profit-bg': 'color-mix(in oklch, var(--profit) 12%, transparent)',
+      '--loss': 'oklch(48% 0.15 145)',
+      '--loss-bg': 'color-mix(in oklch, var(--loss) 12%, transparent)',
 
       // ---- 按钮 ----
-      '--btn-primary-bg': '#2563eb',
-      '--btn-primary-text': '#ffffff',
-      '--btn-primary-hover': '#1d4ed8',
-      '--btn-secondary-bg': '#6b7280',
-      '--btn-secondary-text': '#ffffff',
-      '--btn-secondary-hover': '#4b5563',
+      '--btn-primary-bg': 'oklch(55% 0.22 250)',
+      '--btn-primary-text': 'oklch(99% 0.003 200)',
+      '--btn-primary-hover': 'oklch(50% 0.2 250)',
+      '--btn-secondary-bg': 'oklch(90% 0.005 200)',
+      '--btn-secondary-text': 'oklch(25% 0.015 200)',
+      '--btn-secondary-hover': 'oklch(85% 0.008 200)',
       '--btn-ghost-bg': 'transparent',
-      '--btn-ghost-text': '#1a1a2e',
-      '--btn-ghost-hover': '#f1f3f5',
+      '--btn-ghost-text': 'oklch(25% 0.015 200)',
+      '--btn-ghost-hover': 'oklch(95% 0.005 200)',
 
-      // ---- 状态色 ----
-      '--state-hover': 'rgba(0, 0, 0, 0.04)',
-      '--state-active': 'rgba(0, 0, 0, 0.06)',
-      '--state-focus': 'rgba(37, 99, 235, 0.25)',
-      '--state-selected': 'rgba(37, 99, 235, 0.08)',
+      // ---- 状态色（浅色用 black 派生）----
+      '--state-hover': 'color-mix(in oklch, black 4%, transparent)',
+      '--state-active': 'color-mix(in oklch, black 6%, transparent)',
+      '--state-focus': 'color-mix(in oklch, var(--brand-primary) 25%, transparent)',
+      '--state-selected': 'color-mix(in oklch, var(--brand-primary) 8%, transparent)',
 
-      // ---- 图表色 ----
-      '--chart-grid': '#e5e7eb',
-      '--chart-grid-dash': '#f1f3f5',
-      '--chart-axis': '#6b7280',
-      '--chart-crosshair': '#9ca3af',
-      '--chart-up': '#059669',
-      '--chart-down': '#dc2626',
-      '--chart-volume-up': 'rgba(5, 150, 105, 0.35)',
-      '--chart-volume-down': 'rgba(220, 38, 38, 0.35)',
+      // ---- 图表色（A 股红涨绿跌，浅色）----
+      '--chart-grid': 'oklch(90% 0.005 200)',
+      '--chart-grid-dash': 'oklch(94% 0.004 200)',
+      '--chart-axis': 'oklch(55% 0.012 200)',
+      '--chart-crosshair': 'oklch(60% 0.01 200)',
+      '--chart-up': 'oklch(55% 0.22 27)',
+      '--chart-down': 'oklch(48% 0.15 145)',
+      '--chart-volume-up': 'color-mix(in oklch, var(--chart-up) 28%, transparent)',
+      '--chart-volume-down': 'color-mix(in oklch, var(--chart-down) 28%, transparent)',
 
-      // ---- 阴影 ----
-      '--shadow-sm': '0 1px 2px rgba(0, 0, 0, 0.06)',
-      '--shadow-md': '0 4px 12px rgba(0, 0, 0, 0.08)',
-      '--shadow-lg': '0 8px 24px rgba(0, 0, 0, 0.1)',
-      '--shadow-glow': '0 0 20px rgba(37, 99, 235, 0.15)',
+      // ---- 阴影（浅色用阴影做深度）----
+      '--shadow-sm': '0 1px 2px oklch(20% 0.012 200 / 0.08)',
+      '--shadow-md': '0 4px 12px oklch(20% 0.012 200 / 0.1)',
+      '--shadow-lg': '0 8px 24px oklch(20% 0.012 200 / 0.12)',
+      '--shadow-glow': '0 0 20px color-mix(in oklch, var(--brand-primary) 15%, transparent)',
     }
   },
 
-  // ========== 绿色经典版 - 原版配色优化 ==========
+  // ========== 绿色经典版 - 原版配色优化（hue 150 绿调，亮色） ==========
   green: {
     name: '绿色经典版',
     colors: {
-      // ---- 背景色 ----
-      '--bg-primary': '#f4f7f5',
-      '--bg-secondary': '#ffffff',
-      '--bg-tertiary': '#eef5f0',
-      '--bg-elevated': '#ffffff',
-      '--bg-card': '#ffffff',
-      '--bg-input': '#ffffff',
-      '--bg-overlay': 'rgba(0, 0, 0, 0.4)',
+      // ---- 背景色（亮色，绿调 hue 150）----
+      '--bg-primary': 'oklch(98% 0.005 150)',
+      '--bg-secondary': 'oklch(99% 0.004 150)',
+      '--bg-tertiary': 'oklch(96% 0.006 150)',
+      '--bg-elevated': 'oklch(99% 0.004 150)',
+      '--bg-card': 'oklch(99% 0.004 150)',
+      '--bg-input': 'oklch(99% 0.004 150)',
+      '--bg-overlay': 'oklch(20% 0.012 150 / 0.5)',
 
-      // ---- 文字色 ----
-      '--text-primary': '#0f1c14',
-      '--text-secondary': '#2d4438',
-      '--text-tertiary': '#556b5e',
-      '--text-muted': '#7a8c82',
-      '--text-inverse': '#ffffff',
+      // ---- 文字色（深色，绿调）----
+      '--text-primary': 'oklch(22% 0.02 150)',
+      '--text-secondary': 'oklch(38% 0.018 150)',
+      '--text-tertiary': 'oklch(52% 0.015 150)',
+      '--text-muted': 'oklch(62% 0.012 150)',
+      '--text-inverse': 'oklch(99% 0.004 150)',
 
       // ---- 边框色 ----
-      '--border-primary': '#d0ddd4',
-      '--border-secondary': '#e7eee9',
-      '--border-tertiary': '#f0f5f2',
-      '--border-hover': '#a8d0b5',
+      '--border-primary': 'oklch(88% 0.01 150)',
+      '--border-secondary': 'oklch(92% 0.008 150)',
+      '--border-tertiary': 'oklch(95% 0.006 150)',
+      '--border-hover': 'oklch(80% 0.015 150)',
 
-      // ---- 品牌色 ----
-      '--brand-primary': '#168558',
-      '--brand-secondary': '#19a267',
-      '--brand-tertiary': '#08753d',
-      '--brand-bg': 'rgba(22, 133, 88, 0.08)',
+      // ---- 品牌色（绿 hue 155，浅色背景加深）----
+      '--brand-primary': 'oklch(48% 0.13 155)',
+      '--brand-secondary': 'oklch(43% 0.12 155)',
+      '--brand-tertiary': 'oklch(38% 0.11 155)',
+      '--brand-bg': 'color-mix(in oklch, var(--brand-primary) 10%, transparent)',
 
       // ---- 功能色 ----
-      '--success': '#168558',
-      '--success-bg': 'rgba(22, 133, 88, 0.08)',
-      '--danger': '#ba3b2d',
-      '--danger-bg': 'rgba(186, 59, 45, 0.08)',
-      '--warning': '#d97706',
-      '--warning-bg': 'rgba(217, 119, 6, 0.08)',
-      '--info': '#2563eb',
-      '--info-bg': 'rgba(37, 99, 235, 0.08)',
+      '--success': 'oklch(48% 0.13 155)',
+      '--success-bg': 'color-mix(in oklch, var(--success) 10%, transparent)',
+      '--danger': 'oklch(55% 0.22 27)',
+      '--danger-bg': 'color-mix(in oklch, var(--danger) 10%, transparent)',
+      '--warning': 'oklch(60% 0.16 75)',
+      '--warning-bg': 'color-mix(in oklch, var(--warning) 12%, transparent)',
+      '--info': 'oklch(52% 0.2 240)',
+      '--info-bg': 'color-mix(in oklch, var(--info) 10%, transparent)',
 
-      // ---- 交易色 ----
-      '--long': '#08753d',
-      '--long-bg': 'rgba(8, 117, 61, 0.1)',
-      '--short': '#ba3b2d',
-      '--short-bg': 'rgba(186, 59, 45, 0.1)',
+      // ---- 交易色（A 股红涨绿跌，浅色背景加深）----
+      '--long': 'oklch(55% 0.22 27)',
+      '--long-bg': 'color-mix(in oklch, var(--long) 12%, transparent)',
+      '--short': 'oklch(45% 0.13 155)',
+      '--short-bg': 'color-mix(in oklch, var(--short) 12%, transparent)',
 
       // ---- 盈亏色 ----
-      '--profit': '#08753d',
-      '--profit-bg': 'rgba(8, 117, 61, 0.1)',
-      '--loss': '#ba3b2d',
-      '--loss-bg': 'rgba(186, 59, 45, 0.1)',
+      '--profit': 'oklch(55% 0.22 27)',
+      '--profit-bg': 'color-mix(in oklch, var(--profit) 12%, transparent)',
+      '--loss': 'oklch(45% 0.13 155)',
+      '--loss-bg': 'color-mix(in oklch, var(--loss) 12%, transparent)',
 
       // ---- 按钮 ----
-      '--btn-primary-bg': '#168558',
-      '--btn-primary-text': '#ffffff',
-      '--btn-primary-hover': '#19a267',
-      '--btn-secondary-bg': '#245e42',
-      '--btn-secondary-text': '#ffffff',
-      '--btn-secondary-hover': '#1e4e37',
+      '--btn-primary-bg': 'oklch(48% 0.13 155)',
+      '--btn-primary-text': 'oklch(99% 0.004 150)',
+      '--btn-primary-hover': 'oklch(43% 0.12 155)',
+      '--btn-secondary-bg': 'oklch(88% 0.01 150)',
+      '--btn-secondary-text': 'oklch(25% 0.018 150)',
+      '--btn-secondary-hover': 'oklch(82% 0.012 150)',
       '--btn-ghost-bg': 'transparent',
-      '--btn-ghost-text': '#0f1c14',
-      '--btn-ghost-hover': '#eef5f0',
+      '--btn-ghost-text': 'oklch(25% 0.018 150)',
+      '--btn-ghost-hover': 'oklch(94% 0.006 150)',
 
       // ---- 状态色 ----
-      '--state-hover': 'rgba(22, 133, 88, 0.04)',
-      '--state-active': 'rgba(22, 133, 88, 0.06)',
-      '--state-focus': 'rgba(22, 133, 88, 0.25)',
-      '--state-selected': 'rgba(22, 133, 88, 0.08)',
+      '--state-hover': 'color-mix(in oklch, black 4%, transparent)',
+      '--state-active': 'color-mix(in oklch, black 6%, transparent)',
+      '--state-focus': 'color-mix(in oklch, var(--brand-primary) 25%, transparent)',
+      '--state-selected': 'color-mix(in oklch, var(--brand-primary) 8%, transparent)',
 
-      // ---- 图表色 ----
-      '--chart-grid': '#d0ddd4',
-      '--chart-grid-dash': '#e7eee9',
-      '--chart-axis': '#556b5e',
-      '--chart-crosshair': '#7a8c82',
-      '--chart-up': '#08753d',
-      '--chart-down': '#ba3b2d',
-      '--chart-volume-up': 'rgba(8, 117, 61, 0.35)',
-      '--chart-volume-down': 'rgba(186, 59, 45, 0.35)',
+      // ---- 图表色（A 股红涨绿跌，浅色）----
+      '--chart-grid': 'oklch(88% 0.01 150)',
+      '--chart-grid-dash': 'oklch(92% 0.008 150)',
+      '--chart-axis': 'oklch(55% 0.015 150)',
+      '--chart-crosshair': 'oklch(60% 0.012 150)',
+      '--chart-up': 'oklch(55% 0.22 27)',
+      '--chart-down': 'oklch(45% 0.13 155)',
+      '--chart-volume-up': 'color-mix(in oklch, var(--chart-up) 28%, transparent)',
+      '--chart-volume-down': 'color-mix(in oklch, var(--chart-down) 28%, transparent)',
 
       // ---- 阴影 ----
-      '--shadow-sm': '0 1px 2px rgba(15, 28, 20, 0.05)',
-      '--shadow-md': '0 4px 12px rgba(15, 28, 20, 0.07)',
-      '--shadow-lg': '0 8px 24px rgba(15, 28, 20, 0.09)',
-      '--shadow-glow': '0 0 20px rgba(22, 133, 88, 0.15)',
+      '--shadow-sm': '0 1px 2px oklch(20% 0.012 150 / 0.08)',
+      '--shadow-md': '0 4px 12px oklch(20% 0.012 150 / 0.1)',
+      '--shadow-lg': '0 8px 24px oklch(20% 0.012 150 / 0.12)',
+      '--shadow-glow': '0 0 20px color-mix(in oklch, var(--brand-primary) 15%, transparent)',
     }
   },
 };

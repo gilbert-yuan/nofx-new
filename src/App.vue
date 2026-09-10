@@ -1,6 +1,8 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { api } from './api.js';
+import { marketApi, historyApi } from './api/client.js';
+import { useConfigStore } from './stores/config.js';
 import { router } from './router.js';
 import TopBar from './components/TopBar.vue';
 import SymbolSidebar from './components/SymbolSidebar.vue';
@@ -11,6 +13,12 @@ import AnalysisResultCard from './components/AnalysisResultCard.vue';
 import TradingView from './components/TradingView.vue';
 import BinanceSettings from './components/BinanceSettings.vue';
 import MarketStatus from './components/MarketStatus.vue';
+import DailyTrendView from './components/DailyTrendView.vue';
+
+// 配置/策略/状态集中到 store（前端唯一可信源）
+const configStore = useConfigStore();
+const { config, strategy, tradingStatus, symbolStatus, syncStatus, savedMode, statusError } = configStore;
+const loadStatus = () => configStore.loadStatus();
 
 const activeView = ref('workbench');
 const activeSymbol = ref('BTCUSDT');
@@ -41,12 +49,7 @@ const isHistoryLoading = computed(() => loadingAreas.history > 0);
 const isMarketLoading = computed(() => loadingAreas.market > 0);
 const isAnalysisLoading = computed(() => loadingAreas.analysis > 0);
 const isKlineSyncLoading = computed(() => loadingAreas.klineSync > 0);
-const config = reactive({ model: { enabled: false, apiKey: '', baseUrl: '', model: '', maxConcurrentRequests: 5 }, binance: { apiKey: '', secretKey: '', testnet: true }, trader: { exchange: 'binance', enabled: false, dryRun: true, allowEntryOrders: false, allowCloseOrders: false, allowProtectionUpdates: true, entrySymbolsText: '', maxNewEntriesPerCycle: 1, minConfidence: 0.65, maxLeverage: 3, maxPositionNotionalPct: 0.2, maxTotalNotionalPct: 0.3, minProtectionMoveBps: 25 } });
-const tradingStatus = ref(null), symbolStatus = ref(null), syncStatus = ref(null), statusError = ref('');
-const savedMode = ref('读取配置中');
-let statusTimer;
 const filteredSymbols = computed(() => state.symbols.filter(s => s.symbol.includes(search.value.trim().toUpperCase())));
-const strategy = reactive({ name: '', interval: '1m', klineLimit: 80, systemPrompt: '', rules: '' });
 const scope = reactive({ engine: 'auto', interval: '1m', limit: 80, maxSymbols: 20, batchSize: 10, symbolsText: '' });
 const chart = computed(() => buildChart(state.rows));
 
@@ -120,9 +123,9 @@ async function run(task, area = '') {
 async function loadSymbols(refresh = false) {
   const requestId = ++symbolsRequestId;
   await run(async () => {
-    const result = refresh ? await api('/market/symbols/refresh', { method: 'POST' }) : await api('/market/symbols');
+    const result = refresh ? await marketApi.refresh() : await marketApi.symbols();
     if (requestId === symbolsRequestId) state.symbols = (refresh ? result.symbols : result) || [];
-    symbolStatus.value = await api('/market/symbols/status');
+    symbolStatus.value = await marketApi.status();
   }, 'symbols');
 }
 async function selectSymbol(symbol) {
@@ -146,8 +149,7 @@ async function selectSymbol(symbol) {
   const interval = scope.interval, limit = scope.limit;
   const requestId = ++marketRequestId;
   await Promise.all([run(async () => {
-    const endQuery = chartDate.value ? '&endTime=' + new Date(chartDate.value).getTime() : '';
-    const result = await api(`/market/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit}${endQuery}`, { signal });
+    const result = await marketApi.klines({ symbol, interval, limit, endTime: chartDate.value ? new Date(chartDate.value).getTime() : undefined });
     if (requestId !== marketRequestId) return;
     state.rows = result.rows || [];
   }, 'market'), loadSymbolHistory()]);
@@ -203,10 +205,7 @@ async function fetchLatestKlines(interval = scope.interval) {
     return;
   }
   const result = await run(async () => {
-    const response = await api('/history/fetch', {
-      method: 'POST',
-      body: { symbols: 'ALL', interval, limit: scope.limit }
-    });
+    const response = await historyApi.fetch({ symbols: 'ALL', interval, limit: scope.limit });
     await selectSymbol(activeSymbol.value);
     return response;
   }, 'klineSync');
@@ -234,26 +233,16 @@ async function loadAnalyses(force = false) {
 async function loadHistoryByDate(force = false) {
   await Promise.all([loadAnalyses(force), loadSymbolHistory(force)]);
 }
-async function loadAiSettings() { await run(async () => { const [savedConfig, savedStrategy] = await Promise.all([api('/config'), api('/strategy')]); Object.assign(config.model, savedConfig.model || {}); Object.assign(config.binance, savedConfig.binance || {}); Object.assign(config.trader, savedConfig.trader || {}); updateSavedMode(savedConfig); Object.assign(strategy, savedStrategy || {}); scope.interval = strategy.interval || scope.interval; scope.limit = strategy.klineLimit || scope.limit; }, 'settings'); }
-async function saveAiSettings() { await run(async () => { const savedConfig = await api('/config', { method: 'PUT', body: { model: { ...config.model } } }); const savedStrategy = await api('/strategy', { method: 'PUT', body: { ...strategy, symbolsText: 'ALL' } }); Object.assign(config.model, savedConfig.model || {}); Object.assign(strategy, savedStrategy || {}); message.value = 'AI模型配置和提示词已保存'; }, 'settings'); }
-function updateSavedMode(value) { savedMode.value = !value.trader.enabled ? '币安自动交易关闭' : value.trader.dryRun !== false ? '仅模拟指令' : value.binance.testnet ? '测试网交易' : '实盘交易'; }
-async function saveBinanceSettings() { await run(async () => { const saved = await api('/config', { method: 'PUT', body: { binance: { ...config.binance }, trader: { ...config.trader, exchange: 'binance' } } }); Object.assign(config.binance, saved.binance); Object.assign(config.trader, saved.trader); updateSavedMode(saved); message.value = '币安交易配置已保存'; }, 'settings'); }
-async function testBinance() { const result = await run(() => api('/binance/test', { method: 'POST' }), 'settings'); if (result) message.value = `${result.testnet ? '测试网' : '实盘'}只读连接成功 · ${result.activePositions} 个持仓 · ${result.positionMode === 'hedge' ? '双向持仓（自动交易需切换为单向）' : '单向持仓'}`; }
-async function reviewBinance() { const result = await run(() => api('/binance/review', { method: 'POST' }), 'settings'); if (result) { await loadStatus(); message.value = result.reason || `已复核 ${result.reviewed || 0} 个持仓，请查看执行记录`; } }
-async function loadStatus() {
-  if (statusBusy || document.hidden) return;
-  statusBusy = true;
-  try {
-  const results = await Promise.allSettled([api('/market/symbols/status'), api('/history/sync/status'), api('/binance/status')]);
-  const refs = [symbolStatus, syncStatus, tradingStatus];
-  results.forEach((r, i) => { if (r.status === 'fulfilled') refs[i].value = r.value; });
-  statusError.value = results.find(r => r.status === 'rejected')?.reason?.message || '';
-  } finally { statusBusy = false; }
-}
-async function toggleSync() { await run(async () => { await api(`/history/sync/${syncStatus.value?.running ? 'stop' : 'start'}`, { method: 'POST' }); await loadStatus(); }, 'klineSync'); }
+async function loadAiSettings() { await run(async () => { await configStore.load(); scope.interval = strategy.interval || scope.interval; scope.limit = strategy.klineLimit || scope.limit; }, 'settings'); }
+async function saveAiSettings() { await run(async () => { await configStore.saveAi(); message.value = 'AI模型配置和提示词已保存'; }, 'settings'); }
+async function saveBinanceSettings() { await run(async () => { await configStore.saveBinance(); message.value = '币安交易配置已保存'; }, 'settings'); }
+async function testBinance() { const result = await run(() => configStore.test(), 'settings'); if (result) message.value = `${result.testnet ? '测试网' : '实盘'}只读连接成功 · ${result.activePositions} 个持仓 · ${result.positionMode === 'hedge' ? '双向持仓（自动交易需切换为单向）' : '单向持仓'}`; }
+async function reviewBinance() { const result = await run(() => configStore.review(), 'settings'); if (result) { await loadStatus(); message.value = result.reason || `已复核 ${result.reviewed || 0} 个持仓，请查看执行记录`; } }
+async function toggleSync() { await run(async () => { await (syncStatus.value?.running ? historyApi.syncStop() : historyApi.syncStart()); await loadStatus(); }, 'klineSync'); }
 async function openHistory(item, symbol = '') { await run(async () => { selectedHistorySymbol.value = symbol; selectedHistory.value = await api(`/analyses/${encodeURIComponent(item.id)}`); }); }
 function normalizedPosition(item) { return ['OPEN_LONG','OPEN_SHORT','CLOSE_LONG','CLOSE_SHORT','WAIT'].includes(item.positionRecommendation) ? item.positionRecommendation : ({ BUY: 'OPEN_LONG', SELL: 'OPEN_SHORT', HOLD: 'WAIT' }[item.action] || 'WAIT'); }
 function buildChart(rows) { if (!rows.length) return { width: 960, height: 430, candles: [], volumes: [], min: 0, max: 0 }; const width=960, priceHeight=300, volumeTop=325, volumeHeight=82, pad=18; const highs=rows.map(r=>Number(r.high)), lows=rows.map(r=>Number(r.low)), max=Math.max(...highs), min=Math.min(...lows), span=(max-min || Math.max(Math.abs(max)*0.001, Number.EPSILON)), maxVolume=Math.max(...rows.map(r=>Number(r.volume)),1), step=(width-pad*2)/rows.length, bodyWidth=Math.max(2,step*.62), y=(price)=>pad+((max-price)/span)*(priceHeight-pad*2); return { width, height:430, min, max, candles:rows.map((row,index)=>{ const open=Number(row.open), close=Number(row.close), x=pad+index*step+step/2, openY=y(open), closeY=y(close); return { x, wickY1:y(Number(row.high)), wickY2:y(Number(row.low)), bodyX:x-bodyWidth/2, bodyY:Math.min(openY,closeY), bodyWidth, bodyHeight:Math.max(1,Math.abs(openY-closeY)), color:close>=open?'var(--chart-up)':'var(--chart-down)' }; }), volumes:rows.map((row,index)=>{ const height=Number(row.volume)/maxVolume*volumeHeight; return { x:pad+index*step+step/2-bodyWidth/2, y:volumeTop+volumeHeight-height, width:bodyWidth, height, color:Number(row.close)>=Number(row.open)?'var(--chart-volume-up)':'var(--chart-volume-down)' }; }) }; }
+let statusTimer;
 </script>
 <template>
   <div class="app-shell"><TopBar :active-view="activeView" :mode="savedMode" @change-view="(view) => {
@@ -292,6 +281,7 @@ function buildChart(rows) { if (!rows.length) return { width: 960, height: 430, 
             loadHistoryByDate(true);
           }
         }" @refresh="() => loadHistoryByDate(true)" @open="openHistory" />
+        <DailyTrendView v-else-if="activeView === 'daily-trend'" />
         <AiSettings v-else-if="activeView === 'settings'" :model="config.model" :strategy="strategy" :loading="Boolean(loadingAreas.settings)" @save="saveAiSettings" />
         <BinanceSettings v-else-if="activeView === 'trading'" :binance="config.binance" :trader="config.trader" :status="tradingStatus" :saved-mode="savedMode" :loading="Boolean(loadingAreas.settings)" @save="saveBinanceSettings" @test="testBinance" @review="reviewBinance" />
       </main></div>

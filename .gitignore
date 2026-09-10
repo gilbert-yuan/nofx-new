@@ -5,3 +5,7 @@ data/
 .env
 .DS_Store
 npm-debug.log*
+# 智能体本地工作状态（记忆/工件/自动化记录），非项目源码，不入库
+.workbuddy/
+# 根目录游离的服务运行日志
+/server*.log

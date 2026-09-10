@@ -2,6 +2,7 @@
 import { computed, onMounted, ref, watch } from 'vue';
 import { api } from '../api.js';
 import { router } from '../router.js';
+import { fmt, pct, statusLabel as status, reasonLabel as reason } from '../utils/format.js';
 
 // 数据状态
 const activeTab = ref('account'); // 'account' | 'performance' | 'statistics' | 'replay'
@@ -134,6 +135,91 @@ const orderStats = computed(() => {
   };
 });
 
+// 策略优化建议
+const strategyRecommendations = computed(() => {
+  if (!statisticsData.value?.byHoldingBars || statisticsData.value.byHoldingBars.length === 0) {
+    return [];
+  }
+
+  const recommendations = [];
+  const byHoldingBars = statisticsData.value.byHoldingBars;
+
+  // 找出胜率大于等于60%的持仓时长区间
+  const highWinRatePeriods = byHoldingBars.filter(stat => stat.winRate >= 0.6 && stat.count >= 3);
+
+  // 找出胜率低于40%的持仓时长区间
+  const lowWinRatePeriods = byHoldingBars.filter(stat => stat.winRate < 0.4 && stat.count >= 3);
+
+  // 找出平均盈利最高的区间
+  const bestAvgProfitPeriod = byHoldingBars
+    .filter(stat => stat.count >= 3)
+    .sort((a, b) => b.avgNet - a.avgNet)[0];
+
+  // 计算整体平均持仓时长
+  const totalOrders = byHoldingBars.reduce((sum, stat) => sum + stat.count, 0);
+  const avgHoldingBars = totalOrders > 0
+    ? byHoldingBars.reduce((sum, stat) => sum + stat.bars * stat.count, 0) / totalOrders
+    : 0;
+
+  // 建议1: 高胜率区间
+  if (highWinRatePeriods.length > 0) {
+    const bestPeriod = highWinRatePeriods.sort((a, b) => b.winRate - a.winRate)[0];
+    recommendations.push({
+      type: 'success',
+      icon: '✓',
+      title: `最佳持仓区间: ${bestPeriod.bars}-${bestPeriod.bars + 4}根K线`,
+      detail: `该区间胜率${(bestPeriod.winRate * 100).toFixed(1)}%，平均盈利${bestPeriod.avgNet.toFixed(2)} USDT。建议优化策略在此区间内平仓。`
+    });
+  }
+
+  // 建议2: 避免的区间
+  if (lowWinRatePeriods.length > 0) {
+    const worstPeriod = lowWinRatePeriods.sort((a, b) => a.winRate - b.winRate)[0];
+    recommendations.push({
+      type: 'warning',
+      icon: '⚠',
+      title: `避免持仓至${worstPeriod.bars}-${worstPeriod.bars + 4}根K线`,
+      detail: `该区间胜率仅${(worstPeriod.winRate * 100).toFixed(1)}%，平均亏损${Math.abs(worstPeriod.avgNet).toFixed(2)} USDT。建议提前止盈或止损。`
+    });
+  }
+
+  // 建议3: 最优盈利区间
+  if (bestAvgProfitPeriod && bestAvgProfitPeriod.avgNet > 0) {
+    recommendations.push({
+      type: 'info',
+      icon: '💡',
+      title: `盈利最高区间: ${bestAvgProfitPeriod.bars}-${bestAvgProfitPeriod.bars + 4}根K线`,
+      detail: `平均每单盈利${bestAvgProfitPeriod.avgNet.toFixed(2)} USDT，总盈利${bestAvgProfitPeriod.totalNet.toFixed(2)} USDT。`
+    });
+  }
+
+  // 建议4: 持仓时长优化
+  if (avgHoldingBars > 0) {
+    const optimalRanges = highWinRatePeriods.map(p => `${p.bars}-${p.bars + 4}`).join('、');
+    if (optimalRanges) {
+      recommendations.push({
+        type: 'strategy',
+        icon: '📊',
+        title: '持仓时长策略建议',
+        detail: `当前平均持仓${avgHoldingBars.toFixed(1)}根K线。高胜率区间为: ${optimalRanges}根。建议调整maxHoldBars参数，在高胜率区间内平仓。`
+      });
+    }
+  }
+
+  // 建议5: 整体胜率分析
+  const overallStats = statisticsData.value.overall;
+  if (overallStats && overallStats.winRate < 0.5) {
+    recommendations.push({
+      type: 'danger',
+      icon: '⛔',
+      title: '整体胜率偏低',
+      detail: `当前整体胜率${(overallStats.winRate * 100).toFixed(1)}%。建议: 1) 专注在高胜率持仓区间平仓 2) 严格执行止损 3) 减少低胜率时段交易。`
+    });
+  }
+
+  return recommendations;
+});
+
 // 按原因分组统计
 const reasonStats = computed(() => {
   if (!accountData.value?.orders) return [];
@@ -159,10 +245,7 @@ const reasonStats = computed(() => {
 });
 
 // 格式化函数
-function fmt(v) { return v === null || v === undefined ? '—' : Number(v).toFixed(2); }
-function pct(v) { return v === null || v === undefined ? '—' : (v * 100).toFixed(1) + '%'; }
-function status(s) { return ({ closed: '已平仓', open: '模拟持仓', pending: '等待入场', expired: '到期未入场', cancelled: '已取消', data_gap: '行情缺失', excluded: '未参与' })[s] || s; }
-function reason(s) { return ({ stop_loss: '止损', take_profit: '止盈', timeout: '持有到期', liquidation: '爆仓' })[s] || ''; }
+// fmt / pct / statusLabel / reasonLabel 由 ../utils/format.js 提供
 
 // 加载模拟账户数据
 async function loadAccount() {
@@ -855,6 +938,47 @@ onMounted(() => {
           </div>
         </div>
 
+        <!-- P1-1 跟进：同根K线双触发 ambiguousBar 占比 -->
+        <!-- 1m 周期上单根振幅超过止损距离的情况并不少见：原"双触发一律记止损"会系统性压低胜率。
+             改用"开盘已越过止盈按更优价以止盈结算"后，留这块用于观测到底有多少订单被这层修复覆盖。 -->
+        <template v-if="statisticsData.ambiguousBar && statisticsData.ambiguousBar.sampledFrom > 0">
+          <h2 class="performance-subtitle">同根 K 线双触发（ambiguous）占比</h2>
+          <div class="stats-grid">
+            <div class="stat-box">
+              <div class="stat-label">双触发订单</div>
+              <div class="stat-value">
+                {{ statisticsData.ambiguousBar.total }}
+                <small> / {{ statisticsData.ambiguousBar.sampledFrom }}</small>
+              </div>
+              <div class="stat-detail">
+                占比 <span :class="statisticsData.ambiguousBar.ratio > 0.1 ? 'loss' : 'profit'">{{ pct(statisticsData.ambiguousBar.ratio) }}</span>
+                <small> &gt; 10% 时考虑双触发裁决逻辑</small>
+              </div>
+            </div>
+          </div>
+          <div v-if="statisticsData.ambiguousBar.byReason && statisticsData.ambiguousBar.byReason.length > 0"
+               class="performance-table">
+            <table>
+              <thead>
+                <tr>
+                  <th>出场原因</th>
+                  <th>数量</th>
+                  <th>胜率</th>
+                  <th>平均净收益</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="row in statisticsData.ambiguousBar.byReason" :key="row.reason">
+                  <td>{{ row.reason }}</td>
+                  <td>{{ row.count }}</td>
+                  <td :class="row.winRate >= 0.5 ? 'profit' : 'loss'">{{ pct(row.winRate) }}</td>
+                  <td :class="row.totalNet > 0 ? 'profit' : row.totalNet < 0 ? 'loss' : ''">{{ fmt(row.totalNet) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </template>
+
         <!-- 按策略版本统计 -->
         <template v-if="statisticsData.byStrategy.length > 0">
           <h2 class="performance-subtitle">按策略版本统计（Top 5）</h2>
@@ -945,6 +1069,20 @@ onMounted(() => {
                 </tr>
               </tbody>
             </table>
+          </div>
+
+          <!-- 策略优化建议 -->
+          <div v-if="strategyRecommendations.length > 0" class="strategy-recommendations">
+            <h3 class="performance-subtitle">策略优化建议</h3>
+            <div class="recommendations-box">
+              <div v-for="(rec, idx) in strategyRecommendations" :key="idx" class="recommendation-item">
+                <div class="rec-icon" :class="rec.type">{{ rec.icon }}</div>
+                <div class="rec-content">
+                  <div class="rec-title">{{ rec.title }}</div>
+                  <div class="rec-detail">{{ rec.detail }}</div>
+                </div>
+              </div>
+            </div>
           </div>
         </template>
       </template>
@@ -1695,6 +1833,101 @@ onMounted(() => {
   border-left: 3px solid var(--info);
   border-radius: 4px;
   color: var(--text-primary);
+}
+
+/* 策略优化建议样式 */
+.strategy-recommendations {
+  margin: 24px 0;
+}
+
+.recommendations-box {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.recommendation-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 16px;
+  background: var(--bg-elevated);
+  border-radius: 8px;
+  border-left: 4px solid var(--border-primary);
+}
+
+.recommendation-item .rec-icon {
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  font-size: 16px;
+  font-weight: bold;
+}
+
+.recommendation-item .rec-icon.success {
+  background: rgba(34, 197, 94, 0.1);
+  color: var(--long);
+}
+
+.recommendation-item .rec-icon.warning {
+  background: rgba(251, 146, 60, 0.1);
+  color: var(--warning);
+}
+
+.recommendation-item .rec-icon.info {
+  background: rgba(59, 130, 246, 0.1);
+  color: var(--info);
+}
+
+.recommendation-item .rec-icon.strategy {
+  background: rgba(168, 85, 247, 0.1);
+  color: #a855f7;
+}
+
+.recommendation-item .rec-icon.danger {
+  background: rgba(239, 68, 68, 0.1);
+  color: var(--short);
+}
+
+.recommendation-item.success {
+  border-left-color: var(--long);
+}
+
+.recommendation-item.warning {
+  border-left-color: var(--warning);
+}
+
+.recommendation-item.info {
+  border-left-color: var(--info);
+}
+
+.recommendation-item.strategy {
+  border-left-color: #a855f7;
+}
+
+.recommendation-item.danger {
+  border-left-color: var(--short);
+}
+
+.rec-content {
+  flex: 1;
+}
+
+.rec-title {
+  font-weight: 600;
+  font-size: 15px;
+  color: var(--text-primary);
+  margin-bottom: 6px;
+}
+
+.rec-detail {
+  font-size: 14px;
+  color: var(--text-secondary);
+  line-height: 1.5;
 }
 
 .analysis-dimensions {

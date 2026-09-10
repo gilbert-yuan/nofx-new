@@ -3,16 +3,20 @@ import { ProxyAgent, fetch } from 'undici';
 import { nextOpenTime } from './research.js';
 
 const OKX_BASE_URL = 'https://www.okx.com';
-const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || 'http://127.0.0.1:7890';
 
 export class OkxClient {
-  constructor({ apiKey = '', secretKey = '', passphrase = '', demo = true, baseUrl = OKX_BASE_URL } = {}) {
+  constructor({ apiKey = '', secretKey = '', passphrase = '', demo = true, baseUrl = OKX_BASE_URL,
+    proxyUrl = process.env.OKX_PROXY_URL ?? (process.env.HTTPS_PROXY || process.env.HTTP_PROXY || 'http://127.0.0.1:7890'),
+    fetchImpl = fetch, retryDelayMs = 500 } = {}) {
     this.apiKey = apiKey;
     this.secretKey = secretKey;
     this.passphrase = passphrase;
     this.demo = demo;
     this.baseUrl = baseUrl.replace(/\/$/, '');
     this.dispatcher = proxyUrl ? new ProxyAgent(proxyUrl) : undefined;
+    this.connectionMode = proxyUrl ? 'proxy' : 'direct';
+    this.fetchImpl = fetchImpl;
+    this.retryDelayMs = retryDelayMs;
   }
 
   hasCredentials() { return Boolean(this.apiKey && this.secretKey && this.passphrase); }
@@ -101,6 +105,19 @@ export class OkxClient {
   }
 
   async request(method, path, params = {}, signed = false) {
+    // Only public reads can be replayed safely. A failed order may already be accepted.
+    const maxAttempts = method === 'GET' && !signed ? 3 : 1;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await this.requestOnce(method, path, params, signed);
+      } catch (error) {
+        if (!error.retryable || attempt === maxAttempts) throw error;
+        await new Promise(resolve => setTimeout(resolve, this.retryDelayMs * 2 ** (attempt - 1)));
+      }
+    }
+  }
+
+  async requestOnce(method, path, params = {}, signed = false) {
     const isGet = method === 'GET';
     const query = isGet ? new URLSearchParams(clean(params)).toString() : '';
     const requestPath = `${path}${query ? `?${query}` : ''}`;
@@ -116,10 +133,12 @@ export class OkxClient {
     }
     let response;
     try {
-      response = await fetch(`${this.baseUrl}${requestPath}`, { method, headers, body: body || undefined, dispatcher: this.dispatcher, signal: AbortSignal.timeout(30000) });
+      response = await this.fetchImpl(`${this.baseUrl}${requestPath}`, { method, headers, body: body || undefined, dispatcher: this.dispatcher, signal: AbortSignal.timeout(30000) });
     } catch (cause) {
-      const error = new Error(`Unable to reach OKX ${path}: ${cause?.message || 'network failure'}`);
+      const codes = networkErrorCodes(cause);
+      const error = new Error(`Unable to reach OKX ${path}: ${cause?.message || 'network failure'} (${this.connectionMode}${codes.length ? `; ${codes.join(', ')}` : ''})`, { cause });
       error.status = 502;
+      error.retryable = codes.some(code => RETRYABLE_NETWORK_CODES.has(code));
       throw error;
     }
     const payload = await response.json().catch(() => ({}));
@@ -130,6 +149,19 @@ export class OkxClient {
     }
     return payload.data || [];
   }
+}
+
+const RETRYABLE_NETWORK_CODES = new Set(['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'ENETUNREACH', 'EHOSTUNREACH', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET', 'TimeoutError']);
+
+function networkErrorCodes(error, seen = new Set()) {
+  if (!error || typeof error !== 'object' || seen.has(error)) return [];
+  seen.add(error);
+  return [...new Set([
+    ...(error.code ? [String(error.code)] : []),
+    ...(error.name === 'TimeoutError' ? [error.name] : []),
+    ...networkErrorCodes(error.cause, seen),
+    ...(Array.isArray(error.errors) ? error.errors.flatMap(item => networkErrorCodes(item, seen)) : [])
+  ])];
 }
 
 function toOkxBar(interval) { return ({ '1m': '1m', '3m': '3m', '5m': '5m', '15m': '15m', '30m': '30m', '1h': '1H', '2h': '2H', '4h': '4H', '6h': '6Hutc', '12h': '12Hutc', '1d': '1Dutc', '1w': '1Wutc', '1M': '1Mutc' })[interval] || interval; }

@@ -52,6 +52,9 @@ const defaultConfig = {
     intervalSeconds: 300,
     limit: 500,
     initialLookbackDays: 30
+  },
+  analysis: {
+    engine: 'local'
   }
 };
 
@@ -215,7 +218,10 @@ export function mergeConfig(current, patch) {
     },
     trader: { ...current.trader, ...(patch.trader || {}) },
     marketSync: { ...current.marketSync, ...(patch.marketSync || {}) },
-    tradeSync: { ...current.tradeSync, ...(patch.tradeSync || {}) }
+    tradeSync: { ...current.tradeSync, ...(patch.tradeSync || {}) },
+    // 保留分析引擎选择（enhanced/super/local）。此前该字段不在白名单里，
+    // 每次配置升级/保存都会把它清掉，导致全局自动化悄悄回落到 local 引擎。
+    analysis: { ...(current.analysis || {}), ...(patch.analysis || {}) }
   };
 }
 

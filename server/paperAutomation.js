@@ -1,12 +1,19 @@
 import { randomUUID } from 'node:crypto';
 import { analyzeMarkets, reviewPosition } from './ai.js';
-import { localAnalysis, localAnalysisMultiTimeframe } from './localAnalysis.js';
-import { candleOpenAt, nextOpenTime, prepareMarket, createResearchRecord } from './research.js';
+import { LOCAL_STRATEGY, localAnalysisMultiTimeframe } from './localAnalysis.js';
+import { candleOpenAt, nextOpenTime, prepareMarket, createResearchRecord, MAIN_INTERVAL } from './research.js';
 import { advancePaperOrder, submitPaperOrder } from './simulatedAccount.js';
+import { analyzeHoldingPeriodPerformance, generateOptimizedParameters } from './adaptiveStrategy.js';
+import {
+  filterSymbolsByPerformance,
+  shouldTradeAtCurrentHour,
+  getAdaptiveParametersForSymbol
+} from './adaptiveFilters.js';
+import { getAdaptiveConfig } from './adaptiveConfig.js';
 
 const periods = { scan: 2 * 3600000, review: 5 * 60000 };
 export function automationDefaults(now = Date.now()) {
-  return { version: 1, enabled: true, engine: 'local', interval: '1m', margin: 100,
+  return { version: 1, enabled: true, engine: 'local', interval: MAIN_INTERVAL, margin: 100,
     scan: { nextAt: now, running: false }, review: { nextAt: now + periods.review, running: false } };
 }
 
@@ -30,9 +37,16 @@ export function localProtectionReview(order, market) {
   }, 0) / 14;
   if (!(atr > 0)) return { action: 'HOLD', reason: '波动率无效，保留当前保护价格。' };
   const long = order.direction === 'OPEN_LONG';
-  const stopLoss = long ? Math.max(order.plan.stopLoss, price - 1.5 * atr) : Math.min(order.plan.stopLoss, price + 1.5 * atr);
-  const takeProfit = long ? Math.max(order.plan.takeProfit, price + 3 * atr) : Math.min(order.plan.takeProfit, price - 3 * atr);
-  return { action: 'UPDATE_PROTECTION', stopLoss, takeProfit, confidence: 0.75, reason: '按最新 14 根真实波幅复核；只收紧止损，顺势调整止盈。' };
+  // 未盈利超过2%时保持初始保护价格，避免把止损棘轮式推向现价被噪声扫出。
+  const profit = long ? (price - order.entry) / order.entry : (order.entry - price) / order.entry;
+  if (!(profit > 0.02)) return { action: 'HOLD', reason: '持仓未盈利超过2%，保持初始保护价格，避免噪声止损。' };
+  // 移动止损距离放宽到 2.5×ATR（原 1.5×ATR 过紧，1m 噪音即可扫掉盈利单；P0-1）
+  const TRAIL_ATR = 2.5;
+  const stopLoss = long ? Math.max(order.plan.stopLoss, price - TRAIL_ATR * atr) : Math.min(order.plan.stopLoss, price + TRAIL_ATR * atr);
+  // 止盈跟随对齐开仓目标 4×ATR，让盈利单能跑到完整目标而非被贴身止损提前扫掉
+  const TP_ATR = 4;
+  const takeProfit = long ? Math.max(order.plan.takeProfit, price + TP_ATR * atr) : Math.min(order.plan.takeProfit, price - TP_ATR * atr);
+  return { action: 'UPDATE_PROTECTION', stopLoss, takeProfit, confidence: 0.75, reason: '盈利超过2%，按最新 14 根真实波幅复核；只收紧止损，顺势调整止盈。' };
 }
 
 export function applyPaperProtectionReview(order, proposal, now = Date.now(), engine = 'local') {
@@ -66,6 +80,7 @@ export class PaperAutomation {
   async init() {
     await this.simulation.mutate(state => {
       if (state.automation?.version !== 1) state.automation = automationDefaults();
+      state.automation.interval = MAIN_INTERVAL;
       state.unlimitedCapital = true;
     });
   }
@@ -89,13 +104,33 @@ export class PaperAutomation {
       return fn(job, state);
     });
   }
-  async fresh(symbol, interval = '1m') {
+  async fresh(symbol, interval = MAIN_INTERVAL) {
     const key = this.market.storageSymbol(symbol);
+    const now = Date.now();
+
+    // 交易所也没有足够已收盘K线（如新上币种）时，降级返回部分数据，不抛错
+    const buildPartial = rows => {
+      const closed = (Array.isArray(rows) ? rows : [])
+        .filter(row => row.confirmed !== false && nextOpenTime(row.openTime, interval) <= now)
+        .sort((a, b) => a.openTime - b.openTime).slice(-80)
+        .map(row => ({ ...row, closeTime: nextOpenTime(row.openTime, interval) - 1 }));
+      return {
+        symbol,
+        exchange: 'binance',
+        marketProvider: this.market.provider,
+        interval,
+        dataAsOf: new Date(nextOpenTime(closed.at(-1)?.openTime ?? now, interval)).toISOString(),
+        klines: closed,
+        partial: true
+      };
+    };
+
     let rows = await this.marketDb.listKlines({ symbol: key, interval, limit: 80 });
     try { return prepareMarket({ symbol, interval, rows, limit: 80, marketProvider: this.market.provider }); }
     catch {
-      rows = await this.market.klines({ symbol, interval, limit: 82 });
-      const prepared = prepareMarket({ symbol, interval, rows, limit: 80, marketProvider: this.market.provider });
+      const raw = await this.market.klines({ symbol, interval, limit: 82 });
+      const prepared = prepareMarket({ symbol, interval, rows: raw, limit: 80, marketProvider: this.market.provider, throwOnInsufficient: false });
+      if (prepared.insufficient) return buildPartial(raw);
       await this.marketDb.saveKlines({ symbol: key, interval, rows: prepared.klines });
       return prepared;
     }
@@ -111,8 +146,8 @@ export class PaperAutomation {
       const config = await this.store.getConfig(), hasModel = config.model.enabled && config.model.apiKey;
       if (settings.engine === 'ai' && !hasModel) throw new Error('AI 自动分析需要模型 Key，可在模拟交易页选择本地规则。');
       const engine = settings.engine === 'local' || !hasModel ? 'local' : 'ai';
-      const strategy = { ...await this.store.getStrategy(), interval: '1m' };
-      strategy.rules += '\n本轮为自动模拟任务：使用提供的 1m 已收盘行情，覆盖旧规则中的其他周期要求；开仓等待最多 6 根，持有最多 120 根。持仓复核只考虑保持或调整止盈止损，不扩大止损风险。';
+      const strategy = { ...await this.store.getStrategy(), interval: MAIN_INTERVAL };
+      strategy.rules = `${strategy.rules || ''}\n本轮为自动模拟任务：使用提供的 ${MAIN_INTERVAL} 已收盘行情；持仓时限与保护价格由本地策略版本和经验证的自适应参数决定。持仓复核只考虑保持或调整止盈止损，不扩大止损风险。`;
       await this.editJob(kind, j => { j.engine = engine; });
       if (kind === 'scan') await this.scan(job, config, strategy, engine);
       else await this.reviewOrders(job, config, strategy, engine);
@@ -122,8 +157,86 @@ export class PaperAutomation {
     } finally { this.running.delete(kind); }
   }
   async scan(job, config, strategy, engine) {
-    const symbols = job.symbols || (await this.market.perpetualUsdtContracts()).map(s => s.symbol);
-    await this.editJob('scan', j => { j.symbols = symbols; j.total = symbols.length; });
+    const allSymbols = job.symbols || (await this.market.perpetualUsdtContracts()).map(s => s.symbol);
+
+    // 获取历史订单用于自适应过滤和优化
+    const state = await this.simulation.read();
+    const closedOrders = state.orders.filter(o => o.status === 'closed');
+    // The old strategy is useful for diagnosis, but cannot tune a different
+    // entry/exit rule. Only v2 outcomes can automatically alter v2 parameters.
+    const historicalOrders = closedOrders.filter(o => o.analysisContext?.strategyModel === LOCAL_STRATEGY.modelId);
+    // P3：币种黑名单不能用 strategyModel 过滤——engine 不是 'local' 时（如 enhanced）
+    // strategyModel 不是 LOCAL_STRATEGY.modelId，样本会被过滤成空集，过滤器永远不生效。
+    // 一个币长期亏钱跟它是哪个引擎下单无关，这里用全部已平仓样本。
+    const filterHistory = closedOrders;
+    const adaptiveConfig = getAdaptiveConfig(state.adaptiveConfig);
+    const adaptiveOverrides = state.adaptiveOverrides || {};
+
+    // 1. 应用币种过滤
+    const symbolFilterResult = filterSymbolsByPerformance(allSymbols, filterHistory, {
+      ...adaptiveConfig.symbolFilter,
+      enabled: adaptiveConfig.symbolFilter.enabled && filterHistory.length >= adaptiveConfig.symbolFilter.minOrdersToActivate
+    });
+
+    const symbols = symbolFilterResult.filtered;
+
+    if (symbolFilterResult.filteredOut.length > 0) {
+      console.log(`[自适应过滤] 过滤了${symbolFilterResult.filteredOut.length}个负期望值币种:`,
+        symbolFilterResult.filteredOut.map(f => `${f.symbol}(${Number(f.avgNet || 0).toFixed(2)}U/单, 样本${f.count})`).join(', '));
+    }
+
+    // 2. 检查当前时段是否适合交易
+    const currentHour = new Date().getUTCHours();
+    const hourCheck = shouldTradeAtCurrentHour(currentHour, historicalOrders, {
+      ...adaptiveConfig.hourFilter,
+      enabled: adaptiveConfig.hourFilter.enabled && historicalOrders.length >= adaptiveConfig.hourFilter.minOrdersToActivate
+    });
+
+    if (!hourCheck.shouldTrade) {
+      console.log(`[自适应过滤] ${hourCheck.reason}`);
+      await this.editJob('scan', j => {
+        j.symbols = symbols;
+        j.total = symbols.length;
+        j.skippedDueToHour = true;
+        j.nextAt = Date.now() + 1800000; // 30分钟后重试
+      });
+      return;
+    }
+
+    // 3. 分析持仓时长并生成优化参数
+    const holdingAnalysis = analyzeHoldingPeriodPerformance(historicalOrders);
+    let optimizedParams = null;
+
+    if (adaptiveConfig.holdingPeriodOptimization.enabled && holdingAnalysis.sufficient) {
+      optimizedParams = generateOptimizedParameters(holdingAnalysis, LOCAL_STRATEGY.maxHoldBars);
+
+      if (optimizedParams.shouldApply && optimizedParams.confidence >= adaptiveConfig.holdingPeriodOptimization.autoApplyThreshold) {
+        console.log(`[自适应优化] 基于${holdingAnalysis.sampleSize}笔历史订单，调整maxHoldBars: ${LOCAL_STRATEGY.maxHoldBars} → ${optimizedParams.suggestedMaxHoldBars}`);
+        console.log(`[自适应优化] 整体胜率: ${(holdingAnalysis.overallWinRate * 100).toFixed(1)}%, 平均持仓: ${holdingAnalysis.avgHoldingBars.toFixed(1)}根`);
+
+        // 添加优化建议到策略规则
+        strategy.rules += `\n\n## 自适应策略优化（基于${holdingAnalysis.sampleSize}笔历史订单）\n`;
+        strategy.rules += `- 最大持仓时长: ${optimizedParams.suggestedMaxHoldBars}根K线\n`;
+        strategy.rules += `- 整体胜率: ${(holdingAnalysis.overallWinRate * 100).toFixed(1)}%\n`;
+
+        if (optimizedParams.recommendations.length > 0) {
+          strategy.rules += `\n### 优化建议:\n`;
+          for (const rec of optimizedParams.recommendations.slice(0, 3)) {
+            strategy.rules += `- [${rec.priority.toUpperCase()}] ${rec.message}\n`;
+          }
+        }
+      }
+    }
+
+    await this.editJob('scan', j => {
+      j.symbols = symbols;
+      j.total = symbols.length;
+      j.filteredSymbols = symbolFilterResult.filteredOut.length;
+      j.hourCheck = hourCheck.reason;
+      j.optimizationApplied = optimizedParams?.shouldApply || false;
+      j.adaptiveSampleSize = historicalOrders.length;
+    });
+
     for (let index = job.index; index < symbols.length; index += 5) {
       if (!(await this.simulation.read()).automation.enabled) break;
       const results = await Promise.all(symbols.slice(index, index + 5).map(async symbol => {
@@ -145,28 +258,46 @@ export class PaperAutomation {
                   const auxMarket = await this.fresh(symbol, interval);
                   auxMarkets[interval] = auxMarket;
                 }
-                // 使用多周期分析
-                result = { analyses: [localAnalysisMultiTimeframe(market, auxMarkets)] };
+
+                // 获取该币种的自适应参数
+                const defaults = {
+                  defaultStopLossATR: LOCAL_STRATEGY.stopLossAtr,
+                  defaultTakeProfitATR: LOCAL_STRATEGY.takeProfitAtr,
+                  defaultMaxHoldBars: optimizedParams?.suggestedMaxHoldBars || LOCAL_STRATEGY.maxHoldBars,
+                  minSampleSize: adaptiveConfig.symbolLevelParams.minSampleSize
+                };
+                const calculatedParams = adaptiveConfig.symbolLevelParams.enabled
+                  ? getAdaptiveParametersForSymbol(symbol, historicalOrders, defaults)
+                  : { stopLossATR: defaults.defaultStopLossATR, takeProfitATR: defaults.defaultTakeProfitATR,
+                    maxHoldBars: defaults.defaultMaxHoldBars, confidence: 0, reason: '币种级自适应参数未启用。' };
+                const adaptiveParams = {
+                  ...calculatedParams,
+                  ...adaptiveOverrides,
+                  confidence: Object.keys(adaptiveOverrides).length ? 1 : calculatedParams.confidence,
+                  reason: Object.keys(adaptiveOverrides).length ? '使用手工设定的自适应参数。' : calculatedParams.reason
+                };
+
+                if (adaptiveParams.confidence > 0) {
+                  console.log(`[自适应参数] ${symbol}: ${adaptiveParams.reason}`);
+                }
+
+                // 使用多周期分析（传入自适应参数）
+                result = { analyses: [localAnalysisMultiTimeframe(market, auxMarkets, adaptiveParams)] };
               } catch (error) {
-                // 如果获取辅助周期失败，降级到单周期分析
+                // 辅助数据失败时保持观望，禁止降级开仓。
                 console.warn(`多周期数据获取失败 ${symbol}:`, error.message);
-                result = { analyses: [localAnalysis(market)] };
+                result = { analyses: [localAnalysisMultiTimeframe(market, {})] };
               }
 
-              if (result.analyses[0].plan) {
-                Object.assign(result.analyses[0].plan, { validForBars: 6, maxHoldBars: 120 });
-              }
             } else {
               result = await this.analyze({ config, strategy, market: [market] });
             }
 
-            const modelName = engine === 'local' && result.analyses[0].multiTimeframeAnalysis
-              ? 'local-mtf-trend-atr-v1'
-              : 'local-trend-atr-v1';
+            const modelName = LOCAL_STRATEGY.modelId;
 
             record = createResearchRecord({
               config: engine === 'local' ? { ...config, model: { model: modelName, baseUrl: 'local://rules' } } : config,
-              strategy, market: [market], result, type: 'single', scope: { interval: '1m', limit: 80, engine }
+              strategy, market: [market], result, type: 'single', scope: { interval: MAIN_INTERVAL, limit: 80, engine }
             });
 
             Object.assign(record, { id, analysisEngine: engine, automationRunId: job.runId });
@@ -192,6 +323,14 @@ export class PaperAutomation {
         j.errors = [...j.errors, ...results.filter(r => r.error).map(r => `${r.symbol}: ${r.error}`)].slice(-30);
       });
     }
+
+    // P3 可观测性：区分"降频生效"与"门槛过严 / 币种被全量拉黑"导致的静默失效
+    const finalScan = (await this.simulation.read()).automation?.scan;
+    if (symbols.length === 0) {
+      console.warn('[自适应过滤][告警] 币种过滤后候选为 0 —— 过滤器可能把所有币种都拉黑了，请检查自适应过滤样本！');
+    } else if (finalScan && finalScan.eligible === 0) {
+      console.warn(`[自适应过滤][告警] 本轮 0 个合格信号（候选${symbols.length}，已处理${finalScan.index}）—— 入场门槛可能过严。`);
+    }
   }
   async reviewOrders(job, config, strategy, engine) {
     await this.simulation.refresh();
@@ -207,6 +346,11 @@ export class PaperAutomation {
         const key = `${order.symbol}:${order.interval}`;
         if (!markets.has(key)) markets.set(key, await this.fresh(order.symbol, order.interval));
         const market = markets.get(key);
+        // 已收盘K线过少（如新上币种）时跳过复核，避免指标计算出错
+        if (market.partial && market.klines.length < 15) {
+          await this.editJob('review', j => { j.index = index + 1; j.held++; });
+          continue;
+        }
         const proposal = engine === 'local' ? localProtectionReview(order, market) : await this.review({ config, strategy: { ...strategy, interval: order.interval },
           market, position: { symbol: order.symbol, positionAmt: order.quantity * (order.direction === 'OPEN_LONG' ? 1 : -1), entryPrice: order.entry,
             markPrice: market.klines.at(-1).close, stopLoss: order.plan.stopLoss, takeProfit: order.plan.takeProfit, simulated: true } });

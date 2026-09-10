@@ -6,6 +6,15 @@ export const RESEARCH_VERSION = 'closed-candle-plan-v1';
 export const PAPER_COSTS = Object.freeze({ feeBps: 6, slippageBps: 5, fundingBpsPer8h: 3, notional: 10 });
 const intervals = { '1m': '1', '3m': '3', '5m': '5', '15m': '15', '30m': '30', '1h': '60', '2h': '120', '4h': '240', '6h': '360', '12h': '720', '1d': 'D', '1w': 'W', '1M': 'M' };
 
+// 主交易周期：回退到 1m（2026-09-10 胜率复盘结论）。
+// 上一轮把 1m 升到 5m 的假设是「放大止损/止盈距离以降低成本占比」，但实盘模拟证伪：
+//   · 1m：2227 笔已平仓，胜率 22.8%，均单 -0.913 USDT
+//   · 5m： 235 笔已平仓，胜率 13.6%，均单 -3.727 USDT（按创建时间 09-09 21:00 起切换）
+// 5m 的 ATR 约为 1m 的 2~3 倍，止损距离被同步放大 → 单笔绝对亏损放大，而胜率反而下降，
+// 结果是把亏损速度加快了约 4 倍。周期切换的收益来自「信号质量」，不是「距离放大」。
+// 回退只需改这一处（扫描/下单/复核全部走这个常量）。
+export const MAIN_INTERVAL = '1m';
+
 export function toBybitInterval(interval) {
   if (!intervals[interval]) throw Object.assign(new Error(`不支持的周期：${interval}`), { status: 400 });
   return intervals[interval];
@@ -38,7 +47,7 @@ export function validCandle(row) {
     && Number.isFinite(Number(row.volume)) && Number(row.volume) >= 0;
 }
 
-export function prepareMarket({ symbol, interval, rows, limit, now = Date.now(), marketProvider = 'binance' }) {
+export function prepareMarket({ symbol, interval, rows, limit, now = Date.now(), marketProvider = 'binance', throwOnInsufficient = true }) {
   toBybitInterval(interval);
   const closed = rows.filter(row => row.confirmed !== false && nextOpenTime(row.openTime, interval) <= now)
     .sort((a, b) => a.openTime - b.openTime).slice(-limit)
@@ -47,7 +56,20 @@ export function prepareMarket({ symbol, interval, rows, limit, now = Date.now(),
 
   // 小窗口必须齐全；大窗口最多少两根，指标所需的最少根数由分析器检查。
   const minRequired = Math.min(limit, Math.max(50, limit - 2));
-  if (closed.length < minRequired) fail(`已收盘K线不足，需要至少 ${minRequired} 根，实际 ${closed.length} 根`);
+  if (closed.length < minRequired) {
+    if (!throwOnInsufficient) {
+      // 返回需要更多数据的标记，而不是抛出错误
+      return {
+        insufficient: true,
+        symbol,
+        interval,
+        required: minRequired,
+        actual: closed.length,
+        needMore: minRequired - closed.length
+      };
+    }
+    fail(`已收盘K线不足，需要至少 ${minRequired} 根，实际 ${closed.length} 根`);
+  }
 
   for (let i = 0; i < closed.length; i++) {
     if (!validCandle(closed[i]) || candleOpenAt(Number(closed[i].openTime), interval) !== Number(closed[i].openTime)) fail('K线数值或时间无效');

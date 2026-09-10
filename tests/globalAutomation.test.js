@@ -1,6 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { GlobalAutomation } from '../server/globalAutomation.js';
+import { GlobalAutomation, selectAnalysisEngine } from '../server/globalAutomation.js';
+
+test('GlobalAutomation - 默认使用本地策略，其他引擎必须显式选择', () => {
+  assert.equal(selectAnalysisEngine({ model: { enabled: false } }), 'local');
+  assert.equal(selectAnalysisEngine({ analysis: { engine: 'enhanced' }, model: { enabled: false } }), 'enhanced');
+  assert.equal(selectAnalysisEngine({ analysis: { engine: 'super' }, model: { enabled: false } }), 'super');
+  assert.equal(selectAnalysisEngine({ analysis: { useSuperEnhanced: true }, model: { enabled: false } }), 'super');
+  assert.equal(selectAnalysisEngine({ analysis: { engine: 'ai' }, model: { enabled: false } }), 'local');
+  assert.equal(selectAnalysisEngine({ analysis: { engine: 'ai' }, model: { enabled: true, apiKey: 'configured' } }), 'ai');
+});
 
 test('GlobalAutomation - 初始化', () => {
   const mockSimulation = {

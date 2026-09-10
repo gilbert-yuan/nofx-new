@@ -10,11 +10,23 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { localAnalysis, localAnalysisMultiTimeframe, recommendedLeverage } from './localAnalysis.js';
+import { LOCAL_STRATEGY, localAnalysisMultiTimeframe, recommendedLeverage } from './localAnalysis.js';
+import { getAdaptiveConfig } from './adaptiveConfig.js';
+import { filterSymbolsByPerformance, getAdaptiveParametersForSymbol, shouldTradeAtCurrentHour } from './adaptiveFilters.js';
 import { enhancedAnalysis, enhancedProtectionReview } from './enhancedAnalysis.js';
 import { createSuperEnhancedAnalysis } from './superEnhancedAnalysis.js';
 import { analyzeMarkets, reviewPosition } from './ai.js';
-import { candleOpenAt, nextOpenTime, prepareMarket, createResearchRecord } from './research.js';
+import { candleOpenAt, nextOpenTime, prepareMarket, createResearchRecord, MAIN_INTERVAL } from './research.js';
+import { TRAILING_RULE } from './shared/strategyGuards.js';
+
+export function selectAnalysisEngine(config = {}) {
+  const analysis = config.analysis || {};
+  const requested = analysis.engine
+    || (analysis.useSuperEnhanced === true ? 'super' : analysis.useEnhanced === true ? 'enhanced' : 'local');
+  const hasModel = config.model?.enabled === true && Boolean(config.model.apiKey);
+  if (requested === 'ai') return hasModel ? 'ai' : 'local';
+  return ['local', 'enhanced', 'super'].includes(requested) ? requested : 'local';
+}
 
 export class GlobalAutomation {
   constructor({ simulation, market, marketDb, archive, store }) {
@@ -130,7 +142,7 @@ export class GlobalAutomation {
       try {
         const symbol = contract.symbol;
         const key = this.market.storageSymbol(symbol);
-        const interval = '1m';
+        const interval = MAIN_INTERVAL;
 
         // 获取最新K线
         const rows = await this.market.klines({
@@ -167,28 +179,48 @@ export class GlobalAutomation {
    */
   async runAnalysis() {
     const config = await this.store.getConfig();
-    const hasModel = config.model.enabled && config.model.apiKey;
-    const strategy = { ...await this.store.getStrategy(), interval: '1m' };
-
-    // 支持四种引擎：local、enhanced、super、ai
-    const useSuperEnhanced = config.analysis?.useSuperEnhanced === true;
-    const useEnhanced = config.analysis?.useEnhanced !== false;
-
-    let engine;
-    if (hasModel) {
-      engine = 'ai';
-    } else if (useSuperEnhanced) {
-      engine = 'super';  // 超级增强版（集成外部数据）
-    } else if (useEnhanced) {
-      engine = 'enhanced';
-    } else {
-      engine = 'local';
-    }
+    const strategy = { ...await this.store.getStrategy(), interval: MAIN_INTERVAL };
+    const engine = selectAnalysisEngine(config);
 
     console.log(`[GlobalAutomation] 开始行情分析，使用 ${engine} 模式...`);
 
     let symbols = (await this.market.perpetualUsdtContracts()).map(s => s.symbol);
     const runId = randomUUID();
+
+    // P3 修复：币种过滤原先整段写在 engine === 'local' 分支里，engine='enhanced'/'super' 时
+    // 根本不会执行（而且样本还按 strategyModel === LOCAL_STRATEGY.modelId 过滤，
+    // enhanced 下单的 modelId 是 `${engine}-rules-v1`，导致样本恒为 0、过滤器永远不生效）。
+    // 现在改为：任何引擎都先读取状态并做一次基于"全部已平仓订单"的负期望值币种拉黑。
+    const state = this.simulation.read ? await this.simulation.read() : { orders: [] };
+    const adaptiveConfig = getAdaptiveConfig(state.adaptiveConfig);
+    const adaptiveOverrides = state.adaptiveOverrides || {};
+    // 自适应参数（止盈止损 ATR 等）只信任本地策略自身样本，避免用别的引擎结果调本地参数。
+    const localHistory = (state.orders || []).filter(order =>
+      order.status === 'closed' && order.analysisContext?.strategyModel === LOCAL_STRATEGY.modelId
+    );
+    // 币种黑名单则用全部引擎的已平仓样本：一个币长期亏钱，与它是哪个引擎下单无关。
+    const filterHistory = (state.orders || []).filter(order => order.status === 'closed');
+
+    const symbolFilter = filterSymbolsByPerformance(symbols, filterHistory, {
+      ...adaptiveConfig.symbolFilter,
+      enabled: adaptiveConfig.symbolFilter.enabled && filterHistory.length >= adaptiveConfig.symbolFilter.minOrdersToActivate
+    });
+    symbols = symbolFilter.filtered;
+    if (symbolFilter.filteredOut.length) {
+      console.log(`[GlobalAutomation] 过滤 ${symbolFilter.filteredOut.length} 个负期望值币种: ${symbolFilter.filteredOut
+        .map(f => `${f.symbol}(${Number(f.avgNet || 0).toFixed(2)}U/单, 样本${f.count})`).join(', ')}`);
+    }
+
+    if (engine === 'local') {
+      const hourCheck = shouldTradeAtCurrentHour(new Date().getUTCHours(), localHistory, {
+        ...adaptiveConfig.hourFilter,
+        enabled: adaptiveConfig.hourFilter.enabled && localHistory.length >= adaptiveConfig.hourFilter.minOrdersToActivate
+      });
+      if (!hourCheck.shouldTrade) {
+        console.log(`[GlobalAutomation] 本地策略跳过本轮扫描：${hourCheck.reason}`);
+        return;
+      }
+    }
 
     // 超级增强版：预筛选
     if (engine === 'super') {
@@ -204,6 +236,15 @@ export class GlobalAutomation {
     let eligible = 0;
     let submitted = 0;
     let failed = 0;
+    // P3 可观测性：记录本轮被各道闸门挡掉的数量，用于区分"正常降频"与"门槛过严导致 0 开单"。
+    // 注意 reason 取的是各道 wait() 的首个拦截原因，因此每个币种最多计一次（最靠前的那道闸）。
+    const blockedBy = { score: 0, volume: 0, riskReward: 0 };
+    const tallyBlock = reason => {
+      const text = String(reason || '');
+      if (text.includes('综合信号强度不足')) blockedBy.score++;
+      else if (text.includes('成交量不足')) blockedBy.volume++;
+      else if (text.includes('风险收益比不足')) blockedBy.riskReward++;
+    };
 
     // 并行处理，每次处理20个币种（提高并发数）
     const batchSize = 20;
@@ -213,7 +254,7 @@ export class GlobalAutomation {
       const results = await Promise.all(batch.map(async symbol => {
         try {
           // 获取主周期K线
-          const market = await this.getFreshMarket(symbol, '1m');
+          const market = await this.getFreshMarket(symbol, MAIN_INTERVAL);
 
           // 使用多周期分析作为默认
           let analysis;
@@ -223,6 +264,7 @@ export class GlobalAutomation {
             const intervals = ['15m', '1h', '4h'];
 
             for (const interval of intervals) {
+              if (interval === MAIN_INTERVAL) continue;
               auxMarketsPromises.push(
                 this.getFreshMarket(symbol, interval)
                   .then(m => ({ interval, market: m }))
@@ -239,12 +281,24 @@ export class GlobalAutomation {
               if (item) auxMarkets[item.interval] = item.market;
             }
 
-            // 如果有辅助数据，使用多周期分析，否则降级到单周期
-            if (Object.keys(auxMarkets).length > 0) {
-              analysis = localAnalysisMultiTimeframe(market, auxMarkets);
-            } else {
-              analysis = localAnalysis(market);
-            }
+            // 辅助数据缺失时，多周期分析返回 WAIT。
+            const defaults = {
+              defaultStopLossATR: LOCAL_STRATEGY.stopLossAtr,
+              defaultTakeProfitATR: LOCAL_STRATEGY.takeProfitAtr,
+              defaultMaxHoldBars: LOCAL_STRATEGY.maxHoldBars,
+              minSampleSize: adaptiveConfig.symbolLevelParams.minSampleSize
+            };
+            const calculated = adaptiveConfig.symbolLevelParams.enabled
+              ? getAdaptiveParametersForSymbol(symbol, localHistory, defaults)
+              : { stopLossATR: defaults.defaultStopLossATR, takeProfitATR: defaults.defaultTakeProfitATR,
+                maxHoldBars: defaults.defaultMaxHoldBars, confidence: 0, reason: '币种级自适应参数未启用。' };
+            const adaptiveParams = {
+              ...calculated,
+              ...adaptiveOverrides,
+              confidence: Object.keys(adaptiveOverrides).length ? 1 : calculated.confidence,
+              reason: Object.keys(adaptiveOverrides).length ? '使用手工设定的自适应参数。' : calculated.reason
+            };
+            analysis = localAnalysisMultiTimeframe(market, auxMarkets, adaptiveParams);
           } else if (engine === 'enhanced') {
             analysis = enhancedAnalysis(market);
           } else if (engine === 'super') {
@@ -259,9 +313,9 @@ export class GlobalAutomation {
 
           // All engines use the same timing, price and cost validation as manual analysis.
           const record = createResearchRecord({
-            config: engine === 'ai' ? config : { ...config, model: { model: `${engine}-rules-v1`, baseUrl: 'local://rules' } },
+            config: engine === 'ai' ? config : { ...config, model: { model: engine === 'local' ? LOCAL_STRATEGY.modelId : `${engine}-rules-v1`, baseUrl: 'local://rules' } },
             strategy, market: [market], result: { analyses: analysis ? [analysis] : [] },
-            type: 'single', scope: { interval: '1m', limit: 80, engine }
+            type: 'single', scope: { interval: MAIN_INTERVAL, limit: 80, engine }
           });
           Object.assign(record, { id: `auto-${runId}-${symbol}`, analysisEngine: engine, automationRunId: runId });
           for (const signal of record.analyses) {
@@ -271,6 +325,9 @@ export class GlobalAutomation {
           await this.archive.save(record);
           analysis = record.analyses[0];
 
+          // P3：统计本轮被哪道闸门挡住（用于漏斗观测，不合格时才有拦截原因）
+          if (!(analysis.eligible && analysis.plan)) tallyBlock(analysis.reason);
+
           // 如果有合格的开仓建议，自动下单
           if (analysis.eligible && analysis.plan && ['BUY', 'SELL'].includes(analysis.action)) {
             eligible++;
@@ -278,6 +335,25 @@ export class GlobalAutomation {
             try {
               // 保存分析记录
               const recordId = record.id;
+
+              // 同币种风控：已有未平仓订单不重复开仓；
+              // 止损后60分钟内冷却，避免同一趋势里反复止损（历史数据显示
+              // 37%的止损单在60分钟内同币种再次开单，53%订单集中于29个反复亏损币种）。
+              const simState = this.simulation.read ? await this.simulation.read() : { orders: [] };
+              const sameSymbol = (simState.orders || []).filter(o => o.symbol === symbol);
+              if (sameSymbol.some(o => o.status === 'pending' || o.status === 'open')) {
+                console.log(`[GlobalAutomation] ${symbol} 已有未平仓订单，跳过重复开仓`);
+                return { symbol, success: true, action: 'SKIP_DUPLICATE' };
+              }
+              const lastStopAt = sameSymbol
+                .filter(o => o.status === 'closed' && o.reason === 'stop_loss' && o.exitAt)
+                .map(o => Date.parse(o.exitAt))
+                .filter(t => Number.isFinite(t))
+                .sort((a, b) => b - a)[0];
+              if (lastStopAt && Date.now() - lastStopAt < 60 * 60000) {
+                console.log(`[GlobalAutomation] ${symbol} 止损后60分钟冷却期内，跳过开仓`);
+                return { symbol, success: true, action: 'SKIP_COOLDOWN' };
+              }
 
               // 自动提交模拟订单
               const leverage = recommendedLeverage(analysis.plan, analysis.action === 'BUY' ? 'OPEN_LONG' : 'OPEN_SHORT');
@@ -327,6 +403,15 @@ export class GlobalAutomation {
     this.stats.totalOrders += submitted;
 
     console.log(`[GlobalAutomation] 分析完成: 已分析 ${analyzed}, 合格 ${eligible}, 已下单 ${submitted}, 失败 ${failed}`);
+    // P3 漏斗日志：候选 → 各闸拦截 → 合格 → 下单。用于一眼判断是"降频生效"还是"被过滤光了"。
+    console.log(`[GlobalAutomation][漏斗] 候选${symbols.length} 已分析${analyzed} | 评分不足${blockedBy.score} `
+      + `量能不足${blockedBy.volume} 盈亏比不足${blockedBy.riskReward} | 合格${eligible} 下单${submitted}`);
+    if (symbols.length === 0) {
+      console.warn('[GlobalAutomation][告警] 币种过滤后候选为 0 —— 过滤器可能把所有币种都拉黑了，请检查自适应过滤样本！');
+    } else if (analyzed > 0 && eligible === 0) {
+      console.warn(`[GlobalAutomation][告警] 本轮 0 个合格信号 —— 门槛可能过严（候选${symbols.length}/已分析${analyzed}），`
+        + `请核对上面漏斗计数；可临时下调 NOFX_MIN_TREND_SCORE / NOFX_MIN_RR 恢复出单。`);
+    }
   }
 
   /**
@@ -347,20 +432,7 @@ export class GlobalAutomation {
     console.log(`[GlobalAutomation] 开始复核 ${openOrders.length} 个持仓...`);
 
     const config = await this.store.getConfig();
-    const hasModel = config.model.enabled && config.model.apiKey;
-    const useSuperEnhanced = config.analysis?.useSuperEnhanced === true;
-    const useEnhanced = config.analysis?.useEnhanced !== false;
-
-    let engine;
-    if (hasModel) {
-      engine = 'ai';
-    } else if (useSuperEnhanced) {
-      engine = 'super';
-    } else if (useEnhanced) {
-      engine = 'enhanced';
-    } else {
-      engine = 'local';
-    }
+    const engine = selectAnalysisEngine(config);
 
     let reviewed = 0;
     let updated = 0;
@@ -371,6 +443,12 @@ export class GlobalAutomation {
       try {
         // 获取最新行情
         const market = await this.getFreshMarket(order.symbol, order.interval);
+
+        // 数据不足（如新上币种）时跳过复核，等K线积累够了再处理
+        if (market.partial && market.klines.length < 15) {
+          console.log(`[GlobalAutomation] ${order.symbol} ${order.interval} 已收盘K线不足 ${market.klines.length} 根，本次跳过复核`);
+          continue;
+        }
 
         // 生成复核建议
         let proposal;
@@ -452,22 +530,66 @@ export class GlobalAutomation {
 
   /**
    * 获取最新行情数据
+   * 数据不足时：先查数据库，不够再直接从交易所获取；
+   * 若交易所也提供不了足够多的已收盘K线（如新上币种），
+   * 则降级返回已有的部分数据（partial: true），不再抛错。
    */
-  async getFreshMarket(symbol, interval = '1m') {
+  async getFreshMarket(symbol, interval = MAIN_INTERVAL) {
     const key = this.market.storageSymbol(symbol);
-    let rows;
+    const now = Date.now();
+
+    // 用交易所返回的原始数据构造"尽力而为"的已收盘K线集合
+    const buildPartial = rows => {
+      const closed = (Array.isArray(rows) ? rows : [])
+        .filter(row => row.confirmed !== false && nextOpenTime(row.openTime, interval) <= now)
+        .sort((a, b) => a.openTime - b.openTime).slice(-80)
+        .map(row => ({ ...row, closeTime: nextOpenTime(row.openTime, interval) - 1 }));
+      return {
+        symbol,
+        exchange: 'binance',
+        marketProvider: this.market.provider,
+        interval,
+        dataAsOf: new Date(nextOpenTime(closed.at(-1)?.openTime ?? now, interval)).toISOString(),
+        klines: closed,
+        partial: true
+      };
+    };
+
+    const fetchPrepared = async limit => {
+      const raw = await this.market.klines({ symbol, interval, limit });
+      const prepared = prepareMarket({ symbol, interval, rows: raw, limit: 80, marketProvider: this.market.provider, throwOnInsufficient: false });
+      return prepared.insufficient ? buildPartial(raw) : prepared;
+    };
 
     try {
       // 先尝试从数据库获取
-      rows = await this.marketDb.listKlines({ symbol: key, interval, limit: 80 });
-      return prepareMarket({ symbol, interval, rows, limit: 80, marketProvider: this.market.provider });
-    } catch {
-      // 数据库没有数据，从交易所获取
-      rows = await this.market.klines({ symbol, interval, limit: 82 });
-      const prepared = prepareMarket({ symbol, interval, rows, limit: 80, marketProvider: this.market.provider });
+      const rows = await this.marketDb.listKlines({ symbol: key, interval, limit: 80 });
 
-      // 保存到数据库
-      await this.marketDb.saveKlines({ symbol: key, interval, rows: prepared.klines });
+      // 尝试准备市场数据，检查是否足够
+      let prepared = prepareMarket({ symbol, interval, rows, limit: 80, marketProvider: this.market.provider, throwOnInsufficient: false });
+
+      // 如果数据不足，从交易所获取更多（交易所也不够时降级为部分数据，不报错）
+      if (prepared.insufficient) {
+        prepared = await fetchPrepared(Math.max(82, prepared.required + 2));
+      }
+
+      if (!prepared.partial) {
+        await this.marketDb.saveKlines({ symbol: key, interval, rows: prepared.klines }).catch(() => {});
+      }
+
+      return prepared;
+    } catch (error) {
+      if (error.message && !error.message.includes('行情已过期')) {
+        // 数据库读取等其他错误：直接从交易所获取
+        console.warn(`[GlobalAutomation] 读取 ${symbol} ${interval} 本地数据失败，改用交易所数据:`, error.message);
+      }
+
+      // 从交易所获取（数据仍不足时降级为部分数据，不报错）
+      const prepared = await fetchPrepared(82);
+
+      if (!prepared.partial) {
+        await this.marketDb.saveKlines({ symbol: key, interval, rows: prepared.klines }).catch(() => {});
+      }
 
       return prepared;
     }
@@ -492,15 +614,27 @@ export class GlobalAutomation {
 
     const long = order.direction === 'OPEN_LONG';
 
-    // 只收紧止损，不扩大风险
-    const stopLoss = long
-      ? Math.max(order.plan.stopLoss, price - 1.5 * atr)
-      : Math.min(order.plan.stopLoss, price + 1.5 * atr);
+    // 未盈利超过2%时保持初始保护价格，避免把止损棘轮式推向现价被噪声扫出。
+    const profit = long
+      ? (price - order.entry) / order.entry
+      : (order.entry - price) / order.entry;
+    if (!(profit > 0.02)) {
+      return {
+        action: 'HOLD',
+        reason: '持仓未盈利超过2%，保持初始保护价格，避免噪声止损。'
+      };
+    }
 
-    // 顺势调整止盈
+    // 移动止损距离放宽到 2.5×ATR（P0-1；跨引擎共享常量见 server/shared/strategyGuards.js → TRAILING_RULE）
+    const stopLoss = long
+      ? Math.max(order.plan.stopLoss, price - TRAILING_RULE.stopAtr * atr)
+      : Math.min(order.plan.stopLoss, price + TRAILING_RULE.stopAtr * atr);
+
+    // 止盈跟随对齐开仓目标 4×ATR，让盈利单能跑到完整目标而非被贴身止损提前扫掉
+    const TP_ATR = 4;
     const takeProfit = long
-      ? Math.max(order.plan.takeProfit, price + 3 * atr)
-      : Math.min(order.plan.takeProfit, price - 3 * atr);
+      ? Math.max(order.plan.takeProfit, price + TP_ATR * atr)
+      : Math.min(order.plan.takeProfit, price - TP_ATR * atr);
 
     return {
       action: 'UPDATE_PROTECTION',

@@ -138,8 +138,15 @@ export function projectAccount(state) {
         for (const [key, child] of Object.entries(value)) walk(child, [...path, key]);
       } else if (!mapped.has(JSON.stringify(path))) {
         const kind = value === null ? 'null' : typeof value;
-        if (!['null', 'string', 'number', 'boolean'].includes(kind) || (kind === 'number' && !Number.isFinite(value))) throw new Error(`Unsupported state value at ${path.join('.')}`);
-        addExtension(kind, path, value);
+        if (kind === 'number' && !Number.isFinite(value)) {
+          // 防御：上游可能因"立即触发/未触发"输出 Infinity/NaN；降级为 null 并 warn，不阻塞整体持久化
+          console.warn(`[simulatedAccountRepository] 非有限数值 ${path.join('.')}=${value}，已降级为 null`);
+          addExtension('null', path, null);
+        } else if (!['null', 'string', 'number', 'boolean'].includes(kind)) {
+          throw new Error(`Unsupported state value at ${path.join('.')}`);
+        } else {
+          addExtension(kind, path, value);
+        }
       }
     };
     const addExtension = (kind, path, value) => rows[orderId === undefined ? 'simulated_account_extensions' : 'simulated_order_extensions'].push({

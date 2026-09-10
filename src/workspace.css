@@ -21,7 +21,8 @@
 
   color: var(--text-primary);
   background: var(--bg-primary);
-  font-family: 'Microsoft YaHei', 'Segoe UI', sans-serif;
+  font-family: var(--font-body);
+  font-variant-numeric: tabular-nums;
 }
 
 /* 顶部栏 */
@@ -42,7 +43,7 @@
 }
 .brand-lockup .eyebrow {
   color: var(--text-tertiary);
-  font-family: Consolas, monospace;
+  font-family: var(--font-mono);
 }
 
 /* 导航 */
@@ -110,7 +111,7 @@
   border-radius: 3px;
 }
 .symbol-row span {
-  font-family: Consolas, 'Microsoft YaHei', monospace;
+  font-family: var(--font-mono);
 }
 .symbol-row small { color: var(--text-tertiary); }
 .symbol-row:hover,
@@ -149,7 +150,7 @@
 }
 .market-status p {
   color: var(--text-tertiary);
-  font: 11px/1.7 Consolas, 'Microsoft YaHei', monospace;
+  font: 11px/1.7 var(--font-mono);
   margin-top: 7px;
 }
 .market-status button {
@@ -171,7 +172,7 @@
 
 /* 工作台标题 */
 .workbench-hero h2 {
-  font-family: Consolas, 'Microsoft YaHei', monospace;
+  font-family: var(--font-mono);
   letter-spacing: -1px;
   font-size: 30px;
   color: var(--text-primary);
@@ -193,7 +194,7 @@
 }
 .quote-actions select { padding: 6px; }
 .last-price {
-  font-family: Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 23px;
   color: var(--text-primary);
 }
@@ -490,7 +491,7 @@
   color: var(--text-tertiary);
 }
 .window-strip strong {
-  font: 16px Consolas, monospace;
+  font: 16px var(--font-mono);
   font-variant-numeric: tabular-nums;
   color: var(--text-primary);
 }
@@ -546,7 +547,7 @@
   align-items: center;
   padding: 10px 0;
   border-top: 1px solid var(--border-primary);
-  font: 11px Consolas, 'Microsoft YaHei', monospace;
+  font: 11px var(--font-mono);
   color: var(--text-tertiary);
 }
 .candle-readout b {
@@ -569,7 +570,7 @@
 }
 .price-axis {
   position: relative;
-  font: 10px Consolas, monospace;
+  font: 10px var(--font-mono);
   color: var(--chart-axis);
 }
 .price-axis span {
@@ -589,7 +590,7 @@
   grid-column: 1;
   display: flex;
   justify-content: space-between;
-  font: 10px Consolas, monospace;
+  font: 10px var(--font-mono);
   color: var(--chart-axis);
   padding: 6px 0;
   gap: 8px;
@@ -655,7 +656,7 @@
   background: transparent;
 }
 .research-panel .result-card .result-top strong {
-  font-family: Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 18px;
   color: var(--text-primary);
 }
@@ -691,7 +692,7 @@
   font-size: 12px;
 }
 .empty-symbol {
-  font: 40px Consolas, monospace;
+  font: 40px var(--font-mono);
   color: var(--text-muted);
 }
 
@@ -788,7 +789,7 @@
 }
 .candle-picker p {
   color: var(--text-primary);
-  font-family: Consolas, 'Microsoft YaHei', monospace;
+  font-family: var(--font-mono);
   margin: 8px 0;
   overflow-wrap: anywhere;
 }

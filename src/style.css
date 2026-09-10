@@ -4,92 +4,99 @@
  */
 
 :root {
-  /* ===== 背景色 ===== */
-  --bg-primary: #0d1110;
-  --bg-secondary: #141a19;
-  --bg-tertiary: #1c2322;
-  --bg-elevated: #232b2a;
-  --bg-card: #1a2120;
-  --bg-input: #1c2322;
-  --bg-overlay: rgba(0, 0, 0, 0.6);
+  /* ===== 字体系统（展示字 + 正文 + 等宽数字）===== */
+  --font-display: 'Space Grotesk', 'IBM Plex Sans', system-ui, sans-serif;
+  --font-body: 'IBM Plex Sans', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, Consolas, monospace;
 
-  /* ===== 文字色 ===== */
-  --text-primary: #e8f0ed;
-  --text-secondary: #b8c4c0;
-  --text-tertiary: #8a9a95;
-  --text-muted: #66736e;
-  --text-inverse: #0d1110;
+  /* ===== 背景色（冷色调中性，hue 200，深色 15-22%）===== */
+  --bg-primary: oklch(15% 0.012 200);
+  --bg-secondary: oklch(17.5% 0.012 200);
+  --bg-tertiary: oklch(20% 0.014 200);
+  --bg-elevated: oklch(22% 0.014 200);
+  --bg-card: oklch(19% 0.014 200);
+  --bg-input: oklch(20% 0.014 200);
+  --bg-overlay: oklch(12% 0.012 200 / 0.72);
+
+  /* ===== 文字色（亮色，冷调，深色模式权重降一档由 body 控制）===== */
+  --text-primary: oklch(93% 0.008 200);
+  --text-secondary: oklch(80% 0.008 200);
+  --text-tertiary: oklch(65% 0.008 200);
+  --text-muted: oklch(50% 0.008 200);
+  --text-inverse: oklch(15% 0.012 200);
 
   /* ===== 边框色 ===== */
-  --border-primary: #2d3836;
-  --border-secondary: #222c2a;
-  --border-tertiary: #1a2321;
-  --border-hover: #3d4a48;
+  --border-primary: oklch(28% 0.014 200);
+  --border-secondary: oklch(24% 0.014 200);
+  --border-tertiary: oklch(21% 0.014 200);
+  --border-hover: oklch(34% 0.014 200);
 
-  /* ===== 品牌色 ===== */
-  --brand-primary: #00e0a8;
-  --brand-secondary: #00bd8d;
-  --brand-tertiary: #009a72;
-  --brand-bg: rgba(0, 224, 168, 0.12);
+  /* ===== 品牌色（NOFX 青绿 hue 165）===== */
+  --brand-primary: oklch(72% 0.15 165);
+  --brand-secondary: oklch(65% 0.14 165);
+  --brand-tertiary: oklch(58% 0.13 165);
+  --brand-bg: color-mix(in oklch, var(--brand-primary) 12%, transparent);
 
   /* ===== 功能色 ===== */
-  --success: #00e0a8;
-  --success-bg: rgba(0, 224, 168, 0.12);
-  --danger: #ff6b6b;
-  --danger-bg: rgba(255, 107, 107, 0.12);
-  --warning: #f5a623;
-  --warning-bg: rgba(245, 166, 35, 0.12);
-  --info: #5eb8ff;
-  --info-bg: rgba(94, 184, 255, 0.12);
+  --success: oklch(72% 0.15 165);
+  --success-bg: color-mix(in oklch, var(--success) 12%, transparent);
+  --danger: oklch(64% 0.21 27);
+  --danger-bg: color-mix(in oklch, var(--danger) 12%, transparent);
+  --warning: oklch(75% 0.15 75);
+  --warning-bg: color-mix(in oklch, var(--warning) 12%, transparent);
+  --info: oklch(70% 0.12 240);
+  --info-bg: color-mix(in oklch, var(--info) 12%, transparent);
 
-  /* ===== 交易色 ===== */
-  --long: #00e0a8;
-  --long-bg: rgba(0, 224, 168, 0.15);
-  --short: #ff6b6b;
-  --short-bg: rgba(255, 107, 107, 0.15);
+  /* ===== 交易色（A 股红涨绿跌：涨=红、跌=绿）===== */
+  --long: oklch(64% 0.21 27);
+  --long-bg: color-mix(in oklch, var(--long) 15%, transparent);
+  --short: oklch(62% 0.16 145);
+  --short-bg: color-mix(in oklch, var(--short) 15%, transparent);
 
-  /* ===== 盈亏色 ===== */
-  --profit: #00e0a8;
-  --profit-bg: rgba(0, 224, 168, 0.15);
-  --loss: #ff6b6b;
-  --loss-bg: rgba(255, 107, 107, 0.15);
+  /* ===== 盈亏色（盈=红涨、亏=绿跌）===== */
+  --profit: oklch(64% 0.21 27);
+  --profit-bg: color-mix(in oklch, var(--profit) 15%, transparent);
+  --loss: oklch(62% 0.16 145);
+  --loss-bg: color-mix(in oklch, var(--loss) 15%, transparent);
 
   /* ===== 按钮 ===== */
-  --btn-primary-bg: #00e0a8;
-  --btn-primary-text: #0d1110;
-  --btn-primary-hover: #1aebbd;
-  --btn-secondary-bg: #252f2d;
-  --btn-secondary-text: #e8f0ed;
-  --btn-secondary-hover: #2f3b39;
+  --btn-primary-bg: oklch(72% 0.15 165);
+  --btn-primary-text: oklch(15% 0.012 200);
+  --btn-primary-hover: oklch(78% 0.14 165);
+  --btn-secondary-bg: oklch(26% 0.014 200);
+  --btn-secondary-text: oklch(93% 0.008 200);
+  --btn-secondary-hover: oklch(30% 0.014 200);
   --btn-ghost-bg: transparent;
-  --btn-ghost-text: #e8f0ed;
-  --btn-ghost-hover: #252f2d;
+  --btn-ghost-text: oklch(93% 0.008 200);
+  --btn-ghost-hover: oklch(26% 0.014 200);
 
   /* ===== 状态色 ===== */
-  --state-hover: rgba(255, 255, 255, 0.05);
-  --state-active: rgba(255, 255, 255, 0.08);
-  --state-focus: rgba(0, 224, 168, 0.3);
-  --state-selected: rgba(0, 224, 168, 0.1);
+  --state-hover: color-mix(in oklch, white 5%, transparent);
+  --state-active: color-mix(in oklch, white 8%, transparent);
+  --state-focus: color-mix(in oklch, var(--brand-primary) 30%, transparent);
+  --state-selected: color-mix(in oklch, var(--brand-primary) 10%, transparent);
 
-  /* ===== 图表色 ===== */
-  --chart-grid: #2a3533;
-  --chart-grid-dash: #222c2a;
-  --chart-axis: #66736e;
-  --chart-crosshair: #5a6662;
-  --chart-up: #00e0a8;
-  --chart-down: #ff6b6b;
-  --chart-volume-up: rgba(0, 224, 168, 0.4);
-  --chart-volume-down: rgba(255, 107, 107, 0.4);
+  /* ===== 图表色（A 股红涨绿跌）===== */
+  --chart-grid: oklch(30% 0.014 200);
+  --chart-grid-dash: oklch(24% 0.014 200);
+  --chart-axis: oklch(50% 0.008 200);
+  --chart-crosshair: oklch(55% 0.008 200);
+  --chart-up: oklch(64% 0.21 27);
+  --chart-down: oklch(62% 0.16 145);
+  --chart-volume-up: color-mix(in oklch, var(--chart-up) 40%, transparent);
+  --chart-volume-down: color-mix(in oklch, var(--chart-down) 40%, transparent);
 
-  /* ===== 阴影 ===== */
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
-  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4);
-  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.5);
-  --shadow-glow: 0 0 20px rgba(0, 224, 168, 0.2);
+  /* ===== 阴影（深色模式极简，不用发光）===== */
+  --shadow-sm: 0 1px 2px oklch(0% 0 0 / 0.3);
+  --shadow-md: 0 4px 12px oklch(0% 0 0 / 0.4);
+  --shadow-lg: 0 8px 24px oklch(0% 0 0 / 0.5);
+  --shadow-glow: 0 0 20px color-mix(in oklch, var(--brand-primary) 20%, transparent);
 
   color: var(--text-primary);
   background: var(--bg-primary);
-  font-family: Inter, "Segoe UI", system-ui, sans-serif;
+  font-family: var(--font-body);
+  font-variant-numeric: tabular-nums;
+  font-kerning: normal;
 }
 
 /* ===== 基础重置 ===== */
@@ -136,6 +143,72 @@ ul.signal-warning { padding-left: 28px; }
 .performance-table td { color: var(--text-primary); }
 .performance-table td strong { color: var(--text-primary); font-weight: 650; }
 
+/* ===== Daily Trend View ===== */
+.daily-trend-metrics { margin-top: 18px; }
+.daily-trend-charts {
+  position: relative;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-primary);
+  border-radius: 8px;
+  padding: 16px;
+  margin: 12px 0 20px;
+}
+.daily-trend-svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: 320px;
+}
+.daily-trend-axis-text {
+  fill: var(--text-tertiary);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.daily-trend-bars rect, .daily-trend-line circle {
+  transition: opacity 0.18s ease, r 0.18s ease;
+  cursor: pointer;
+}
+.daily-trend-line circle:hover { r: 5; }
+.daily-trend-empty {
+  text-align: center;
+  color: var(--text-tertiary);
+  padding: 40px 0;
+  font-size: 13px;
+}
+.daily-trend-tooltip {
+  position: absolute;
+  top: 12px;
+  right: 18px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-hover);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  pointer-events: none;
+  box-shadow: 0 4px 12px var(--bg-overlay);
+  min-width: 160px;
+  z-index: 5;
+}
+.daily-trend-tooltip strong {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--text-primary);
+  font-size: 13px;
+}
+.daily-trend-tooltip p {
+  margin: 2px 0;
+  font-variant-numeric: tabular-nums;
+}
+.daily-trend-tooltip b {
+  color: var(--text-primary);
+  font-weight: 650;
+}
+@media (max-width: 720px) {
+  .daily-trend-tooltip { right: 8px; top: 8px; }
+  .daily-trend-svg { max-height: 240px; }
+}
+
 /* ===== 应用外壳 ===== */
 .app-shell { min-height: 100vh; background: var(--bg-primary); }
 
@@ -165,8 +238,8 @@ ul.signal-warning { padding-left: 28px; }
 }
 .brand-lockup h1 { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 h1, h2, p { margin: 0; }
-h1 { font-size: 22px; font-weight: 650; }
-h2 { font-size: 20px; letter-spacing: 0; color: var(--text-primary); }
+h1 { font-family: var(--font-display); font-size: 22px; font-weight: 650; letter-spacing: -0.01em; }
+h2 { font-family: var(--font-display); font-size: 20px; letter-spacing: -0.01em; color: var(--text-primary); }
 .eyebrow {
   display: block;
   color: var(--text-tertiary);

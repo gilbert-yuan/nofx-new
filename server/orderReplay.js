@@ -10,12 +10,13 @@
  */
 
 import { candleOpenAt, nextOpenTime } from './research.js';
+import { marketStorageSymbol } from './marketData.js';
 
 /**
  * 获取订单复盘数据
  */
 export async function getOrderReplayData(order, market, marketDb) {
-  const { symbol, interval, createdAt, entry, exit, plan, direction } = order;
+  const { symbol, interval, entry, plan, direction } = order;
 
   if (!entry) {
     return { error: '订单未入场，无法复盘' };
@@ -24,49 +25,66 @@ export async function getOrderReplayData(order, market, marketDb) {
   const isLong = direction === 'OPEN_LONG';
   const entryTime = Date.parse(order.entryAt);
   const exitTime = order.exitAt ? Date.parse(order.exitAt) : Date.now();
+  if (!Number.isFinite(entryTime) || !Number.isFinite(exitTime) || exitTime < entryTime) {
+    return { error: '订单入场或出场时间无效，无法复盘' };
+  }
+  const provider = order.marketProvider || market?.provider || 'okx';
+  const entryOpen = candleOpenAt(entryTime, interval);
+  const exitOpen = candleOpenAt(exitTime, interval);
 
   // 获取入场前K线（20根，用于判断趋势背景）
-  const beforeEntryStart = entryTime - 20 * getIntervalMs(interval);
+  const beforeEntryStart = entryOpen - 20 * getIntervalMs(interval);
 
   // 获取完整周期K线（入场前20根 + 持仓期间 + 出场后5根）
-  const afterExitEnd = exitTime + 5 * getIntervalMs(interval);
+  const afterExitEnd = Math.min(exitOpen + 5 * getIntervalMs(interval), Date.now());
 
   let klines = [];
 
   try {
     // 从市场数据库或API获取K线
     if (marketDb) {
-      // 使用listKlines获取所有K线，然后根据时间范围筛选
-      const allKlines = await marketDb.listKlines({
-        symbol: symbol,
-        interval,
-        limit: 1000
-      });
-
-      // 筛选出需要的时间范围
-      klines = allKlines.filter(k =>
-        k.openTime >= beforeEntryStart && k.openTime <= afterExitEnd
-      );
-    } else {
-      klines = await market.klines({
-        symbol,
+      // 在数据库中限定订单时间范围，避免最新1000根窗口遗漏历史订单。
+      klines = await marketDb.listKlines({
+        symbol: marketStorageSymbol(symbol, provider),
         interval,
         startTime: beforeEntryStart,
         endTime: afterExitEnd,
-        limit: 500
+        limit: null
       });
+    }
+    if (!klines.length && market?.klines) {
+      if (market.provider && market.provider !== provider) {
+        return { error: `无K线数据: ${provider} ${symbol}，当前行情来源为 ${market.provider}` };
+      }
+      // 分段请求，避免客户端单页上限截断长持仓。
+      for (let startTime = beforeEntryStart; startTime <= afterExitEnd;) {
+        const endTime = Math.min(startTime + 300 * getIntervalMs(interval) - 1, afterExitEnd);
+        klines.push(...await market.klines({ symbol, interval, startTime, endTime, limit: 300 }));
+        startTime = endTime + 1;
+      }
     }
   } catch (error) {
     return { error: `获取K线失败: ${error.message}` };
   }
 
+  klines = [...new Map(klines.map(k => [Number(k.openTime), { ...k, openTime: Number(k.openTime) }])).values()]
+    .filter(k => k.openTime >= beforeEntryStart && k.openTime <= afterExitEnd)
+    .sort((a, b) => a.openTime - b.openTime);
   if (klines.length === 0) {
-    return { error: '无K线数据' };
+    return { error: `无K线数据: ${provider} ${symbol} ${interval}，${new Date(beforeEntryStart).toISOString()} 至 ${new Date(afterExitEnd).toISOString()}` };
   }
 
   // 标注关键K线
-  const entryIndex = klines.findIndex(k => k.openTime >= entryTime);
-  const exitIndex = order.exitAt ? klines.findIndex(k => k.openTime >= exitTime) : klines.length - 1;
+  const entryIndex = klines.findIndex(k => k.openTime === entryOpen);
+  const exitIndex = order.exitAt ? klines.findIndex(k => k.openTime === exitOpen) : klines.length - 1;
+  if (entryIndex < 1 || exitIndex < entryIndex) {
+    return { error: `K线数据不完整: ${provider} ${symbol} 缺少入场前、入场或出场K线` };
+  }
+  for (let i = entryIndex + 1; i <= exitIndex; i++) {
+    if (klines[i].openTime !== nextOpenTime(klines[i - 1].openTime, interval)) {
+      return { error: `K线数据不完整: ${provider} ${symbol} 持仓期间存在缺口` };
+    }
+  }
 
   // 分析各个维度
   const directionAnalysis = analyzeDirection(klines, entryIndex, exitIndex, isLong, entry);
@@ -214,11 +232,14 @@ function analyzeStopLoss(klines, entryIndex, exitIndex, stopLoss, isLong, entryP
     optimal = true;
   }
 
+  // 触及瞬间或从未接近过止损时，输出 null（语义：无可量距离），避免下游持久化因 Infinity 报错
+  const minDistanceToSLPct = Number.isFinite(minDistanceToSL) ? minDistanceToSL * 100 : null;
+
   return {
     stopLoss,
     distance: stopLossDistance * 100,
     touched: slTouched,
-    minDistanceToSL: minDistanceToSL * 100,
+    minDistanceToSL: minDistanceToSLPct,
     atr,
     atrRatio,
     optimal,
@@ -275,11 +296,14 @@ function analyzeTakeProfit(klines, entryIndex, exitIndex, takeProfit, isLong, en
     optimal = true;
   }
 
+  // 同上：触及瞬间/未接近过 → null，避免下游 Infinity 报错
+  const minDistanceToTPPct = Number.isFinite(minDistanceToTP) ? minDistanceToTP * 100 : null;
+
   return {
     takeProfit,
     distance: takeProfitDistance * 100,
     touched: tpTouched,
-    minDistanceToTP: minDistanceToTP * 100,
+    minDistanceToTP: minDistanceToTPPct,
     maxFavorable: maxFavorable * 100,
     optimal,
     assessment
@@ -398,7 +422,7 @@ function generateDiagnosis({ order, directionAnalysis, stopLossAnalysis, takePro
 
     if (takeProfitAnalysis.touched && takeProfitAnalysis.maxFavorable > takeProfitAnalysis.distance * 1.5) {
       recommendations.push('考虑使用移动止盈或分批止盈，捕捉更多利润');
-    } else if (!takeProfitAnalysis.touched && takeProfitAnalysis.minDistanceToTP > 5) {
+    } else if (!takeProfitAnalysis.touched && (takeProfitAnalysis.minDistanceToTP ?? 0) > 5) {
       recommendations.push('止盈目标过于激进，建议降低盈亏比预期');
     }
   } else {

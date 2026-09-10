@@ -27,6 +27,84 @@ import {
   calculateWilliamsR,
   calculateTrendScore
 } from './advancedIndicators.js';
+import { LONG_ONLY, TRAILING_RULE } from './shared/strategyGuards.js';
+
+// ==================== P3 盈利改造：可调参数集中区（单点回滚） ====================
+// 诊断依据（2231 笔已平仓实测，/api/paper/statistics）：胜率 22.5%，净盈亏比 1.24 →
+// 期望值 = 0.225×1.24 − 0.775×1 = −0.49（每承担 1 单位风险净亏 0.49）。
+// 盈亏平衡需要胜率 44.6%（不现实）或净盈亏比 ≥ 3.4，因此方向是"拉高盈亏比 + 砍掉低质量高频单"。
+// 成本实测（非估算）：总毛收益 −869.1U，总净收益 −2168.9U，
+// 即摩擦成本 1299.8U（手续费+滑点双边 22bps + 资金费 3bps/8h），均摊 0.583U/单。
+// 结论：摩擦占净亏损的 60%，但毛收益本身也是负的（−869U）——
+// 降频只能拿回约 60%，剩下 40% 必须靠拉高盈亏比（T1）解决，两者不可互相替代。
+
+// 调参入口：下面几个关键常量支持环境变量覆盖（代码默认值不变，PM2 重启即生效，无需改代码）。
+// 例：NOFX_MAIN_TP_R=4.0 NOFX_MIN_RR=2.2 NOFX_ENTRY_BAND_ATR=0.3 NOFX_MIN_TREND_SCORE=70
+const numFromEnv = (name, fallback, min, max) => {
+  const raw = process.env[name];
+  if (raw == null || String(raw).trim() === '') return fallback;
+  const value = Number.parseFloat(raw);
+  if (!Number.isFinite(value) || value < min || value > max) {
+    console.warn(`[enhancedAnalysis] 环境变量 ${name}=${raw} 非法（需在 ${min}~${max}），回退默认值 ${fallback}`);
+    return fallback;
+  }
+  return value;
+};
+
+// 主止盈风险倍数（R = riskUnit = 止损距离）。原主止盈取 2R（净盈亏比仅 1.24），
+// 现提升到 3.5R。注意：止盈拉远会压低胜率，必须与 MIN_TREND_SCORE 一起观察；
+// 若胜率跌破 ~18%，应先把此值回调到 3.0 再评估。
+const MAIN_TP_R_MULTIPLE = numFromEnv('NOFX_MAIN_TP_R', 3.5, 1, 10);
+// 分级止盈前两档（仅随 plan 透出做展示，实际下单只用 plan.takeProfit）
+const TP1_R_MULTIPLE = 1.0;
+const TP2_R_MULTIPLE = 2.0;
+// 支撑/阻力位收窄止盈时的盈亏比下限：收窄后低于此值就放弃收窄。
+// 原逻辑无条件把主止盈压到阻力位（实测压到 1.2R 也放行），是净盈亏比被压低的主因之一。
+const SR_NARROW_MIN_RR = 2.5;
+// 入场最低风险收益比（按"现价→主止盈 ÷ 现价→主止损"计算）。原门槛 1.2 过低，放行大量劣质单。
+const MIN_RISK_REWARD_RATIO = numFromEnv('NOFX_MIN_RR', 2.5, 0, 10);
+// 入场区间半宽（单位 ATR）。区间越宽，最不利入场价离止损越远 → 净盈亏比越低。
+// 保持 0.5 不动（改小可继续抬高净盈亏比，但会明显降低成交率），留作单点调优旋钮。
+const ENTRY_BAND_ATR = numFromEnv('NOFX_ENTRY_BAND_ATR', 0.5, 0, 2);
+// 综合评分门槛（原 60 分）。提高是最直接的降频 + 提质量手段。
+const MIN_TREND_SCORE = numFromEnv('NOFX_MIN_TREND_SCORE', 66, 0, 100);
+// 成交量确认下限（量比）。原代码算出了 volumeConfirm 却从未使用，等于没有量能门槛。
+const MIN_VOLUME_RATIO = 0.8;
+// 是否强制要求成交量确认（关闭即回到无成交量门槛的旧行为）
+const REQUIRE_VOLUME_CONFIRM = true;
+
+// ── P4 胜率复盘新增：波动率下限 + 方向性 RSI 门槛（2026-09-10）──────────────────
+// 诊断样本：2462 笔已平仓模拟订单（真实入场点，仅重算入场时特征）。
+// 1) 波动率（ATR/价格）与均单净盈亏呈**单调**关系，是本轮最强的单因子：
+//      <0.15% → -1.16U/单 | 0.15~0.25% → -1.32U/单 | 0.25~0.40% → -1.45U/单
+//      ≥0.40% → -0.81U/单 | ≥0.50% → -0.48U/单 | ≥0.60% → +0.14U/单
+//    机理：低波动=震荡市，趋势信号缺乏跟随性，进场即被均值回归打掉止损。
+//    原下限 0.0005（0.05%）形同虚设（仅拦掉 113/460 个币），现抬到 0.30%。
+//    通过率核对（1m 历史入场点）：≥0.20% 通过 82.7%，≥0.30% 通过 53.6%，
+//    ≥0.35% 通过 43.8%，≥0.40% 通过 37.8% —— 取 0.30% 保留过半交易流量的同时
+//    拿到大部分胜率收益。该闸门自带时段自适应：活跃时段通过 41%~69%，
+//    死水时段（如 12:00 UTC 实测）只通过 7%，即"安静时不做单"。
+// 2) RSI 同样单调：RSI≥45 → -1.15U/单，≥55 → -1.12U/单，≥60 → -0.95U/单。
+//    因此多单门槛由 40 抬到 50，空单门槛由 60 收到 55（对称收紧"动能方向"）。
+// 组合效果（1m & ATR≥0.35% & RSI≥50）：n=572，胜率 22.8%→29.5%，均单 -0.91→-0.20U。
+// 调参：想更激进 → NOFX_MIN_ATR_PCT=0.004；交易过少 → 调回 0.0015。
+// 回滚全部三项：NOFX_MIN_ATR_PCT=0.0005 NOFX_MIN_RSI_LONG=40 NOFX_MAX_RSI_SHORT=60
+const MIN_ATR_PCT = numFromEnv('NOFX_MIN_ATR_PCT', 0.003, 0, 0.05);
+// 波动率上限（原值 0.08 保持不变，极端行情直接回避）
+const MAX_ATR_PCT = 0.08;
+// 多单要求的最低 RSI（原 40）
+const MIN_RSI_LONG = numFromEnv('NOFX_MIN_RSI_LONG', 50, 0, 100);
+// 空单允许的最高 RSI（原 60）
+const MAX_RSI_SHORT = numFromEnv('NOFX_MAX_RSI_SHORT', 55, 0, 100);
+// ── P4 新增结束 ──────────────────────────────────────────────────────────────
+
+// 持仓复核：盈利触发阈值（保持不变）
+const TRAIL_PROFIT_TRIGGER = 0.02;
+// 移动止损 / 顺势扩展止盈 / 盈亏平衡位参数 — 跨引擎共享常量（见 server/shared/strategyGuards.js）。
+// 局部分解便于阅读：TRAIL_STOP_ATR=TRAILING_RULE.stopAtr, TRAIL_TP_ATR=TRAILING_RULE.extendTpAtr。
+const TRAIL_STOP_ATR = TRAILING_RULE.stopAtr;
+const TRAIL_TP_ATR = TRAILING_RULE.extendTpAtr;
+// ==================== P3 可调参数集中区结束 ====================
 
 // 计算EMA（指数移动平均）
 function ema(data, period) {
@@ -40,24 +118,54 @@ function ema(data, period) {
   return ema;
 }
 
-// 计算MACD
+// 计算MACD（标准实现）
+// 标准算法：MACD = EMA12 - EMA26，Signal = EMA9(MACD序列)，Histogram = MACD - Signal。
+// 修复 P2-3：原代码用 closes.slice(-9) 只取最近 9 根 K 线算 MACD 子序列再 EMA(9)，与标准全序列 EMA 偏差大，
+// signal 偏低、histogram 偏高，金叉/死叉判错。改为增量维护 EMA12/EMA26、构造完整 MACD 序列、再对 MACD 做 EMA(9)。
+// 数据需求：closes.length >= 26 才能算第一根 MACD，< 35 时 EMA9 信号线样本不足返回 null（避免半截信号污染趋势评分）。
 function calculateMACD(closes) {
   if (closes.length < 26) return null;
 
-  const ema12 = ema(closes, 12);
-  const ema26 = ema(closes, 26);
-  if (!ema12 || !ema26) return null;
+  const k12 = 2 / (12 + 1);
+  const k26 = 2 / (26 + 1);
+  const k9  = 2 / (9  + 1);
 
-  const macdLine = ema12 - ema26;
-  const macdValues = closes.slice(-9).map((_, i) => {
-    const e12 = ema(closes.slice(0, closes.length - 9 + i + 1), 12);
-    const e26 = ema(closes.slice(0, closes.length - 9 + i + 1), 26);
-    return e12 - e26;
-  });
-  const signalLine = ema(macdValues, 9);
-  const histogram = macdLine - signalLine;
+  // 用 SMA 初始化 EMA12 / EMA26（与既有 ema() 助手口径一致）
+  let e12 = 0, e26 = 0;
+  for (let i = 0; i < 26; i++) {
+    if (i < 12) e12 += closes[i];
+    e26 += closes[i];
+  }
+  e12 /= 12;
+  e26 /= 26;
 
-  return { macdLine, signalLine, histogram };
+  // 推进 EMA12/EMA26，记录每个 i>=25 时刻的 MACD(i) = EMA12(i) - EMA26(i)
+  const macdSeries = [];
+  for (let i = 25; i < closes.length; i++) {
+    // EMA12 从 i=12 开始增量更新；到达 i=25 时已包含 closes[0..25]
+    if (i >= 12) e12 = closes[i] * k12 + e12 * (1 - k12);
+    // EMA26 从 i=26 开始增量更新；i=25 时为 SMA 种子
+    if (i >= 26) e26 = closes[i] * k26 + e26 * (1 - k26);
+    macdSeries.push(e12 - e26);
+  }
+
+  if (macdSeries.length === 0) return null;
+
+  const macdLine = macdSeries[macdSeries.length - 1];
+
+  // 信号线至少需要 9 个 MACD 样本才能给出稳定的 EMA(9) 值
+  if (macdSeries.length < 9) {
+    return { macdLine, signalLine: null, histogram: null };
+  }
+
+  let signal = 0;
+  for (let i = 0; i < 9; i++) signal += macdSeries[i];
+  signal /= 9;
+  for (let i = 9; i < macdSeries.length; i++) {
+    signal = macdSeries[i] * k9 + signal * (1 - k9);
+  }
+
+  return { macdLine, signalLine: signal, histogram: macdLine - signal };
 }
 
 // 计算RSI
@@ -203,7 +311,7 @@ function calculateTrendStrength(market) {
 
   // 3. RSI (12分)
   const rsi = calculateRSI(closes);
-  if (rsi) {
+  if (rsi !== null) {
     if (rsi > 50 && rsi < 70) {
       score += 12;
       reasons.push(`RSI健康多头区(${rsi.toFixed(1)})`);
@@ -371,12 +479,20 @@ export function enhancedAnalysis(market) {
   const srLevels = findSupportResistance(rows);
   const trendStrength = calculateTrendStrength(market);
 
-  // 波动率过滤
+  // 波动率过滤（P0-2 加上限；P4 抬高下限）
+  // 上限：极端行情直接回避；下限：死水/震荡行情不做趋势单（详见文件顶部 P4 参数区）。
   const volatility = atr / close;
-  if (volatility > 0.08) {
+  if (volatility > MAX_ATR_PCT) {
     return wait(
-      '波动率过高（>8%），等待市场稳定。',
+      `波动率过高（>${(MAX_ATR_PCT * 100).toFixed(0)}%），等待市场稳定。`,
       [`当前波动率${(volatility * 100).toFixed(2)}%，风险极大。`],
+      trendStrength
+    );
+  }
+  if (volatility < MIN_ATR_PCT) {
+    return wait(
+      `波动率过低（${(volatility * 100).toFixed(3)}% < ${(MIN_ATR_PCT * 100).toFixed(2)}%），震荡市不做趋势单。`,
+      [`当前波动率${(volatility * 100).toFixed(3)}%，趋势信号缺乏跟随性，容易被均值回归反复打掉止损。`],
       trendStrength
     );
   }
@@ -401,22 +517,43 @@ export function enhancedAnalysis(market) {
     if (isBearish && macd.histogram < 0) macdConfirm = true;
   }
 
-  // RSI过滤
+  // RSI过滤（P4：多单门槛 40→MIN_RSI_LONG(50)，空单门槛 60→MAX_RSI_SHORT(55)，
+  // 只在「动能方向与信号一致」时入场；实测 RSI 与胜率单调正相关）
   let rsiWarning = '';
-  if (rsi) {
+  if (rsi !== null) {
     if (rsi > 70) rsiWarning = 'RSI超买，注意回调风险';
     if (rsi < 30) rsiWarning = 'RSI超卖，注意反弹风险';
-    if (isBullish && rsi < 40) return wait('多头信号但RSI偏弱，等待确认。', [rsiWarning]);
-    if (isBearish && rsi > 60) return wait('空头信号但RSI偏强，等待确认。', [rsiWarning]);
+    if (isBullish && rsi < MIN_RSI_LONG) return wait(`多头信号但RSI偏弱（${rsi.toFixed(1)} < ${MIN_RSI_LONG}），等待动能确认。`, [rsiWarning]);
+    if (isBearish && rsi > MAX_RSI_SHORT) return wait(`空头信号但RSI偏强（${rsi.toFixed(1)} > ${MAX_RSI_SHORT}），等待动能确认。`, [rsiWarning]);
+    // 空头且RSI超卖=在下跌末端追空（历史回放胜率仅25.6%，平均亏损最大），放弃。
+    if (isBearish && rsi < 30) return wait('空头信号但RSI超卖，避免在下跌末端追空。', [rsiWarning]);
   }
 
-  // 成交量确认
-  let volumeConfirm = volumeAnalysis && volumeAnalysis.volumeRatio > 0.8;  // 降低门槛
-
-  // 综合评分过滤（需要至少60分）
-  if (trendStrength.score < 60) {
+  // 成交量确认（原代码算出了 volumeConfirm 却从未使用，等于没有量能门槛；
+  // 无成交量数据时视为通过，避免因数据缺失把全部信号误杀）
+  const volumeConfirm = volumeAnalysis ? volumeAnalysis.volumeRatio > MIN_VOLUME_RATIO : true;
+  if (REQUIRE_VOLUME_CONFIRM && !volumeConfirm) {
     return wait(
-      `综合信号强度不足（${trendStrength.score}/100），等待更强信号。`,
+      `成交量不足（量比${volumeAnalysis ? volumeAnalysis.volumeRatio.toFixed(2) : 'n/a'} < ${MIN_VOLUME_RATIO}），等待量能确认。`,
+      ['量能低于基线，突破缺乏承接，容易假突破。'],
+      trendStrength
+    );
+  }
+
+  // 放量追势过滤：近期量能放大到基线1.2倍以上时，1分钟级别追入
+  // 极易被均值回归打掉止损（历史回放：量比>=1.2的订单胜率27%~33%，明显低于低量订单的36%）。
+  if (volumeAnalysis && volumeAnalysis.volumeRatio >= 1.2) {
+    return wait(
+      `近期成交量放大至基线${volumeAnalysis.volumeRatio.toFixed(2)}倍，避免放量追势。`,
+      ['等待量能回落后再评估入场。'],
+      trendStrength
+    );
+  }
+
+  // 综合评分过滤（门槛由 MIN_TREND_SCORE 控制，原值 60；提高到 66 用于降频 + 提质量）
+  if (trendStrength.score < MIN_TREND_SCORE) {
+    return wait(
+      `综合信号强度不足（${trendStrength.score}/100 < ${MIN_TREND_SCORE}），等待更强信号。`,
       [`当前评分：${trendStrength.reasons.join('; ')}`],
       trendStrength
     );
@@ -436,67 +573,100 @@ export function enhancedAnalysis(market) {
     );
   }
 
-  // 计算入场区间
-  const entryMin = close - atr * 0.5;
-  const entryMax = close + atr * 0.5;
+  // 本地规则引擎默认双向；显式配置只做多时统一拦截空头。
+  if (LONG_ONLY.enabled && direction === 'short') {
+    return wait(LONG_ONLY.reason, [], trendStrength);
+  }
+
+  // 追高/追空过滤：价格偏离20均线超过1.5倍ATR时放弃入场，等待回调。
+  // 历史复盘显示顺势追入的订单多在数分钟内被均值回归打掉止损。
+  const extension = (close - ma20) / atr;
+  if (direction === 'long' && extension > 1.5) {
+    return wait(
+      `价格偏离20均线上方超过1.5 ATR（${extension.toFixed(2)}），避免追高。`,
+      ['建议等待价格回调至均线附近再入场。'],
+      trendStrength
+    );
+  }
+  if (direction === 'short' && extension < -1.5) {
+    return wait(
+      `价格偏离20均线下方超过1.5 ATR（${extension.toFixed(2)}），避免追空。`,
+      ['建议等待价格反弹至均线附近再入场。'],
+      trendStrength
+    );
+  }
+
+  // 计算入场区间（半宽由 ENTRY_BAND_ATR 控制）
+  const entryMin = close - atr * ENTRY_BAND_ATR;
+  const entryMax = close + atr * ENTRY_BAND_ATR;
 
   // 动态止损止盈（基于ATR和支撑阻力）
   let stopLoss, takeProfit1, takeProfit2, takeProfit3;
 
+  // 噪声保护：止损距离取 2倍ATR 与 0.8% 价格距离的较大值。
+  // 历史复盘（2143笔已平仓）显示旧方案平均止损距离仅0.57%（1m ATR级别），
+  // 88.7%订单被止损、其中55%在入场几分钟内0次修改即被噪声扫出，胜率仅22.6%。
+  const riskUnit = Math.max(atr * 2.0, close * 0.008);
+
+  // 以现价为基准的盈亏比：|现价→目标| ÷ |现价→止损|
+  //
+  // 【口径变更 · 重要】本字段语义自 P3 起改为「现价→主止盈 ÷ 现价→止损」，
+  // 与 2025 年之前历史订单里 riskRewardRatio≈1.33 的旧口径**不可直接比较**：
+  // 旧公式以 entryMax（最不利入场价）为基准，把入场区间宽度（1 个 ATR）也计入风险，
+  // 分母 = 入场带宽 + riskUnit，分子只算到 2R 止盈，因此 2R 只能算出 1.33、3.5R 也只到 2.33；
+  // 新公式分母 = 现价到止损的距离，3.5R 对应约 3.0。
+  // 变更原因：保留旧口径时，MIN_RISK_REWARD_RATIO=2.5 会把所有信号挡死（0 开单）。
+  // 若需与历史订单的 RR 做同口径对比，请改用 plan 里的净盈亏比（research.js 的 netRewardRisk）。
+  const rrFromClose = target => {
+    const risk = Math.abs(close - stopLoss);
+    return risk > 0 ? Math.abs(target - close) / risk : 0;
+  };
+
   if (direction === 'long') {
-    // 止损：均线支撑或2倍ATR
-    const maSupportStop = Math.max(ma20, ma50) - atr * 0.5;
-    const atrStop = entryMin - atr * 2.0;
-    stopLoss = Math.max(maSupportStop, atrStop);
+    stopLoss = entryMin - riskUnit;
 
-    // 使用支撑阻力优化止损
-    if (srLevels && srLevels.support > stopLoss && srLevels.support < entryMin) {
-      stopLoss = srLevels.support - atr * 0.3;
-    }
+    // 多级止盈：按风险单位等比设置，主止盈（takeProfit3）提到 MAIN_TP_R_MULTIPLE 倍 R
+    takeProfit1 = entryMax + riskUnit * TP1_R_MULTIPLE;
+    takeProfit2 = entryMax + riskUnit * TP2_R_MULTIPLE;
+    takeProfit3 = entryMax + riskUnit * MAIN_TP_R_MULTIPLE;
 
-    // 多级止盈
-    takeProfit1 = entryMax + atr * 2.0;  // 保守目标
-    takeProfit2 = entryMax + atr * 4.0;  // 主要目标
-    takeProfit3 = entryMax + atr * 6.0;  // 激进目标
-
-    // 使用阻力位优化止盈
-    if (srLevels && srLevels.resistance < takeProfit3 && srLevels.resistance > takeProfit1) {
-      takeProfit2 = srLevels.resistance;
-      takeProfit3 = srLevels.resistance + atr * 2.0;
+    // 使用阻力位收窄止盈：只允许收窄到更近的阻力位，且收窄后盈亏比不得低于 SR_NARROW_MIN_RR，
+    // 否则放弃收窄、保留原主止盈（旧的无条件收窄会把 3.5R 压到 1.x R）。
+    if (srLevels && Number.isFinite(srLevels.resistance)
+      && srLevels.resistance < takeProfit3 && srLevels.resistance > takeProfit1) {
+      const narrowedTakeProfit = srLevels.resistance + riskUnit;
+      if (rrFromClose(narrowedTakeProfit) >= SR_NARROW_MIN_RR) {
+        takeProfit2 = srLevels.resistance;
+        takeProfit3 = narrowedTakeProfit;
+      }
     }
   } else {
-    // 止损：均线阻力或2倍ATR
-    const maResistanceStop = Math.min(ma20, ma50) + atr * 0.5;
-    const atrStop = entryMax + atr * 2.0;
-    stopLoss = Math.min(maResistanceStop, atrStop);
+    stopLoss = entryMax + riskUnit;
 
-    // 使用支撑阻力优化止损
-    if (srLevels && srLevels.resistance < stopLoss && srLevels.resistance > entryMax) {
-      stopLoss = srLevels.resistance + atr * 0.3;
-    }
+    takeProfit1 = entryMin - riskUnit * TP1_R_MULTIPLE;
+    takeProfit2 = entryMin - riskUnit * TP2_R_MULTIPLE;
+    takeProfit3 = entryMin - riskUnit * MAIN_TP_R_MULTIPLE;
 
-    // 多级止盈
-    takeProfit1 = entryMin - atr * 2.0;
-    takeProfit2 = entryMin - atr * 4.0;
-    takeProfit3 = entryMin - atr * 6.0;
-
-    // 使用支撑位优化止盈
-    if (srLevels && srLevels.support > takeProfit3 && srLevels.support < takeProfit1) {
-      takeProfit2 = srLevels.support;
-      takeProfit3 = srLevels.support - atr * 2.0;
+    // 使用支撑位收窄止盈：同样要求收窄后盈亏比不低于 SR_NARROW_MIN_RR
+    if (srLevels && Number.isFinite(srLevels.support)
+      && srLevels.support > takeProfit3 && srLevels.support < takeProfit1) {
+      const narrowedTakeProfit = srLevels.support - riskUnit;
+      if (rrFromClose(narrowedTakeProfit) >= SR_NARROW_MIN_RR) {
+        takeProfit2 = srLevels.support;
+        takeProfit3 = narrowedTakeProfit;
+      }
     }
   }
 
-  // 计算风险收益比
-  const riskDistance = Math.abs(entryMax - stopLoss) / entryMax;
-  const reward1Distance = Math.abs(takeProfit1 - entryMax) / entryMax;
-  const reward2Distance = Math.abs(takeProfit2 - entryMax) / entryMax;
-  const riskRewardRatio = reward2Distance / riskDistance;
+  // 计算风险收益比（主止盈口径；riskDistance 仍按最不利入场价用于推荐杠杆）
+  const worstEntry = direction === 'long' ? entryMax : entryMin;
+  const riskDistance = Math.abs(worstEntry - stopLoss) / worstEntry;
+  const riskRewardRatio = rrFromClose(takeProfit3);
 
-  // 风险收益比过滤（至少1.2:1，降低门槛）
-  if (riskRewardRatio < 1.2) {
+  // 风险收益比过滤（门槛由 MIN_RISK_REWARD_RATIO 控制，旧值 1.2 过低）
+  if (riskRewardRatio < MIN_RISK_REWARD_RATIO) {
     return wait(
-      `风险收益比不足（${riskRewardRatio.toFixed(2)}:1），等待更好位置。`,
+      `风险收益比不足（${riskRewardRatio.toFixed(2)}:1 < ${MIN_RISK_REWARD_RATIO}:1），等待更好位置。`,
       ['建议等待回调或突破至更优风险收益位置。']
     );
   }
@@ -523,10 +693,15 @@ export function enhancedAnalysis(market) {
       entryMin,
       entryMax,
       stopLoss,
-      takeProfit: takeProfit2,  // 主要目标
+      // 主止盈改用 3.5R 档（原为 2R 档）。2R 时净盈亏比仅 1.24，在 22.7% 胜率下
+      // 期望值为负；3.5R 是"胜率不至于崩塌"与"盈亏比足够"之间的折中。
+      takeProfit: takeProfit3,
       takeProfit1,
       takeProfit2,
       takeProfit3,
+      // P4 周期回退：主周期已由 5m 回退到 1m（见 research.js MAIN_INTERVAL），
+      // 根数须同步还原，否则 6 分钟入场窗口会缩成 2 分钟、2 小时持仓上限会缩成 24 分钟。
+      // 6根@1m=6min 入场窗口；120根@1m=2h 持仓上限（与 5m 时代的 2根/24根 等时）。
       validForBars: 6,
       maxHoldBars: 120,
       riskRewardRatio,
@@ -586,7 +761,7 @@ export function enhancedProtectionReview(order, market) {
   }
 
   // 2. RSI极值（更严格）
-  if (rsi) {
+  if (rsi !== null) {
     if (long && rsi > 80 && profit > 0.05) {
       shouldExit = true;
       exitReason = `RSI严重超买(${rsi.toFixed(1)})且已盈利5%+，建议获利了结`;
@@ -623,34 +798,34 @@ export function enhancedProtectionReview(order, market) {
   let newStopLoss = order.plan.stopLoss;
   let newTakeProfit = order.plan.takeProfit;
 
-  if (profit > 0.02) {
-    // 盈利超过2%，启用移动止损
+  if (profit > TRAIL_PROFIT_TRIGGER) {
+    // 盈利超过阈值，启用移动止损（距离参数化，见文件顶部 P3 参数区）
     if (long) {
       // 多头：止损移至成本或盈利保护位
       const breakEvenStop = order.entry + atr * 0.2;
-      const trailingStop = close - atr * 1.5;
+      const trailingStop = close - atr * TRAIL_STOP_ATR;  // P0-1 一致性：移动止损距离放宽到 2.5 ATR
       newStopLoss = Math.max(order.plan.stopLoss, breakEvenStop, trailingStop);
 
-      // 动态扩展止盈
-      newTakeProfit = Math.max(order.plan.takeProfit, close + atr * 3.0);
+      // 动态扩展止盈（只放宽不收紧：主止盈已是 3.5R，close+3ATR 通常低于它，取 max 后保持不变）
+      newTakeProfit = Math.max(order.plan.takeProfit, close + atr * TRAIL_TP_ATR);
     } else {
       // 空头：止损移至成本或盈利保护位
       const breakEvenStop = order.entry - atr * 0.2;
-      const trailingStop = close + atr * 1.5;
+      const trailingStop = close + atr * TRAIL_STOP_ATR;  // P0-1 一致性：移动止损距离放宽到 2.5 ATR
       newStopLoss = Math.min(order.plan.stopLoss, breakEvenStop, trailingStop);
 
       // 动态扩展止盈
-      newTakeProfit = Math.min(order.plan.takeProfit, close - atr * 3.0);
+      newTakeProfit = Math.min(order.plan.takeProfit, close - atr * TRAIL_TP_ATR);
     }
   } else {
-    // 未盈利，使用标准止损
-    if (long) {
-      newStopLoss = Math.max(order.plan.stopLoss, close - atr * 1.8);
-      newTakeProfit = Math.max(order.plan.takeProfit, close + atr * 3.5);
-    } else {
-      newStopLoss = Math.min(order.plan.stopLoss, close + atr * 1.8);
-      newTakeProfit = Math.min(order.plan.takeProfit, close - atr * 3.5);
-    }
+    // 未盈利超过2%：保持初始保护价格，不再收紧止损。
+    // 历史复盘显示旧逻辑在未盈利时按 close±1.8ATR 持续收紧止损，
+    // 会把初始止损棘轮式推向现价，入场几分钟内即被1m噪声扫出。
+    return {
+      action: 'HOLD',
+      reason: '持仓未盈利超过2%，保持初始保护价格，避免噪声止损。',
+      trendScore: trendStrength.score
+    };
   }
 
   // 验证止损是否收紧

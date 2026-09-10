@@ -3,9 +3,10 @@ import { analyzeMarkets } from './ai.js';
 import { createResearchRecord, prepareMarket, toBybitInterval, nextOpenTime } from './research.js';
 import { ResearchStore } from './researchStore.js';
 import { evaluateSignal, evaluationEnd, summarizeResults } from './paperTrading.js';
-import { localAnalysis, localAnalysisMultiTimeframe } from './localAnalysis.js';
+import { LOCAL_STRATEGY, localAnalysis, localAnalysisMultiTimeframe } from './localAnalysis.js';
 import { SimulatedAccount, registerSimulationRoutes } from './simulatedAccount.js';
 import { PaperAutomation, registerAutomationRoutes } from './paperAutomation.js';
+import { registerAdaptiveStrategyRoutes } from './adaptiveRoutes.js';
 
 const bounded = (value, fallback, min, max) => Number.isFinite(Number(value)) ? Math.max(min, Math.min(max, Math.trunc(Number(value)))) : fallback;
 
@@ -33,6 +34,7 @@ export async function registerResearchRoutes({ app, store, marketDb, loadContrac
   const simulation = new SimulatedAccount({ pool: marketDb.pool, market: marketData, archive, marketDb });
   await simulation.init();
   registerSimulationRoutes(app, simulation);
+  registerAdaptiveStrategyRoutes(app, simulation);
   simulation.start();
   const automation = new PaperAutomation({ simulation, store, market: marketData, marketDb, archive });
   await automation.init();
@@ -126,7 +128,7 @@ export async function registerResearchRoutes({ app, store, marketDb, loadContrac
           }
         }
 
-        const modelName = engine === 'local-mtf' ? 'local-mtf-trend-atr-v1' : 'local-trend-atr-v1';
+        const modelName = engine === 'local-mtf' ? LOCAL_STRATEGY.modelId : 'local-trend-atr-v2';
         const record = createResearchRecord({
           config: engine.startsWith('local') ? { ...config, model: { model: modelName, baseUrl: 'local://rules' } } : config,
           strategy: effectiveStrategy, market, result: { analyses, error: failures.join(' | ') }, type, scope
