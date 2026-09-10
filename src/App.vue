@@ -8,13 +8,12 @@ import { router } from './router.js';
 import TopBar from './components/TopBar.vue';
 import SymbolSidebar from './components/SymbolSidebar.vue';
 import WorkbenchView from './components/WorkbenchView.vue';
-import HistoryView from './components/HistoryView.vue';
-import AiSettings from './components/AiSettings.vue';
 import AnalysisResultCard from './components/AnalysisResultCard.vue';
 import TradingView from './components/TradingView.vue';
 import BinanceSettings from './components/BinanceSettings.vue';
 import MarketStatus from './components/MarketStatus.vue';
 import DailyTrendView from './components/DailyTrendView.vue';
+import AutomationView from './components/AutomationView.vue';
 
 // 配置/策略/状态集中到 store（前端唯一可信源）
 const configStore = useConfigStore();
@@ -22,28 +21,30 @@ const { config, strategy } = configStore;
 const { tradingStatus, symbolStatus, syncStatus, savedMode, statusError } = storeToRefs(configStore);
 const loadStatus = () => configStore.loadStatus();
 
+// 前端已下线的视图：「历史分析」「模型设置」（导航入口已移除）。
+// 老书签 / 历史 URL 落到这两个视图时回落到工作台，避免白屏。
+const AVAILABLE_VIEWS = ['workbench', 'trading', 'trading-simulation', 'automation', 'daily-trend'];
+const normalizeView = view => (AVAILABLE_VIEWS.includes(view) ? view : 'workbench');
+
 const activeView = ref('workbench');
 const activeSymbol = ref('BTCUSDT');
 const chartDate = ref('');
 const search = ref('');
 const historyDate = ref(new Date().toISOString().slice(0, 10));
-const historySymbol = ref('');
 const selectedHistory = ref(null);
 const selectedHistorySymbol = ref('');
 const loading = ref(false);
 const loadingAreas = reactive({ symbols: 0, market: 0, history: 0, analysis: 0, settings: 0, klineSync: 0 });
 const message = ref('');
 const error = ref('');
-const state = reactive({ symbols: [], rows: [], analyses: [], currentAnalysis: null, symbolAnalyses: [] });
-let marketController, historyController, symbolHistoryController;
+const state = reactive({ symbols: [], rows: [], currentAnalysis: null, symbolAnalyses: [] });
+let marketController, symbolHistoryController;
 let selectedInterval = '1m';
 let symbolsRequestId = 0;
 let marketRequestId = 0;
 let analysisRequestId = 0;
 let mounted = false;
 let unsubscribeRoute;
-let historyRequestId = 0;
-let lastHistoryQuery = '';
 let lastSymbolHistoryQuery = '';
 let statusBusy = false;
 
@@ -57,9 +58,12 @@ const scope = reactive({ engine: 'auto', interval: '1m', limit: 80, maxSymbols: 
 const chart = computed(() => buildChart(state.rows));
 
 onMounted(async () => {
-  // 从 URL 恢复状态
+  // 从 URL 恢复状态（已下线的视图回落工作台）
   const routeState = router.getState();
-  activeView.value = routeState.view || 'workbench';
+  const wanted = routeState.view || 'workbench';
+  const restored = normalizeView(wanted);
+  activeView.value = restored;
+  if (restored !== wanted) router.replace(restored, {});
 
   if (routeState.params.symbol) {
     activeSymbol.value = routeState.params.symbol;
@@ -73,30 +77,23 @@ onMounted(async () => {
 
   // 监听路由变化
   unsubscribeRoute = router.onChange((newState) => {
-    activeView.value = newState.view;
+    activeView.value = normalizeView(newState.view);
     if (newState.params.symbol && newState.params.symbol !== activeSymbol.value) {
       selectSymbol(newState.params.symbol);
     }
     if (newState.params.date && newState.params.date !== historyDate.value) {
       historyDate.value = newState.params.date;
-      if (newState.view === 'history') {
-        loadHistoryByDate(true);
-      }
+      loadSymbolHistory(true);
     }
   });
 
-  await loadAiSettings();
+  await loadConfig();
   mounted = true;
-  await Promise.allSettled([loadSymbols(), selectSymbol(activeSymbol.value), loadAnalyses(), loadStatus()]);
-
-  // 根据当前视图加载必要数据
-  if (activeView.value === 'history') {
-    loadHistoryByDate();
-  }
+  await Promise.allSettled([loadSymbols(), selectSymbol(activeSymbol.value), loadStatus()]);
 
   if (mounted) statusTimer = setInterval(loadStatus, 10000);
 });
-onBeforeUnmount(() => { mounted = false; unsubscribeRoute?.(); clearInterval(statusTimer); marketController?.abort(); historyController?.abort(); symbolHistoryController?.abort(); });
+onBeforeUnmount(() => { mounted = false; unsubscribeRoute?.(); clearInterval(statusTimer); marketController?.abort(); symbolHistoryController?.abort(); });
 
 watch(() => [scope.interval, scope.limit, chartDate.value], () => {
   if (mounted) {
@@ -184,7 +181,7 @@ async function analyzeSymbol() {
       throw err;
     });
     if (requestId === analysisRequestId && symbol === activeSymbol.value && interval === scope.interval) state.currentAnalysis = record;
-    await Promise.all([loadAnalyses(true), loadSymbolHistory(true)]);
+    await loadSymbolHistory(true);
     if (record.error) error.value = record.error;
     message.value = record.error ? '' : '已保存 ' + symbol + ' 的分析';
   }, 'analysis');
@@ -194,10 +191,9 @@ async function analyzeAll() { await analyzeBatch('all'); }
 async function analyzeBatch(type) {
   await run(async () => {
     const record = await api('/market/analyze-' + type, { method: 'POST', body: { scope: { ...scope } } });
-    await loadAnalyses(true);
+    // 「历史分析」页已下线：批量分析结果直接弹详情弹窗展示
     selectedHistory.value = record;
     selectedHistorySymbol.value = '';
-    activeView.value = 'history';
     if (record.error) error.value = record.error;
     message.value = record.error ? '' : '已保存 ' + record.marketCount + ' 个币种的分析';
   }, 'analysis');
@@ -218,26 +214,7 @@ async function fetchLatestKlines(interval = scope.interval) {
     await loadStatus();
   }
 }
-async function loadAnalyses(force = false) {
-  const query = `${historyDate.value}|${historySymbol.value}`;
-  historyController?.abort();
-  if (!force && query === lastHistoryQuery) return;
-  historyController = new AbortController();
-  const signal = historyController.signal;
-  const requestId = ++historyRequestId;
-  await run(async () => {
-    const records = await api(`/analyses?date=${historyDate.value}&symbol=${encodeURIComponent(historySymbol.value)}&limit=100`, { signal });
-    if (requestId === historyRequestId) {
-      lastHistoryQuery = query;
-      state.analyses = records || [];
-    }
-  }, 'history');
-}
-async function loadHistoryByDate(force = false) {
-  await Promise.all([loadAnalyses(force), loadSymbolHistory(force)]);
-}
-async function loadAiSettings() { await run(async () => { await configStore.load(); scope.interval = strategy.interval || scope.interval; scope.limit = strategy.klineLimit || scope.limit; }, 'settings'); }
-async function saveAiSettings() { await run(async () => { await configStore.saveAi(); message.value = 'AI模型配置和提示词已保存'; }, 'settings'); }
+async function loadConfig() { await run(async () => { await configStore.load(); scope.interval = strategy.interval || scope.interval; scope.limit = strategy.klineLimit || scope.limit; }, 'settings'); }
 async function saveBinanceSettings() { await run(async () => { await configStore.saveBinance(); message.value = '币安交易配置已保存'; }, 'settings'); }
 async function testBinance() { const result = await run(() => configStore.test(), 'settings'); if (result) message.value = `${result.testnet ? '测试网' : '实盘'}只读连接成功 · ${result.activePositions} 个持仓 · ${result.positionMode === 'hedge' ? '双向持仓（自动交易需切换为单向）' : '单向持仓'}`; }
 async function reviewBinance() { const result = await run(() => configStore.review(), 'settings'); if (result) { await loadStatus(); message.value = result.reason || `已复核 ${result.reviewed || 0} 个持仓，请查看执行记录`; } }
@@ -257,12 +234,8 @@ let statusTimer;
     if (view === 'workbench') {
       params.symbol = activeSymbol;
       params.interval = scope.interval;
-    } else if (view === 'history') {
-      params.date = historyDate;
     }
     router.push(view, params);
-
-    if (view === 'history') loadHistoryByDate();
   }" /><div v-if="isBusy" class="global-progress" role="status"><span></span>正在加载，请稍候…</div><div v-if="message" class="notice">{{ message }}</div><div v-if="error" class="error">{{ error }}</div>
     <div class="workspace" :class="{ 'summary-page': activeView !== 'workbench' }"><SymbolSidebar v-if="activeView === 'workbench'" v-model:search="search" :symbols="filteredSymbols" :active-symbol="activeSymbol" :loading="Boolean(loadingAreas.symbols)" @refresh="loadSymbols(true)" @select="selectSymbol" />
       <main class="main-content">
@@ -273,19 +246,12 @@ let statusTimer;
         }" :active-symbol="activeSymbol" :interval="scope.interval" :rows="state.rows" :chart="chart" :current-analysis="visibleAnalysis" :symbol-analyses="visibleHistory" :loading="isAnalysisLoading" :market-loading="isMarketLoading" :kline-sync-loading="isKlineSyncLoading" :history-loading="isHistoryLoading" :history-date="historyDate" :scope="scope" :symbol-count="state.symbols.length" @analyze="analyzeSymbol" @analyze-range="analyzeRange" @analyze-all="analyzeAll" @refresh="selectSymbol(activeSymbol)" @fetch-latest="fetchLatestKlines" @update:history-date="(date) => {
           if (date !== historyDate) {
             historyDate = date;
-            loadHistoryByDate(true);
+            loadSymbolHistory(true);
           }
         }" @history="openHistory" />
         <TradingView v-else-if="activeView === 'trading-simulation'" />
-        <HistoryView v-else-if="activeView === 'history'" :date="historyDate" :records="state.analyses" :loading="isHistoryLoading" @update:date="(date) => {
-          if (date !== historyDate) {
-            historyDate = date;
-            router.updateParams({ date });
-            loadHistoryByDate(true);
-          }
-        }" @refresh="() => loadHistoryByDate(true)" @open="openHistory" />
+        <AutomationView v-else-if="activeView === 'automation'" />
         <DailyTrendView v-else-if="activeView === 'daily-trend'" />
-        <AiSettings v-else-if="activeView === 'settings'" :model="config.model" :strategy="strategy" :loading="Boolean(loadingAreas.settings)" @save="saveAiSettings" />
         <BinanceSettings v-else-if="activeView === 'trading'" :binance="config.binance" :trader="config.trader" :status="tradingStatus" :saved-mode="savedMode" :loading="Boolean(loadingAreas.settings)" @save="saveBinanceSettings" @test="testBinance" @review="reviewBinance" />
       </main></div>
     <div v-if="selectedHistory" class="modal-backdrop" @click.self="selectedHistory = null"><article class="modal"><button class="modal-close" @click="selectedHistory = null">×</button><span class="eyebrow">ANALYSIS DETAIL</span><h2>{{ selectedHistory.type !== 'single' ? '范围分析详情' : selectedHistory.symbol }}</h2><p class="muted">{{ new Date(selectedHistory.at).toLocaleString() }} · {{ selectedHistory.interval }} · 版本 {{ selectedHistory.strategyVersion || '旧记录' }}</p><div v-for="item in selectedHistory.analyses.filter((entry) => !selectedHistorySymbol || entry.symbol === selectedHistorySymbol)" :key="`${selectedHistory.id}-${item.symbol}`" class="detail-item"><AnalysisResultCard :item="item" /></div></article></div>

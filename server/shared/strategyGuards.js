@@ -49,6 +49,37 @@ export const LONG_ONLY = Object.freeze({
   reason: '当前配置 NOFX_LONG_ONLY 已启用，仅允许做多。'
 });
 
+// ───────────────────────── 挂单复核（pendingReview） ─────────────────────────
+//
+// 背景（2026-09-11 实测，见 output/strategy-review-2026-09-11.html 第六节）：
+// 01:12 禁空上线后创建的 18 笔挂单被 **100% 取消、成交 0 笔**，平均只活 18.9 分钟。
+// 取消原因（signal.reason 原文）绝大多数是「量比 < 0.8」「波动率 < 0.20%」这类
+// **每根 1m K 线重算**的软门槛在门槛线附近抖动（0.71 / 0.74 / 0.78 / 0.79 都判不合格）。
+// 系统因此事实停摆（只挂单、不成交）。
+//
+// 对策：把「取消」拆成两级 ——
+//   1. 方向反转（推荐方向变成相反的开仓方向）→ 立即取消，这是真正的「策略不再支持」；
+//   2. 软门槛不合格（量能 / 波动率 / 评分 / 追高等）→ 需累计到宽限阈值才取消，
+//      单轮抖动不再砍单。
+//
+// 另：改价（repriced）实测无效 —— 16 次改价全部落在最终被取消的单上，无一次救回，
+// 幅度 0.25%~0.9%（≈0.4~1.3R）纯属抖动，且每次改价会重置 initialPlan /
+// protectionRevisions。故默认关闭：挂单挂出后只保留或取消，不再改价。
+export const PENDING_REVIEW = Object.freeze({
+  // 方向反转时立即取消（关掉后方向反转也走宽限，仅用于对照实验）
+  cancelOnReversal: bool('NOFX_PENDING_CANCEL_ON_REVERSAL', true),
+  // 软门槛连续不合格达到该轮数才取消。
+  // ⚠️ 注意：positionReview 每 10 秒一轮，实测 6 轮只撑 1.2 分钟 ——「轮数」不是时间的好代理。
+  // 默认取 240（≈56 分钟）作为**安全阀**，正常情况下由下面的时间阈值先触发。
+  graceRounds: num('NOFX_PENDING_GRACE_ROUNDS', 240, 1, 2000),
+  // 或持续不合格达到该分钟数才取消（与轮数是「或」关系，先到先生效）。
+  // 这是实际生效的宽限时长：量比/波动率这类抖动的周期是分钟级，30 分钟足以过滤，
+  // 同时不至于让失效挂单长期占用活动订单额度（上限 20 笔）。
+  graceMinutes: num('NOFX_PENDING_GRACE_MIN', 30, 0, 480),
+  // true = 挂单挂出后不再改价；false = 回退到旧的改价（repriced）行为
+  noReprice: bool('NOFX_PENDING_NO_REPRICE', true)
+});
+
 // ───────────────────────── 移动止损（trailing）规则 ─────────────────────────
 //
 // ⚠️ 2026-09-10 修正（保本跳变）：旧实现是 `newStop = max(原止损, entry±0.2ATR,
@@ -113,6 +144,94 @@ export const SMART_EXIT = Object.freeze({
   // 根级离场：把「均线失守」下沉到逐根K线判定，避免只在复核周期（120s+）才检查
   barLevelMaExit: bool('NOFX_SMART_EXIT_BAR_LEVEL', true)
 });
+
+// ─────────────────── 分批止盈（Partial Take Profit）规则 ───────────────────
+//
+// 背景（2026-09-11，P3~P5 复盘的延续）：
+//   主止盈 k·R（当前 3.0R）与样本平均最大浮盈 MFE ≈ 1.9R 之间存在**结构性缺口** ——
+//   多数订单走到 1~2R 就被回撤打回止损，3R 几乎从不兑现，属「账面盈亏比」。
+//   enhancedAnalysis 顶部注释已判定：靠调单一止盈价已到极限，真正的出口是分批止盈。
+//
+// 机制：把「全仓一次性止盈」拆成三段 ——
+//   · 触及 TP1（1R）→ 平掉 tp1ClosePct，并把剩余仓位的止损抬到**净保本线**（锁定无风险）
+//   · 触及 TP2（2R）→ 再平 tp2ClosePct
+//   · 剩余「奔跑仓」→ 继续奔主止盈（plan.takeProfit，当前 3R）
+//   任一时刻若先命中止损 / 主止盈 / 智能退出，剩余仓位一次性结清，
+//   各批已实现盈亏一并汇总进 net（见 tradingSimulator._settle）。
+//
+// 口径：TP 价格一律以**实际成交价 entry** 为基准按 R 折算（entry ± tpNR × R），
+//   与 TRAILING_RULE / SMART_EXIT 的 R 口径同源（R = |entry − 初始止损|）。
+//   ⚠️ 刻意**不复用** plan.takeProfit1/2 —— 那两个是 enhancedAnalysis 以 entryMax
+//   为基准算的展示值，与本规则的 entry 基准不同源，混用会静默偏移目标价。
+//
+// ⚠️ 这是出场节奏的实质改变：会显著改变平均持仓时长与单笔盈亏分布。
+//   启用后必须重新累计 ≥100 笔再评估（与移动止损阶梯同纪律）。
+//   回滚：NOFX_PARTIAL_TP=false（立即回到「全仓等主止盈」的旧行为）。
+const TP1_CLOSE_PCT = num('NOFX_TP1_CLOSE_PCT', 0.4, 0.05, 0.95);
+const TP2_CLOSE_PCT_RAW = num('NOFX_TP2_CLOSE_PCT', 0.4, 0.05, 0.95);
+// 奔跑仓下限：两批之和不得吃光全部仓位，否则最后一档「奔主止盈」形同虚设
+const RUNNER_MIN_PCT = 0.05;
+const TP2_CLOSE_PCT = (() => {
+  if (TP1_CLOSE_PCT + TP2_CLOSE_PCT_RAW <= 1 - RUNNER_MIN_PCT) return TP2_CLOSE_PCT_RAW;
+  const clamped = Math.max(0.05, 1 - RUNNER_MIN_PCT - TP1_CLOSE_PCT);
+  console.warn(`[strategyGuards] ⚠️ NOFX_TP1_CLOSE_PCT(${TP1_CLOSE_PCT}) + NOFX_TP2_CLOSE_PCT(${TP2_CLOSE_PCT_RAW})`
+    + ` 超过 ${1 - RUNNER_MIN_PCT}，已把第二批截断为 ${clamped.toFixed(3)}（保留奔跑仓奔主止盈）。`);
+  return clamped;
+})();
+
+export const PARTIAL_TP = Object.freeze({
+  enabled: bool('NOFX_PARTIAL_TP', true),
+  tp1R: num('NOFX_TP1_R', 1.0, 0.1, 10),
+  tp2R: num('NOFX_TP2_R', 2.0, 0.1, 10),
+  tp1ClosePct: TP1_CLOSE_PCT,
+  tp2ClosePct: TP2_CLOSE_PCT,
+  // TP1 成交后是否把剩余仓位的止损抬到净保本线。
+  //
+  // 默认**关闭**。理由（本轮实测发现的坑）：
+  //   已有的移动止损阶梯 TRAILING_RULE.ladder 在 1R 档就提供等效锁盈
+  //   （lockR = 0.30R，与本开关的保本线 0.325R 几乎重合），而本开关是**根级用 low 判定**，
+  //   比复核级（用 close 判定）激进得多 —— 会把「刚平完 TP1、当根就回踩」的单直接扫掉。
+  //   这与历史结论「盈利需要持仓时间（<5 根胜率 0%、≥45 根胜率 64-70%）」直接相悖：
+  //   胜率会好看，但均单盈亏会被过早离场吃掉（与 0.2R 触发那次同型错误）。
+  // 故默认只让分批止盈改变「落袋节奏」，止损节奏仍交给已验证过的阶梯（风险最小）。
+  // 想更激进：NOFX_TP_BREAKEVEN=true —— 需重新累计 ≥100 笔再评估。
+  moveStopToBreakEven: bool('NOFX_TP_BREAKEVEN', false)
+});
+
+(() => {
+  if (PARTIAL_TP.enabled && PARTIAL_TP.tp1R + 1e-9 >= PARTIAL_TP.tp2R) {
+    console.warn(`[strategyGuards] ⚠️ 配置冲突：NOFX_TP1_R(${PARTIAL_TP.tp1R}) 不小于 NOFX_TP2_R(${PARTIAL_TP.tp2R})，`
+      + ` 两档顺序颠倒，TP2 会在 TP1 之前触发。请让 TP1_R < TP2_R。`);
+  }
+})();
+
+/**
+ * 分批止盈的两档目标价（以实际成交价为基准的 R 口径）。
+ *
+ * 严格晚于（劣于）主止盈的档位会被丢弃 —— 那种档位永远轮不到触发，
+ * 主止盈会先成交，留着只会让「已实现盈亏」分摊逻辑多出一条死分支。
+ *
+ * @param {{long:boolean, entry:number, riskUnit:number, mainTakeProfit?:number}} p
+ * @returns {Array<{stage:number, price:number, closePct:number, r:number}>} 按 stage 升序
+ */
+export function partialTpLevels({ long, entry, riskUnit, mainTakeProfit }) {
+  if (!PARTIAL_TP.enabled) return [];
+  const r = Number(riskUnit);
+  const base = Number(entry);
+  if (!Number.isFinite(base) || !Number.isFinite(r) || r <= 0) return [];
+
+  const main = Number(mainTakeProfit);
+  const levels = [];
+  const push = (stage, rMultiple, closePct) => {
+    const price = long ? base + rMultiple * r : base - rMultiple * r;
+    // 主止盈已知时，只保留严格早于主止盈的档位（多头更低、空头更高）
+    if (Number.isFinite(main) && main > 0 && (long ? !(price < main) : !(price > main))) return;
+    levels.push({ stage, price, closePct, r: rMultiple });
+  };
+  push(1, PARTIAL_TP.tp1R, PARTIAL_TP.tp1ClosePct);
+  push(2, PARTIAL_TP.tp2R, PARTIAL_TP.tp2ClosePct);
+  return levels;
+}
 
 // ─────────────────────── 风险几何（止损口径 / 杠杆） ───────────────────────
 //

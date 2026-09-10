@@ -1,7 +1,6 @@
 <script setup>
 import { computed, onMounted, ref, watch } from 'vue';
 import { api } from '../api.js';
-import AutomationTasks from './AutomationTasks.vue';
 import { router } from '../router.js';
 import { fmt, pct, statusLabel as status, reasonLabel as reason } from '../utils/format.js';
 
@@ -30,7 +29,7 @@ const page = ref(1);
 const appliedFilter = ref('全部日期 / 全部币种');
 
 // 筛选器
-const statusFilter = ref('all'); // all, pending, open, closed, cancelled
+const statusFilter = ref('all'); // all, pending, open（交易模拟只展示持仓与待入场单）
 const directionFilter = ref('all'); // all, long, short
 const sortBy = ref('createdAt'); // createdAt, net, roi
 const sortOrder = ref('desc'); // asc, desc
@@ -44,7 +43,8 @@ const groups = computed(() => performanceData.value?.[grouping.value] || []);
 const filteredOrders = computed(() => {
   if (!accountData.value?.orders) return [];
 
-  let orders = accountData.value.orders;
+  // 交易模拟只关注「持仓」(open) 与「待入场单」(pending)，其余状态（已平仓/已取消等）一律不在此页展示
+  let orders = accountData.value.orders.filter(o => ['pending', 'open'].includes(o.status));
 
   // 状态筛选
   if (statusFilter.value === 'pending') {
@@ -455,7 +455,6 @@ onMounted(() => {
       </div>
     </div>
 
-    <AutomationTasks />
     <!-- 标签切换 -->
     <div class="tab-switcher">
       <button
@@ -559,8 +558,6 @@ onMounted(() => {
             <option value="all">全部</option>
             <option value="pending">等待入场</option>
             <option value="open">模拟持仓</option>
-            <option value="closed">已平仓</option>
-            <option value="cancelled">已取消</option>
           </select>
         </label>
 
@@ -595,7 +592,7 @@ onMounted(() => {
       </div>
 
       <!-- 订单表格 -->
-      <h2 class="performance-subtitle">订单列表（第 {{ orderPage }} / {{ totalOrderPages }} 页）</h2>
+      <h2 class="performance-subtitle">持仓与待入场单（第 {{ orderPage }} / {{ totalOrderPages }} 页）</h2>
       <div class="performance-table">
         <table>
           <thead>
@@ -643,6 +640,9 @@ onMounted(() => {
                   取消
                 </button>
               </td>
+            </tr>
+            <tr v-if="!paginatedOrders.length">
+              <td colspan="10" class="empty">当前没有持仓或待入场单</td>
             </tr>
           </tbody>
         </table>

@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { GlobalAutomation } from '../server/globalAutomation.js';
 import { SimulatedAccount, accountSummary, advancePaperOrder } from '../server/simulatedAccount.js';
-import { applyPendingReview } from '../server/shared/pendingReview.js';
+import { applyPendingReview, HELD_INELIGIBLE } from '../server/shared/pendingReview.js';
+import { PENDING_REVIEW } from '../server/shared/strategyGuards.js';
 import { candleOpenAt, nextOpenTime, PAPER_COSTS } from '../server/research.js';
 
 const minute = 60000;
@@ -14,6 +15,9 @@ const pending = (extra = {}) => ({ id: 'p1', symbol: 'BTCUSDT', interval: '1m', 
 const signal = (extra = {}) => ({ eligible: true, positionRecommendation: 'OPEN_LONG', plan: { ...plan, entryLimit: 97 },
   validationIssues: [], dataAsOf: new Date(now).toISOString(), ...extra });
 const candle = (t, extra = {}) => ({ openTime: t, open: 105, high: 106, low: 104, close: 105, volume: 10, confirmed: true, ...extra });
+// 软门槛不合格（量能/波动率类）的信号：eligible=false、无 plan、方向为 WAIT
+const ineligibleAt = (t, extra = {}) => signal({ eligible: false, positionRecommendation: 'WAIT', plan: null,
+  dataAsOf: new Date(candleOpenAt(t, '1m')).toISOString(), ...extra });
 const makeAutomation = (extra = {}) => new GlobalAutomation({ simulation: {}, market: {}, marketDb: {}, archive: {}, store: {}, ...extra });
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
@@ -76,32 +80,77 @@ test('start is idempotent and stop clears both schedules', async () => {
   assert.equal(Object.values(automation.timers).filter(Boolean).length, 0);
 });
 
-test('pending repricing preserves id and margin, lowers risk and cannot fill retroactively', () => {
+test('pending orders keep their original limit and leverage; repricing is off by default', () => {
   const order = pending();
-  const beforeNotional = order.notional;
   const result = applyPendingReview(order, signal(), now + 1000);
-  assert.equal(result.action, 'repriced');
-  assert.equal(order.id, 'p1'); assert.equal(order.margin, 100);
-  assert.ok(order.notional <= beforeNotional);
-  assert.equal(order.plan.entryLimit, 97);
-  assert.equal(order.nextTime, now + minute);
-  advancePaperOrder(order, [candle(now, { low: 96 })], now + minute);
+  assert.equal(result.action, 'held');
   assert.equal(order.status, 'pending');
-  advancePaperOrder(order, [candle(now + minute, { low: 96 })], now + 2 * minute);
-  assert.equal(order.status, 'open');
-  assert.equal(order.entryAt, new Date(now + minute).toISOString());
+  assert.equal(order.plan.entryLimit, 98);   // 未被改成信号里的 97
+  assert.equal(order.leverage, 3);
+  assert.equal(order.notional, 300);
+  assert.deepEqual(order.initialPlan, plan); // 改价会重置 initialPlan，默认不允许
 });
 
-test('WAIT and opposite direction cancel pending orders and release reserves', () => {
-  for (const replacement of [signal({ eligible: false, positionRecommendation: 'WAIT', plan: null }),
-    signal({ positionRecommendation: 'OPEN_SHORT' })]) {
-    const order = pending();
-    const state = { initialBalance: 10000, orders: [order] };
-    assert.ok(accountSummary(state).available < 10000);
-    assert.equal(applyPendingReview(order, replacement, now).action, 'cancelled');
-    assert.equal(order.reason, 'strategy_cancelled');
-    assert.equal(accountSummary(state).available, 10000);
+test('opposite direction cancels pending orders immediately and releases reserves', () => {
+  const order = pending();
+  const state = { initialBalance: 10000, orders: [order] };
+  assert.ok(accountSummary(state).available < 10000);
+  assert.equal(applyPendingReview(order, signal({ positionRecommendation: 'OPEN_SHORT' }), now).action, 'cancelled');
+  assert.equal(order.reason, 'strategy_cancelled');
+  assert.equal(accountSummary(state).available, 10000);
+});
+
+test('soft ineligibility is held within grace and only cancels after the grace is exhausted', () => {
+  const rounds = PENDING_REVIEW.graceRounds;
+  // 轮数宽限：每轮只推进 1 秒，避免时间阈值提前触发，单独验证轮数上限
+  const byRounds = pending();
+  for (let round = 1; round < rounds; round++) {
+    const t = now + round * 1000;
+    byRounds.nextTime = candleOpenAt(t, '1m');
+    assert.equal(applyPendingReview(byRounds, ineligibleAt(t), t).action, HELD_INELIGIBLE, `第 ${round} 轮应在宽限内`);
+    assert.equal(byRounds.status, 'pending');
   }
+  const last = now + rounds * 1000;
+  byRounds.nextTime = candleOpenAt(last, '1m');
+  assert.equal(applyPendingReview(byRounds, ineligibleAt(last), last).action, 'cancelled');
+  assert.equal(byRounds.reason, 'strategy_cancelled');
+
+  // 时间宽限：第 1 轮保留，超过 graceMinutes 后第 2 轮即取消
+  const byTime = pending();
+  byTime.nextTime = candleOpenAt(now, '1m');
+  assert.equal(applyPendingReview(byTime, ineligibleAt(now), now).action, HELD_INELIGIBLE);
+  const later = now + (PENDING_REVIEW.graceMinutes + 5) * minute;
+  byTime.nextTime = candleOpenAt(later, '1m');
+  assert.equal(applyPendingReview(byTime, ineligibleAt(later), later).action, 'cancelled');
+
+  // 未超过时间阈值时，即使多轮也必须保留
+  const withinTime = pending();
+  for (let round = 0; round < 20; round++) {
+    const t = now + round * 60_000;
+    withinTime.nextTime = candleOpenAt(t, '1m');
+    assert.equal(applyPendingReview(withinTime, ineligibleAt(t), t).action, HELD_INELIGIBLE);
+  }
+  assert.equal(withinTime.status, 'pending');
+});
+
+test('grace counter resets once the signal becomes eligible again', () => {
+  const order = pending();
+  const t1 = now + minute;
+  order.nextTime = candleOpenAt(t1, '1m');
+  applyPendingReview(order, ineligibleAt(t1), t1);
+  assert.equal(order.ineligibleRounds, 1);
+
+  const t2 = now + 2 * minute;
+  order.nextTime = candleOpenAt(t2, '1m');
+  applyPendingReview(order, signal({ dataAsOf: new Date(candleOpenAt(t2, '1m')).toISOString() }), t2);
+  assert.equal(order.ineligibleRounds, 0);
+  assert.equal(order.ineligibleSince, null);
+
+  // 重新不合格后从 1 开始数，不继承旧计数
+  const t3 = now + 3 * minute;
+  order.nextTime = candleOpenAt(t3, '1m');
+  assert.equal(applyPendingReview(order, ineligibleAt(t3), t3).action, HELD_INELIGIBLE);
+  assert.equal(order.ineligibleRounds, 1);
 });
 
 test('missing, stale, invalid or incomplete analysis never cancels or reprices', () => {

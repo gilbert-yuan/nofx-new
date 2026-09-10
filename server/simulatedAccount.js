@@ -74,14 +74,35 @@ export function submitPaperOrder(state, record, input, now = Date.now()) {
 export function settlePaperOrder(order, price, reason, time, ambiguousBar = false) {
   const direction = order.direction === 'OPEN_LONG' ? 1 : -1;
   const exit = price * (1 - direction * order.costs.slippageBps / 10000);
-  const gross = direction * (exit - order.entry) * order.quantity;
-  const exitFee = exit * order.quantity * order.costs.feeBps / 10000;
-  const funding = order.notional * order.costs.fundingBpsPer8h / 10000 * Math.max(0, time - Date.parse(order.entryAt)) / 28800000;
-  const rawNet = gross - order.entryFee - exitFee - funding;
+  const quantity = order.quantity;
+
+  // ── 分批止盈汇总（2026-09-11）──────────────────────────────────────────
+  // 手动平仓 / 智能退出 CLOSE 走的都是本函数，而不是 tradingSimulator._settle。
+  // 若此前已分批成交，order.quantity 只剩奔跑仓，已实现盈亏记在 realized* 上 ——
+  // 不并入的话，这批盈利会凭空消失（明明赚了却被记成少赚）。
+  // 入场费按剩余仓位比例分摊，与 _settle 完全同口径。
+  const prior = {
+    gross: Number(order.realizedGross) || 0,
+    fee: Number(order.realizedFee) || 0,
+    funding: Number(order.realizedFunding) || 0,
+    net: Number(order.realizedNet) || 0,
+    qty: Number(order.realizedQty) || 0
+  };
+  const originalQty = prior.qty + quantity;
+  const share = originalQty > 0 ? quantity / originalQty : 0;
+
+  const gross = direction * (exit - order.entry) * quantity;
+  const exitFee = exit * quantity * order.costs.feeBps / 10000;
+  const entryFee = (order.entryFee || 0) * share;
+  const funding = order.notional * share * order.costs.fundingBpsPer8h / 10000 * Math.max(0, time - Date.parse(order.entryAt)) / 28800000;
+  const rawNet = (gross - entryFee - exitFee - funding) + prior.net;
   // Isolated simulated collateral: never debit more than reserved margin + entry fee.
   const net = Math.max(-order.margin - order.entryFee, rawNet);
-  Object.assign(order, { status: 'closed', exit, exitAt: new Date(time).toISOString(), reason, gross,
-    fees: order.entryFee + exitFee, funding, net, roi: net / order.margin,
+  Object.assign(order, { status: 'closed', exit, exitAt: new Date(time).toISOString(), reason,
+    gross: gross + prior.gross,
+    fees: entryFee + exitFee + prior.fee,
+    funding: funding + prior.funding,
+    net, roi: net / order.margin,
     isolatedLossAdjustment: net - rawNet, ambiguousBar, unrealized: 0, error: '' });
 
   // 标记需要进行复盘分析
@@ -102,8 +123,11 @@ export function advancePaperOrder(order, rows, now = Date.now()) {
   const result = simulator.evaluate(order, rows, now);
 
   // 只保存引擎实际处理的连续已收盘K线进度，包括缺口之前和同根平仓时的入场。
+  // 分批止盈状态（tpStage / tpStopFloor / realized*）必须回写，否则分批进度跨轮丢失 ——
+  // 下一轮会从头重新平第一批，导致仓位被重复平掉。全部是标量，落 extensions 表无压力。
   for (const key of ['nextTime', 'entry', 'entryAt', 'heldBars', 'quantity', 'entryFee',
-    'liquidationPrice', 'markPrice', 'markAt', 'unrealized']) {
+    'liquidationPrice', 'markPrice', 'markAt', 'unrealized',
+    'tpStage', 'tpStopFloor', 'realizedGross', 'realizedFee', 'realizedFunding', 'realizedNet', 'realizedQty']) {
     if (result[key] !== undefined && result[key] !== null) order[key] = result[key];
   }
 
@@ -134,6 +158,7 @@ export function advancePaperOrder(order, rows, now = Date.now()) {
       roi: result.roi,
       isolatedLossAdjustment: result.isolatedLossAdjustment,
       ambiguousBar: result.ambiguousBar,
+      partialFills: result.partialFills || 0,
       unrealized: 0,
       error: ''
     });

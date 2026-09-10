@@ -43,7 +43,7 @@ onBeforeUnmount(() => { disposed = true; clearInterval(timer); });
         <p v-if="task.progress?.symbol">当前币种：{{ task.progress.symbol }}</p>
         <small>最近完成：{{ time(task.lastRun) }}</small>
         <small>下一轮：{{ state.active && task.enabled ? time(task.nextRunAt) : '—' }}</small>
-        <p v-if="key === 'positionReview'">本次启动以来：撤单 {{ task.cancelled || 0 }} · 挂单改价 {{ task.repriced || 0 }}</p>
+        <p v-if="key === 'positionReview'">本次启动以来：撤单 {{ task.cancelled || 0 }} · 宽限保留 {{ task.graced || 0 }} · 改价 {{ task.repriced || 0 }}</p>
         <p v-if="task.error" class="signal-warning">{{ task.error }}</p>
         <div class="task-actions">
           <button class="secondary" :disabled="busy" @click="action(`/automation/tasks/${key}`, 'PUT', { enabled: !task.enabled })">{{ task.enabled ? '暂停此任务' : '启用此任务' }}</button>

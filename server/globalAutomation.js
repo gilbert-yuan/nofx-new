@@ -14,7 +14,24 @@ import { analyzeMarkets, reviewPosition } from './ai.js';
 import { nextOpenTime, prepareMarket, createResearchRecord, MAIN_INTERVAL } from './research.js';
 import { localProtectionReview, applyPaperProtectionReview } from './shared/protectionReview.js';
 import { proxyHealth } from './core/proxyHealth.js';
-import { applyPendingReview } from './shared/pendingReview.js';
+import { applyPendingReview, HELD_INELIGIBLE } from './shared/pendingReview.js';
+
+// ── 同币种冷却（2026-09-11 优化：由「仅止损后」扩展到「任意平仓后」）────────
+// 依据：2711 笔真实成交 + 真实 1m K 线回放，统一出场（2ATR 止损/3R 止盈/1R 后移动 1.5ATR/120 根）。
+// 策略期望为负（均单 -0.0108，t=-9.64），因此「少交易」是唯一确定的减亏手段。
+// 冷却不改变单笔质量（均单几乎不变），靠降低交易频率线性减亏：
+//   无冷却      保留100%  累计 -29.3  均单 -0.0108
+//   15 分钟     保留 72%  累计 -21.8  均单 -0.0112
+//   30 分钟     保留 62%  累计 -19.2  均单 -0.0114   ← 采用（减亏约 34%）
+//   60 分钟     保留 53%  累计 -19.2  均单 -0.0134
+//   120 分钟    保留 44%  累计 -16.9  均单 -0.0141
+// 为什么不用「提高 ATR 门槛」：当前市况 1m 波动率中位数仅 0.079%，
+//   绝对阈值 0.40% 只有 3.7% 的币能通过、0.60% 仅 0.5% → 系统停摆。冷却与市况无关，安全。
+// 验证口径：训练/测试按入场时间前 50%/后 50% 切分，两段结论一致。
+// 回滚：NOFX_SYMBOL_COOLDOWN_MIN=0
+const SYMBOL_COOLDOWN_MIN = Math.max(0, Number(process.env.NOFX_SYMBOL_COOLDOWN_MIN ?? 30));
+// 止损后的加长冷却（保持历史行为，默认 60 分钟）
+const STOP_COOLDOWN_MIN = Math.max(0, Number(process.env.NOFX_STOP_COOLDOWN_MIN ?? 60));
 
 export function selectAnalysisEngine(config = {}) {
   const analysis = config.analysis || {};
@@ -37,7 +54,7 @@ export class GlobalAutomation {
 
     this.tasks = {
       klineSync: { enabled: true, interval: 60000, lastRun: null, running: false },
-      positionReview: { enabled: true, interval: 30000, lastRun: null, running: false }
+      positionReview: { enabled: true, interval: 10000, lastRun: null, running: false }
     };
     this.inFlight = new Map();
 
@@ -346,8 +363,19 @@ export class GlobalAutomation {
                 .map(o => Date.parse(o.exitAt))
                 .filter(t => Number.isFinite(t))
                 .sort((a, b) => b - a)[0];
-              if (lastStopAt && Date.now() - lastStopAt < 60 * 60000) {
-                console.log(`[GlobalAutomation] ${symbol} 止损后60分钟冷却期内，跳过开仓`);
+              // 任意平仓后的通用冷却（新增）：止盈/超时/手动平仓后同样不再立刻重进同一标的
+              const lastClosedAt = sameSymbol
+                .filter(o => o.status === 'closed' && o.exitAt)
+                .map(o => Date.parse(o.exitAt))
+                .filter(t => Number.isFinite(t))
+                .sort((a, b) => b - a)[0];
+              if (SYMBOL_COOLDOWN_MIN > 0 && lastClosedAt && Date.now() - lastClosedAt < SYMBOL_COOLDOWN_MIN * 60000) {
+                const waitedMin = ((Date.now() - lastClosedAt) / 60000).toFixed(1);
+                console.log(`[GlobalAutomation] ${symbol} 平仓后冷却期内（已等待 ${waitedMin}/${SYMBOL_COOLDOWN_MIN} 分钟），跳过开仓`);
+                return { symbol, success: true, action: 'SKIP_COOLDOWN' };
+              }
+              if (STOP_COOLDOWN_MIN > 0 && lastStopAt && Date.now() - lastStopAt < STOP_COOLDOWN_MIN * 60000) {
+                console.log(`[GlobalAutomation] ${symbol} 止损后${STOP_COOLDOWN_MIN}分钟冷却期内，跳过开仓`);
                 return { symbol, success: true, action: 'SKIP_COOLDOWN' };
               }
 
@@ -584,6 +612,7 @@ export class GlobalAutomation {
       const report = applyPendingReview(current, signals?.[0]);
       const task = this.tasks.positionReview;
       if (report.action === 'cancelled') task.cancelled = (task.cancelled || 0) + 1;
+      if (report.action === HELD_INELIGIBLE) task.graced = (task.graced || 0) + 1;
       if (report.action === 'repriced') task.repriced = (task.repriced || 0) + 1;
       return report;
     });

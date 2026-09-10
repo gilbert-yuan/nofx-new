@@ -6,6 +6,7 @@
  */
 
 import { nextOpenTime, validCandle, PAPER_COSTS } from './research.js';
+import { PARTIAL_TP, partialTpLevels, netBreakEvenBps } from './shared/strategyGuards.js';
 
 /**
  * 交易模拟器配置
@@ -105,11 +106,30 @@ export class TradingSimulator {
     let entryTime = order.entryTime ?? null;
     let held = order.heldBars || 0;
     let adverse = 0;
+
+    // ── 分批止盈状态（跨轮续跑：从 order 恢复）────────────────────────────
+    // 全部用**标量**而不是 fills[] 数组：simulated_order_extensions 按 path 逐字段
+    // 展开存行（当前已 9 万行、是已知性能瓶颈），数组会让行数成倍膨胀。
+    let tpStage = Number(order.tpStage) || 0;
+    const realized = {
+      gross: Number(order.realizedGross) || 0,
+      fee: Number(order.realizedFee) || 0,
+      funding: Number(order.realizedFunding) || 0,
+      net: Number(order.realizedNet) || 0,
+      qty: Number(order.realizedQty) || 0,
+      fills: tpStage
+    };
+    // 分批档位：入场后才能算（需要 entry 与 R），惰性计算一次
+    let tpLevels = null;
+
     const checkpoint = () => ({
       nextTime: time, entry, entryAt: entryTime !== null ? new Date(entryTime).toISOString() : null,
       heldBars: held, quantity: order.quantity, entryFee: order.entryFee,
       liquidationPrice: order.liquidationPrice, markPrice: order.markPrice,
-      markAt: order.markAt, unrealized: order.unrealized
+      markAt: order.markAt, unrealized: order.unrealized,
+      tpStage, tpStopFloor: order.tpStopFloor,
+      realizedGross: realized.gross, realizedFee: realized.fee,
+      realizedFunding: realized.funding, realizedNet: realized.net, realizedQty: realized.qty
     });
 
     // ── 根级智能退出（Task #8）：把「均线失守」下沉到逐根判定 ──────────────────
@@ -194,10 +214,72 @@ export class TradingSimulator {
           0
         );
 
+        // 止损的「工作副本」：分批止盈会把止损抬到保本线，这个抬升必须跨根保留
+        // （否则下一根又退回初始止损），故持久化在 order.tpStopFloor 上。
+        let workingStop = protection.stopLoss;
+        const floor = Number(order.tpStopFloor);
+        if (Number.isFinite(floor) && floor > 0) {
+          workingStop = long ? Math.max(workingStop, floor) : Math.min(workingStop, floor);
+        }
+
+        // ── 分批止盈（2026-09-11）：先于「主止盈」、后于「止损」 ──────────────
+        // 单根 K 线没有 tick，无法判定命中先后，按最坏情况处理：
+        //   · 止损/爆仓 → 交给下面的 _checkExit 立即出场（保护优先），不巧立分批；
+        //   · TP1/TP2   → 在价格路径上必然先于主止盈被触及，故先按各档价位分批，
+        //                 剩余「奔跑仓」再交给 _checkExit 的主止盈判定。
+        if (tpLevels === null) {
+          const riskUnit = Number(order.plan?.riskUnit) > 0
+            ? Number(order.plan.riskUnit)
+            : Math.abs(entry - Number(order.initialPlan?.stopLoss ?? protection.stopLoss));
+          tpLevels = partialTpLevels({ long, entry, riskUnit, mainTakeProfit: protection.takeProfit });
+        }
+        while (tpStage < tpLevels.length) {
+          const level = tpLevels[tpStage];
+          const hit = long ? row.high >= level.price : row.low <= level.price;
+          if (!hit) break;
+          const originalQty = realized.qty + order.quantity;
+          const batchQty = Math.min(originalQty * level.closePct, order.quantity);
+          if (!(batchQty > 0)) break;
+
+          const costs = order.costs;
+          const exitPrice = level.price * (1 - direction * costs.slippageBps / 10000);
+          const gross = direction * (exitPrice - entry) * batchQty;
+          const exitFee = exitPrice * batchQty * costs.feeBps / 10000;
+          // 入场费与名义按「该批占原始仓位」的比例分摊；最后一批由 _settle 用剩余
+          // 比例结清，各批份额之和恰为 1，合计恰好等于全额入场费（不会重复计或漏计）。
+          const share = originalQty > 0 ? batchQty / originalQty : 0;
+          const entryFeeShare = (order.entryFee || 0) * share;
+          const funding = this._calcFunding(order.notional * share, costs, entryTime, nextOpenTime(time, order.interval));
+          const net = gross - entryFeeShare - exitFee - funding;
+
+          realized.gross += gross;
+          realized.fee += entryFeeShare + exitFee;
+          realized.funding += funding;
+          realized.net += net;
+          realized.qty += batchQty;
+          // 剩余 = 当前剩余 − 本批。
+          // 不能写成 originalQty − batchQty：originalQty 是「原始总量」，
+          // 第二档那样算会把剩余仓位错误地还原成 60%（应为 20%）。
+          order.quantity = Math.max(0, order.quantity - batchQty);
+          tpStage++;
+          realized.fills = tpStage;
+
+          // 分批成交后，把剩余仓位止损抬到净保本线（含往返成本 + 缓冲），锁成无风险
+          if (PARTIAL_TP.moveStopToBreakEven) {
+            const costDist = entry * netBreakEvenBps(costs) / 10000;
+            const beStop = long ? entry + costDist : entry - costDist;
+            const nextFloor = Number.isFinite(order.tpStopFloor) && order.tpStopFloor > 0
+              ? (long ? Math.max(order.tpStopFloor, beStop) : Math.min(order.tpStopFloor, beStop))
+              : beStop;
+            order.tpStopFloor = nextFloor;
+            workingStop = long ? Math.max(workingStop, nextFloor) : Math.min(workingStop, nextFloor);
+          }
+        }
+
         // 检查出场条件
         const exitResult = this._checkExit(
           row,
-          protection,
+          { ...protection, stopLoss: workingStop },
           entry,
           held,
           direction,
@@ -205,6 +287,7 @@ export class TradingSimulator {
         );
 
         if (exitResult) {
+          realized.fills = tpStage;
           const settled = this._settle(
             order,
             exitResult,
@@ -213,7 +296,8 @@ export class TradingSimulator {
             nextOpenTime(time, order.interval),
             held,
             direction,
-            adverse
+            adverse,
+            realized
           );
           time = nextOpenTime(time, order.interval);
           return { ...checkpoint(), ...settled };
@@ -235,6 +319,7 @@ export class TradingSimulator {
             const maxR = Number.isFinite(smartExit.maExitMaxProfitR) ? smartExit.maExitMaxProfitR : 0.4;
             const belowLine = !Number.isFinite(profitR) || profitR < maxR;
             if (invalidated && deviated && belowLine) {
+              realized.fills = tpStage;
               const settled = this._settle(
                 order,
                 { reason: 'smart_exit_ma', price: row.close, ambiguous: false },
@@ -243,7 +328,8 @@ export class TradingSimulator {
                 nextOpenTime(time, order.interval),
                 held,
                 direction,
-                adverse
+                adverse,
+                realized
               );
               time = nextOpenTime(time, order.interval);
               return { ...checkpoint(), ...settled };
@@ -305,9 +391,16 @@ export class TradingSimulator {
       entryFee: input.entryFee,
       liquidationPrice: input.liquidationPrice ?? (this.config.enableLiquidation && input.entry && input.leverage > 1
         ? input.entry * (1 - (input.direction === 'OPEN_LONG' ? 1 : -1) * (1 / input.leverage - 0.005)) : undefined),
-      markPrice: input.markPrice, markAt: input.markAt, unrealized: input.unrealized
-    };
-  }
+    markPrice: input.markPrice, markAt: input.markAt, unrealized: input.unrealized,
+    // ── 分批止盈状态（2026-09-11）：必须透传 ──────────────────────────────
+    // 订单每轮复核都会重新走 _normalizeInput，若这里丢掉 tpStage / realized*，
+    // _simulate 会以为「还没平过任何一批」，从第一档开始重平，
+    // 剩余仓位（已只剩 60%）被当成原始总量再切一次 40% —— 仓位被重复平掉、盈亏少算一半。
+    tpStage: input.tpStage, tpStopFloor: input.tpStopFloor,
+    realizedGross: input.realizedGross, realizedFee: input.realizedFee,
+    realizedFunding: input.realizedFunding, realizedNet: input.realizedNet, realizedQty: input.realizedQty
+  };
+}
 
   /**
    * 检查是否可评估
@@ -486,26 +579,35 @@ export class TradingSimulator {
   /**
    * 结算平仓
    */
-  _settle(order, exitResult, entry, entryTime, exitTime, held, direction, adverse) {
+  _settle(order, exitResult, entry, entryTime, exitTime, held, direction, adverse, realized = null) {
     const costs = order.costs;
 
     // 计算出场滑点
     const exit = exitResult.price * (1 - direction * costs.slippageBps / 10000);
     const quantity = order.quantity;
 
-    // 计算盈亏
+    // ── 分批止盈汇总 ──────────────────────────────────────────────────────
+    // 有分批时 order.quantity 只剩「奔跑仓」，此前各批盈亏已累计在 realized 里。
+    // 入场费与名义按剩余仓位比例分摊（各批份额 + 剩余份额 = 1），合计恰为全额。
+    const prior = realized || { gross: 0, fee: 0, funding: 0, net: 0, qty: 0, fills: 0 };
+    const originalQty = prior.qty + quantity;
+    const share = originalQty > 0 ? quantity / originalQty : 0;
+
+    // 计算盈亏（本批 = 剩余全部）
     const gross = direction * (exit - entry) * quantity;
-    const entryFee = order.entryFee || order.notional * costs.feeBps / 10000;
+    const entryFee = (order.entryFee || order.notional * costs.feeBps / 10000) * share;
     const exitFee = exit * quantity * costs.feeBps / 10000;
-    const funding = this._calcFunding(order.notional, costs, entryTime, exitTime);
-    const rawNet = gross - entryFee - exitFee - funding;
+    const funding = this._calcFunding(order.notional * share, costs, entryTime, exitTime);
+    const rawNet = (gross - entryFee - exitFee - funding) + prior.net;
 
     // 隔离保证金保护（如果启用）
+    // 已实现盈亏（prior.net）必须并入后判定：前面分批赚到的钱要能抵补奔跑仓的亏损，
+    // 否则「先赚后亏」的单会被误判成穿仓。
     let net = rawNet;
     let isolatedAdjustment = 0;
 
     if (this.config.enableIsolatedMargin && rawNet < 0) {
-      const maxLoss = -order.margin - entryFee;
+      const maxLoss = -order.margin - (order.entryFee || 0);
       if (rawNet < maxLoss) {
         isolatedAdjustment = maxLoss - rawNet;
         net = maxLoss;
@@ -519,18 +621,20 @@ export class TradingSimulator {
       exit,
       entryAt: new Date(entryTime).toISOString(),
       exitAt: new Date(exitTime).toISOString(),
-      gross,
-      fee: entryFee + exitFee,
-      fees: entryFee + exitFee,  // 兼容两种命名
-      fundingReserve: funding,
-      funding,  // 兼容两种命名
+      gross: gross + prior.gross,
+      fee: entryFee + exitFee + prior.fee,
+      fees: entryFee + exitFee + prior.fee,  // 兼容两种命名
+      fundingReserve: funding + prior.funding,
+      funding: funding + prior.funding,  // 兼容两种命名
       net,
       netReturn: net / order.notional,
       roi: net / order.margin,
       heldBars: held,
       adverseReturnUpperBound: adverse,
       isolatedLossAdjustment: isolatedAdjustment,
-      ambiguousBar: exitResult.ambiguous
+      ambiguousBar: exitResult.ambiguous,
+      // 分批成交次数（0 = 未分批），供复盘区分「全仓主止盈」与「分批止盈」
+      partialFills: prior.fills || 0
     };
   }
 

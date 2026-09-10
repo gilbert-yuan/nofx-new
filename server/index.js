@@ -52,8 +52,19 @@ app.use('/api', (req, res) => res.status(404).json({ error: 'API 接口不存在
 const distDir = path.join(container.rootDir, 'dist');
 const indexHtml = path.join(distDir, 'index.html');
 if (fs.existsSync(indexHtml)) {
-  app.use(express.static(distDir, { maxAge: '1h', etag: true }));
-  app.get(/^(?!\/api).*/, (_req, res) => res.sendFile(indexHtml));
+  // 带 hash 的 assets 可以长缓存；但 index.html 必须每次回源校验 —— 否则前端重建后，
+  // 浏览器仍按 max-age 使用旧 index.html，去请求已被删除的旧 chunk 就会白屏。
+  app.use(express.static(distDir, {
+    maxAge: '1h',
+    etag: true,
+    setHeaders: (res, filePath) => {
+      if (filePath.endsWith('index.html')) res.setHeader('Cache-Control', 'no-cache');
+    }
+  }));
+  app.get(/^(?!\/api).*/, (_req, res) => {
+    res.setHeader('Cache-Control', 'no-cache');
+    res.sendFile(indexHtml);
+  });
 } else {
   const buildHint = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />

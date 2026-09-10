@@ -40,9 +40,8 @@ function toggleThemeMenu() {
       <button :class="{ active: activeView === 'workbench' }" @click="$emit('change-view', 'workbench')">行情工作台</button>
       <button :class="{ active: activeView === 'trading' }" @click="$emit('change-view', 'trading')">币安交易</button>
       <button :class="{ active: activeView === 'trading-simulation' }" @click="$emit('change-view', 'trading-simulation')">交易模拟</button>
+      <button :class="{ active: activeView === 'automation' }" @click="$emit('change-view', 'automation')">自动化任务</button>
       <button :class="{ active: activeView === 'daily-trend' }" @click="$emit('change-view', 'daily-trend')">每日趋势</button>
-      <button :class="{ active: activeView === 'history' }" @click="$emit('change-view', 'history')">历史分析</button>
-      <button :class="{ active: activeView === 'settings' }" @click="$emit('change-view', 'settings')">模型设置</button>
     </nav>
     <div class="theme-switcher">
       <button class="theme-toggle" @click="toggleThemeMenu">
