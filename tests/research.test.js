@@ -34,7 +34,8 @@ test('calendar months and weeks use UTC boundaries', () => {
 test('validated plans start strictly after generation', () => {
   assert.equal(signal.eligible, true);
   assert.equal(start, Date.UTC(2026, 8, 5, 11));
-  assert.equal(Date.parse(signal.expiresAt), start + 2 * hour);
+  assert.equal(signal.expiresAt, undefined);
+  assert.equal(signal.plan.validForBars, undefined);
 });
 test('invalid scores, reversed exits, thin reward and noninteger horizons become WAIT', () => {
   const variants = [
@@ -77,7 +78,21 @@ test('no look-ahead: pre-generation and unfinished candles cannot close a trade'
 });
 test('intrabar touch cannot enter when opening price is outside entry range', () => {
   const result = evaluateSignal(signal, [candle(start, { open: 105, high: 121, low: 99, close: 110 }), candle(start + hour, { open: 105, high: 121, low: 99, close: 110 })], zeroCosts, start + 2 * hour);
-  assert.equal(result.status, 'expired');
+  assert.equal(result.status, 'pending');
+});
+
+test('long and short backtests ignore legacy entry deadlines and fill later', () => {
+  for (const short of [false, true]) {
+    const legacy = { ...signal, expiresAt: new Date(start + 2 * hour).toISOString(),
+      positionRecommendation: short ? 'OPEN_SHORT' : 'OPEN_LONG',
+      plan: { ...signal.plan, validForBars: 2, stopLoss: short ? 120 : 90, takeProfit: short ? 80 : 120 } };
+    const waiting = Array.from({ length: 8 }, (_, i) => candle(start + i * hour,
+      { open: 105, high: 106, low: 104, close: 105 }));
+    assert.equal(evaluateSignal(legacy, waiting, zeroCosts, start + 8 * hour).status, 'pending');
+    const filled = evaluateSignal(legacy, [...waiting, candle(start + 8 * hour)], zeroCosts, start + 9 * hour);
+    assert.equal(filled.status, 'open');
+    assert.equal(filled.entryAt, new Date(start + 8 * hour).toISOString());
+  }
 });
 test('both exits in one bar select stop loss', () => {
   const result = evaluateSignal(signal, [candle(start, { high: 125, low: 90 })], zeroCosts, start + hour);

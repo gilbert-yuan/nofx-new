@@ -69,6 +69,8 @@ class ProxyHealth {
     return () => this.listeners.delete(cb);
   }
 
+  async check() { await this._probe(); return this.alive; }
+
   async _probe() {
     if (!this.host) {
       this._setAlive(true);

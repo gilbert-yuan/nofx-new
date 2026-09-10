@@ -1,7 +1,7 @@
 // Deterministic reference strategy; scores are rule strength, never win probabilities.
 // 优化调整：基于2081笔历史订单分析（整体胜率22.1%，最优区间45-49根胜率100%）
 import { LONG_ONLY, RISK_RULE, planRefEntry, planRiskUnit } from './shared/strategyGuards.js';
-import { computeEntryLimit, trendProxyToScore, ENTRY_NO_EXPIRY } from './shared/entryModel.js';
+import { computeEntryLimit, trendProxyToScore } from './shared/entryModel.js';
 
 export const LOCAL_STRATEGY = Object.freeze({
   modelId: 'local-mtf-trend-atr-v2',
@@ -9,7 +9,6 @@ export const LOCAL_STRATEGY = Object.freeze({
   maxHoldBars: 120,          // 1m 主周期：默认持仓 120 根（2 小时）；P5 周期回退同步修正
   stopLossAtr: 2.5,
   takeProfitAtr: 4.0,
-  validForBars: 6            // 1m 主周期：6 根（6 分钟）内可成交；P5 周期回退同步修正
 });
 const MIN_REWARD_TO_RISK = 1.25;
 const validRows = rows => Array.isArray(rows) && rows.length >= 50 && rows.every(r =>
@@ -46,9 +45,7 @@ export function localAnalysis(market) {
       takeProfit: long ? entryMax + atr * LOCAL_STRATEGY.takeProfitAtr : entryMin - atr * LOCAL_STRATEGY.takeProfitAtr,
       // R 口径基准（实际成交锚点 → 初始止损），供移动止损 / 复核统一换算浮盈。
       riskUnit: Math.abs(entryLimit - (long ? entryMin - atr * LOCAL_STRATEGY.stopLossAtr : entryMax + atr * LOCAL_STRATEGY.stopLossAtr)),
-      // validForBars: 0 = GTC（取消下单有效期限制，老板 2026-09-10 要求）；
-      // 置 NOFX_ENTRY_NO_EXPIRY=false 可回退到 LOCAL_STRATEGY.validForBars（6 根）。
-      validForBars: ENTRY_NO_EXPIRY ? 0 : LOCAL_STRATEGY.validForBars, maxHoldBars: LOCAL_STRATEGY.maxHoldBars } };
+      maxHoldBars: LOCAL_STRATEGY.maxHoldBars } };
 }
 
 // 多周期分析版本：引入15分钟、1小时、4小时辅助判断
@@ -182,8 +179,6 @@ export function localAnalysisMultiTimeframe(market, auxMarkets = {}, adaptivePar
       takeProfit: long ? entryMax + atr * takeProfitATR : entryMin - atr * takeProfitATR,
       // R 口径基准（实际成交锚点 → 初始止损）
       riskUnit: Math.abs(entryLimit - (long ? entryMin - atr * stopLossATR : entryMax + atr * stopLossATR)),
-      // validForBars: 0 = GTC（取消下单有效期限制，可经 NOFX_ENTRY_NO_EXPIRY 回退）
-      validForBars: ENTRY_NO_EXPIRY ? 0 : LOCAL_STRATEGY.validForBars,
       maxHoldBars
     }
   };

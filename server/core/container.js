@@ -35,7 +35,6 @@ export class Container {
 
     this.positionMonitor = new BinancePositionMonitor({ store: this.store, marketDb: this.marketDb });
     this.klineSync = new KlineSync({ store: this.store, marketDb: this.marketDb, positionMonitor: this.positionMonitor });
-    await this.klineSync.configureFromStore();
 
     this.marketData = marketData;
     this.ready = true;
@@ -61,11 +60,12 @@ export class Container {
       archive: this.researchInstances.archive,
       store: this.store
     });
+    this.klineSync.automation = this.globalAutomation;
     registerGlobalAutomationRoutes(app, this.globalAutomation);
     return this.globalAutomation;
   }
 
-  /** 应用启动后调用：拉起自动化与定时清理任务 */
+  /** 应用启动后调用：仅启动两项自动交易任务。 */
   startLifecycle() {
     setTimeout(() => {
       try {
@@ -77,45 +77,5 @@ export class Container {
     }, 5000);
     console.log('[GlobalAutomation] 系统就绪，将在5秒后自动启动');
 
-    setTimeout(() => this.scheduleKlineCleanup(), 10000);
-    setTimeout(() => this.scheduleAnalysisCleanup(), 15000);
-  }
-
-  scheduleKlineCleanup() {
-    const tick = async () => {
-      try {
-        const state = await this.researchInstances.simulation.read();
-        const symbols = [...new Set(state.orders.map((o) => o.symbol))];
-        const result = await this.marketDb.cleanOldKlines(symbols, 3);
-        console.log(`[KlineCleanup] 完成: 删除 ${result.deletedCount} 条, 币种 ${result.symbolsCleaned.join(', ') || '无'}`);
-      } catch (error) {
-        console.error('[KlineCleanup] 失败:', error.message);
-      }
-    };
-    const next = () => {
-      const now = new Date();
-      const t = new Date(now); t.setHours(2, 0, 0, 0);
-      if (t <= now) t.setDate(t.getDate() + 1);
-      setTimeout(async () => { await tick(); next(); }, t.getTime() - now.getTime());
-    };
-    next();
-  }
-
-  scheduleAnalysisCleanup() {
-    const tick = async () => {
-      try {
-        const state = await this.researchInstances.simulation.read();
-        const keep = [...new Set(state.orders.map((o) => o.recordId).filter(Boolean))];
-        const result = await this.researchInstances.archive.cleanOldRecords(keep, 30);
-        console.log(`[AnalysisCleanup] 完成: 删除 ${result.deletedCount} 条, 保护 ${result.protectedRecords} 条`);
-      } catch (error) {
-        console.error('[AnalysisCleanup] 失败:', error.message);
-      }
-    };
-    setTimeout(async () => {
-      await tick();
-      setInterval(tick, 60 * 60 * 1000);
-      console.log('[AnalysisCleanup] 定时清理已启动（每小时）');
-    }, 0);
   }
 }

@@ -1,3 +1,4 @@
+import { MAIN_INTERVAL } from './research.js';
 import { marketData } from './marketData.js';
 import { normalizeSymbols } from './tradeSync.js';
 import { fetchContinuousKlines } from './continuousKlines.js';
@@ -23,6 +24,11 @@ export class KlineSync {
 
   async configureFromStore() {
     const config = await this.store.getConfig();
+    if (this.automation) {
+      this.automation.configure('klineSync', { enabled: config.marketSync?.enabled !== false,
+        interval: Math.max(30, Number(config.marketSync?.intervalSeconds || 60)) * 1000 });
+      return;
+    }
     const key = JSON.stringify(config.marketSync);
     if (this.timer && key === this.scheduleKey) return;
     this.scheduleKey = key;
@@ -38,6 +44,11 @@ export class KlineSync {
   }
 
   async start() {
+    if (this.automation) {
+      this.automation.configure('klineSync', { enabled: true });
+      this.automation.start();
+      return this.status();
+    }
     const config = await this.store.getConfig();
     if (this.timer) return this.status();
 
@@ -58,6 +69,10 @@ export class KlineSync {
   }
 
   async stop() {
+    if (this.automation) {
+      this.automation.configure('klineSync', { enabled: false });
+      return this.status();
+    }
     this.nextRunAt = null;
     if (this.timer) {
       clearInterval(this.timer);
@@ -67,6 +82,14 @@ export class KlineSync {
   }
 
   async status() {
+    if (this.automation) {
+      const task = this.automation.tasks.klineSync;
+      return { running: this.automation.schedulerActive && task.enabled, busy: task.running,
+        lastRunAt: task.lastRun, nextRunAt: task.nextRunAt, lastError: task.error || '',
+        progress: task.progress || { total: 0, completed: 0, failed: 0 },
+        interval: MAIN_INTERVAL, intervalSeconds: task.interval / 1000,
+        provider: this.client.provider, states: [], managedBy: 'globalAutomation' };
+    }
     return {
       running: Boolean(this.timer),
       busy: this.running,

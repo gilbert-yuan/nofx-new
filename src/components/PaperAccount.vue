@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onMounted, onBeforeUnmount, ref, watch } from 'vue';
 import { api } from '../api.js';
+import AutomationTasks from './AutomationTasks.vue';
 const account = ref(null), plans = ref([]), selected = ref(''), margin = ref(100), leverage = ref(1), stopLoss = ref(0), takeProfit = ref(0);
 const busy = ref(false), error = ref(''), notice = ref('');
 let timer, polling = false, disposed = false;
@@ -17,7 +18,7 @@ watch(() => history.value.length, n => { historyPage.value = Math.min(historyPag
 const fmt = value => Number.isFinite(Number(value)) ? Number(value).toLocaleString(undefined, { maximumFractionDigits: 4 }) : '—';
 const money = value => Number.isFinite(Number(value)) ? Number(value).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '—';
 const time = value => value ? new Date(value).toLocaleString() : '—';
-const label = value => ({ pending: '等待入场', open: '持仓中', closed: '已平仓', cancelled: '已取消', expired: '到期未入场', stop_loss: '止损', take_profit: '止盈', manual: '手动平仓', timeout: '到期平仓', liquidation: '模拟强平' })[value] || value;
+const label = value => ({ pending: '等待入场', open: '持仓中', closed: '已平仓', cancelled: '已取消', expired: '未成交（历史记录）', stop_loss: '止损', take_profit: '止盈', manual: '手动平仓', timeout: '到期平仓', liquidation: '模拟强平' })[value] || value;
 watch(selected, () => { const value = plan.value; if (value) { leverage.value = value.recommendedLeverage || 1; stopLoss.value = value.plan.stopLoss; takeProfit.value = value.plan.takeProfit; } });
 async function load() {
   if (polling) return;
@@ -38,8 +39,6 @@ async function action(fn, message) {
 }
 function submit() { if (plan.value) return action(() => api('/paper/orders', { method: 'POST', body: { recordId: plan.value.recordId, symbol: plan.value.symbol, margin: margin.value, leverage: leverage.value, stopLoss: stopLoss.value, takeProfit: takeProfit.value } }), '模拟计划已提交，从未来 K 线开始等待入场。'); }
 function close(order) { return action(() => api(`/paper/orders/${order.id}/close`, { method: 'POST' }), order.status === 'pending' ? '模拟挂单已取消。' : '已处理模拟平仓。'); }
-function configure(body) { return action(() => api('/paper/automation', { method: 'PUT', body }), '自动模拟设置已保存。'); }
-function runTask(kind) { return action(() => api(`/paper/automation/${kind}`, { method: 'POST' }), '任务已提交，进度会自动刷新。'); }
 onMounted(() => { load(); timer = setInterval(() => { if (!document.hidden && !busy.value) load(); }, 10000); });
 onBeforeUnmount(() => { disposed = true; clearInterval(timer); });
 </script>
@@ -54,19 +53,14 @@ onBeforeUnmount(() => { disposed = true; clearInterval(timer); });
       <article class="summary-metric"><span>已实现净盈亏</span><strong :class="account.realized >= 0 ? 'price-up' : 'price-down'">{{ money(account.realized) }}</strong><small>已扣双边手续费与资金费估算</small></article>
       <article class="summary-metric"><span>浮动盈亏</span><strong :class="account.unrealized >= 0 ? 'price-up' : 'price-down'">{{ money(account.unrealized) }}</strong><small>按最新已处理收盘价 · 开仓费已扣余额</small></article>
     </div>
-    <section v-if="account?.automation" class="history-panel automation-panel">
-      <div class="section-head"><h3>自动任务</h3><button class="secondary" :disabled="busy" @click="configure({ enabled: !account.automation.enabled })">{{ account.automation.enabled ? '暂停自动模拟' : '开启自动模拟' }}</button></div>
-      <div class="history-filter"><label>自动分析方式<select :value="account.automation.engine" :disabled="busy || account.automation.scan.running || account.automation.review.running" @change="configure({ engine: $event.target.value })"><option value="local">本地规则（免 Key）</option><option value="auto">自动（有模型 Key 则用 AI）</option><option value="ai">AI 模型</option></select></label><p class="muted">行情每 60 秒尝试同步 1m K 线；行情面板可单独暂停。暂停自动模拟会停止新扫描和保护复核，已有订单仍继续撮合。</p></div>
-      <div class="automation-jobs"><article v-for="kind in ['scan', 'review']" :key="kind"><span class="eyebrow">{{ kind === 'scan' ? '每 2 小时 / 全量分析' : '每 5 分钟 / 持仓复核' }}</span><h3>{{ account.automation[kind].running ? '执行中' : account.automation.enabled ? '等待下轮' : '已暂停' }}</h3><p>进度 {{ account.automation[kind].index || 0 }} / {{ account.automation[kind].total || 0 }} · 失败 {{ account.automation[kind].failed || 0 }}</p><p>{{ kind === 'scan' ? '模拟下单 ' + (account.automation[kind].submitted || 0) + ' 笔' : '保护调整 ' + (account.automation[kind].updated || 0) + ' 笔' }} · 保持/观望 {{ account.automation[kind].held || 0 }}</p><small>上次开始 {{ time(account.automation[kind].startedAt) }}</small><small>下次运行 {{ time(account.automation[kind].nextAt) }}</small><button class="ghost" :disabled="busy || !account.automation.enabled || account.automation[kind].running" @click="runTask(kind)">{{ kind === 'scan' ? '立即全量分析并模拟下单' : '立即复核止盈止损' }}</button><details v-if="account.automation[kind].errors?.length"><summary>查看最近错误</summary><p v-for="(e, i) in account.automation[kind].errors" :key="i" class="signal-warning">{{ e }}</p></details></article></div>
-      <p class="muted">总资金不设上限；挂单及持仓保证金 {{ money(account.usedMargin) }} USDT。每轮合适计划独立下单，相同任务重试不会重复下单。</p>
-    </section>
+    <AutomationTasks />
     <section class="history-panel paper-order-form">
       <div class="section-head"><h3>采用分析计划</h3><span class="research-badge">仅模拟，不发送交易所订单</span></div>
       <p v-if="!plans.length" class="muted">暂无有效开仓计划。请到行情工作台选择“本地规则（免 Key）”或 AI 分析；观望、无效及过期计划不能下单。</p>
       <form v-else @submit.prevent="submit">
         <label>分析计划<select v-model="selected" :disabled="busy"><option v-for="p in plans" :key="`${p.recordId}:${p.symbol}`" :value="`${p.recordId}:${p.symbol}`">{{ p.symbol }} · {{ p.positionRecommendation === 'OPEN_LONG' ? '做多' : '做空' }} · {{ p.analysisEngine === 'local' ? '本地规则' : 'AI' }} · {{ time(p.at) }}</option></select></label>
         <div class="model-grid"><label>保证金（USDT）<input v-model.number="margin" type="number" min="1" max="100000" step="0.01" required :disabled="busy" /></label><label>杠杆（推荐 {{ plan?.recommendedLeverage || 1 }}×）<input v-model.number="leverage" type="number" min="1" max="5" step="1" required :disabled="busy" /></label><label>止损价格<input v-model.number="stopLoss" type="number" min="0" step="any" required :disabled="busy" /></label><label>止盈价格<input v-model.number="takeProfit" type="number" min="0" step="any" required :disabled="busy" /></label></div>
-        <p v-if="plan" class="muted">名义仓位 {{ money(margin * leverage) }} USDT · 入场区间 {{ fmt(plan.plan.entryMin) }}～{{ fmt(plan.plan.entryMax) }} · 有效至 {{ time(plan.expiresAt) }}</p>
+        <p v-if="plan" class="muted">名义仓位 {{ money(margin * leverage) }} USDT · 入场区间 {{ fmt(plan.plan.entryMin) }}～{{ fmt(plan.plan.entryMax) }}</p>
         <button class="primary" type="submit" :disabled="busy || !plan">提交模拟开仓计划</button>
       </form>
     </section>

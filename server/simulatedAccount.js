@@ -1,3 +1,4 @@
+import { fetchContinuousKlines } from './continuousKlines.js';
 import { randomUUID } from 'node:crypto';
 import { candleOpenAt, nextOpenTime, validCandle, PAPER_COSTS } from './research.js';
 import { recommendedLeverage } from './localAnalysis.js';
@@ -34,9 +35,7 @@ export function submitPaperOrder(state, record, input, now = Date.now()) {
   if (!signal?.eligible || !signal.plan || !['OPEN_LONG', 'OPEN_SHORT'].includes(signal.positionRecommendation)) fail('该分析为观望或没有有效开仓计划，不能模拟下单。');
   if ((signal.marketProvider || record.marketProvider) !== 'okx') fail('请使用当前 OKX 行情重新分析后模拟下单。');
   const first = Math.max(Date.parse(signal.firstEntryAt), nextOpenTime(candleOpenAt(now, signal.interval), signal.interval));
-  // GTC（validForBars===0）取消有效期限制，跳过「已过期」判断；其余仍校验入场窗口。
-  const isGtc = signal.plan?.validForBars === 0;
-  if (!Number.isFinite(first) || !Number.isFinite(Date.parse(signal.expiresAt)) || (!isGtc && first >= Date.parse(signal.expiresAt))) fail('分析计划已过期或已无未来入场窗口，请重新分析。');
+  if (!Number.isFinite(first)) fail('分析计划的入场时间无效，请重新分析。');
   const margin = Number(input.margin ?? 100), leverage = Number(input.leverage ?? signal.recommendedLeverage ?? recommendedLeverage(signal.plan, signal.positionRecommendation));
   if (!Number.isFinite(margin) || margin < 1 || margin > 100000 || !Number.isInteger(leverage) || leverage < 1 || leverage > 5) fail('保证金须为 1～100000 USDT，杠杆须为 1～5 的整数。');
   if (!state.unlimitedCapital && state.orders.filter(active).length >= 20) fail('最多同时持有 20 个模拟挂单或持仓。');
@@ -67,7 +66,7 @@ export function submitPaperOrder(state, record, input, now = Date.now()) {
     direction: signal.positionRecommendation, status: 'pending', margin, leverage, notional, plan, initialPlan: { ...plan }, costs: { ...PAPER_COSTS },
     automatic: input.automatic === true, protectionRevisions: [], reviewHistory: [],
     analysisContext, // 新增：完整分析上下文
-    createdAt: new Date(now).toISOString(), nextTime: first, expiresAt: signal.expiresAt, heldBars: 0, error: '' };
+    createdAt: new Date(now).toISOString(), nextTime: first, heldBars: 0, error: '' };
   state.orders.unshift(order);
   return order;
 }
@@ -115,13 +114,6 @@ export function advancePaperOrder(order, rows, now = Date.now()) {
     return order;
   }
 
-  if (result.status === 'expired') {
-    order.status = 'expired';
-    order.nextTime = Math.max(order.nextTime, Date.parse(order.expiresAt));
-    order.error = '';
-    return order;
-  }
-
   if (result.status === 'pending' || result.status === 'open') {
     order.status = result.status;
     order.error = '';
@@ -156,8 +148,6 @@ export class SimulatedAccount {
   constructor({ pool, market, archive, marketDb }) {
     Object.assign(this, { pool, market, archive, marketDb, busy: false, lastError: '', lastRunAt: null });
     this.repository = new SimulatedAccountRepository(pool);
-    this.pendingAnalysis = []; // 待分析的订单队列
-    this.activeOrderAnalysis = new Map(); // 活跃订单的分析记录 orderId -> { lastAnalyzedAt, analysisCount }
   }
   async init() {
     await this.repository.init();
@@ -182,294 +172,64 @@ export class SimulatedAccount {
     // 收益：跳过 ~9 万行 simulated_order_extensions 的拉取与 hydrate，把每次轮询从 3-8s 压到亚秒级。
     // 想要某笔已平仓订单的完整明细，用 GET /api/paper/orders/:id（走 read({orderId})）。
     const state = summary ? await this.repository.read({ summary: true }) : await this.readLight();
-    return { ...accountSummary(state), automation: state.automation, orders: state.orders, busy: this.busy, lastRunAt: this.lastRunAt, error: this.lastError };
+    return { ...accountSummary(state), orders: state.orders, busy: this.busy, lastRunAt: this.lastRunAt, error: this.lastError };
   }
   async getOrder(id) { return (await this.repository.read({ orderId: id })).orders[0]; }
   // 开仓只新增一个订单，不依赖历史订单明细
   async submit(input) { const record = await this.archive.get(String(input.recordId || '')); return this.mutateLight(state => submitPaperOrder(state, record, input)); }
-  async refresh() {
-    if (this.busy) return this.status();
+  async refresh(options = {}) {
+    while (this.refreshPromise) await this.refreshPromise.catch(() => {});
+    const work = this.refreshOrders(options);
+    this.refreshPromise = work;
+    try { return await work; }
+    finally { if (this.refreshPromise === work) this.refreshPromise = null; }
+  }
+
+  async refreshOrders({ symbols, shouldContinue = () => true } = {}) {
     this.busy = true;
     try {
-      // 轻量读取：本轮只推进活跃订单，不需要历史（已平仓）订单的 extensions/reviews 明细
       const state = await this.readLight(), now = Date.now();
-      const updates = [];
-      const cache = new Map();
-      for (const order of state.orders.filter(active).sort((a, b) => a.nextTime - b.nextTime)) {
+      const groups = new Map();
+      for (const order of state.orders.filter(o => active(o) && (!symbols || symbols.includes(o.symbol)))) {
+        const key = `${order.marketProvider}:${order.symbol}:${order.interval}`;
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(order);
+      }
+      for (const orders of groups.values()) {
+        if (!shouldContinue()) break;
+        const first = orders.reduce((a, b) => a.nextTime < b.nextTime ? a : b);
+        const rows = [];
+        let failure;
         try {
-          const end = candleOpenAt(now, order.interval);
-          const key = `${order.symbol}:${order.interval}`;
-          if (!cache.has(key)) {
-            const rows = order.nextTime >= end ? [] : this.marketDb && order.interval === '1m'
-              ? await this.archive.candles(order.symbol, order.interval, order.nextTime, end, order.marketProvider)
-              : await this.market.klines({ symbol: order.symbol, interval: order.interval, startTime: order.nextTime, endTime: end - 1, limit: 200 });
-            cache.set(key, rows);
+          await fetchContinuousKlines({ client: this.market, symbol: first.symbol, interval: first.interval,
+            startTime: first.nextTime, now,
+            savePage: async page => {
+              if (!shouldContinue()) throw new Error('Order refresh stopped');
+              if (this.marketDb) await this.marketDb.saveKlines({
+                symbol: this.market.storageSymbol(first.symbol), interval: first.interval, rows: page });
+              rows.push(...page);
+            } });
+        } catch (error) { failure = error.message; }
+        if (!shouldContinue()) break;
+        await this.mutateLight(current => {
+          if (!shouldContinue()) return;
+          for (const snapshot of orders) {
+            const order = current.orders.find(o => o.id === snapshot.id);
+            if (!order || !active(order) || order.nextTime !== snapshot.nextTime) continue;
+            advancePaperOrder(order, rows, now);
+            if (failure && active(order)) order.error = failure;
           }
-          const rows = cache.get(key);
-          updates.push({ id: order.id, cursor: order.nextTime, rows });
-        } catch (error) { updates.push({ id: order.id, cursor: order.nextTime, error: error.message }); }
-        // 让出事件循环，避免长任务期间 HTTP 请求被饿死
+        });
         await new Promise(resolve => setImmediate(resolve));
       }
-
-      const newlyClosedOrders = [];
-
-      // 轻量写入：只推进活跃订单，不需要历史订单的 extensions/reviews 明细
-      await this.mutateLight(current => {
-        for (const update of updates) {
-          const order = current.orders.find(o => o.id === update.id);
-          if (!order || !active(order) || order.nextTime !== update.cursor) continue;
-
-          const wasActive = order.status === 'open' || order.status === 'pending';
-
-          if (update.error) order.error = update.error;
-          else advancePaperOrder(order, update.rows, now);
-
-          // 检测订单是否刚刚平仓
-          if (wasActive && order.status === 'closed') {
-            newlyClosedOrders.push(order);
-          }
-        }
-      });
-
-      // 对新平仓的订单安排多次延迟分析（15分钟、30分钟、4小时）
-      if (newlyClosedOrders.length > 0) {
-        for (const order of newlyClosedOrders) {
-          // 安排3次分析
-          const analysisSchedule = [
-            { delay: 15 * 60 * 1000, label: '15分钟' },   // 15分钟
-            { delay: 30 * 60 * 1000, label: '30分钟' },   // 30分钟
-            { delay: 4 * 60 * 60 * 1000, label: '4小时' } // 4小时
-          ];
-
-          for (const schedule of analysisSchedule) {
-            this.pendingAnalysis.push({
-              orderId: order.id,
-              symbol: order.symbol,
-              direction: order.direction,
-              scheduledAt: now + schedule.delay,
-              closedAt: now,
-              analysisLabel: schedule.label
-            });
-          }
-
-          console.log(`[AutoReplay] 订单 ${order.symbol} ${order.direction} 已平仓，安排 15分钟、30分钟、4小时 后进行深度分析`);
-        }
-      }
-
-      // 执行到期的分析任务
-      await this.processScheduledAnalysis(now);
-
-      // 对活跃订单进行定期分析（每小时一次）；复用本轮已读的 state，避免第二次全量读
-      await this.analyzeActiveOrders(now, state);
-
       this.lastRunAt = new Date().toISOString(); this.lastError = '';
     } catch (error) { this.lastError = error.message; throw error; }
     finally { this.busy = false; }
     return this.status();
   }
 
-  async analyzeActiveOrders(now, state) {
-    // state 由调用方（refresh）传入以复用已加载的数据；缺失时才回退到独立读取。
-    const snapshot = state || await this.read();
-    const activeOrders = snapshot.orders.filter(o => o.status === 'open' && o.entry);
-
-    if (activeOrders.length === 0) return;
-
-    const ordersToAnalyze = [];
-
-    for (const order of activeOrders) {
-      const record = this.activeOrderAnalysis.get(order.id);
-
-      if (!record) {
-        // 首次分析：入场后10分钟
-        const entryTime = Date.parse(order.entryAt);
-        if (now - entryTime >= 10 * 60 * 1000) {
-          ordersToAnalyze.push(order);
-          this.activeOrderAnalysis.set(order.id, {
-            lastAnalyzedAt: now,
-            analysisCount: 0
-          });
-        }
-      } else {
-        // 后续分析：每小时一次
-        const timeSinceLastAnalysis = now - record.lastAnalyzedAt;
-        if (timeSinceLastAnalysis >= 60 * 60 * 1000) {
-          ordersToAnalyze.push(order);
-          record.lastAnalyzedAt = now;
-          record.analysisCount++;
-        }
-      }
-    }
-
-    if (ordersToAnalyze.length === 0) return;
-
-    console.log(`[ActiveAnalysis] 开始分析 ${ordersToAnalyze.length} 个活跃订单`);
-
-    // 阶段一：拉取复盘数据（网络 IO）。逐个让出事件循环，避免独占主线程。
-    // 原来每个订单各自 mutate 一次，而每次 mutate 都要全量读 + 全量 diff（extensions 近 9 万行），
-    // 是 refresh 耗时长达数十秒的主因。改为统一收集后单次写入。
-    const collected = [];
-    for (const order of ordersToAnalyze) {
-      try {
-        const record = this.activeOrderAnalysis.get(order.id);
-        const analysisCount = record ? record.analysisCount + 1 : 1;
-
-        // 执行实时复盘分析
-        const replayData = await getOrderReplayData(order, this.market, this.marketDb);
-
-        if (replayData.error) {
-          console.log(`[ActiveAnalysis] 订单 ${order.symbol} 分析失败: ${replayData.error}`);
-          continue;
-        }
-
-        collected.push({ order, analysisCount, replayData });
-      } catch (error) {
-        console.error(`[ActiveAnalysis] 订单 ${order.id} 分析异常:`, error.message);
-      }
-      // 让出事件循环：保证 HTTP 请求能在长任务间隙得到处理
-      await new Promise(resolve => setImmediate(resolve));
-    }
-
-    if (collected.length === 0) return;
-
-    // 阶段二：一次性写入所有分析结果（单次事务）；只涉及活跃订单，走轻量写入
-    await this.mutateLight(currentState => {
-      for (const { order, analysisCount, replayData } of collected) {
-        const targetOrder = currentState.orders.find(o => o.id === order.id);
-        if (!targetOrder) continue;
-        if (!targetOrder.liveAnalysis) targetOrder.liveAnalysis = [];
-
-        targetOrder.liveAnalysis.push({
-          sequence: analysisCount,
-          score: replayData.diagnosis.score,
-          primaryIssue: replayData.diagnosis.primaryIssue,
-          summary: replayData.diagnosis.summary,
-          direction: {
-            correct: replayData.analysis.direction.correct,
-            favorableMove: replayData.analysis.direction.favorableMove,
-            adverseMove: replayData.analysis.direction.adverseMove
-          },
-          stopLoss: {
-            optimal: replayData.analysis.stopLoss.optimal,
-            minDistanceToSL: replayData.analysis.stopLoss.minDistanceToSL
-          },
-          takeProfit: {
-            optimal: replayData.analysis.takeProfit.optimal,
-            minDistanceToTP: replayData.analysis.takeProfit.minDistanceToTP
-          },
-          analyzedAt: new Date().toISOString(),
-          heldBars: targetOrder.heldBars,
-          unrealized: targetOrder.unrealized
-        });
-
-        // 只保留最近5次分析记录
-        if (targetOrder.liveAnalysis.length > 5) {
-          targetOrder.liveAnalysis.shift();
-        }
-      }
-    });
-
-    for (const { order, analysisCount, replayData } of collected) {
-      console.log(`[ActiveAnalysis] ✓ 订单 ${order.symbol} ${order.direction} 第${analysisCount}次分析 - 评分: ${replayData.diagnosis.score}, 浮盈: ${order.unrealized?.toFixed(2) || 0}`);
-    }
-
-    console.log(`[ActiveAnalysis] 完成活跃订单分析`);
-  }
-
-  async processScheduledAnalysis(now) {
-    // 找出所有到期的分析任务
-    const dueAnalysis = this.pendingAnalysis.filter(task => task.scheduledAt <= now);
-
-    if (dueAnalysis.length === 0) return;
-
-    console.log(`[AutoReplay] 开始执行 ${dueAnalysis.length} 个到期的复盘分析任务`);
-    let succeeded = 0, failed = 0, skipped = 0;
-
-    // 从待处理队列中移除
-    this.pendingAnalysis = this.pendingAnalysis.filter(task => task.scheduledAt > now);
-
-    const state = await this.read();
-
-    for (const task of dueAnalysis) {
-      try {
-        const order = state.orders.find(o => o.id === task.orderId);
-
-        if (!order || order.status !== 'closed') {
-          skipped++;
-          console.log(`[AutoReplay] 订单 ${task.orderId} 未找到或状态异常，跳过分析`);
-          continue;
-        }
-
-        // 执行复盘分析
-        const replayData = await getOrderReplayData(order, this.market, this.marketDb);
-
-        if (replayData.error) {
-          // 数据窗口不足（K线缺失/缺口）属数据完整度问题，非系统错误：
-          // 计为「跳过」而非「失败」，避免复盘统计里虚高失败数、误导排障。
-          if (/K线数据不完整|无K线数据|缺少入场前|缺少入场或出场|持仓期间存在缺口/.test(replayData.error)) {
-            skipped++;
-            console.log(`[AutoReplay] 订单 ${task.symbol} K线不完整，跳过复盘（数据窗口不足）: ${replayData.error}`);
-          } else {
-            failed++;
-            console.log(`[AutoReplay] 订单 ${task.symbol} 分析失败: ${replayData.error}`);
-          }
-          continue;
-        }
-
-        // 保存复盘分析结果到订单
-        await this.mutate(currentState => {
-          const targetOrder = currentState.orders.find(o => o.id === task.orderId);
-          if (targetOrder) {
-            targetOrder.replayAnalysis = {
-              score: replayData.diagnosis.score,
-              primaryIssue: replayData.diagnosis.primaryIssue,
-              summary: replayData.diagnosis.summary,
-              issues: replayData.diagnosis.issues,
-              recommendations: replayData.diagnosis.recommendations,
-              analysis: {
-                direction: {
-                  correct: replayData.analysis.direction.correct,
-                  favorableMove: replayData.analysis.direction.favorableMove,
-                  adverseMove: replayData.analysis.direction.adverseMove,
-                  summary: replayData.analysis.direction.summary
-                },
-                stopLoss: {
-                  optimal: replayData.analysis.stopLoss.optimal,
-                  distance: replayData.analysis.stopLoss.distance,
-                  touched: replayData.analysis.stopLoss.touched,
-                  assessment: replayData.analysis.stopLoss.assessment
-                },
-                takeProfit: {
-                  optimal: replayData.analysis.takeProfit.optimal,
-                  distance: replayData.analysis.takeProfit.distance,
-                  touched: replayData.analysis.takeProfit.touched,
-                  assessment: replayData.analysis.takeProfit.assessment
-                },
-                entry: {
-                  optimal: replayData.analysis.entry.optimal,
-                  timing: replayData.analysis.entry.timing
-                }
-              },
-              analyzedAt: new Date().toISOString()
-            };
-            targetOrder.needsReplayAnalysis = false;
-          }
-        });
-
-        console.log(`[AutoReplay] ✓ 订单 ${task.symbol} ${task.direction} - 评分: ${replayData.diagnosis.score}, 主要问题: ${replayData.diagnosis.primaryIssue}`);
-        succeeded++;
-
-      } catch (error) {
-        console.error(`[AutoReplay] 订单 ${task.orderId} 分析异常:`, error.message);
-        failed++;
-      }
-    }
-
-    console.log(`[AutoReplay] 深度分析结束: 成功 ${succeeded}，失败 ${failed}，跳过 ${skipped}`);
-  }
-  async close(id) {
-    await this.refresh();
+  async close(id, { refresh = true } = {}) {
+    if (refresh) await this.refresh();
     // 只操作单个目标订单，不需要历史订单明细
     return this.mutateLight(state => {
       const order = state.orders.find(o => o.id === id);
@@ -481,7 +241,6 @@ export class SimulatedAccount {
       return order;
     });
   }
-  start() { this.timer = setInterval(() => this.refresh().catch(() => {}), 30000); this.timer.unref(); this.refresh().catch(() => {}); }
 }
 
 export function registerSimulationRoutes(app, simulation) {
@@ -535,7 +294,7 @@ export function registerSimulationRoutes(app, simulation) {
 
   app.get('/api/paper/account', route(accountHandler));
   app.get('/api/paper/plans', route(async () => (await simulation.archive.list({ limit: 100 })).flatMap(record => (record.analyses || [])
-    .filter(s => s.eligible && s.marketProvider === 'okx' && Date.parse(s.expiresAt) > Date.now())
+    .filter(s => s.eligible && s.marketProvider === 'okx')
     .map(s => ({ ...s, recordId: record.id, at: record.at })))));
   app.post('/api/paper/orders', route(async req => { const r = await simulation.submit(req.body || {}); invalidateReadCaches(); return r; }));
   app.post('/api/paper/refresh', route(async () => { const r = await simulation.refresh(); invalidateReadCaches(); return r; }));

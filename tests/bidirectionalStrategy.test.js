@@ -2,8 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { enhancedAnalysis, enhancedProtectionReview } from '../server/enhancedAnalysis.js';
 import { createResearchRecord } from '../server/research.js';
-import { ENTRY_EVAL_BARS } from '../server/shared/entryModel.js';
 import { initialPaperAccount, submitPaperOrder, advancePaperOrder } from '../server/simulatedAccount.js';
+import { RISK_RULE } from '../server/shared/strategyGuards.js';
 import { execFileSync } from 'node:child_process';
 
 const bar = 900000;
@@ -22,21 +22,20 @@ test('enhanced bearish signal survives validation, submits short and settles pro
   const plan = signal.plan;
   assert.ok(plan.stopLoss > plan.entryMax);
   assert.ok(plan.takeProfit3 < plan.takeProfit2 && plan.takeProfit2 < plan.takeProfit1 && plan.takeProfit1 < plan.entryMin);
-  assert.equal(plan.recommendedLeverage, Math.max(1, Math.min(5, Math.floor(0.08 / ((plan.stopLoss - plan.entryMin) / plan.entryMin)))));
+  // 杠杆公式已抽到 shared RISK_RULE（riskBudgetPct 默认 0.1），ref 与生产一致：优先 entryLimit
+  const levRef = Number.isFinite(plan.entryLimit) ? plan.entryLimit : plan.entryMin;
+  assert.equal(plan.recommendedLeverage, Math.max(1, Math.min(RISK_RULE.maxLeverage, Math.floor(RISK_RULE.riskBudgetPct / ((plan.stopLoss - levRef) / levRef)))));
   const now = 80 * bar;
   const record = createResearchRecord({ config: { model: { model: 'enhanced-rules-v1', baseUrl: 'local://rules' } },
     strategy: { interval: '15m' }, market: [market], result: { analyses: [signal] }, type: 'single', scope: { limit: 80 }, now });
   assert.equal(record.analyses[0].eligible, true, JSON.stringify(record.analyses[0].validationIssues));
   assert.equal(record.analyses[0].interval, '15m');
-  // P5：周期上限/有效期改为「按主周期根数」语义，不再硬编码 15m 的小时数。
-  // 断言改为「与引擎常量一致 + 换算后的挂单时间正确」，这样周期回退 1m 时不会假失败。
+  // 持仓上限按 K 线根数计算；挂单不设入场期限。
   assert.equal(plan.maxHoldBars, 120);
-  // 老板 2026-09-10：取消下单有效期限制 → GTC（validForBars: 0）。
-  assert.equal(plan.validForBars, 0);
+  assert.equal(plan.validForBars, undefined);
   assert.equal(record.analyses[0].plan.entryRule, 'limit_pullback');
   assert.equal(Date.parse(record.analyses[0].firstEntryAt), now + bar);
-  // GTC 回测有界窗口：expiresAt = 首个可入场根 + ENTRY_EVAL_BARS 根（仅用于回测收敛，实盘不退市）。
-  assert.equal(Date.parse(record.analyses[0].expiresAt), now + bar + ENTRY_EVAL_BARS * bar);
+  assert.equal(record.analyses[0].expiresAt, undefined);
   const order = submitPaperOrder(initialPaperAccount(), record, { symbol: market.symbol, margin: 100, leverage: 2, automatic: true }, now);
   assert.equal(order.direction, 'OPEN_SHORT');
   const open = market.klines.at(-1).close;
@@ -58,7 +57,7 @@ test('zero RSI is treated as oversold for short entries and protection reviews',
   const market = bearishMarket();
   market.klines = market.klines.map((row, i) => ({ ...row, open: 100 - i * 0.1, close: 100 - i * 0.1, high: 101 - i * 0.1, low: 99 - i * 0.1 }));
   assert.match(enhancedAnalysis(market).reason, /RSI超卖/);
-  const review = enhancedProtectionReview({ direction: 'OPEN_SHORT', entry: 110, plan: { stopLoss: 115, takeProfit: 80 } }, market);
+  const review = enhancedProtectionReview({ direction: 'OPEN_SHORT', entry: 110, plan: { stopLoss: 115, takeProfit: 80, entryMin: 110, entryMax: 110 } }, market);
   assert.equal(review.action, 'CLOSE');
   assert.match(review.reason, /RSI严重超卖/);
 });

@@ -2,11 +2,11 @@ import { marketData, marketStorageSymbol } from './marketData.js';
 import { analyzeMarkets } from './ai.js';
 import { createResearchRecord, prepareMarket, toBybitInterval, nextOpenTime } from './research.js';
 import { ResearchStore } from './researchStore.js';
-import { evaluateSignal, evaluationEnd, summarizeResults } from './paperTrading.js';
+import { evaluateSignal, summarizeResults } from './paperTrading.js';
 import { LOCAL_STRATEGY, localAnalysis, localAnalysisMultiTimeframe } from './localAnalysis.js';
 import { SimulatedAccount, registerSimulationRoutes } from './simulatedAccount.js';
-import { PaperAutomation, registerAutomationRoutes } from './paperAutomation.js';
 import { registerAdaptiveStrategyRoutes } from './adaptiveRoutes.js';
+import { fetchContinuousKlines } from './continuousKlines.js';
 
 const bounded = (value, fallback, min, max) => Number.isFinite(Number(value)) ? Math.max(min, Math.min(max, Math.trunc(Number(value)))) : fallback;
 
@@ -35,11 +35,10 @@ export async function registerResearchRoutes({ app, store, marketDb, loadContrac
   await simulation.init();
   registerSimulationRoutes(app, simulation);
   registerAdaptiveStrategyRoutes(app, simulation);
-  simulation.start();
-  const automation = new PaperAutomation({ simulation, store, market: marketData, marketDb, archive });
-  await automation.init();
-  registerAutomationRoutes(app, automation);
-  automation.start();
+  // Legacy independent automation has been merged into the two global tasks.
+  app.all(['/api/paper/automation', '/api/paper/automation/:kind'], (req, res) => res.status(410).json({
+    error: 'Use /api/automation/tasks/klineSync or /api/automation/tasks/positionReview.'
+  }));
   let analysisBusy = false, refreshBusy = false;
 
   for (const type of ['single', 'range', 'all']) {
@@ -169,7 +168,7 @@ export async function registerResearchRoutes({ app, store, marketDb, loadContrac
       for (const signal of record.analyses || []) {
         if (filters(req).symbol && signal.symbol !== filters(req).symbol) continue;
         if (!record.snapshot?.costs || !signal.eligible || record.snapshot.exchange !== 'binance') { excluded++; continue; }
-        const start = Date.parse(signal.firstEntryAt), end = Math.min(now, evaluationEnd(signal));
+        const start = Date.parse(signal.firstEntryAt), end = now;
         const provider = record.snapshot.marketProvider || 'binance';
         if (refresh && provider !== client.provider) errors.push(`${signal.symbol}：保留原 ${provider} 行情评估，当前行情源不同，未混用新数据。`);
         if (refresh && provider === client.provider && start < end) {
@@ -177,10 +176,10 @@ export async function registerResearchRoutes({ app, store, marketDb, loadContrac
           if (!fetched.has(key)) {
             fetched.add(key);
             try {
-              // Every plan is bounded to <=126 bars, so a 200-row bounded window is complete.
-              const rows = await client.klines({ symbol: signal.symbol, interval: signal.interval, endTime: end - 1, startTime: start, limit: 200 });
-              await marketDb.saveKlines({ symbol: marketStorageSymbol(signal.symbol, provider), interval: signal.interval,
-                rows: rows.filter(r => r.openTime >= start && r.openTime < end && nextOpenTime(r.openTime, signal.interval) <= now) });
+              await fetchContinuousKlines({ client, symbol: signal.symbol, interval: signal.interval,
+                startTime: start, now: end,
+                savePage: rows => marketDb.saveKlines({ symbol: marketStorageSymbol(signal.symbol, provider),
+                  interval: signal.interval, rows }) });
             } catch (error) { errors.push(`${signal.symbol}: ${error.message}`); }
           }
         }
@@ -206,7 +205,7 @@ export async function registerResearchRoutes({ app, store, marketDb, loadContrac
   });
 
   // 返回实例供全局自动化使用
-  return { simulation, archive, automation };
+  return { simulation, archive };
 }
 
 function filters(req) {

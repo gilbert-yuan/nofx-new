@@ -12,7 +12,7 @@ const page = ref(1);
 const appliedFilter = ref('全部日期 / 全部币种');
 
 // 新增筛选选项
-const statusFilter = ref('all'); // all, closed, pending, expired
+const statusFilter = ref('all'); // all, closed, pending
 const directionFilter = ref('all'); // all, long, short
 const resultFilter = ref('all'); // all, win, loss
 const sortBy = ref('at'); // at, net, symbol
@@ -29,8 +29,6 @@ const filteredItems = computed(() => {
     items = items.filter(i => i.evaluation.status === 'closed');
   } else if (statusFilter.value === 'pending') {
     items = items.filter(i => ['pending', 'open'].includes(i.evaluation.status));
-  } else if (statusFilter.value === 'expired') {
-    items = items.filter(i => i.evaluation.status === 'expired');
   }
 
   // 方向筛选
@@ -176,7 +174,7 @@ const exitReasonStats = computed(() => {
 
 function fmt(v) { return v === null || v === undefined ? '—' : Number(v).toFixed(2); }
 function pct(v) { return v === null || v === undefined ? '—' : (v * 100).toFixed(1) + '%'; }
-function status(s) { return ({ closed: '已平仓', open: '模拟持仓', pending: '等待入场', expired: '到期未入场', data_gap: '行情缺失', excluded: '未参与' })[s] || s; }
+function status(s) { return ({ closed: '已平仓', open: '模拟持仓', pending: '等待入场', expired: '未成交（历史记录）', data_gap: '行情缺失', excluded: '未参与' })[s] || s; }
 function reason(s) { return ({ stop_loss: '止损', take_profit: '止盈', timeout: '持有到期', liquidation: '爆仓' })[s] || s; }
 
 async function load(refresh = false) {
@@ -248,7 +246,7 @@ onMounted(() => load());
         <article class="summary-metric">
           <span>已平仓样本</span>
           <strong>{{ data.summary.closed }}</strong>
-          <small>等待/持仓 {{ data.summary.pending }} · 到期未入场 {{ data.summary.expired }}</small>
+          <small>等待/持仓 {{ data.summary.pending }}</small>
         </article>
         <article class="summary-metric">
           <span>估算净胜率</span>
@@ -443,7 +441,6 @@ onMounted(() => load());
             <option value="all">全部</option>
             <option value="closed">已平仓</option>
             <option value="pending">活跃</option>
-            <option value="expired">已过期</option>
           </select>
         </label>
 

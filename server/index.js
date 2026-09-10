@@ -24,8 +24,8 @@ await container.init();
 // 代理宕机时 okxClient 会快速失败、globalAutomation 跳过本轮，并在恢复后自动重试。
 const proxyUrl = process.env.OKX_PROXY_URL ?? (process.env.HTTPS_PROXY || process.env.HTTP_PROXY || 'http://127.0.0.1:7890');
 proxyHealth.configure(proxyUrl);
-proxyHealth.start();
-console.log(`[ProxyHealth] 代理探测已启动: ${proxyHealth.url}`);
+await proxyHealth.check();
+console.log(`[ProxyHealth] 初始探测完成，后续由自动任务检查: ${proxyHealth.url}`);
 
 const app = express();
 app.use(cors({ origin: process.env.CORS_ORIGIN || 'http://127.0.0.1:5173' }));
@@ -82,5 +82,5 @@ app.listen(container.port, () => {
   console.log(`NOFX Lite API listening on http://127.0.0.1:${container.port}`);
 });
 
-// 启动自动化与定时清理（应用就绪后）
+// 应用就绪后启动两项自动任务。
 container.startLifecycle();

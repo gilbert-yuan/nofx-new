@@ -646,10 +646,10 @@ paths:
   /api/paper/plans:
     get:
       tags: [Paper]
-      summary: 当前可下单的策略信号候选（OKX 行情 + 未过期 + eligible）
+      summary: 当前可下单的策略信号候选（OKX 行情 + eligible）
       description: |
         从最近 100 条分析记录中筛出 `marketProvider==='okx'`、
-        `eligible===true` 且 `expiresAt > now` 的信号，附 `recordId`、`at`。
+        `eligible===true` 的信号，附 `recordId`、`at`。
       responses:
         '200':
           description: 信号候选数组
@@ -836,48 +836,25 @@ paths:
   /api/paper/automation:
     put:
       tags: [PaperAutomation]
-      summary: 更新模拟账户自动巡检配置
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              description: 由 `PaperAutomation.configure` 接受的任意键值
-              additionalProperties: true
+      deprecated: true
+      summary: Replaced by the two global automation tasks
       responses:
-        '200':
-          description: 更新后的配置
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/JsonObject' }
+        '410':
+          description: Use /api/automation/tasks/klineSync or /api/automation/tasks/positionReview
   /api/paper/automation/{kind}:
     post:
       tags: [PaperAutomation]
-      summary: 手动触发一次 scan / review 任务（异步，返回 202）
+      deprecated: true
+      summary: Replaced by the two global automation tasks
       parameters:
         - in: path
           name: kind
           required: true
-          schema: { type: string, enum: [scan, review] }
+          schema: { type: string }
       responses:
-        '202':
-          description: 已接收
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  accepted: { type: boolean }
-                  message: { type: string }
-        '400':
-          description: kind 不合法
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-              example: { error: '未知模拟任务。' }
+        '410':
+          description: Use /api/automation/tasks/{taskName}/trigger
 
-  # ───────── Adaptive ─────────
   /api/adaptive/config:
     get:
       tags: [Adaptive]
@@ -1043,12 +1020,12 @@ paths:
   /api/automation/tasks/{taskName}:
     put:
       tags: [Automation]
-      summary: 配置某个全局任务（`klineSync` / `analysisCleanup` / ...）
+      summary: Configure klineSync or positionReview
       parameters:
         - in: path
           name: taskName
           required: true
-          schema: { type: string }
+          schema: { type: string, enum: [klineSync, positionReview] }
       requestBody:
         required: true
         content:
@@ -1070,7 +1047,7 @@ paths:
         - in: path
           name: taskName
           required: true
-          schema: { type: string }
+          schema: { type: string, enum: [klineSync, positionReview] }
       responses:
         '202':
           description: 已接收
@@ -1320,7 +1297,6 @@ components:
         analysisEngine: { type: string, enum: [local, local-mtf, ai] }
         positionRecommendation: { type: string, enum: [OPEN_LONG, OPEN_SHORT, HOLD] }
         firstEntryAt: { type: string, format: date-time }
-        expiresAt: { type: string, format: date-time }
         reasons:
           type: array
           items: { type: string }

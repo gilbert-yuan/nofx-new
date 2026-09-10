@@ -20,25 +20,36 @@ function order(short = false, input = {}) {
 }
 const almost = (a, b) => assert.ok(Math.abs(a - b) < 1e-8, `${a} != ${b}`);
 
-test('paper reservation is funded, idempotent and refuses stale or invalid plans without credentials', () => {
+test('paper reservation is funded, idempotent and refuses invalid plans without credentials', () => {
   const { state, o } = order();
   assert.equal(o.notional, 300);
   almost(accountSummary(state).available, 10000 - 100 - 0.18);
   assert.equal(submitPaperOrder(state, record(), { symbol: 'BTCUSDT' }, now).id, o.id);
   assert.equal(state.orders.length, 1);
   for (const input of [{ margin: 10001 }, { margin: -1 }, { leverage: 6 }, { leverage: NaN }, { stopLoss: 105 }, { takeProfit: 95 }]) assert.throws(() => order(false, input));
-  assert.throws(() => submitPaperOrder(initialPaperAccount(), record(), { symbol: 'BTCUSDT' }, 14 * bar), /过期/);
+  const late = submitPaperOrder(initialPaperAccount(), record(), { symbol: 'BTCUSDT' }, 14 * bar);
+  assert.equal(late.status, 'pending');
+  assert.equal(late.nextTime, 15 * bar);
+  assert.equal(late.expiresAt, undefined);
+  const noDeadline = record(); delete noDeadline.analyses[0].expiresAt;
+  assert.equal(submitPaperOrder(initialPaperAccount(), noDeadline, { symbol: 'BTCUSDT' }, now).status, 'pending');
   const invalid = record(); invalid.analyses[0].eligible = false;
   assert.throws(() => submitPaperOrder(initialPaperAccount(), invalid, { symbol: 'BTCUSDT' }, now), /观望/);
 });
 
-test('no retroactive or unfinished-bar fills; pending reserves are released on expiry', () => {
+test('pending orders retain reserves and can fill after a legacy entry deadline', () => {
   const { state, o } = order();
+  o.expiresAt = new Date(14 * bar).toISOString();
+  o.plan.validForBars = 3;
   advancePaperOrder(o, [candle(10 * bar), candle(11 * bar)], 11 * bar + 1);
   assert.equal(o.status, 'pending');
   advancePaperOrder(o, [11, 12, 13].map(t => candle(t * bar, { open: 105, high: 106, low: 104, close: 105 })), 14 * bar);
-  assert.equal(o.status, 'expired');
-  assert.equal(accountSummary(state).available, 10000);
+  assert.equal(o.status, 'pending');
+  assert.equal(o.nextTime, 14 * bar);
+  almost(accountSummary(state).available, 10000 - 100 - 0.18);
+  advancePaperOrder(o, [candle(14 * bar)], 15 * bar);
+  assert.equal(o.status, 'open');
+  assert.equal(o.entryAt, new Date(14 * bar).toISOString());
 });
 
 test('3x changes position size once; long TP books exact gross, fees, funding and margin ROI', () => {
@@ -99,6 +110,24 @@ test('key-free local analysis emits transparent trend/ATR plans, flat markets WA
   assert.equal(localAnalysis({ symbol: 'BTCUSDT', klines: rows.map(r => candle(r.openTime)) }).action, 'WAIT');
   assert.equal(recommendedLeverage({ entryMin: 99, entryMax: 100, stopLoss: 99.9 }, 'OPEN_LONG'), 5);
   assert.equal(recommendedLeverage({ entryMin: 99, entryMax: 100, stopLoss: 50 }, 'OPEN_LONG'), 1);
+});
+
+test('plan candidates include legacy deadlines and plans without deadlines', async () => {
+  const legacy = record();
+  const current = record(true); delete current.analyses[0].expiresAt;
+  const excluded = record(); excluded.analyses[0].eligible = false;
+  const app = express();
+  registerSimulationRoutes(app, { archive: { list: async () => [legacy, current, excluded] } });
+  let server;
+  try {
+    await new Promise(resolve => { server = app.listen(0, '127.0.0.1', resolve); });
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/api/paper/plans`);
+    assert.equal(response.status, 200);
+    const plans = await response.json();
+    assert.deepEqual(plans.map(p => p.recordId), ['long', 'short']);
+  } finally {
+    if (server) await new Promise(resolve => server.close(resolve));
+  }
 });
 
 test('PostgreSQL simulation ledger persists changes atomically and survives a service restart', { skip: process.env.RESEARCH_DB_TEST !== '1' }, async () => {

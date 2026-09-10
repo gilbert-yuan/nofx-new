@@ -263,14 +263,18 @@ test('增强版复核 - 移动止损', () => {
     markPrice: current,
     plan: {
       stopLoss: entry - 500,
-      takeProfit: entry + 2000
+      takeProfit: entry + 2000,
+      // R 口径复核需要可计算的入场基准价（ref = entryMax for long）
+      entryMin: entry,
+      entryMax: entry
     }
   };
 
-  // 创建继续上涨的K线
+  // 创建继续上涨的K线：阶梯上涨、每 3 根带一次回调 ——
+  // 单边直涨会让 RSI 触顶 80 触发智能退出获利了结（CLOSE），盖过本用例要验证的移动止损路径
   const klines = [];
   for (let i = 0; i < 60; i++) {
-    const price = entry + (i * 30);  // 逐步上涨
+    const price = entry + Math.floor(i / 3) * 130 + [60, 120, 70][i % 3];
     klines.push({
       openTime: Date.now() - (60 - i) * 60000,
       open: price,
@@ -331,7 +335,7 @@ test('P5 移动止损：浮盈约 0.5R 就应提前保护（而非等 2%）', ()
   const market = flatMarket(entry, entry + 1.0, atr);
   const order = {
     direction: 'OPEN_LONG', entry,
-    plan: { stopLoss, takeProfit: entry + 8 }
+    plan: { stopLoss, takeProfit: entry + 8, entryMin: entry, entryMax: entry }
   };
   const result = enhancedProtectionReview(order, market);
   assert.strictEqual(result.action, 'UPDATE_PROTECTION',

@@ -1,5 +1,7 @@
 # 全局自动化交易系统
 
+> 2026-09-11: Automation now has only `klineSync` and `positionReview`. See [current task flow and API](automation-two-tasks.md). The automation examples below describe the previous implementation.
+
 全局自动化系统整合了K线同步、行情分析、模拟下单和持仓复核功能，实现完全自动化的交易流程。
 
 ## 核心特性
@@ -398,7 +400,6 @@ export function customAnalysis(market) {
       entryMax: price + delta,
       stopLoss: stopLossPrice,
       takeProfit: takeProfitPrice,
-      validForBars: 6,
       maxHoldBars: 120
     }
   };

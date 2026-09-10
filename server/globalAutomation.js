@@ -1,12 +1,7 @@
 /**
  * 全局自动化交易系统
  *
- * 核心功能：
- * 1. 定时获取K线（使用OKX公共接口，无需API Key）
- * 2. 定时分析行情（本地规则或AI）
- * 3. 自动模拟下单
- * 4. 动态止盈止损管理
- * 5. 持仓实时复核
+ * 仅两项自动任务：全市场逐币种拉取、分析、挂单；活跃订单行情、复核和盈亏。
  */
 
 import { randomUUID } from 'node:crypto';
@@ -19,6 +14,7 @@ import { analyzeMarkets, reviewPosition } from './ai.js';
 import { nextOpenTime, prepareMarket, createResearchRecord, MAIN_INTERVAL } from './research.js';
 import { localProtectionReview, applyPaperProtectionReview } from './shared/protectionReview.js';
 import { proxyHealth } from './core/proxyHealth.js';
+import { applyPendingReview } from './shared/pendingReview.js';
 
 export function selectAnalysisEngine(config = {}) {
   const analysis = config.analysis || {};
@@ -39,14 +35,11 @@ export class GlobalAutomation {
     this.owner = randomUUID();
     this.superAnalysis = createSuperEnhancedAnalysis({ store });
 
-    // 任务状态
     this.tasks = {
       klineSync: { enabled: true, interval: 60000, lastRun: null, running: false },
-      analysis: { enabled: true, interval: 5 * 60000, lastRun: null, running: false },  // 5分钟执行一次
-      // 主周期为 15m K 线，1 分钟复核并无额外信息量；且单轮本身耗时数十秒。
-      // 放宽到 2 分钟可显著降低事件循环占用，改善 API 响应速度。
-      positionReview: { enabled: true, interval: 120000, lastRun: null, running: false }  // 2分钟执行一次
+      positionReview: { enabled: true, interval: 30000, lastRun: null, running: false }
     };
+    this.inFlight = new Map();
 
     this.timers = {};
     // 递归调度的代际标记：重新调度/停止时递增，使旧循环自然退出，避免重复循环
@@ -64,19 +57,9 @@ export class GlobalAutomation {
    * 启动全局自动化系统
    */
   start() {
-    console.log('[GlobalAutomation] 启动全局自动化系统...');
+    if (this.schedulerActive) return;
     this.schedulerActive = true;
-
-    // 启动K线同步任务（每60秒）
-    this.scheduleTask('klineSync', () => this.syncKlines(), this.tasks.klineSync.interval);
-
-    // 启动行情分析任务（每15分钟）
-    this.scheduleTask('analysis', () => this.runAnalysis(), this.tasks.analysis.interval);
-
-    // 启动持仓复核任务（每2分钟）
-    this.scheduleTask('positionReview', () => this.reviewPositions(), this.tasks.positionReview.interval);
-
-    console.log('[GlobalAutomation] 全局自动化系统已启动');
+    for (const name of Object.keys(this.tasks)) this.scheduleTask(name);
   }
 
   /**
@@ -86,7 +69,7 @@ export class GlobalAutomation {
     console.log('[GlobalAutomation] 停止全局自动化系统...');
     // 先置代际标记并停用调度，让递归循环自然退出（clearTimeout 只清理已排队的那一跳）
     this.schedulerActive = false;
-    this.taskTokens = {};
+    for (const name of Object.keys(this.tasks)) this.taskTokens[name] = (this.taskTokens[name] || 0) + 1;
     Object.keys(this.timers).forEach(key => {
       if (this.timers[key]) {
         clearTimeout(this.timers[key]);
@@ -99,123 +82,97 @@ export class GlobalAutomation {
   /**
    * 调度任务
    */
-  scheduleTask(name, fn, interval) {
-    // 采用「完成后再等待」的递归调度，而不是固定 setInterval。
-    // 原因：部分任务（如 positionReview）单轮耗时可达数十秒、超过设定间隔，
-    // 固定周期会在上一轮结束后立刻触发下一轮，事件循环被持续占满，
-    // 导致 /api 请求长时间排队（实测 /api/health 曾达 4s+）。
-    const token = (this.taskTokens[name] = (this.taskTokens[name] || 0) + 1);
+  scheduleTask(name) {
+    clearTimeout(this.timers[name]);
+    const token = this.taskTokens[name] = (this.taskTokens[name] || 0) + 1;
+    const current = () => this.schedulerActive && this.taskTokens[name] === token;
     const run = async () => {
-      if (this.taskTokens[name] !== token) return;
-      await this.executeTask(name, fn);
-      if (this.taskTokens[name] !== token || !this.schedulerActive) return;
-      this.timers[name] = setTimeout(run, interval);
+      if (!current()) return;
+      await this.executeTask(name, this.getTaskFunction(name), current);
+      if (!current()) return;
+      this.tasks[name].nextRunAt = new Date(Date.now() + this.tasks[name].interval).toISOString();
+      this.timers[name] = setTimeout(run, this.tasks[name].interval);
       this.timers[name].unref();
     };
-    run();
+    void run();
   }
 
   /**
    * 执行任务
    */
-  async executeTask(name, fn) {
+  async executeTask(name, fn, current = () => true) {
     const task = this.tasks[name];
-    if (!task.enabled || task.running) return;
-
+    if (!task) throw new Error(`Unknown automation task: ${name}`);
+    if (this.inFlight.has(name)) return this.inFlight.get(name);
+    if (!task.enabled || !current()) return;
     task.running = true;
-    const startTime = Date.now();
-
-    try {
-      await fn();
-      task.lastRun = new Date().toISOString();
-      console.log(`[GlobalAutomation] ${name} 完成，耗时 ${Date.now() - startTime}ms`);
-    } catch (error) {
-      console.error(`[GlobalAutomation] ${name} 失败:`, error.message);
-      this.stats.errors.push({
-        task: name,
-        error: error.message,
-        time: new Date().toISOString()
-      });
-      this.stats.errors = this.stats.errors.slice(-50);
-    } finally {
-      task.running = false;
-    }
-  }
-
-  /**
-   * 任务1: 同步K线数据（使用OKX公共接口，无需API Key）
-   */
-  async syncKlines() {
-    // 代理宕机时跳过本轮：避免对全市场币种逐个抛 fetch failed，等代理恢复后下一轮自动重试。
-    if (!proxyHealth.isAlive()) {
-      console.warn('[GlobalAutomation] 代理不可用，跳过本轮 K线同步（OKX 行情中断）。');
-      return;
-    }
-    const symbols = await this.market.perpetualUsdtContracts();
-    console.log(`[GlobalAutomation] 开始同步 ${symbols.length} 个币种的K线...`);
-
-    let synced = 0;
-    let failed = 0;
-
-    for (const contract of symbols) {
+    task.startedAt = new Date().toISOString();
+    task.nextRunAt = null;
+    task.error = '';
+    const shouldContinue = () => current() && task.enabled;
+    const work = (async () => {
       try {
-        const symbol = contract.symbol;
-        const key = this.market.storageSymbol(symbol);
-        const interval = MAIN_INTERVAL;
-
-        // 获取最新K线
-        const rows = await this.market.klines({
-          symbol,
-          interval,
-          limit: 100
-        });
-
-        if (rows.length > 0) {
-          // 保存到数据库
-          await this.marketDb.saveKlines({
-            symbol: key,
-            interval,
-            rows
-          });
-          synced++;
-        }
+        await proxyHealth.check();
+        if (!proxyHealth.isAlive()) throw new Error('Market proxy unavailable');
+        await fn(shouldContinue);
+        task.lastRun = new Date().toISOString();
       } catch (error) {
-        failed++;
-        console.error(`[GlobalAutomation] 同步 ${contract.symbol} 失败:`, error.message);
+        task.error = error.message;
+        this.stats.errors.push({ task: name, error: error.message, time: new Date().toISOString() });
+        this.stats.errors = this.stats.errors.slice(-50);
+      } finally {
+        task.running = false;
+        this.inFlight.delete(name);
       }
-
-      // 避免请求过快
-      if (synced % 10 === 0) {
-        await new Promise(resolve => setTimeout(resolve, 100));
-      }
-    }
-
-    console.log(`[GlobalAutomation] K线同步完成: 成功 ${synced}, 失败 ${failed}`);
+    })();
+    this.inFlight.set(name, work);
+    return work;
   }
 
-  /**
-   * 任务2: 定时分析行情并自动下单
-   */
-  async runAnalysis() {
+  // Task 1: finish fetch -> analysis -> optional submission for each symbol.
+  async syncKlines(shouldContinue = () => true) {
+    const symbols = (await this.market.perpetualUsdtContracts()).map(c => c.symbol);
+    const context = {};
+    const progress = this.tasks.klineSync.progress = { total: symbols.length, completed: 0, failed: 0, symbol: null };
+    for (const symbol of symbols) {
+      if (!shouldContinue()) break;
+      progress.symbol = symbol;
+      try {
+        const market = await this.getFreshMarket(symbol, MAIN_INTERVAL, true);
+        if (!shouldContinue()) break;
+        await this.runAnalysis({ symbols: [symbol], preparedMarket: market, shouldContinue, context });
+      } catch (error) {
+        progress.failed++;
+        this.tasks.klineSync.error = `${symbol}: ${error.message}`;
+      }
+      progress.completed++;
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    progress.symbol = null;
+  }
+
+  async runAnalysis({ symbols: requestedSymbols, preparedMarket, submit = true, interval = MAIN_INTERVAL, shouldContinue = () => true, context = {} } = {}) {
     // 代理宕机时跳过本轮分析，避免对全市场币种逐个刷 fetch failed。
     if (!proxyHealth.isAlive()) {
       console.warn('[GlobalAutomation] 代理不可用，跳过本轮行情分析（OKX 行情中断）。');
       return;
     }
-    const config = await this.store.getConfig();
-    const strategy = { ...await this.store.getStrategy(), interval: MAIN_INTERVAL };
+    const config = context.config ??= await this.store.getConfig();
+    const strategy = { ...(context.strategy ??= await this.store.getStrategy()), interval };
     const engine = selectAnalysisEngine(config);
 
     console.log(`[GlobalAutomation] 开始行情分析，使用 ${engine} 模式...`);
 
-    let symbols = (await this.market.perpetualUsdtContracts()).map(s => s.symbol);
+    let symbols = requestedSymbols || (await this.market.perpetualUsdtContracts()).map(s => s.symbol);
+    const signals = [];
     const runId = randomUUID();
+    const failures = [];
 
     // P3 修复：币种过滤原先整段写在 engine === 'local' 分支里，engine='enhanced'/'super' 时
     // 根本不会执行（而且样本还按 strategyModel === LOCAL_STRATEGY.modelId 过滤，
     // enhanced 下单的 modelId 是 `${engine}-rules-v1`，导致样本恒为 0、过滤器永远不生效）。
     // 现在改为：任何引擎都先读取状态并做一次基于"全部已平仓订单"的负期望值币种拉黑。
-    const state = this.simulation.read ? await this.simulation.read() : { orders: [] };
+    const state = context.state ??= this.simulation.read ? await this.simulation.read() : { orders: [] };
     const adaptiveConfig = getAdaptiveConfig(state.adaptiveConfig);
     const adaptiveOverrides = state.adaptiveOverrides || {};
     // 自适应参数（止盈止损 ATR 等）只信任本地策略自身样本，避免用别的引擎结果调本地参数。
@@ -273,12 +230,13 @@ export class GlobalAutomation {
     // 并行处理，每次处理20个币种（提高并发数）
     const batchSize = 20;
     for (let i = 0; i < symbols.length; i += batchSize) {
+      if (!shouldContinue()) break;
       const batch = symbols.slice(i, i + batchSize);
 
       const results = await Promise.all(batch.map(async symbol => {
         try {
           // 获取主周期K线
-          const market = await this.getFreshMarket(symbol, MAIN_INTERVAL);
+          const market = preparedMarket || await this.getFreshMarket(symbol, interval);
 
           // 使用多周期分析作为默认
           let analysis;
@@ -288,7 +246,7 @@ export class GlobalAutomation {
             const intervals = ['15m', '1h', '4h'];
 
             for (const interval of intervals) {
-              if (interval === MAIN_INTERVAL) continue;
+              if (interval === market.interval) continue;
               auxMarketsPromises.push(
                 this.getFreshMarket(symbol, interval)
                   .then(m => ({ interval, market: m }))
@@ -300,6 +258,9 @@ export class GlobalAutomation {
             }
 
             const auxMarketsArray = await Promise.all(auxMarketsPromises);
+            if (!submit && auxMarketsArray.some(item => !item || item.market.partial)) {
+              throw new Error('Auxiliary market data incomplete; retaining pending order');
+            }
             const auxMarkets = {};
             for (const item of auxMarketsArray) {
               if (item) auxMarkets[item.interval] = item.market;
@@ -346,15 +307,18 @@ export class GlobalAutomation {
           const record = createResearchRecord({
             config: engine === 'ai' ? config : { ...config, model: { model: engine === 'local' ? LOCAL_STRATEGY.modelId : `${engine}-rules-v1`, baseUrl: 'local://rules' } },
             strategy, market: [market], result: { analyses: analysis ? [analysis] : [] },
-            type: 'single', scope: { interval: MAIN_INTERVAL, limit: 80, engine }
+            type: 'single', scope: { interval, limit: 80, engine }
           });
           Object.assign(record, { id: `auto-${runId}-${symbol}`, analysisEngine: engine, automationRunId: runId });
           for (const signal of record.analyses) {
             signal.analysisEngine = engine;
             if (engine !== 'ai') signal.confidenceType = 'rule_strength';
           }
+          if (!shouldContinue()) return;
           await this.archive.save(record);
           analysis = record.analyses[0];
+          signals.push(analysis);
+          if (!submit) return { symbol, success: true };
 
           // P3：统计本轮被哪道闸门挡住（用于漏斗观测，不合格时才有拦截原因）
           if (!(analysis.eligible && analysis.plan)) tallyBlock(analysis.reason);
@@ -370,7 +334,8 @@ export class GlobalAutomation {
               // 同币种风控：已有未平仓订单不重复开仓；
               // 止损后60分钟内冷却，避免同一趋势里反复止损（历史数据显示
               // 37%的止损单在60分钟内同币种再次开单，53%订单集中于29个反复亏损币种）。
-              const simState = this.simulation.read ? await this.simulation.read() : { orders: [] };
+              const simState = this.simulation.readLight ? await this.simulation.readLight()
+                : this.simulation.read ? await this.simulation.read() : { orders: [] };
               const sameSymbol = (simState.orders || []).filter(o => o.symbol === symbol);
               if (sameSymbol.some(o => o.status === 'pending' || o.status === 'open')) {
                 console.log(`[GlobalAutomation] ${symbol} 已有未平仓订单，跳过重复开仓`);
@@ -388,6 +353,7 @@ export class GlobalAutomation {
 
               // 自动提交模拟订单
               const leverage = recommendedLeverage(analysis.plan, analysis.action === 'BUY' ? 'OPEN_LONG' : 'OPEN_SHORT');
+              if (!shouldContinue()) return;
               await this.simulation.submit({
                 recordId,
                 symbol,
@@ -425,9 +391,10 @@ export class GlobalAutomation {
           return { symbol, error: error.message };
         }
       }));
+      failures.push(...results.filter(result => result?.error));
 
       // 避免请求过快
-      await new Promise(resolve => setTimeout(resolve, 200));
+      await new Promise(resolve => setImmediate(resolve));
     }
 
     this.stats.totalAnalyzed += analyzed;
@@ -437,23 +404,24 @@ export class GlobalAutomation {
     // P3 漏斗日志：候选 → 各闸拦截 → 合格 → 下单。用于一眼判断是"降频生效"还是"被过滤光了"。
     console.log(`[GlobalAutomation][漏斗] 候选${symbols.length} 已分析${analyzed} | 评分不足${blockedBy.score} `
       + `量能不足${blockedBy.volume} 盈亏比不足${blockedBy.riskReward} | 合格${eligible} 下单${submitted}`);
-    if (symbols.length === 0) {
+    if (!requestedSymbols && symbols.length === 0) {
       console.warn('[GlobalAutomation][告警] 币种过滤后候选为 0 —— 过滤器可能把所有币种都拉黑了，请检查自适应过滤样本！');
-    } else if (analyzed > 0 && eligible === 0) {
+    } else if (!requestedSymbols && analyzed > 0 && eligible === 0) {
       console.warn(`[GlobalAutomation][告警] 本轮 0 个合格信号 —— 门槛可能过严（候选${symbols.length}/已分析${analyzed}），`
         + `请核对上面漏斗计数；可临时下调 NOFX_MIN_TREND_SCORE / NOFX_MIN_RR 恢复出单。`);
     }
+    if (requestedSymbols && failures.length) throw new Error(failures.map(item => `${item.symbol}: ${item.error}`).join('; '));
+    return signals;
   }
 
   /**
-   * 任务3: 复核持仓，动态调整止盈止损
+   * 任务2: 更新挂单和持仓行情、复核订单并计算盈亏
    */
-  async reviewPositions() {
-    // 先刷新所有持仓状态
-    await this.simulation.refresh();
+  async reviewPositions(shouldContinue = () => true) {
 
-    const state = await this.simulation.read();
-    const openOrders = state.orders.filter(o => o.status === 'open');
+    const state = this.simulation.readLight ? await this.simulation.readLight() : await this.simulation.read();
+    const openOrders = state.orders.filter(o => ['pending', 'open'].includes(o.status));
+    this.tasks.positionReview.progress = { total: openOrders.length, completed: 0, failed: 0, symbol: null };
 
     if (openOrders.length === 0) {
       console.log('[GlobalAutomation] 无持仓需要复核');
@@ -466,14 +434,36 @@ export class GlobalAutomation {
     const engine = selectAnalysisEngine(config);
 
     let reviewed = 0;
+    const context = { config };
     let updated = 0;
     let held = 0;
     let closed = 0;
 
-    for (const order of openOrders) {
+    const refreshed = new Set();
+    const markets = new Map();
+    const progress = this.tasks.positionReview.progress = { total: openOrders.length, completed: 0, failed: 0, symbol: null };
+    for (const snapshot of openOrders) {
+      if (!shouldContinue()) break;
+      progress.symbol = snapshot.symbol;
       try {
+        if (!refreshed.has(snapshot.symbol)) {
+          await this.simulation.refresh({ symbols: [snapshot.symbol], shouldContinue });
+          refreshed.add(snapshot.symbol);
+        }
+        if (!shouldContinue()) break;
+        const order = this.simulation.getOrder ? await this.simulation.getOrder(snapshot.id)
+          : (await this.simulation.read()).orders.find(o => o.id === snapshot.id);
+        if (!order || !['pending', 'open'].includes(order.status) || order.error) continue;
         // 获取最新行情
-        const market = await this.getFreshMarket(order.symbol, order.interval);
+        const key = `${order.symbol}:${order.interval}`;
+        if (!markets.has(key)) markets.set(key, await this.getFreshMarket(order.symbol, order.interval));
+        const market = markets.get(key);
+        if (!shouldContinue()) break;
+        if (order.status === 'pending') {
+          await this.reviewPendingOrder(order, market, shouldContinue, context);
+          reviewed++;
+          continue;
+        }
 
         // 数据不足（如新上币种）时跳过复核，等K线积累够了再处理
         if (market.partial && market.klines.length < 15) {
@@ -512,8 +502,10 @@ export class GlobalAutomation {
         // 从不平仓 —— 等于 enhanced/super 引擎里「趋势反转 / RSI 极值 / MACD 背离」三条退出规则
         // 全是死代码（其中「均线失守且未盈利5%」极易命中）。
         // ⚠️ 行为变更：CLOSE 建议一旦命中，立即按最新标记价市价平仓，不再等待人工确认。
+        if (!shouldContinue()) break;
         if (proposal.action === 'CLOSE') {
           await this.simulation.mutateLight(state => {
+            if (!shouldContinue()) return;
             const current = state.orders.find(o => o.id === order.id);
             if (!current || current.status !== 'open') return;
             current.reviewHistory = [...(current.reviewHistory || []), {
@@ -527,7 +519,8 @@ export class GlobalAutomation {
           });
 
           // 真正的平仓动作：刷新行情后按 markPrice 以 manual 原因结算（与 /api/paper/orders/:id/close 同一原语）
-          await this.simulation.close(order.id);
+          if (!shouldContinue()) break;
+          await this.simulation.close(order.id, { refresh: false });
           closed++;
           console.log(`[GlobalAutomation] ${order.symbol} 智能退出平仓：${proposal.reason}`);
           reviewed++;
@@ -536,6 +529,7 @@ export class GlobalAutomation {
 
         // 应用复核建议（只改当前这个活跃订单，走轻量写入）
         await this.simulation.mutateLight(state => {
+          if (!shouldContinue()) return;
           const current = state.orders.find(o => o.id === order.id);
           if (!current || current.status !== 'open') return;
 
@@ -558,9 +552,14 @@ export class GlobalAutomation {
 
         reviewed++;
       } catch (error) {
-        console.error(`[GlobalAutomation] 复核 ${order.symbol} 失败:`, error.message);
+        progress.failed++;
+        this.tasks.positionReview.error = `${snapshot.symbol}: ${error.message}`;
+        console.error(`[GlobalAutomation] Review ${snapshot.symbol} failed:`, error.message);
+      } finally {
+        progress.completed++;
       }
     }
+    progress.symbol = null;
 
     this.stats.totalReviews += reviewed;
 
@@ -573,7 +572,24 @@ export class GlobalAutomation {
    * 若交易所也提供不了足够多的已收盘K线（如新上币种），
    * 则降级返回已有的部分数据（partial: true），不再抛错。
    */
-  async getFreshMarket(symbol, interval = MAIN_INTERVAL) {
+  async reviewPendingOrder(order, market, shouldContinue = () => true, context = {}) {
+    if (market.partial) return;
+    const signals = await this.runAnalysis({ symbols: [order.symbol], preparedMarket: market,
+      interval: order.interval, submit: false, shouldContinue, context });
+    if (!shouldContinue()) return;
+    return this.simulation.mutateLight(state => {
+      if (!shouldContinue()) return;
+      const current = state.orders.find(o => o.id === order.id);
+      if (!current || current.status !== 'pending' || current.nextTime !== order.nextTime) return;
+      const report = applyPendingReview(current, signals?.[0]);
+      const task = this.tasks.positionReview;
+      if (report.action === 'cancelled') task.cancelled = (task.cancelled || 0) + 1;
+      if (report.action === 'repriced') task.repriced = (task.repriced || 0) + 1;
+      return report;
+    });
+  }
+
+  async getFreshMarket(symbol, interval = MAIN_INTERVAL, forceFetch = false) {
     const key = this.market.storageSymbol(symbol);
     const now = Date.now();
 
@@ -596,9 +612,12 @@ export class GlobalAutomation {
 
     const fetchPrepared = async limit => {
       const raw = await this.market.klines({ symbol, interval, limit });
+      await this.marketDb.saveKlines({ symbol: key, interval, rows: raw });
       const prepared = prepareMarket({ symbol, interval, rows: raw, limit: 80, marketProvider: this.market.provider, throwOnInsufficient: false });
       return prepared.insufficient ? buildPartial(raw) : prepared;
     };
+
+    if (forceFetch) return fetchPrepared(100);
 
     try {
       // 先尝试从数据库获取
@@ -641,6 +660,7 @@ export class GlobalAutomation {
     const accountStatus = await this.simulation.status();
 
     return {
+      active: this.schedulerActive,
       tasks: this.tasks,
       stats: this.stats,
       account: accountStatus,
@@ -652,30 +672,14 @@ export class GlobalAutomation {
    * 配置任务
    */
   configure(taskName, options) {
-    if (!this.tasks[taskName]) {
-      throw new Error(`未知任务: ${taskName}`);
-    }
-
     const task = this.tasks[taskName];
-
-    if (typeof options.enabled === 'boolean') {
-      task.enabled = options.enabled;
-      console.log(`[GlobalAutomation] ${taskName} ${options.enabled ? '已启用' : '已禁用'}`);
+    if (!task) throw Object.assign(new Error(`Unknown automation task: ${taskName}`), { status: 400 });
+    if (options.interval !== undefined && (!Number.isFinite(options.interval) || options.interval < 1000)) {
+      throw Object.assign(new Error('Task interval must be at least 1000 ms'), { status: 422 });
     }
-
-    if (typeof options.interval === 'number' && options.interval > 0) {
-      task.interval = options.interval;
-
-      // 重新调度任务（scheduleTask 内部递增 token，旧循环会自动退出）
-      if (this.timers[taskName]) {
-        clearTimeout(this.timers[taskName]);
-        this.timers[taskName] = null;
-      }
-      this.scheduleTask(taskName, this.getTaskFunction(taskName), task.interval);
-
-      console.log(`[GlobalAutomation] ${taskName} 间隔已更新为 ${options.interval}ms`);
-    }
-
+    if (typeof options.enabled === 'boolean') task.enabled = options.enabled;
+    if (options.interval !== undefined) task.interval = options.interval;
+    if (this.schedulerActive) this.scheduleTask(taskName);
     return task;
   }
 
@@ -684,9 +688,8 @@ export class GlobalAutomation {
    */
   getTaskFunction(taskName) {
     const taskFunctions = {
-      klineSync: () => this.syncKlines(),
-      analysis: () => this.runAnalysis(),
-      positionReview: () => this.reviewPositions()
+      klineSync: guard => this.syncKlines(guard),
+      positionReview: guard => this.reviewPositions(guard)
     };
 
     return taskFunctions[taskName];
@@ -701,7 +704,8 @@ export class GlobalAutomation {
     }
 
     const fn = this.getTaskFunction(taskName);
-    await this.executeTask(taskName, fn);
+    const token = this.taskTokens[taskName];
+    await this.executeTask(taskName, fn, () => this.taskTokens[taskName] === token);
   }
 }
 
@@ -731,6 +735,7 @@ export function registerGlobalAutomationRoutes(app, automation) {
   // 手动触发任务
   app.post('/api/automation/tasks/:taskName/trigger', async (req, res, next) => {
     try {
+      if (!automation.tasks[req.params.taskName]) return res.status(400).json({ error: '未知自动任务。' });
       automation.triggerTask(req.params.taskName).catch(() => {});
       res.status(202).json({
         message: '任务已提交',

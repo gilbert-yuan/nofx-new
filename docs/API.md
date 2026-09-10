@@ -1,5 +1,7 @@
 # API 参考文档
 
+> 2026-09-11: Automation now has only `klineSync` and `positionReview`. See [current task flow and API](automation-two-tasks.md). The automation examples below describe the previous implementation.
+
 全局自动化系统的完整API接口说明。
 
 ## 基础信息
@@ -299,7 +301,6 @@ GET /api/paper/account
         "takeProfit": 53000,
         "entryMin": 49800,
         "entryMax": 50200,
-        "validForBars": 6,
         "maxHoldBars": 120
       },
       "protectionRevisions": [
@@ -470,7 +471,6 @@ GET /api/research/list?limit=100&date=2026-09-08
           "entryMax": 50200,
           "stopLoss": 49000,
           "takeProfit": 53000,
-          "validForBars": 6,
           "maxHoldBars": 120
         },
         "recommendedLeverage": 3

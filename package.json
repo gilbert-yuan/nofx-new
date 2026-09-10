@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "migrate:simulated-account": "node scripts/migrate-simulated-account.js",
+    "orders:cancel": "node scripts/cancel-pending-orders.mjs",
     "test": "node --test tests/*.test.js",
     "build": "vite build",
     "prestart": "vite build",

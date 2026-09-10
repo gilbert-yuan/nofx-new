@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onMounted, ref, watch } from 'vue';
 import { api } from '../api.js';
+import AutomationTasks from './AutomationTasks.vue';
 import { router } from '../router.js';
 import { fmt, pct, statusLabel as status, reasonLabel as reason } from '../utils/format.js';
 
@@ -29,7 +30,7 @@ const page = ref(1);
 const appliedFilter = ref('全部日期 / 全部币种');
 
 // 筛选器
-const statusFilter = ref('all'); // all, pending, open, closed, expired, cancelled
+const statusFilter = ref('all'); // all, pending, open, closed, cancelled
 const directionFilter = ref('all'); // all, long, short
 const sortBy = ref('createdAt'); // createdAt, net, roi
 const sortOrder = ref('desc'); // asc, desc
@@ -52,8 +53,6 @@ const filteredOrders = computed(() => {
     orders = orders.filter(o => o.status === 'open');
   } else if (statusFilter.value === 'closed') {
     orders = orders.filter(o => o.status === 'closed');
-  } else if (statusFilter.value === 'expired') {
-    orders = orders.filter(o => o.status === 'expired');
   } else if (statusFilter.value === 'cancelled') {
     orders = orders.filter(o => o.status === 'cancelled');
   }
@@ -456,6 +455,7 @@ onMounted(() => {
       </div>
     </div>
 
+    <AutomationTasks />
     <!-- 标签切换 -->
     <div class="tab-switcher">
       <button
@@ -560,7 +560,6 @@ onMounted(() => {
             <option value="pending">等待入场</option>
             <option value="open">模拟持仓</option>
             <option value="closed">已平仓</option>
-            <option value="expired">到期未入场</option>
             <option value="cancelled">已取消</option>
           </select>
         </label>
@@ -766,7 +765,7 @@ onMounted(() => {
           <article class="summary-metric">
             <span>已平仓样本</span>
             <strong>{{ performanceData.summary.closed }}</strong>
-            <small>等待/持仓 {{ performanceData.summary.pending }} · 到期未入场 {{ performanceData.summary.expired }}</small>
+            <small>等待/持仓 {{ performanceData.summary.pending }}</small>
           </article>
           <article class="summary-metric">
             <span>估算净胜率</span>
@@ -1265,8 +1264,6 @@ onMounted(() => {
               <dd v-if="selectedOrder.entryAt">{{ new Date(selectedOrder.entryAt).toLocaleString() }}</dd>
               <dt v-if="selectedOrder.exitAt">平仓时间</dt>
               <dd v-if="selectedOrder.exitAt">{{ new Date(selectedOrder.exitAt).toLocaleString() }}</dd>
-              <dt>过期时间</dt>
-              <dd>{{ new Date(selectedOrder.expiresAt).toLocaleString() }}</dd>
             </dl>
           </div>
         </div>

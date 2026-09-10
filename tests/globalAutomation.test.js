@@ -60,7 +60,7 @@ test('GlobalAutomation - 初始化', () => {
   assert.ok(automation, 'GlobalAutomation 实例已创建');
   assert.ok(automation.tasks, '任务配置已初始化');
   assert.ok(automation.tasks.klineSync, 'K线同步任务已配置');
-  assert.ok(automation.tasks.analysis, '分析任务已配置');
+  assert.deepEqual(Object.keys(automation.tasks), ['klineSync', 'positionReview']);
   assert.ok(automation.tasks.positionReview, '持仓复核任务已配置');
 });
 
@@ -85,8 +85,8 @@ test('GlobalAutomation - 任务配置', () => {
   assert.strictEqual(automation.tasks.klineSync.enabled, true, 'K线同步任务已启用');
 
   // 测试修改间隔
-  automation.configure('analysis', { interval: 300000 });
-  assert.strictEqual(automation.tasks.analysis.interval, 300000, '分析任务间隔已更新');
+  automation.configure('positionReview', { interval: 300000 });
+  assert.strictEqual(automation.tasks.positionReview.interval, 300000, '分析任务间隔已更新');
 });
 
 test('持仓保护复核 - 本地规则（已下沉到 shared/protectionReview）', () => {
@@ -129,14 +129,19 @@ test('持仓保护复核 - 止损/扩盈距离引用 TRAILING_RULE（防再次�
     status: 'open',
     direction: 'OPEN_LONG',
     entry: 100,
-    plan: { stopLoss: 90, takeProfit: 105 }  // 低于扩展目标，确保取扩展值
+    // R 口径复核：ref = entryMax → R = |100 - 90| = 10，浮盈 10 = 1.0R → 阶梯 L1
+    plan: { stopLoss: 90, takeProfit: 105, entryMin: 100, entryMax: 100 }
   };
 
   const proposal = localProtectionReview(order, { klines: rows });
 
   assert.equal(proposal.action, 'UPDATE_PROTECTION');
-  assert.ok(Math.abs(proposal.stopLoss - (price - TRAILING_RULE.stopAtr * atr)) < 1e-9,
-    '止损距离应等于 TRAILING_RULE.stopAtr × ATR');
+  // 止损 = 现价 − 阶梯档 trailR × R（1.0R → L1 档 trailR），不再使用 stopAtr 固定距离
+  const riskUnit = Math.abs(order.entry - order.plan.stopLoss);
+  const profitR = (price - order.entry) / riskUnit;
+  const ladderStep = [...TRAILING_RULE.ladder].reverse().find(s => profitR >= s.atR);
+  assert.ok(Math.abs(proposal.stopLoss - (price - ladderStep.trailR * riskUnit)) < 1e-9,
+    '止损距离应等于现价 − 阶梯档 trailR × R（TRAILING_RULE.ladder）');
   assert.ok(Math.abs(proposal.takeProfit - (price + TRAILING_RULE.extendTpAtr * atr)) < 1e-9,
     '扩盈距离应等于 TRAILING_RULE.extendTpAtr × ATR');
   // 回归守卫：扩盈口径与 enhancedAnalysis 统一为 extendTpAtr(3.0)，不得再回到硬编码 4 ATR

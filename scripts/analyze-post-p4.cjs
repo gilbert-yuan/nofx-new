@@ -1,7 +1,7 @@
 // 分析 P4 优化（cdc57cd，2026-09-10 ~10:16 部署）之后的新订单表现
 const { Client } = require('pg');
 const DB = 'postgres://postgres:admin@127.0.0.1:5432/nofx_lite';
-const SINCE = '2026-09-10 10:16:00+08';
+const SINCE = '2026-09-10 14:00:00+08';
 
 async function main() {
   const c = new Client(DB);

@@ -35,7 +35,7 @@ import {
   profitRFrom,
   reachedR
 } from './shared/strategyGuards.js';
-import { computeEntryLimit, ENTRY_NO_EXPIRY } from './shared/entryModel.js';
+import { computeEntryLimit } from './shared/entryModel.js';
 
 // ==================== P3 盈利改造：可调参数集中区（单点回滚） ====================
 // 诊断依据（2231 笔已平仓实测，/api/paper/statistics）：胜率 22.5%，净盈亏比 1.24 →
@@ -849,15 +849,6 @@ export function enhancedAnalysis(market) {
         maBreakAtr: SMART_EXIT.maBreakAtr,
         maExitMaxProfitR: SMART_EXIT.maExitMaxProfitR
       },
-      // 1m 主周期：下单后 6 根（6 分钟）内可成交，最多持仓 120 根（2 小时）。
-      // P5 修正：周期回退 1m 后，这两个值必须同步回退（此前被改成 15m 口径的 1/8，
-      // 换算成 1m 只有 1 分钟有效、8 分钟最大持仓 —— 订单几乎来不及走完就被超时平掉，
-      // 直接解释了 750 笔 expired 与「活不过 14 根」的高占比）。
-      // 老板 2026-09-10 要求：取消下单有效期限制 → validForBars: 0 表示 GTC（永不退市，
-      // 改为限价挂单等回调触达 entryLimit 才成交）。
-      // ENTRY_NO_EXPIRY（NOFX_ENTRY_NO_EXPIRY，默认开）此前是「文档有、代码无」的死开关；
-      // 现接上：置 NOFX_ENTRY_NO_EXPIRY=false 可回退到 6 根有效期的旧行为。
-      validForBars: ENTRY_NO_EXPIRY ? 0 : 6,
       maxHoldBars: 120,
       riskRewardRatio,
       recommendedLeverage,

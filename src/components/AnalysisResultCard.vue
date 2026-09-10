@@ -1,11 +1,6 @@
 <script setup>
-import { computed, onMounted, onBeforeUnmount, ref } from 'vue';
+import { computed } from 'vue';
 const props = defineProps({ item: { type: Object, required: true } });
-const now = ref(Date.now());
-let timer;
-onMounted(() => { timer = setInterval(() => { now.value = Date.now(); }, 1000); });
-onBeforeUnmount(() => clearInterval(timer));
-const expired = computed(() => props.item.expiresAt && Date.parse(props.item.expiresAt) <= now.value);
 const hasMultiTimeframe = computed(() => props.item.multiTimeframeAnalysis && Object.keys(props.item.multiTimeframeAnalysis).length > 0);
 function time(value) { return value ? new Date(value).toLocaleString() : '未记录'; }
 function number(value) { return Number(value).toLocaleString(undefined, { maximumFractionDigits: 8 }); }
@@ -45,7 +40,6 @@ function trendIcon(trend) { return trend === 'long' ? '↑' : trend === 'short' 
     <p v-if="item.eligible">推荐模拟杠杆：<b>{{ item.recommendedLeverage || 1 }}×</b> · 按止损距离计算，上限 5×；可到"模拟交易"采用此计划。</p>
     <p>{{ item.reason }}</p>
     <small v-if="item.risk">风险：{{ item.risk }}</small><small v-if="item.suggestion">建议：{{ item.suggestion }}</small>
-    <p v-if="expired" class="signal-warning">已过入场有效期，请重新分析。</p>
     <p v-if="!item.generatedAt" class="signal-warning">旧记录未经交易计划校验，不计入模拟统计。</p>
     <ul v-if="item.validationIssues?.length" class="signal-warning"><li v-for="issue in item.validationIssues" :key="issue">{{ issue }}</li></ul>
     <dl v-if="item.plan" class="signal-plan">
@@ -58,7 +52,6 @@ function trendIcon(trend) { return trend === 'long' ? '↑' : trend === 'short' 
       <small>已收盘行情截至：{{ time(item.dataAsOf) }}</small>
       <small>分析生成：{{ time(item.generatedAt) }}</small>
       <small v-if="item.plan">模拟入场：{{ time(item.firstEntryAt) }} 起，仅在K线开盘价落入区间时入场</small>
-      <small v-if="item.expiresAt">入场截止：{{ time(item.expiresAt) }}</small>
     </div>
   </article>
 </template>

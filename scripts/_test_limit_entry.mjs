@@ -63,7 +63,7 @@ const { rec: rec2, r: r2 } = runSimPlan(
 if (r2.status !== 'closed' || r2.reason !== 'take_profit') { console.error('FAIL(hand): 限价单未以 take_profit 平仓'); process.exit(1); }
 if (rec2.plan?.entryRule !== 'limit_pullback') { console.error('FAIL(hand): entryRule 应为 limit_pullback'); process.exit(1); }
 
-// GTC 验证：价格永不回调到 entryLimit → 实盘应一直 pending（不 expired）
+// 价格未回调到 entryLimit 时持续等待入场。
 const noPullback = [];
 const firstEntryAt2 = Date.parse(rec2.firstEntryAt);
 for (let i = 0; i < 5; i++) {
@@ -72,9 +72,9 @@ for (let i = 0; i < 5; i++) {
 }
 const r3 = createAccountSimulator().evaluate(rec2, noPullback, noPullback.at(-1).openTime);
 console.log('[GTC] no-pullback status:', r3.status);
-if (r3.status === 'expired') { console.error('FAIL(GTC): 实盘 GTC 不应 expired'); process.exit(1); }
+if (r3.status !== 'pending') { console.error('FAIL: 未触价订单应持续等待'); process.exit(1); }
 
-// 回测有界窗口：validForBars=0 在回测下收敛（不报错）
+// 回测只处理已收盘行情，触价后按正常保护规则结算。
 const bars = [];
 for (let i = 0; i < 8; i++) {
   const t = firstEntryAt2 + i * 60000;

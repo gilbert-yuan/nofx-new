@@ -5,19 +5,7 @@
  * 保持原有 API 接口不变，内部切换到新引擎
  */
 
-import { nextOpenTime } from './research.js';
 import { createBacktestSimulator } from './tradingSimulator.js';
-
-/**
- * 计算评估结束时间
- */
-export function evaluationEnd(signal) {
-  let end = Date.parse(signal.expiresAt);
-  for (let i = 0; i < signal.plan.maxHoldBars; i++) {
-    end = nextOpenTime(end, signal.interval);
-  }
-  return end;
-}
 
 /**
  * 评估单个信号
@@ -61,7 +49,6 @@ export function summarizeResults(items) {
     averageLoss: losses.length ? sum(losses, 'net') / losses.length : null,
     profitFactor: losses.length ? sum(wins, 'net') / -sum(losses, 'net') : null,
     dataGaps: items.filter(i => i.evaluation.status === 'data_gap').length,
-    pending: items.filter(i => ['open', 'pending'].includes(i.evaluation.status)).length,
-    expired: items.filter(i => i.evaluation.status === 'expired').length
+    pending: items.filter(i => ['open', 'pending'].includes(i.evaluation.status)).length
   };
 }

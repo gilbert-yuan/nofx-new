@@ -1,6 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { recommendedLeverage, plannedMarginRiskPct } from './localAnalysis.js';
-import { ENTRY_EVAL_BARS } from './shared/entryModel.js';
 
 export const RESEARCH_VERSION = 'closed-candle-plan-v1';
 // Scenario assumptions, not exchange fee quotes. Frozen into every new record.
@@ -103,19 +102,19 @@ export function normalizePlan(raw, market, now, costs = PAPER_COSTS) {
   const plan = raw?.plan;
   let normalized = null;
   if (['OPEN_LONG', 'OPEN_SHORT'].includes(action)) {
-    const fields = ['entryMin', 'entryMax', 'stopLoss', 'takeProfit', 'validForBars', 'maxHoldBars'];
-    // validForBars 允许为 0（GTC 无有效期限制）；其余字段必须为正数。先判 null 再读字段。
-    if (!plan || fields.some(k => typeof plan[k] !== 'number' || !Number.isFinite(plan[k]) || (k !== 'validForBars' && plan[k] <= 0))) {
+    const fields = ['entryMin', 'entryMax', 'stopLoss', 'takeProfit', 'maxHoldBars'];
+
+    if (!plan || fields.some(k => typeof plan[k] !== 'number' || !Number.isFinite(plan[k]) || plan[k] <= 0)) {
       issues.push('缺少有效入场区间、止损、止盈或持有期限');
     }
     else {
-      const { entryMin, entryMax, stopLoss, takeProfit, validForBars, maxHoldBars } = plan;
+      const { entryMin, entryMax, stopLoss, takeProfit, maxHoldBars } = plan;
       const long = action === 'OPEN_LONG';
       // entryLimit（限价挂单价）可选：有则按评分预测回调最优价挂单；无则回退旧区间逻辑。
       const entryLimit = Number.isFinite(plan.entryLimit) ? plan.entryLimit : null;
       if (entryMin > entryMax || (long ? !(stopLoss < entryMin && takeProfit > entryMax) : !(takeProfit < entryMin && stopLoss > entryMax))) issues.push('入场、止损、止盈价格关系无效');
-      // validForBars: 0 = GTC（取消有效期限制）；否则必须为 1～6 根。
-      if (!Number.isInteger(validForBars) || validForBars < 0 || validForBars > 6 || !Number.isInteger(maxHoldBars) || maxHoldBars > 120) issues.push('入场期限须为0（GTC）或1～6根，持有期限须为1～120根');
+
+      if (!Number.isInteger(maxHoldBars) || maxHoldBars > 120) issues.push('持有期限须为1～120根');
       if (!issues.length) {
         // 入场基准价：优先限价 entryLimit（实际成交价），否则用区间边沿（最不利价）。
         const entry = entryLimit != null ? entryLimit : (long ? entryMax : entryMin);
@@ -137,8 +136,8 @@ export function normalizePlan(raw, market, now, costs = PAPER_COSTS) {
         const takeProfit1 = optNum(plan.takeProfit1);
         const takeProfit2 = optNum(plan.takeProfit2);
         const takeProfit3 = optNum(plan.takeProfit3);
-        normalized = { entryMin, entryMax, entryLimit, stopLoss, takeProfit, validForBars, maxHoldBars, netRewardRisk,
-          entryRule: validForBars === 0 ? 'limit_pullback' : 'next_candle_open_in_range',
+        normalized = { entryMin, entryMax, entryLimit, stopLoss, takeProfit, maxHoldBars, netRewardRisk,
+          entryRule: entryLimit != null ? 'limit_pullback' : 'next_candle_open_in_range',
           ...(riskUnit !== undefined ? { riskUnit } : {}),
           ...(takeProfit1 !== undefined ? { takeProfit1 } : {}),
           ...(takeProfit2 !== undefined ? { takeProfit2 } : {}),
@@ -149,18 +148,14 @@ export function normalizePlan(raw, market, now, costs = PAPER_COSTS) {
     }
   }
   if (issues.length) action = 'WAIT';
-  let firstEntryAt = nextOpenTime(candleOpenAt(now, market.interval), market.interval);
-  let expiresAt = firstEntryAt;
-  // GTC（validForBars===0）：回测用有界窗口 ENTRY_EVAL_BARS 收敛；实盘由 tradingSimulator 忽略过期真正等待。
-  const evalBars = normalized?.validForBars === 0 ? ENTRY_EVAL_BARS : (normalized?.validForBars || 1);
-  for (let i = 0; i < evalBars; i++) expiresAt = nextOpenTime(expiresAt, market.interval);
+  const firstEntryAt = nextOpenTime(candleOpenAt(now, market.interval), market.interval);
   // 推荐杠杆 + 真实保证金风险（Task #5）：杠杆由共享的 RISK_RULE 反推，
   // marginRiskPct = 杠杆 × 止损距离，用于替代「10% 预算已用满」的模糊暗示。
   const leverage = issues.length ? 1 : recommendedLeverage(normalized, action);
   const marginRiskPct = issues.length ? 0 : plannedMarginRiskPct(normalized, action, leverage);
   return {
     symbol: market.symbol, exchange: 'binance', marketProvider: market.marketProvider || 'binance', interval: market.interval, dataAsOf: market.dataAsOf,
-    generatedAt: new Date(now).toISOString(), firstEntryAt: new Date(firstEntryAt).toISOString(), expiresAt: new Date(expiresAt).toISOString(),
+    generatedAt: new Date(now).toISOString(), firstEntryAt: new Date(firstEntryAt).toISOString(),
     positionRecommendation: action, action: action === 'OPEN_LONG' ? 'BUY' : action === 'OPEN_SHORT' ? 'SELL' : 'HOLD',
     confidence, confidenceType: 'model_self_assessment', reason: String(raw?.reason || ''), risk: String(raw?.risk || ''), suggestion: String(raw?.suggestion || ''),
     recommendedLeverage: leverage,

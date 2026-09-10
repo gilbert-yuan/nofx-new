@@ -148,12 +148,6 @@ export class TradingSimulator {
 
     // 逐根K线推进
     while (nextOpenTime(time, order.interval) <= now) {
-      // 检查过期（未入场）。GTC（validForBars===0）在实盘账户模式下永不退市，仅回测走有界窗口。
-      const expired = !entry && time >= order.expiresAt && !(order.gtc && this.config.mode === 'account');
-      if (expired) {
-        return { status: 'expired' };
-      }
-
       // 获取当前K线
       const row = byTime.get(time);
       if (!this._validateKline(row, time, order.interval)) {
@@ -262,11 +256,6 @@ export class TradingSimulator {
     }
 
     // 未完成
-    const expired = !entry && time >= order.expiresAt && !(order.gtc && this.config.mode === 'account');
-    if (expired) {
-      return { status: 'expired' };
-    }
-
     return {
       ...checkpoint(),
       status: entry ? 'open' : 'pending',
@@ -287,8 +276,6 @@ export class TradingSimulator {
         symbol: input.symbol,
         interval: input.interval,
         startTime: Date.parse(input.firstEntryAt),
-        expiresAt: Date.parse(input.expiresAt),
-        gtc: input.plan?.validForBars === 0,
         notional: this.config.costs.notional ?? PAPER_COSTS.notional,
         leverage: 1,
         margin: this.config.costs.notional ?? PAPER_COSTS.notional,
@@ -306,8 +293,6 @@ export class TradingSimulator {
       symbol: input.symbol,
       interval: input.interval,
       startTime: input.nextTime ?? Date.parse(input.createdAt),
-      expiresAt: Date.parse(input.expiresAt),
-      gtc: input.plan?.validForBars === 0,
       notional: input.notional,
       leverage: input.leverage,
       margin: input.margin,
@@ -580,7 +565,6 @@ export class TradingSimulator {
       profitFactor: losses.length ? sum(wins, 'net') / -sum(losses, 'net') : null,
       dataGaps: items.filter(i => i.evaluation?.status === 'data_gap').length,
       pending: items.filter(i => ['open', 'pending'].includes(i.evaluation?.status)).length,
-      expired: items.filter(i => i.evaluation?.status === 'expired').length,
       items
     };
   }

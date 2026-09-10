@@ -6,7 +6,7 @@
 - 多周期要求 1h、4h 均同向、收盘价与趋势一致且均线差超过 0.5 ATR；15m 同向、价格一致且均线差超过 0.3 ATR。
 - 辅助数据不足、无效或获取失败时保持 WAIT。PaperAutomation 和 GlobalAutomation 均不再降级为单周期开仓。
 - 主周期恰好为辅助周期时复用主周期数据。
-- `server/localAnalysis.js` 的 LOCAL_STRATEGY 统一定义入场偏离上限、3 根入场有效期、50 根最大持仓期与策略标识。自动模拟不再覆盖成 6/120 根。
+- `server/localAnalysis.js` 的 LOCAL_STRATEGY 统一定义入场偏离上限、最大持仓期与策略标识。未成交订单持续等待成交或取消。
 - 自动自适应只读取同为 `local-mtf-trend-atr-v2` 的已平仓订单；旧版本订单保留在统计与诊断中，但不会用于修改 v2 的参数。
 - 主周期仍为原来的 1m；止损止盈价格公式、只做多行为不变。既有订单不迁移。
 - 新分析记录的模型标识使用 local-trend-atr-v2 或 local-mtf-trend-atr-v2。单周期手动分析仍只有单周期过滤。

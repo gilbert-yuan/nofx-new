@@ -8,14 +8,8 @@
  *     - 空头：entryLimit = close + pullbackAtr * atr（等反弹到更高价）
  *   pullbackAtr 由趋势评分映射：评分越高→回调越浅（越急于入场），评分越低→回调越深（越耐心等更好价）。
  *
- * 有效期：validForBars === 0 表示 GTC（永不退市），由 NOFX_ENTRY_NO_EXPIRY 控制（默认开启，
- * 因为老板明确要求「取消下单有效期限制」）。实盘由 tradingSimulator 忽略 expiresAt 真正等待；
- * 研究回测用 ENTRY_EVAL_BARS 有界窗口，避免把 GTC 信号评估到无穷远。
+ * Unfilled orders remain pending until filled or cancelled.
  */
-
-export const ENTRY_NO_EXPIRY = process.env.NOFX_ENTRY_NO_EXPIRY !== 'false';
-// 研究回测用的有界评估窗口（根）。1m 下 240 根 = 4 小时。仅用于回测评估收敛，不影响实盘 GTC。
-export const ENTRY_EVAL_BARS = Number(process.env.NOFX_ENTRY_EVAL_BARS ?? 240);
 
 const PULLBACK_ATR_DEEP = Number(process.env.NOFX_PULLBACK_ATR_DEEP ?? 1.5);     // 低评分时的回撤深度(ATR)
 const PULLBACK_ATR_SHALLOW = Number(process.env.NOFX_PULLBACK_ATR_SHALLOW ?? 0.3); // 高评分时的回撤深度(ATR)

@@ -1,5 +1,7 @@
 # 全局自动化配置示例
 
+> 2026-09-11: Automation now has only `klineSync` and `positionReview`. See [current task flow and API](automation-two-tasks.md). The automation examples below describe the previous implementation.
+
 ## 默认配置
 
 ```javascript
