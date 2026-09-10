@@ -952,6 +952,17 @@ export function enhancedProtectionReview(order, market) {
   // 总开关：NOFX_SMART_EXIT=false 时三条规则全部停用（只保留移动止损）。
   if (!SMART_EXIT.enabled) { shouldExit = false; exitReason = ''; }
 
+  // 最小持仓保护（P8，2026-09-11）：入场后 minHoldBars 根内禁止智能退出 CLOSE。
+  // 依据：50 币×30 天 1m 回测 —— 回调挂单入场与均线失守退出几何重叠，
+  // 52% 订单成交后 1 根内即被「均线失守」平掉。保护期内移动止损（下方
+  // UPDATE_PROTECTION 分支）与 _simulate 逐根的止损/止盈/超时照常生效。
+  // 订单级覆盖：plan.smartExit.minHoldBars（默认读全局 NOFX_SMART_MIN_HOLD，0=关闭）。
+  const smartMinHold = Number(order.plan?.smartExit?.minHoldBars ?? SMART_EXIT.minHoldBars);
+  if (shouldExit && smartMinHold > 0 && Number(order.heldBars || 0) < smartMinHold) {
+    shouldExit = false;
+    exitReason = '';
+  }
+
   // 如果应该退出，返回市价平仓建议
   if (shouldExit) {
     return {

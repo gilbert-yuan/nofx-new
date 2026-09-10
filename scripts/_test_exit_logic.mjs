@@ -179,6 +179,31 @@ console.log('\n[#8] 根级均线失守（tradingSimulator）');
   ok(r2.status !== 'closed' || r2.reason !== 'smart_exit_ma', 'NOFX_SMART_EXIT_BAR_LEVEL=false 时不根级平仓', `status=${r2.status} reason=${r2.reason}`);
 }
 
+console.log('\n[#9] 最小持仓保护（P8：入场 N 根内禁智能退出 CLOSE）');
+{
+  // 均线失守场景（浮亏 + 跌破 MA20 超 1 ATR）——默认无 minHoldBars 时必 CLOSE（见 #2）
+  const calm = calmRows(30, ENTRY, ATR);
+  calm[calm.length - 1] = bar(99.7, 99.7 + 0.1, 99.6, 99.7);
+
+  const inHold = { ...mkOrder(), heldBars: 3, plan: { ...mkOrder().plan, smartExit: { minHoldBars: 15 } } };
+  const rIn = enhancedProtectionReview(inHold, { klines: calm });
+  ok(rIn.action !== 'CLOSE', 'heldBars=3 < 15 → 智能退出被抑制', `action=${rIn.action}`);
+
+  const afterHold = { ...mkOrder(), heldBars: 16, plan: { ...mkOrder().plan, smartExit: { minHoldBars: 15 } } };
+  const rAfter = enhancedProtectionReview(afterHold, { klines: calm });
+  ok(rAfter.action === 'CLOSE' && /均线失守/.test(rAfter.reason), 'heldBars=16 ≥ 15 → 智能退出恢复生效', `action=${rAfter.action}`);
+
+  // 保护期内移动止损仍要正常工作：浮盈 0.4R → UPDATE_PROTECTION（而非 HOLD）
+  const rows04 = calmRows(30, ENTRY, ATR);
+  rows04[rows04.length - 1] = bar(ENTRY + 0.4 * R, ENTRY + 0.4 * R + 0.05, ENTRY + 0.1, ENTRY + 0.4 * R);
+  const rTrail = enhancedProtectionReview({ ...inHold, markPrice: ENTRY + 0.4 * R }, { klines: rows04 });
+  ok(rTrail.action === 'UPDATE_PROTECTION', '保护期内移动止损照常生效（0.4R → UPDATE_PROTECTION）', `action=${rTrail.action}`);
+
+  // 无 plan.smartExit.minHoldBars 的旧订单走全局默认 0 → 行为不变
+  const legacy = enhancedProtectionReview(mkOrder(), { klines: calm });
+  ok(legacy.action === 'CLOSE', '旧订单（无 plan.smartExit.minHoldBars）行为不变（全局默认关闭）', `action=${legacy.action}`);
+}
+
 console.log('\n[集成] enhancedAnalysis 计划携带 R 基准 / smartExit / marginRiskPct');
 {
   // 「上升通道 + 正弦回踩」的合成行情：能通过增强引擎的全部闸门（评分/RR/RSI/追高过滤）。

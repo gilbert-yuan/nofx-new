@@ -142,7 +142,13 @@ export const SMART_EXIT = Object.freeze({
   // RSI 极值 / MACD 背离止盈要求的最小浮盈（R 口径，取代硬编码 5%）
   tpMinR: num('NOFX_SMART_TP_MIN_R', 2.0, 0, 20),
   // 根级离场：把「均线失守」下沉到逐根K线判定，避免只在复核周期（120s+）才检查
-  barLevelMaExit: bool('NOFX_SMART_EXIT_BAR_LEVEL', true)
+  barLevelMaExit: bool('NOFX_SMART_EXIT_BAR_LEVEL', true),
+  // 最小持仓保护（P8，2026-09-11）：入场后 minHoldBars 根内禁止智能退出 CLOSE。
+  // 依据：50 币×30 天 1m 全量回测 —— 回调挂单入场（成交=价格已回落）与均线失守退出
+  // 几何重叠，52% 订单成交后 1 根内被平；SMART_MA_ATR=2.0 + 最小持仓 15 根组合
+  // 胜率 15.5%→31.4%、净亏 -900.8→-759.0U。移动止损/止损止盈/超时照常生效。
+  // 0 = 关闭（保持旧行为）；订单级可用 plan.smartExit.minHoldBars 覆盖。
+  minHoldBars: num('NOFX_SMART_MIN_HOLD', 0, 0, 1000)
 });
 
 // ─────────────────── 分批止盈（Partial Take Profit）规则 ───────────────────
