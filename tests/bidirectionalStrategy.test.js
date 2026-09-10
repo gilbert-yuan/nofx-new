@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { enhancedAnalysis, enhancedProtectionReview } from '../server/enhancedAnalysis.js';
 import { createResearchRecord } from '../server/research.js';
+import { ENTRY_EVAL_BARS } from '../server/shared/entryModel.js';
 import { initialPaperAccount, submitPaperOrder, advancePaperOrder } from '../server/simulatedAccount.js';
 import { execFileSync } from 'node:child_process';
 
@@ -30,14 +31,17 @@ test('enhanced bearish signal survives validation, submits short and settles pro
   // P5：周期上限/有效期改为「按主周期根数」语义，不再硬编码 15m 的小时数。
   // 断言改为「与引擎常量一致 + 换算后的挂单时间正确」，这样周期回退 1m 时不会假失败。
   assert.equal(plan.maxHoldBars, 120);
-  assert.equal(plan.validForBars, 6);
+  // 老板 2026-09-10：取消下单有效期限制 → GTC（validForBars: 0）。
+  assert.equal(plan.validForBars, 0);
+  assert.equal(record.analyses[0].plan.entryRule, 'limit_pullback');
   assert.equal(Date.parse(record.analyses[0].firstEntryAt), now + bar);
-  // 有效期从「首个可入场根」起算：firstEntryAt + validForBars 根。
-  assert.equal(Date.parse(record.analyses[0].expiresAt), now + (1 + plan.validForBars) * bar);
+  // GTC 回测有界窗口：expiresAt = 首个可入场根 + ENTRY_EVAL_BARS 根（仅用于回测收敛，实盘不退市）。
+  assert.equal(Date.parse(record.analyses[0].expiresAt), now + bar + ENTRY_EVAL_BARS * bar);
   const order = submitPaperOrder(initialPaperAccount(), record, { symbol: market.symbol, margin: 100, leverage: 2, automatic: true }, now);
   assert.equal(order.direction, 'OPEN_SHORT');
   const open = market.klines.at(-1).close;
-  advancePaperOrder(order, [{ openTime: order.nextTime, open, high: open + 0.1, low: plan.takeProfit - 0.1,
+  // 限价挂单（空头）：需当根 high 触达 entryLimit 才成交；随后 low 跌破 takeProfit 止盈。
+  advancePaperOrder(order, [{ openTime: order.nextTime, open, high: plan.entryLimit + 0.1, low: plan.takeProfit - 0.1,
     close: plan.takeProfit, volume: 1000, confirmed: true }], order.nextTime + bar);
   assert.equal(order.reason, 'take_profit');
   assert.ok(order.net > 0);

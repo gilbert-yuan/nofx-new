@@ -16,8 +16,8 @@ import { filterSymbolsByPerformance, getAdaptiveParametersForSymbol, shouldTrade
 import { enhancedAnalysis, enhancedProtectionReview } from './enhancedAnalysis.js';
 import { createSuperEnhancedAnalysis } from './superEnhancedAnalysis.js';
 import { analyzeMarkets, reviewPosition } from './ai.js';
-import { candleOpenAt, nextOpenTime, prepareMarket, createResearchRecord, MAIN_INTERVAL } from './research.js';
-import { TRAILING_RULE } from './shared/strategyGuards.js';
+import { nextOpenTime, prepareMarket, createResearchRecord, MAIN_INTERVAL } from './research.js';
+import { localProtectionReview, applyPaperProtectionReview } from './shared/protectionReview.js';
 import { proxyHealth } from './core/proxyHealth.js';
 
 export function selectAnalysisEngine(config = {}) {
@@ -43,10 +43,15 @@ export class GlobalAutomation {
     this.tasks = {
       klineSync: { enabled: true, interval: 60000, lastRun: null, running: false },
       analysis: { enabled: true, interval: 5 * 60000, lastRun: null, running: false },  // 5分钟执行一次
-      positionReview: { enabled: true, interval: 60000, lastRun: null, running: false }  // 1分钟执行一次
+      // 主周期为 15m K 线，1 分钟复核并无额外信息量；且单轮本身耗时数十秒。
+      // 放宽到 2 分钟可显著降低事件循环占用，改善 API 响应速度。
+      positionReview: { enabled: true, interval: 120000, lastRun: null, running: false }  // 2分钟执行一次
     };
 
     this.timers = {};
+    // 递归调度的代际标记：重新调度/停止时递增，使旧循环自然退出，避免重复循环
+    this.taskTokens = {};
+    this.schedulerActive = false;
     this.stats = {
       totalAnalyzed: 0,
       totalOrders: 0,
@@ -60,6 +65,7 @@ export class GlobalAutomation {
    */
   start() {
     console.log('[GlobalAutomation] 启动全局自动化系统...');
+    this.schedulerActive = true;
 
     // 启动K线同步任务（每60秒）
     this.scheduleTask('klineSync', () => this.syncKlines(), this.tasks.klineSync.interval);
@@ -67,7 +73,7 @@ export class GlobalAutomation {
     // 启动行情分析任务（每15分钟）
     this.scheduleTask('analysis', () => this.runAnalysis(), this.tasks.analysis.interval);
 
-    // 启动持仓复核任务（每1分钟）
+    // 启动持仓复核任务（每2分钟）
     this.scheduleTask('positionReview', () => this.reviewPositions(), this.tasks.positionReview.interval);
 
     console.log('[GlobalAutomation] 全局自动化系统已启动');
@@ -78,9 +84,12 @@ export class GlobalAutomation {
    */
   stop() {
     console.log('[GlobalAutomation] 停止全局自动化系统...');
+    // 先置代际标记并停用调度，让递归循环自然退出（clearTimeout 只清理已排队的那一跳）
+    this.schedulerActive = false;
+    this.taskTokens = {};
     Object.keys(this.timers).forEach(key => {
       if (this.timers[key]) {
-        clearInterval(this.timers[key]);
+        clearTimeout(this.timers[key]);
         this.timers[key] = null;
       }
     });
@@ -91,15 +100,19 @@ export class GlobalAutomation {
    * 调度任务
    */
   scheduleTask(name, fn, interval) {
-    // 立即执行一次
-    this.executeTask(name, fn);
-
-    // 设置定时任务
-    this.timers[name] = setInterval(() => {
-      this.executeTask(name, fn);
-    }, interval);
-
-    this.timers[name].unref();
+    // 采用「完成后再等待」的递归调度，而不是固定 setInterval。
+    // 原因：部分任务（如 positionReview）单轮耗时可达数十秒、超过设定间隔，
+    // 固定周期会在上一轮结束后立刻触发下一轮，事件循环被持续占满，
+    // 导致 /api 请求长时间排队（实测 /api/health 曾达 4s+）。
+    const token = (this.taskTokens[name] = (this.taskTokens[name] || 0) + 1);
+    const run = async () => {
+      if (this.taskTokens[name] !== token) return;
+      await this.executeTask(name, fn);
+      if (this.taskTokens[name] !== token || !this.schedulerActive) return;
+      this.timers[name] = setTimeout(run, interval);
+      this.timers[name].unref();
+    };
+    run();
   }
 
   /**
@@ -464,7 +477,7 @@ export class GlobalAutomation {
         // 生成复核建议
         let proposal;
         if (engine === 'local') {
-          proposal = this.localProtectionReview(order, market);
+          proposal = localProtectionReview(order, market);
         } else if (engine === 'enhanced') {
           proposal = enhancedProtectionReview(order, market);
         } else if (engine === 'super') {
@@ -487,31 +500,39 @@ export class GlobalAutomation {
           });
         }
 
-        // 应用复核建议
-        await this.simulation.mutate(state => {
-          const current = state.orders.find(o => o.id === order.id);
-          if (!current || current.status !== 'open') return;
-
-          // 如果建议平仓
-          if (proposal.action === 'CLOSE') {
-            // 记录建议
-            current.reviewHistory = current.reviewHistory || [];
-            current.reviewHistory.push({
+        // ── 智能退出：真正执行平仓 ──────────────────────────────────────────
+        // 此前 `proposal.action === 'CLOSE'` 只往 reviewHistory 记一条 close_suggested 就 return，
+        // 从不平仓 —— 等于 enhanced/super 引擎里「趋势反转 / RSI 极值 / MACD 背离」三条退出规则
+        // 全是死代码（其中「均线失守且未盈利5%」极易命中）。
+        // ⚠️ 行为变更：CLOSE 建议一旦命中，立即按最新标记价市价平仓，不再等待人工确认。
+        if (proposal.action === 'CLOSE') {
+          await this.simulation.mutateLight(state => {
+            const current = state.orders.find(o => o.id === order.id);
+            if (!current || current.status !== 'open') return;
+            current.reviewHistory = [...(current.reviewHistory || []), {
               at: new Date().toISOString(),
               engine,
-              action: 'close_suggested',
+              action: 'smart_exit',
               reason: proposal.reason,
               confidence: proposal.confidence,
               sentiment: proposal.sentiment
-            });
+            }].slice(-50);
+          });
 
-            console.log(`[GlobalAutomation] ${order.symbol} ${proposal.reason}`);
-            closed++;
-            // 注意：实际平仓需要用户确认或在Web界面操作
-            return;
-          }
+          // 真正的平仓动作：刷新行情后按 markPrice 以 manual 原因结算（与 /api/paper/orders/:id/close 同一原语）
+          await this.simulation.close(order.id);
+          closed++;
+          console.log(`[GlobalAutomation] ${order.symbol} 智能退出平仓：${proposal.reason}`);
+          reviewed++;
+          continue;
+        }
 
-          const report = this.applyPaperProtectionReview(current, proposal, Date.now(), engine);
+        // 应用复核建议（只改当前这个活跃订单，走轻量写入）
+        await this.simulation.mutateLight(state => {
+          const current = state.orders.find(o => o.id === order.id);
+          if (!current || current.status !== 'open') return;
+
+          const report = applyPaperProtectionReview(current, proposal, Date.now(), engine);
           if (report.action === 'updated') {
             updated++;
             console.log(`[GlobalAutomation] ${order.symbol} 止盈止损已更新`);
@@ -536,7 +557,7 @@ export class GlobalAutomation {
 
     this.stats.totalReviews += reviewed;
 
-    console.log(`[GlobalAutomation] 复核完成: 已复核 ${reviewed}, 已更新 ${updated}, 保持 ${held}, 建议平仓 ${closed}`);
+    console.log(`[GlobalAutomation] 复核完成: 已复核 ${reviewed}, 已更新 ${updated}, 保持 ${held}, 智能退出 ${closed}`);
   }
 
   /**
@@ -607,141 +628,6 @@ export class GlobalAutomation {
   }
 
   /**
-   * 本地规则复核持仓
-   */
-  localProtectionReview(order, market) {
-    const rows = market.klines;
-    const price = rows.at(-1).close;
-
-    // 计算14根平均真实波幅
-    const atr = rows.slice(-14).reduce((sum, r, i) => {
-      const previous = rows[rows.length - 15 + i].close;
-      return sum + Math.max(r.high - r.low, Math.abs(r.high - previous), Math.abs(r.low - previous));
-    }, 0) / 14;
-
-    if (!(atr > 0)) {
-      return { action: 'HOLD', reason: '波动率无效，保留当前保护价格。' };
-    }
-
-    const long = order.direction === 'OPEN_LONG';
-
-    // 未盈利超过2%时保持初始保护价格，避免把止损棘轮式推向现价被噪声扫出。
-    const profit = long
-      ? (price - order.entry) / order.entry
-      : (order.entry - price) / order.entry;
-    if (!(profit > 0.02)) {
-      return {
-        action: 'HOLD',
-        reason: '持仓未盈利超过2%，保持初始保护价格，避免噪声止损。'
-      };
-    }
-
-    // 移动止损距离放宽到 2.5×ATR（P0-1；跨引擎共享常量见 server/shared/strategyGuards.js → TRAILING_RULE）
-    const stopLoss = long
-      ? Math.max(order.plan.stopLoss, price - TRAILING_RULE.stopAtr * atr)
-      : Math.min(order.plan.stopLoss, price + TRAILING_RULE.stopAtr * atr);
-
-    // 止盈跟随对齐开仓目标 4×ATR，让盈利单能跑到完整目标而非被贴身止损提前扫掉
-    const TP_ATR = 4;
-    const takeProfit = long
-      ? Math.max(order.plan.takeProfit, price + TP_ATR * atr)
-      : Math.min(order.plan.takeProfit, price - TP_ATR * atr);
-
-    return {
-      action: 'UPDATE_PROTECTION',
-      stopLoss,
-      takeProfit,
-      confidence: 0.75,
-      reason: '按最新 14 根真实波幅复核；只收紧止损，顺势调整止盈。'
-    };
-  }
-
-  /**
-   * 应用持仓保护复核建议
-   */
-  applyPaperProtectionReview(order, proposal, now = Date.now(), engine = 'local') {
-    if (order.status !== 'open') {
-      return { action: 'held', reason: '订单尚未入场或已经结束。' };
-    }
-
-    const report = {
-      at: new Date(now).toISOString(),
-      engine,
-      action: 'held',
-      reason: proposal.reason || '保留当前保护价格。'
-    };
-
-    const record = () => {
-      order.reviewHistory = [...(order.reviewHistory || []), report].slice(-50);
-      return report;
-    };
-
-    // 检查行情是否最新
-    if (order.error || Date.parse(order.markAt) !== candleOpenAt(now, order.interval)) {
-      report.reason = '行情尚未连续结算到最新收盘时间，暂不修改。';
-      return record();
-    }
-
-    if (proposal.action !== 'UPDATE_PROTECTION') {
-      return record();
-    }
-
-    // AI模式需要验证置信度
-    if (engine === 'ai') {
-      const confidence = Number(proposal.confidence);
-      if (!Number.isFinite(confidence) || confidence < 0.65 || confidence > 1) {
-        report.reason = 'AI 自评分无效或低于复核阈值，保留原保护。';
-        return record();
-      }
-    }
-
-    const stopLoss = Number(proposal.stopLoss);
-    const takeProfit = Number(proposal.takeProfit);
-    const price = Number(order.markPrice);
-    const long = order.direction === 'OPEN_LONG';
-
-    // 验证价格有效性
-    if (
-      ![stopLoss, takeProfit, price].every(v => Number.isFinite(v) && v > 0) ||
-      (long ? !(stopLoss < price && price < takeProfit) : !(takeProfit < price && price < stopLoss)) ||
-      (long ? stopLoss < order.plan.stopLoss : stopLoss > order.plan.stopLoss)
-    ) {
-      report.reason = '建议价格无效、已被穿越或扩大了止损风险，保留原保护。';
-      return record();
-    }
-
-    // 检查变化是否足够大（避免微小调整）
-    if (
-      Math.abs(stopLoss - order.plan.stopLoss) / price < 0.0001 &&
-      Math.abs(takeProfit - order.plan.takeProfit) / price < 0.0001
-    ) {
-      return record();
-    }
-
-    // 保存初始计划
-    order.initialPlan ||= { ...order.plan };
-
-    // 记录修订
-    const effectiveFrom = nextOpenTime(candleOpenAt(now, order.interval), order.interval);
-    const revision = { stopLoss, takeProfit, effectiveFrom, at: report.at };
-    order.protectionRevisions = [...(order.protectionRevisions || []), revision];
-
-    // 更新报告
-    Object.assign(report, {
-      action: 'updated',
-      previous: { stopLoss: order.plan.stopLoss, takeProfit: order.plan.takeProfit },
-      stopLoss,
-      takeProfit,
-      effectiveFrom
-    });
-
-    // 应用新的保护价格
-    order.plan = { ...order.plan, stopLoss, takeProfit };
-
-    return record();
-  }
-
-  /**
    * 获取系统状态
    */
   async getStatus() {
@@ -773,11 +659,12 @@ export class GlobalAutomation {
     if (typeof options.interval === 'number' && options.interval > 0) {
       task.interval = options.interval;
 
-      // 重新调度任务
+      // 重新调度任务（scheduleTask 内部递增 token，旧循环会自动退出）
       if (this.timers[taskName]) {
-        clearInterval(this.timers[taskName]);
-        this.scheduleTask(taskName, this.getTaskFunction(taskName), task.interval);
+        clearTimeout(this.timers[taskName]);
+        this.timers[taskName] = null;
       }
+      this.scheduleTask(taskName, this.getTaskFunction(taskName), task.interval);
 
       console.log(`[GlobalAutomation] ${taskName} 间隔已更新为 ${options.interval}ms`);
     }

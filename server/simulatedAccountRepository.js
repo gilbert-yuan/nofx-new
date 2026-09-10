@@ -194,6 +194,49 @@ export function hydrateAccount(tables) {
 
 const rowKey = (def, row) => JSON.stringify(primaryKeys(def).map(key => row[key]));
 const comparable = (def, row) => Object.fromEntries(columnsFor(def).map(([key]) => [key, row[key] ?? null]));
+
+/** 大表（行数 ≥ 此阈值）改用分桶快速 diff */
+const FAST_DIFF_MIN_ROWS = 500;
+
+/** 整桶签名：用原生 JSON.stringify 代替 JS 层递归深比较，快一个数量级 */
+const bucketSignature = (def, rows) => JSON.stringify(rows.map((row) => comparable(def, row)));
+
+/**
+ * 按 order_id 分桶的差异计算。
+ *
+ * 背景：simulated_order_extensions 已达 9 万行，而每次 mutate 只会改动极少数订单。
+ * 原先对全部行逐行执行 comparable() + isDeepStrictEqual（JS 层递归），实测占
+ * mutate 总耗时的 ~80%（约 15s/次），直接把事件循环堵死、导致 API 响应数秒。
+ *
+ * 优化：先按 order_id 分桶，用原生序列化做整桶签名比较；整桶未变则跳过该桶所有行。
+ * 只有签名不同的桶才回退到逐行深比较，语义与原来完全一致。
+ */
+function diffRowsByBucket(def, previousRows, nextRows) {
+  const bucketBy = (rows) => {
+    const map = new Map();
+    for (const row of rows) {
+      const key = row.order_id;
+      let list = map.get(key);
+      if (!list) { list = []; map.set(key, list); }
+      list.push(row);
+    }
+    return map;
+  };
+  const prevBuckets = bucketBy(previousRows);
+  const nextBuckets = bucketBy(nextRows);
+  const changed = [];
+
+  for (const [orderId, rows] of nextBuckets) {
+    const prevRows = prevBuckets.get(orderId);
+    // 行数相同且整桶签名一致 ⇒ 该订单这部分数据完全没变
+    if (prevRows && prevRows.length === rows.length && bucketSignature(def, prevRows) === bucketSignature(def, rows)) continue;
+    const old = new Map((prevRows || []).map((row) => [rowKey(def, row), comparable(def, row)]));
+    for (const row of rows) {
+      if (!isDeepStrictEqual(old.get(rowKey(def, row)), comparable(def, row))) changed.push(row);
+    }
+  }
+  return changed;
+}
 async function insertRows(client, def, rows) {
   const columns = columnsFor(def).map(([name]) => name);
   const keys = primaryKeys(def);
@@ -217,13 +260,47 @@ export class SimulatedAccountRepository {
     }
     if (!(await this.pool.query('SELECT 1 FROM simulated_accounts WHERE account_id=1')).rowCount) throw new Error('Normalized simulated account is not initialized');
   }
-  async readFrom(client, { summary = false, orderId } = {}) {
+  /**
+   * @param {object} options
+   * @param {boolean} [options.summary] 只加载摘要所需的少量表
+   * @param {string} [options.orderId] 只加载指定订单（订单级表）
+   * @param {boolean} [options.light] 轻量模式：订单级明细表（extensions/reviews/plans…）
+   *   只加载「活跃订单」的数据。历史（已平仓）订单的明细不参与读取与写回。
+   *
+   *   背景：simulated_order_extensions 已达 9 万行，其中已平仓订单占 99.6%，
+   *   而每次 mutate 要把它们全部读出、深拷贝、逐行深比较，实测单次阻塞 8~19 秒，
+   *   是 API 整体变慢的根因。
+   *
+   *   安全性：writeChanges 的删除只针对 previous 中出现的行；轻量模式下未加载的
+   *   历史行既不在 previous 也不在 next，因此不会被误删，也不会被重新插入。
+   *   代价是 mutate 回调内读不到历史订单的明细，故仅限确认不需要历史数据的写路径使用。
+   */
+  async readFrom(client, { summary = false, orderId, light = false } = {}) {
     const tables = {};
     const summaryTables = new Set(['simulated_accounts', 'simulated_orders', 'simulated_order_costs', 'simulated_order_plans', 'simulated_automation_settings', 'simulated_automation_jobs', 'simulated_account_extensions']);
+    let activeOrderIds = null;
+    if (light) {
+      const res = await client.query(
+        `SELECT order_id FROM simulated_orders WHERE account_id=1 AND status IN ('pending','open')`
+      );
+      activeOrderIds = res.rows.map(row => row.order_id);
+    }
     for (const def of allDefinitions) {
       if (summary && !summaryTables.has(def.name)) continue;
       const filterOrder = orderId !== undefined && def.order;
-      tables[def.name] = (await client.query(`SELECT * FROM ${def.name} WHERE account_id=1${filterOrder ? ' AND order_id=$1' : ''}${summary && def.name === 'simulated_order_plans' ? " AND plan_kind='current'" : ''}`, filterOrder ? [orderId] : [])).rows;
+      // 订单主表始终全量（业务逻辑需遍历/查找全部订单）；只有明细子表才按需裁剪
+      const childTable = def.order && def.name !== 'simulated_orders';
+      let sql = `SELECT * FROM ${def.name} WHERE account_id=1`;
+      const params = [];
+      if (filterOrder) {
+        sql += ' AND order_id=$1';
+        params.push(orderId);
+      } else if (light && childTable) {
+        sql += ' AND order_id = ANY($1::text[])';
+        params.push(activeOrderIds);
+      }
+      if (summary && def.name === 'simulated_order_plans') sql += " AND plan_kind='current'";
+      tables[def.name] = (await client.query(sql, params)).rows;
     }
     return hydrateAccount(tables);
   }
@@ -249,19 +326,27 @@ export class SimulatedAccountRepository {
       }
     }
     for (const def of allDefinitions) {
-      const old = new Map(previous[def.name].map(row => [rowKey(def, row), comparable(def, row)]));
-      const changed = next[def.name].filter(row => !isDeepStrictEqual(old.get(rowKey(def, row)), comparable(def, row)));
+      const nextRows = next[def.name];
+      let changed;
+      if (nextRows.length >= FAST_DIFF_MIN_ROWS && nextRows[0] && 'order_id' in nextRows[0]) {
+        // 大表走分桶快路径：一次 mutate 通常只改动极少数订单，
+        // 按 order_id 分桶后整桶签名相同即可跳过该桶全部行的逐行深比较。
+        changed = diffRowsByBucket(def, previous[def.name], nextRows);
+      } else {
+        const old = new Map(previous[def.name].map(row => [rowKey(def, row), comparable(def, row)]));
+        changed = nextRows.filter(row => !isDeepStrictEqual(old.get(rowKey(def, row)), comparable(def, row)));
+      }
       await insertRows(client, def, changed);
     }
   }
-  async mutate(fn) {
+  async mutate(fn, options = {}) {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
       // Preserve the existing account-wide transaction boundary for reservations,
       // job leases and concurrent reviews. No lost read/modify/write updates.
       await client.query('SELECT account_id FROM simulated_accounts WHERE account_id=1 FOR UPDATE');
-      const before = await this.readFrom(client);
+      const before = await this.readFrom(client, options);
       const state = structuredClone(before);
       const result = await fn(state);
       await this.writeChanges(client, before, state);

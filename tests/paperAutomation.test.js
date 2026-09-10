@@ -21,7 +21,7 @@ function openOrder(end = candleOpenAt(Date.now(), '1m')) {
 
 test('auxiliary fetch failure archives WAIT without falling back to single timeframe entries', async () => {
   const state = initialPaperAccount(), records = [];
-  const simulation = { mutate: async fn => fn(state), read: async () => structuredClone(state) };
+  const simulation = { mutate: async fn => fn(state), mutateLight: async fn => fn(state), read: async () => structuredClone(state), readLight: async () => structuredClone(state) };
   const automation = new PaperAutomation({
     simulation,
     store: { getConfig: async () => ({ model: {} }), getStrategy: async () => ({ rules: '' }) },
@@ -95,7 +95,7 @@ test('review refuses wider stops, stale data, bad levels and weak AI proposals',
 
 test('complete key-free scan uses cached data, archives every symbol and automatically submits fixed 100 margin', async () => {
   const state = initialPaperAccount(), records = new Map();
-  const simulation = { mutate: async fn => fn(state), read: async () => structuredClone(state), refresh: async () => {} };
+  const simulation = { mutate: async fn => fn(state), mutateLight: async fn => fn(state), read: async () => structuredClone(state), readLight: async () => structuredClone(state), refresh: async () => {} };
   const market = { provider: 'okx', storageSymbol: symbol => `OKX_PUBLIC_${symbol}`, perpetualUsdtContracts: async () => ['BTCUSDT', 'ETHUSDT'].map(symbol => ({ symbol })), klines: async () => { throw new Error('No external fetch required with fresh cache'); } };
   const archive = { get: async id => records.get(id), save: async record => records.set(record.id, record) };
   const automation = new PaperAutomation({ simulation, market, archive, store: { getConfig: async () => ({ model: {} }), getStrategy: async () => ({ interval: '1m' }) }, marketDb: { listKlines: async ({ interval }) => currentWindow(interval) }, analyze: async () => { throw Error('No model key is used'); } });
@@ -115,7 +115,7 @@ test('complete key-free scan uses cached data, archives every symbol and automat
 test('saved adaptive overrides are applied to newly generated paper plans', async () => {
   const state = initialPaperAccount(), records = new Map();
   state.adaptiveOverrides = { maxHoldBars: 77 };
-  const simulation = { mutate: async fn => fn(state), read: async () => structuredClone(state), refresh: async () => {} };
+  const simulation = { mutate: async fn => fn(state), mutateLight: async fn => fn(state), read: async () => structuredClone(state), readLight: async () => structuredClone(state), refresh: async () => {} };
   const market = { provider: 'okx', storageSymbol: symbol => `OKX_PUBLIC_${symbol}`, perpetualUsdtContracts: async () => [{ symbol: 'BTCUSDT' }], klines: async () => { throw new Error('cached data expected'); } };
   const archive = { get: async id => records.get(id), save: async record => records.set(record.id, record) };
   const automation = new PaperAutomation({ simulation, market, archive, store: { getConfig: async () => ({ model: {} }), getStrategy: async () => ({}) }, marketDb: { listKlines: async ({ interval }) => currentWindow(interval) } });

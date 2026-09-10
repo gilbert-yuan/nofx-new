@@ -1,6 +1,7 @@
 // Deterministic reference strategy; scores are rule strength, never win probabilities.
 // 优化调整：基于2081笔历史订单分析（整体胜率22.1%，最优区间45-49根胜率100%）
 import { LONG_ONLY } from './shared/strategyGuards.js';
+import { computeEntryLimit, trendProxyToScore, ENTRY_NO_EXPIRY } from './shared/entryModel.js';
 
 export const LOCAL_STRATEGY = Object.freeze({
   modelId: 'local-mtf-trend-atr-v2',
@@ -33,15 +34,19 @@ export function localAnalysis(market) {
   if (Math.abs(close - fast) / atr > LOCAL_STRATEGY.maxEntryDistanceAtr) return wait(`价格偏离20均线超过${LOCAL_STRATEGY.maxEntryDistanceAtr} ATR，等待回归确认，避免追涨杀跌。`);
 
   const entryMin = close - atr * 0.35, entryMax = close + atr * 0.35;
+  // 按评分预测的回调最优限价：市价追入 → 限价挂单，等价格回调触达 entryLimit 才成交。
+  // 评分越高（趋势越清晰）回调越浅，评分越低越耐心等更深回调。
+  const score = trendProxyToScore(Math.abs(fast - slow) / atr);
+  const entryLimit = computeEntryLimit({ close, atr, direction: long ? 'long' : 'short', score });
   return { symbol: market.symbol, action: long ? 'BUY' : 'SELL', confidence: Math.min(0.85, 0.65 + Math.abs(fast - slow) / atr * 0.03),
     reason: `本地规则：20 根均线${long ? '高于' : '低于'}50 根均线，收盘价与趋势同向。`,
     risk: '均线趋势可能反转；以 14 根平均真实波幅设置保护价格。规则分数不是胜率。',
-    // 优化调整：
-    // 2. 止损从 1.5 ATR 放宽到 2.5 ATR（减少过早止损）
-    // 3. 止盈从 3 ATR 扩大到 4 ATR（匹配更大止损的盈亏比）
-    // 4. 1m 主周期默认持有 120 根（2 小时）
-    plan: { entryMin, entryMax, stopLoss: long ? entryMin - atr * LOCAL_STRATEGY.stopLossAtr : entryMax + atr * LOCAL_STRATEGY.stopLossAtr,
-      takeProfit: long ? entryMax + atr * LOCAL_STRATEGY.takeProfitAtr : entryMin - atr * LOCAL_STRATEGY.takeProfitAtr, validForBars: LOCAL_STRATEGY.validForBars, maxHoldBars: LOCAL_STRATEGY.maxHoldBars } };
+    plan: { entryMin, entryMax, entryLimit,
+      stopLoss: long ? entryMin - atr * LOCAL_STRATEGY.stopLossAtr : entryMax + atr * LOCAL_STRATEGY.stopLossAtr,
+      takeProfit: long ? entryMax + atr * LOCAL_STRATEGY.takeProfitAtr : entryMin - atr * LOCAL_STRATEGY.takeProfitAtr,
+      // validForBars: 0 = GTC（取消下单有效期限制，老板 2026-09-10 要求）；
+      // 置 NOFX_ENTRY_NO_EXPIRY=false 可回退到 LOCAL_STRATEGY.validForBars（6 根）。
+      validForBars: ENTRY_NO_EXPIRY ? 0 : LOCAL_STRATEGY.validForBars, maxHoldBars: LOCAL_STRATEGY.maxHoldBars } };
 }
 
 // 多周期分析版本：引入15分钟、1小时、4小时辅助判断
@@ -135,6 +140,9 @@ export function localAnalysisMultiTimeframe(market, auxMarkets = {}, adaptivePar
 
   const entryMin = close - atr * 0.35, entryMax = close + atr * 0.35;
   const long = mainTrend === 'long';
+  // 按评分预测的回调最优限价（市价追入 → 限价挂单，GTC 无有效期限制）
+  const score = trendProxyToScore(Math.abs(fast - slow) / atr);
+  const entryLimit = computeEntryLimit({ close, atr, direction: long ? 'long' : 'short', score });
 
   // 自适应参数必须保留最低 1.25:1 的计划风险收益比（从最坏入场价计算）。
   const stopLossATR = Math.min(3.5, Math.max(1, Number(adaptiveParams.stopLossATR ?? LOCAL_STRATEGY.stopLossAtr)));
@@ -167,9 +175,11 @@ export function localAnalysisMultiTimeframe(market, auxMarkets = {}, adaptivePar
     plan: {
       entryMin,
       entryMax,
+      entryLimit,
       stopLoss: long ? entryMin - atr * stopLossATR : entryMax + atr * stopLossATR,
       takeProfit: long ? entryMax + atr * takeProfitATR : entryMin - atr * takeProfitATR,
-      validForBars: LOCAL_STRATEGY.validForBars,
+      // validForBars: 0 = GTC（取消下单有效期限制，可经 NOFX_ENTRY_NO_EXPIRY 回退）
+      validForBars: ENTRY_NO_EXPIRY ? 0 : LOCAL_STRATEGY.validForBars,
       maxHoldBars
     }
   };
@@ -177,7 +187,10 @@ export function localAnalysisMultiTimeframe(market, auxMarkets = {}, adaptivePar
 
 export function recommendedLeverage(plan, direction) {
   if (!plan) return 1;
-  const entry = direction === 'OPEN_SHORT' ? plan.entryMin : plan.entryMax;
+  // 优先用限价 entryLimit（实际成交价）；旧计划回退到入场区间边沿。
+  const entry = Number.isFinite(plan.entryLimit)
+    ? plan.entryLimit
+    : (direction === 'OPEN_SHORT' ? plan.entryMin : plan.entryMax);
   const distance = Math.abs(entry - plan.stopLoss) / entry;
   // Target a <=10% margin loss at the planned stop before costs, capped at 5x.
   return Number.isFinite(distance) && distance > 0 ? Math.max(1, Math.min(5, Math.floor(0.1 / distance))) : 1;

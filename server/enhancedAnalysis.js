@@ -8,26 +8,24 @@
  * 成交量: Volume分析
  * 支撑阻力: 动态识别
  *
- * 高级指标:
+ * 高级指标（已接入趋势评分，合计 30 分）:
  * - Ichimoku Cloud (一目均衡表)
  * - DMI/ADX (方向指标)
  * - Supertrend (超级趋势)
  * - OBV (能量潮)
- * - CMF (资金流量)
- * - Williams %R
+ *
+ * 说明：advancedIndicators.js 还导出 CMF / Williams %R / calculateTrendScore，
+ * 但本引擎的评分逻辑从未使用它们（旧版文件头把这些误列为「集成指标」，已移除）。
  */
 
-import { request } from 'undici';
 import {
   calculateIchimoku,
   calculateDMI,
   calculateSupertrend,
-  calculateOBV,
-  calculateCMF,
-  calculateWilliamsR,
-  calculateTrendScore
+  calculateOBV
 } from './advancedIndicators.js';
 import { LONG_ONLY, TRAILING_RULE } from './shared/strategyGuards.js';
+import { computeEntryLimit, ENTRY_NO_EXPIRY } from './shared/entryModel.js';
 
 // ==================== P3 盈利改造：可调参数集中区（单点回滚） ====================
 // 诊断依据（2231 笔已平仓实测，/api/paper/statistics）：胜率 22.5%，净盈亏比 1.24 →
@@ -107,22 +105,17 @@ const REQUIRE_VOLUME_CONFIRM = true;
 //   绝对阈值的内在缺陷：它把「分子（ATR）」和「分母（价格水平）」都写死了，
 //   但市场整体波动水平本身会随时间大幅漂移（隔夜 0.04% ↔ 活跃时段 0.15%）。
 //
-// 解决：改成「绝对下限 + 相对分位」双闸门，两者取较小值生效。
-//   · 绝对下限 NOFX_MIN_ATR_PCT（默认 0.0020）：硬性剔除最差的噪声带。
+// 原方案：改成「绝对下限 + 相对分位」双闸门，两者取较小值生效。
+//   · 绝对下限 NOFX_MIN_ATR_PCT（默认 0.0020）：硬性剔除最差的噪声带。✅ 已实现
 //     历史数据显示 <0.15% 是灾难区（胜率 20.2%、均单 -2.45U），0.20% 已脱离该区。
-//   · 相对分位 NOFX_MIN_ATR_QUANTILE（默认 0.60）：在本轮扫描的候选币中，
-//     要求波动率排进前 40%（即高于 60% 分位）。市况清淡时自动降低绝对门槛，
-//     市况剧烈时自动抬高 —— 保证「永远只做当下相对活跃的那部分币」。
-//   双闸门等价于：「不低于噪声底线，且属于当下相对活跃品种」。
-//   这保留了原阈值想表达的「安静时不做单」语义，但不再因为市况整体变淡而停摆。
+//   · 相对分位 NOFX_MIN_ATR_QUANTILE（默认 0.60）：要求波动率排进前 40%。
+//     ❌ **从未实现**——相对分位必须在「同批候选」上下文里计算，而 enhancedAnalysis
+//     是单币函数，拿不到全市场分布；旧注释引用的 makeVolatilityGate 全项目不存在。
+//   因此**当前只有绝对下限在生效**，市况整体变淡时不会自动降门槛。
 //
-// 调参：想更激进 → NOFX_MIN_ATR_PCT=0.004 NOFX_MIN_ATR_QUANTILE=0.8；
-//       想更保守 → NOFX_MIN_ATR_QUANTILE=0.4（只做波动率上半区）。
-// 回滚全部：NOFX_MIN_ATR_PCT=0.0005 NOFX_MIN_ATR_QUANTILE=0 \
-//           NOFX_MIN_RSI_LONG=40 NOFX_MAX_RSI_SHORT=60
+// 调参：想更激进 → NOFX_MIN_ATR_PCT=0.004；想更保守 → 调回 0.0005。
+// 回滚全部：NOFX_MIN_ATR_PCT=0.0005 NOFX_MIN_RSI_LONG=40 NOFX_MAX_RSI_SHORT=60
 const MIN_ATR_PCT = numFromEnv('NOFX_MIN_ATR_PCT', 0.002, 0, 0.05);
-// 相对分位闸门（0 = 关闭）。需要在「同批候选」上下文中生效，见 makeVolatilityGate。
-const MIN_ATR_QUANTILE = numFromEnv('NOFX_MIN_ATR_QUANTILE', 0.6, 0, 0.95);
 // 波动率上限（原值 0.08 保持不变，极端行情直接回避）
 const MAX_ATR_PCT = 0.08;
 // 多单要求的最低 RSI（原 40）
@@ -157,7 +150,7 @@ const TRAIL_TRIGGER_R = numFromEnv('NOFX_TRAIL_TRIGGER_R', 0.4, 0.05, 3.0);
  *
  * @returns {{fire: boolean, detail: string}}
  */
-function shouldFireTrailing(order, close, atr, long) {
+function shouldFireTrailing(order, close, long) {
   const entry = Number(order.entry);
   const stop = Number(order.plan?.stopLoss);
   const profit = long ? (close - entry) / entry : (entry - close) / entry;
@@ -677,6 +670,10 @@ export function enhancedAnalysis(market) {
   const entryMin = close - atr * ENTRY_BAND_ATR;
   const entryMax = close + atr * ENTRY_BAND_ATR;
 
+  // 按评分预测的回调最优限价：市价追入 → 限价挂单，等价格回调触达 entryLimit 才成交。
+  // 评分越高（趋势越强）回调越浅、越急于入场；评分越低越耐心等更深回调。
+  const entryLimit = computeEntryLimit({ close, atr, direction, score: trendStrength.score });
+
   // 动态止损止盈（基于ATR和支撑阻力）
   let stopLoss, takeProfit1, takeProfit2, takeProfit3;
 
@@ -769,6 +766,7 @@ export function enhancedAnalysis(market) {
     plan: {
       entryMin,
       entryMax,
+      entryLimit,
       stopLoss,
       // 主止盈改用 3.5R 档（原为 2R 档）。2R 时净盈亏比仅 1.24，在 22.7% 胜率下
       // 期望值为负；3.5R 是"胜率不至于崩塌"与"盈亏比足够"之间的折中。
@@ -780,7 +778,11 @@ export function enhancedAnalysis(market) {
       // P5 修正：周期回退 1m 后，这两个值必须同步回退（此前被改成 15m 口径的 1/8，
       // 换算成 1m 只有 1 分钟有效、8 分钟最大持仓 —— 订单几乎来不及走完就被超时平掉，
       // 直接解释了 750 笔 expired 与「活不过 14 根」的高占比）。
-      validForBars: 6,
+      // 老板 2026-09-10 要求：取消下单有效期限制 → validForBars: 0 表示 GTC（永不退市，
+      // 改为限价挂单等回调触达 entryLimit 才成交）。
+      // ENTRY_NO_EXPIRY（NOFX_ENTRY_NO_EXPIRY，默认开）此前是「文档有、代码无」的死开关；
+      // 现接上：置 NOFX_ENTRY_NO_EXPIRY=false 可回退到 6 根有效期的旧行为。
+      validForBars: ENTRY_NO_EXPIRY ? 0 : 6,
       maxHoldBars: 120,
       riskRewardRatio,
       recommendedLeverage,
@@ -876,13 +878,13 @@ export function enhancedProtectionReview(order, market) {
   let newStopLoss = order.plan.stopLoss;
   let newTakeProfit = order.plan.takeProfit;
 
-  const fireTrail = shouldFireTrailing(order, close, atr, long);
+  const fireTrail = shouldFireTrailing(order, close, long);
 
   if (fireTrail.fire) {
     // 达到「提前保护」触发条件，启用移动止损（距离参数化，见文件顶部 P3 参数区）
     if (long) {
       // 多头：止损移至成本或盈利保护位
-      const breakEvenStop = order.entry + atr * 0.2;
+      const breakEvenStop = order.entry + atr * TRAILING_RULE.breakEvenFloorAtr;
       const trailingStop = close - atr * TRAIL_STOP_ATR;  // P0-1 一致性：移动止损距离放宽到 2.5 ATR
       newStopLoss = Math.max(order.plan.stopLoss, breakEvenStop, trailingStop);
 
@@ -890,7 +892,7 @@ export function enhancedProtectionReview(order, market) {
       newTakeProfit = Math.max(order.plan.takeProfit, close + atr * TRAIL_TP_ATR);
     } else {
       // 空头：止损移至成本或盈利保护位
-      const breakEvenStop = order.entry - atr * 0.2;
+      const breakEvenStop = order.entry - atr * TRAILING_RULE.breakEvenFloorAtr;
       const trailingStop = close + atr * TRAIL_STOP_ATR;  // P0-1 一致性：移动止损距离放宽到 2.5 ATR
       newStopLoss = Math.min(order.plan.stopLoss, breakEvenStop, trailingStop);
 

@@ -37,7 +37,10 @@ export const TRAILING_RULE = Object.freeze({
   stopAtr: 2.5,
   // 顺势扩展止盈（只放宽不收窄）：与主止盈 3.5R 经验上同档
   extendTpAtr: 3.0,
-  // 上移到盈亏平衡位的最小浮盈触发（单位 ATR），防止一盈利就锁死
+  // 触发移动止损后，止损「落点」相对成交价的偏移量（单位 ATR）：
+  //   多头 newStop = entry + N×ATR；空头 newStop = entry − N×ATR。
+  // ⚠️ 这是「落点」不是「触发阈值」：触发阈值在 enhancedAnalysis.js 的
+  //    TRAIL_TRIGGER_R（浮盈 0.4R）。旧注释把它写成「最小浮盈触发」，与实现不符，已更正。
   breakEvenFloorAtr: 0.2
 });
 

@@ -34,7 +34,9 @@ export function submitPaperOrder(state, record, input, now = Date.now()) {
   if (!signal?.eligible || !signal.plan || !['OPEN_LONG', 'OPEN_SHORT'].includes(signal.positionRecommendation)) fail('该分析为观望或没有有效开仓计划，不能模拟下单。');
   if ((signal.marketProvider || record.marketProvider) !== 'okx') fail('请使用当前 OKX 行情重新分析后模拟下单。');
   const first = Math.max(Date.parse(signal.firstEntryAt), nextOpenTime(candleOpenAt(now, signal.interval), signal.interval));
-  if (!Number.isFinite(first) || !Number.isFinite(Date.parse(signal.expiresAt)) || first >= Date.parse(signal.expiresAt)) fail('分析计划已过期或已无未来入场窗口，请重新分析。');
+  // GTC（validForBars===0）取消有效期限制，跳过「已过期」判断；其余仍校验入场窗口。
+  const isGtc = signal.plan?.validForBars === 0;
+  if (!Number.isFinite(first) || !Number.isFinite(Date.parse(signal.expiresAt)) || (!isGtc && first >= Date.parse(signal.expiresAt))) fail('分析计划已过期或已无未来入场窗口，请重新分析。');
   const margin = Number(input.margin ?? 100), leverage = Number(input.leverage ?? signal.recommendedLeverage ?? recommendedLeverage(signal.plan, signal.positionRecommendation));
   if (!Number.isFinite(margin) || margin < 1 || margin > 100000 || !Number.isInteger(leverage) || leverage < 1 || leverage > 5) fail('保证金须为 1～100000 USDT，杠杆须为 1～5 的整数。');
   if (!state.unlimitedCapital && state.orders.filter(active).length >= 20) fail('最多同时持有 20 个模拟挂单或持仓。');
@@ -161,17 +163,28 @@ export class SimulatedAccount {
     await this.repository.init();
   }
   async read() { return this.repository.read(); }
+  /** 轻量读取：只加载活跃订单的明细子表，供不需要历史明细的运行时路径使用 */
+  async readLight() { return this.repository.read({ light: true }); }
   async mutate(fn) {
     return this.repository.mutate(fn);
   }
+  /**
+   * 轻量写入：只加载活跃订单的明细子表。
+   * 适用于确认不读取历史（已平仓）订单明细的写路径，可避免搬运近 9 万行历史数据。
+   */
+  async mutateLight(fn) {
+    return this.repository.mutate(fn, { light: true });
+  }
   async status({ summary = false } = {}) { const state = summary ? await this.repository.read({ summary: true }) : await this.read(); return { ...accountSummary(state), automation: state.automation, orders: state.orders, busy: this.busy, lastRunAt: this.lastRunAt, error: this.lastError }; }
   async getOrder(id) { return (await this.repository.read({ orderId: id })).orders[0]; }
-  async submit(input) { const record = await this.archive.get(String(input.recordId || '')); return this.mutate(state => submitPaperOrder(state, record, input)); }
+  // 开仓只新增一个订单，不依赖历史订单明细
+  async submit(input) { const record = await this.archive.get(String(input.recordId || '')); return this.mutateLight(state => submitPaperOrder(state, record, input)); }
   async refresh() {
     if (this.busy) return this.status();
     this.busy = true;
     try {
-      const state = await this.read(), now = Date.now();
+      // 轻量读取：本轮只推进活跃订单，不需要历史（已平仓）订单的 extensions/reviews 明细
+      const state = await this.readLight(), now = Date.now();
       const updates = [];
       const cache = new Map();
       for (const order of state.orders.filter(active).sort((a, b) => a.nextTime - b.nextTime)) {
@@ -193,7 +206,8 @@ export class SimulatedAccount {
 
       const newlyClosedOrders = [];
 
-      await this.mutate(current => {
+      // 轻量写入：只推进活跃订单，不需要历史订单的 extensions/reviews 明细
+      await this.mutateLight(current => {
         for (const update of updates) {
           const order = current.orders.find(o => o.id === update.id);
           if (!order || !active(order) || order.nextTime !== update.cursor) continue;
@@ -311,8 +325,8 @@ export class SimulatedAccount {
 
     if (collected.length === 0) return;
 
-    // 阶段二：一次性写入所有分析结果（单次事务）
-    await this.mutate(currentState => {
+    // 阶段二：一次性写入所有分析结果（单次事务）；只涉及活跃订单，走轻量写入
+    await this.mutateLight(currentState => {
       for (const { order, analysisCount, replayData } of collected) {
         const targetOrder = currentState.orders.find(o => o.id === order.id);
         if (!targetOrder) continue;
@@ -448,7 +462,8 @@ export class SimulatedAccount {
   }
   async close(id) {
     await this.refresh();
-    return this.mutate(state => {
+    // 只操作单个目标订单，不需要历史订单明细
+    return this.mutateLight(state => {
       const order = state.orders.find(o => o.id === id);
       if (!order) fail('模拟订单不存在。');
       if (order.status === 'pending') { order.status = 'cancelled'; return order; }

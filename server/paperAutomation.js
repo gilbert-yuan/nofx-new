@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { analyzeMarkets, reviewPosition } from './ai.js';
 import { LOCAL_STRATEGY, localAnalysisMultiTimeframe } from './localAnalysis.js';
-import { candleOpenAt, nextOpenTime, prepareMarket, createResearchRecord, MAIN_INTERVAL } from './research.js';
+import { nextOpenTime, prepareMarket, createResearchRecord, MAIN_INTERVAL } from './research.js';
 import { advancePaperOrder, submitPaperOrder } from './simulatedAccount.js';
 import { analyzeHoldingPeriodPerformance, generateOptimizedParameters } from './adaptiveStrategy.js';
 import {
@@ -10,6 +10,11 @@ import {
   getAdaptiveParametersForSymbol
 } from './adaptiveFilters.js';
 import { getAdaptiveConfig } from './adaptiveConfig.js';
+import { localProtectionReview, applyPaperProtectionReview } from './shared/protectionReview.js';
+
+// 持仓复核的两个实现已下沉到 server/shared/protectionReview.js（跨引擎单一事实源），
+// 此处 re-export 以保持既有引用路径不变（含 tests/paperAutomation.test.js）。
+export { localProtectionReview, applyPaperProtectionReview };
 
 const periods = { scan: 2 * 3600000, review: 5 * 60000 };
 export function automationDefaults(now = Date.now()) {
@@ -29,56 +34,15 @@ export function claimAutomationJob(state, kind, owner, now = Date.now(), force =
   return structuredClone(job);
 }
 
-export function localProtectionReview(order, market) {
-  const rows = market.klines, price = rows.at(-1).close;
-  const atr = rows.slice(-14).reduce((sum, r, i) => {
-    const previous = rows[rows.length - 15 + i].close;
-    return sum + Math.max(r.high - r.low, Math.abs(r.high - previous), Math.abs(r.low - previous));
-  }, 0) / 14;
-  if (!(atr > 0)) return { action: 'HOLD', reason: '波动率无效，保留当前保护价格。' };
-  const long = order.direction === 'OPEN_LONG';
-  // 未盈利超过2%时保持初始保护价格，避免把止损棘轮式推向现价被噪声扫出。
-  const profit = long ? (price - order.entry) / order.entry : (order.entry - price) / order.entry;
-  if (!(profit > 0.02)) return { action: 'HOLD', reason: '持仓未盈利超过2%，保持初始保护价格，避免噪声止损。' };
-  // 移动止损距离放宽到 2.5×ATR（原 1.5×ATR 过紧，1m 噪音即可扫掉盈利单；P0-1）
-  const TRAIL_ATR = 2.5;
-  const stopLoss = long ? Math.max(order.plan.stopLoss, price - TRAIL_ATR * atr) : Math.min(order.plan.stopLoss, price + TRAIL_ATR * atr);
-  // 止盈跟随对齐开仓目标 4×ATR，让盈利单能跑到完整目标而非被贴身止损提前扫掉
-  const TP_ATR = 4;
-  const takeProfit = long ? Math.max(order.plan.takeProfit, price + TP_ATR * atr) : Math.min(order.plan.takeProfit, price - TP_ATR * atr);
-  return { action: 'UPDATE_PROTECTION', stopLoss, takeProfit, confidence: 0.75, reason: '盈利超过2%，按最新 14 根真实波幅复核；只收紧止损，顺势调整止盈。' };
-}
-
-export function applyPaperProtectionReview(order, proposal, now = Date.now(), engine = 'local') {
-  if (order.status !== 'open') return { action: 'held', reason: '订单尚未入场或已经结束。' };
-  const report = { at: new Date(now).toISOString(), engine, action: 'held', reason: proposal.reason || '保留当前保护价格。' };
-  const record = () => { order.reviewHistory = [...(order.reviewHistory || []), report].slice(-50); return report; };
-  if (order.error || Date.parse(order.markAt) !== candleOpenAt(now, order.interval)) { report.reason = '行情尚未连续结算到最新收盘时间，暂不修改。'; return record(); }
-  if (proposal.action !== 'UPDATE_PROTECTION') return record();
-  if (engine === 'ai' && (!Number.isFinite(Number(proposal.confidence)) || Number(proposal.confidence) < 0.65 || Number(proposal.confidence) > 1)) { report.reason = 'AI 自评分无效或低于复核阈值，保留原保护。'; return record(); }
-  const stopLoss = Number(proposal.stopLoss), takeProfit = Number(proposal.takeProfit), price = Number(order.markPrice);
-  const long = order.direction === 'OPEN_LONG';
-  if (![stopLoss, takeProfit, price].every(v => Number.isFinite(v) && v > 0)
-    || (long ? !(stopLoss < price && price < takeProfit) : !(takeProfit < price && price < stopLoss))
-    || (long ? stopLoss < order.plan.stopLoss : stopLoss > order.plan.stopLoss)) {
-    report.reason = '建议价格无效、已被穿越或扩大了止损风险，保留原保护。'; return record();
-  }
-  if (Math.abs(stopLoss - order.plan.stopLoss) / price < 0.0001 && Math.abs(takeProfit - order.plan.takeProfit) / price < 0.0001) return record();
-  order.initialPlan ||= { ...order.plan };
-  const effectiveFrom = nextOpenTime(candleOpenAt(now, order.interval), order.interval);
-  const revision = { stopLoss, takeProfit, effectiveFrom, at: report.at };
-  order.protectionRevisions = [...(order.protectionRevisions || []), revision];
-  Object.assign(report, { action: 'updated', previous: { stopLoss: order.plan.stopLoss, takeProfit: order.plan.takeProfit }, stopLoss, takeProfit, effectiveFrom });
-  order.plan = { ...order.plan, stopLoss, takeProfit };
-  return record();
-}
+// localProtectionReview / applyPaperProtectionReview 见文件顶部 import：
+// 实现已统一到 server/shared/protectionReview.js，本文件不再保留副本。
 
 export class PaperAutomation {
   constructor({ simulation, store, market, marketDb, archive, analyze = analyzeMarkets, review = reviewPosition }) {
     Object.assign(this, { simulation, store, market, marketDb, archive, analyze, review, owner: randomUUID(), running: new Set() });
   }
   async init() {
-    await this.simulation.mutate(state => {
+    await this.simulation.mutateLight(state => {
       if (state.automation?.version !== 1) state.automation = automationDefaults();
       state.automation.interval = MAIN_INTERVAL;
       state.unlimitedCapital = true;
@@ -87,7 +51,7 @@ export class PaperAutomation {
   start() { this.timer = setInterval(() => this.tick(), 5000); this.timer.unref(); this.tick(); }
   tick() { for (const kind of ['scan', 'review']) this.run(kind).catch(() => {}); }
   async configure(input) {
-    return this.simulation.mutate(state => {
+    return this.simulation.mutateLight(state => {
       if (typeof input.enabled === 'boolean') state.automation.enabled = input.enabled;
       if (input.engine !== undefined) {
         if (!['local', 'auto', 'ai'].includes(input.engine)) throw Object.assign(new Error('不支持的分析方式。'), { status: 422 });
@@ -97,7 +61,8 @@ export class PaperAutomation {
     });
   }
   async editJob(kind, fn) {
-    return this.simulation.mutate(state => {
+    // 只改自动化任务状态（或活跃订单），不需搬运历史订单明细
+    return this.simulation.mutateLight(state => {
       const job = state.automation[kind];
       if (job.owner !== this.owner || !job.running) throw new Error('任务租约已被其他进程接管。');
       job.leaseUntil = Date.now() + 180000;
@@ -339,8 +304,11 @@ export class PaperAutomation {
     await this.editJob('review', j => { j.symbols = ids; j.total = ids.length; });
     const markets = new Map();
     for (let index = job.index; index < ids.length; index++) {
-      if (!(await this.simulation.read()).automation.enabled) break;
-      const order = (await this.simulation.read()).orders.find(o => o.id === ids[index]);
+      // 原来此处每个订单触发两次全量 read（各约 1.4s），是复核任务的主要耗时来源。
+      // 合并为一次轻量读取（只加载活跃订单明细）。
+      const snapshot = await this.simulation.readLight();
+      if (!snapshot.automation.enabled) break;
+      const order = snapshot.orders.find(o => o.id === ids[index]);
       if (!order || order.status !== 'open') { await this.editJob('review', j => { j.index = index + 1; j.held++; }); continue; }
       try {
         const key = `${order.symbol}:${order.interval}`;

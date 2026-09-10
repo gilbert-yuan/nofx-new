@@ -114,8 +114,9 @@ export class TradingSimulator {
 
     // 逐根K线推进
     while (nextOpenTime(time, order.interval) <= now) {
-      // 检查过期（未入场）
-      if (!entry && time >= order.expiresAt) {
+      // 检查过期（未入场）。GTC（validForBars===0）在实盘账户模式下永不退市，仅回测走有界窗口。
+      const expired = !entry && time >= order.expiresAt && !(order.gtc && this.config.mode === 'account');
+      if (expired) {
         return { status: 'expired' };
       }
 
@@ -195,7 +196,8 @@ export class TradingSimulator {
     }
 
     // 未完成
-    if (!entry && time >= order.expiresAt) {
+    const expired = !entry && time >= order.expiresAt && !(order.gtc && this.config.mode === 'account');
+    if (expired) {
       return { status: 'expired' };
     }
 
@@ -220,6 +222,7 @@ export class TradingSimulator {
         interval: input.interval,
         startTime: Date.parse(input.firstEntryAt),
         expiresAt: Date.parse(input.expiresAt),
+        gtc: input.plan?.validForBars === 0,
         notional: this.config.costs.notional ?? PAPER_COSTS.notional,
         leverage: 1,
         margin: this.config.costs.notional ?? PAPER_COSTS.notional,
@@ -238,6 +241,7 @@ export class TradingSimulator {
       interval: input.interval,
       startTime: input.nextTime ?? Date.parse(input.createdAt),
       expiresAt: Date.parse(input.expiresAt),
+      gtc: input.plan?.validForBars === 0,
       notional: input.notional,
       leverage: input.leverage,
       margin: input.margin,
@@ -307,9 +311,24 @@ export class TradingSimulator {
    * 尝试入场
    */
   _tryEntry(row, protection, direction, costs) {
-    const { entryMin, entryMax } = protection;
+    const { entryMin, entryMax, entryLimit } = protection;
 
-    // 开盘价必须在入场区间内
+    // 限价挂单（entryLimit 存在）：等价格回调触达 entryLimit 才成交。
+    // 多头：当根最低价触及 entryLimit；空头：当根最高价触及 entryLimit。
+    if (Number.isFinite(entryLimit)) {
+      const long = direction === 1;
+      const reached = long ? row.low <= entryLimit : row.high >= entryLimit;
+      if (!reached) return null;
+      // 限价单成交价不劣于挂单价；这里加保守滑点（与全系统成本模型一致）。
+      const slipped = entryLimit * (1 + direction * costs.slippageBps / 10000);
+      const valid = long
+        ? slipped > protection.stopLoss && slipped < protection.takeProfit
+        : slipped < protection.stopLoss && slipped > protection.takeProfit;
+      if (!valid) return null;
+      return { price: slipped };
+    }
+
+    // 兼容旧计划：下一根开盘价必须在入场区间内（近似市价）
     if (row.open < entryMin || row.open > entryMax) {
       return null;
     }

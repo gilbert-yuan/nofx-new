@@ -25,8 +25,9 @@ export async function analyzeMarkets({ config, strategy, market }) {
           '"plan":{"entryMin":0,"entryMax":0,"stopLoss":0,"takeProfit":0,"validForBars":3,"maxHoldBars":12}}]}. ' +
           'Use numeric values, confidence in [0,1] is self-assessment, not measured win probability. ' +
           'Only provided closed candles are available. No account positions are provided; do not recommend closing positions. ' +
-          'Entry occurs only at a future candle open within entryMin..entryMax after generation, never intrabar. ' +
-          'validForBars must be an integer 1..6, maxHoldBars 1..120. For longs stopLoss < entryMin <= entryMax < takeProfit; reverse for shorts. ' +
+          'Entry default: next future candle open within entryMin..entryMax after generation, never intrabar. ' +
+          'Optional limit order: if plan.entryLimit (number) is provided, entry is a limit order filled when price pulls back to entryLimit (long: low<=entryLimit; short: high>=entryLimit), not the next-candle-open band. ' +
+          'validForBars: 0 means GTC (no expiry limit); otherwise integer 1..6. maxHoldBars 1..120. For longs stopLoss < entryMin <= entryMax < takeProfit; reverse for shorts. ' +
           'Use WAIT with plan:null if evidence is weak. Return exactly one result for each supplied symbol. Explain invalidation in risk.',
       },
       {
