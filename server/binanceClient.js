@@ -174,6 +174,16 @@ async function parseBinanceResponse(res) {
   }
   if (!res.ok) {
     const msg = body.msg || body.message || res.statusText;
+    // 地区法律封锁：连代理都过不去，真实盘交易不可用，给出明确指引而非裸 451。
+    if (res.status === 451) {
+      const error = new Error(
+        'Binance 返回 451（地区法律封锁）：真实盘交易不可用。' +
+        '请保持模拟盘，或改用合规交易所/数据源，或更换代理地区后重试。'
+      );
+      error.status = 451;
+      error.regionBlocked = true;
+      throw error;
+    }
     const responseError = new Error(`Binance ${res.status}: ${msg}`);
     responseError.status = res.status;
     throw responseError;

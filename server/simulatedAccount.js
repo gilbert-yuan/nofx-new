@@ -164,7 +164,8 @@ export class SimulatedAccount {
   async mutate(fn) {
     return this.repository.mutate(fn);
   }
-  async status() { const state = await this.read(); return { ...accountSummary(state), automation: state.automation, orders: state.orders, busy: this.busy, lastRunAt: this.lastRunAt, error: this.lastError }; }
+  async status({ summary = false } = {}) { const state = summary ? await this.repository.read({ summary: true }) : await this.read(); return { ...accountSummary(state), automation: state.automation, orders: state.orders, busy: this.busy, lastRunAt: this.lastRunAt, error: this.lastError }; }
+  async getOrder(id) { return (await this.repository.read({ orderId: id })).orders[0]; }
   async submit(input) { const record = await this.archive.get(String(input.recordId || '')); return this.mutate(state => submitPaperOrder(state, record, input)); }
   async refresh() {
     if (this.busy) return this.status();
@@ -186,6 +187,8 @@ export class SimulatedAccount {
           const rows = cache.get(key);
           updates.push({ id: order.id, cursor: order.nextTime, rows });
         } catch (error) { updates.push({ id: order.id, cursor: order.nextTime, error: error.message }); }
+        // 让出事件循环，避免长任务期间 HTTP 请求被饿死
+        await new Promise(resolve => setImmediate(resolve));
       }
 
       const newlyClosedOrders = [];
@@ -235,8 +238,8 @@ export class SimulatedAccount {
       // 执行到期的分析任务
       await this.processScheduledAnalysis(now);
 
-      // 对活跃订单进行定期分析（每小时一次）
-      await this.analyzeActiveOrders(now);
+      // 对活跃订单进行定期分析（每小时一次）；复用本轮已读的 state，避免第二次全量读
+      await this.analyzeActiveOrders(now, state);
 
       this.lastRunAt = new Date().toISOString(); this.lastError = '';
     } catch (error) { this.lastError = error.message; throw error; }
@@ -244,9 +247,10 @@ export class SimulatedAccount {
     return this.status();
   }
 
-  async analyzeActiveOrders(now) {
-    const state = await this.read();
-    const activeOrders = state.orders.filter(o => o.status === 'open' && o.entry);
+  async analyzeActiveOrders(now, state) {
+    // state 由调用方（refresh）传入以复用已加载的数据；缺失时才回退到独立读取。
+    const snapshot = state || await this.read();
+    const activeOrders = snapshot.orders.filter(o => o.status === 'open' && o.entry);
 
     if (activeOrders.length === 0) return;
 
@@ -280,6 +284,10 @@ export class SimulatedAccount {
 
     console.log(`[ActiveAnalysis] 开始分析 ${ordersToAnalyze.length} 个活跃订单`);
 
+    // 阶段一：拉取复盘数据（网络 IO）。逐个让出事件循环，避免独占主线程。
+    // 原来每个订单各自 mutate 一次，而每次 mutate 都要全量读 + 全量 diff（extensions 近 9 万行），
+    // 是 refresh 耗时长达数十秒的主因。改为统一收集后单次写入。
+    const collected = [];
     for (const order of ordersToAnalyze) {
       try {
         const record = this.activeOrderAnalysis.get(order.id);
@@ -293,49 +301,55 @@ export class SimulatedAccount {
           continue;
         }
 
-        // 保存分析结果到订单的实时分析数组
-        await this.mutate(currentState => {
-          const targetOrder = currentState.orders.find(o => o.id === order.id);
-          if (targetOrder) {
-            if (!targetOrder.liveAnalysis) {
-              targetOrder.liveAnalysis = [];
-            }
-
-            targetOrder.liveAnalysis.push({
-              sequence: analysisCount,
-              score: replayData.diagnosis.score,
-              primaryIssue: replayData.diagnosis.primaryIssue,
-              summary: replayData.diagnosis.summary,
-              direction: {
-                correct: replayData.analysis.direction.correct,
-                favorableMove: replayData.analysis.direction.favorableMove,
-                adverseMove: replayData.analysis.direction.adverseMove
-              },
-              stopLoss: {
-                optimal: replayData.analysis.stopLoss.optimal,
-                minDistanceToSL: replayData.analysis.stopLoss.minDistanceToSL
-              },
-              takeProfit: {
-                optimal: replayData.analysis.takeProfit.optimal,
-                minDistanceToTP: replayData.analysis.takeProfit.minDistanceToTP
-              },
-              analyzedAt: new Date().toISOString(),
-              heldBars: targetOrder.heldBars,
-              unrealized: targetOrder.unrealized
-            });
-
-            // 只保留最近5次分析记录
-            if (targetOrder.liveAnalysis.length > 5) {
-              targetOrder.liveAnalysis.shift();
-            }
-          }
-        });
-
-        console.log(`[ActiveAnalysis] ✓ 订单 ${order.symbol} ${order.direction} 第${analysisCount}次分析 - 评分: ${replayData.diagnosis.score}, 浮盈: ${order.unrealized?.toFixed(2) || 0}`);
-
+        collected.push({ order, analysisCount, replayData });
       } catch (error) {
         console.error(`[ActiveAnalysis] 订单 ${order.id} 分析异常:`, error.message);
       }
+      // 让出事件循环：保证 HTTP 请求能在长任务间隙得到处理
+      await new Promise(resolve => setImmediate(resolve));
+    }
+
+    if (collected.length === 0) return;
+
+    // 阶段二：一次性写入所有分析结果（单次事务）
+    await this.mutate(currentState => {
+      for (const { order, analysisCount, replayData } of collected) {
+        const targetOrder = currentState.orders.find(o => o.id === order.id);
+        if (!targetOrder) continue;
+        if (!targetOrder.liveAnalysis) targetOrder.liveAnalysis = [];
+
+        targetOrder.liveAnalysis.push({
+          sequence: analysisCount,
+          score: replayData.diagnosis.score,
+          primaryIssue: replayData.diagnosis.primaryIssue,
+          summary: replayData.diagnosis.summary,
+          direction: {
+            correct: replayData.analysis.direction.correct,
+            favorableMove: replayData.analysis.direction.favorableMove,
+            adverseMove: replayData.analysis.direction.adverseMove
+          },
+          stopLoss: {
+            optimal: replayData.analysis.stopLoss.optimal,
+            minDistanceToSL: replayData.analysis.stopLoss.minDistanceToSL
+          },
+          takeProfit: {
+            optimal: replayData.analysis.takeProfit.optimal,
+            minDistanceToTP: replayData.analysis.takeProfit.minDistanceToTP
+          },
+          analyzedAt: new Date().toISOString(),
+          heldBars: targetOrder.heldBars,
+          unrealized: targetOrder.unrealized
+        });
+
+        // 只保留最近5次分析记录
+        if (targetOrder.liveAnalysis.length > 5) {
+          targetOrder.liveAnalysis.shift();
+        }
+      }
+    });
+
+    for (const { order, analysisCount, replayData } of collected) {
+      console.log(`[ActiveAnalysis] ✓ 订单 ${order.symbol} ${order.direction} 第${analysisCount}次分析 - 评分: ${replayData.diagnosis.score}, 浮盈: ${order.unrealized?.toFixed(2) || 0}`);
     }
 
     console.log(`[ActiveAnalysis] 完成活跃订单分析`);
@@ -369,8 +383,15 @@ export class SimulatedAccount {
         const replayData = await getOrderReplayData(order, this.market, this.marketDb);
 
         if (replayData.error) {
-          console.log(`[AutoReplay] 订单 ${task.symbol} 分析失败: ${replayData.error}`);
-          failed++;
+          // 数据窗口不足（K线缺失/缺口）属数据完整度问题，非系统错误：
+          // 计为「跳过」而非「失败」，避免复盘统计里虚高失败数、误导排障。
+          if (/K线数据不完整|无K线数据|缺少入场前|缺少入场或出场|持仓期间存在缺口/.test(replayData.error)) {
+            skipped++;
+            console.log(`[AutoReplay] 订单 ${task.symbol} K线不完整，跳过复盘（数据窗口不足）: ${replayData.error}`);
+          } else {
+            failed++;
+            console.log(`[AutoReplay] 订单 ${task.symbol} 分析失败: ${replayData.error}`);
+          }
           continue;
         }
 
@@ -442,7 +463,7 @@ export class SimulatedAccount {
 
 export function registerSimulationRoutes(app, simulation) {
   const route = fn => async (req, res, next) => { try { res.json(await fn(req)); } catch (error) { next(error); } };
-  app.get('/api/paper/account', route(() => simulation.status()));
+  app.get('/api/paper/account', route(req => simulation.status({ summary: req.query.view === 'summary' })));
   app.get('/api/paper/plans', route(async () => (await simulation.archive.list({ limit: 100 })).flatMap(record => (record.analyses || [])
     .filter(s => s.eligible && s.marketProvider === 'okx' && Date.parse(s.expiresAt) > Date.now())
     .map(s => ({ ...s, recordId: record.id, at: record.at })))));
@@ -466,8 +487,7 @@ export function registerSimulationRoutes(app, simulation) {
 
   // 获取订单详情（包含完整分析上下文）
   app.get('/api/paper/orders/:id', route(async (req) => {
-    const state = await simulation.read();
-    const order = state.orders.find(o => o.id === req.params.id);
+    const order = simulation.getOrder ? await simulation.getOrder(req.params.id) : (await simulation.read()).orders.find(o => o.id === req.params.id);
     if (!order) fail('订单不存在');
     return order;
   }));

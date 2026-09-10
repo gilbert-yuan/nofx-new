@@ -1,5 +1,6 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
+import { storeToRefs } from 'pinia';
 import { api } from './api.js';
 import { marketApi, historyApi } from './api/client.js';
 import { useConfigStore } from './stores/config.js';
@@ -17,7 +18,8 @@ import DailyTrendView from './components/DailyTrendView.vue';
 
 // 配置/策略/状态集中到 store（前端唯一可信源）
 const configStore = useConfigStore();
-const { config, strategy, tradingStatus, symbolStatus, syncStatus, savedMode, statusError } = configStore;
+const { config, strategy } = configStore;
+const { tradingStatus, symbolStatus, syncStatus, savedMode, statusError } = storeToRefs(configStore);
 const loadStatus = () => configStore.loadStatus();
 
 const activeView = ref('workbench');
@@ -39,6 +41,7 @@ let symbolsRequestId = 0;
 let marketRequestId = 0;
 let analysisRequestId = 0;
 let mounted = false;
+let unsubscribeRoute;
 let historyRequestId = 0;
 let lastHistoryQuery = '';
 let lastSymbolHistoryQuery = '';
@@ -69,7 +72,7 @@ onMounted(async () => {
   }
 
   // 监听路由变化
-  router.onChange((newState) => {
+  unsubscribeRoute = router.onChange((newState) => {
     activeView.value = newState.view;
     if (newState.params.symbol && newState.params.symbol !== activeSymbol.value) {
       selectSymbol(newState.params.symbol);
@@ -91,9 +94,9 @@ onMounted(async () => {
     loadHistoryByDate();
   }
 
-  statusTimer = setInterval(loadStatus, 10000);
+  if (mounted) statusTimer = setInterval(loadStatus, 10000);
 });
-onBeforeUnmount(() => { mounted = false; clearInterval(statusTimer); marketController?.abort(); historyController?.abort(); symbolHistoryController?.abort(); });
+onBeforeUnmount(() => { mounted = false; unsubscribeRoute?.(); clearInterval(statusTimer); marketController?.abort(); historyController?.abort(); symbolHistoryController?.abort(); });
 
 watch(() => [scope.interval, scope.limit, chartDate.value], () => {
   if (mounted) {
@@ -252,10 +255,10 @@ let statusTimer;
     // 更新 URL
     const params = {};
     if (view === 'workbench') {
-      params.symbol = activeSymbol.value;
+      params.symbol = activeSymbol;
       params.interval = scope.interval;
     } else if (view === 'history') {
-      params.date = historyDate.value;
+      params.date = historyDate;
     }
     router.push(view, params);
 

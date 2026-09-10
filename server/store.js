@@ -42,7 +42,7 @@ const defaultConfig = {
   marketSync: {
     enabled: true,
     symbolsText: 'ALL',
-    interval: '1m',
+    interval: '15m',
     intervalSeconds: 60,
     limit: 80
   },
@@ -59,9 +59,9 @@ const defaultConfig = {
 };
 
 const defaultStrategy = {
-  name: 'OKX USDT perpetual contracts, 1-minute research',
+  name: 'OKX USDT perpetual contracts, 15-minute research',
   symbols: ['ALL'],
-  interval: '1m',
+  interval: '15m',
   klineLimit: 80,
   systemPrompt:
     'You are a cautious crypto futures market analyst. Analyze every symbol independently and return strict JSON only. This is research, not an order.',
@@ -100,8 +100,8 @@ export class Store {
     }
     const upgraded = await this.getConfig();
     if (upgraded.paperAutomationVersion !== 1) {
-      await this.saveConfig(mergeConfig(upgraded, { paperAutomationVersion: 1, marketSync: { enabled: true, symbolsText: 'ALL', interval: '1m', intervalSeconds: 60, limit: 80 } }));
-      await this.saveStrategy({ ...await this.getStrategy(), interval: '1m' });
+      await this.saveConfig(mergeConfig(upgraded, { paperAutomationVersion: 1, marketSync: { enabled: true, symbolsText: 'ALL', interval: '15m', intervalSeconds: 60, limit: 80 } }));
+      await this.saveStrategy({ ...await this.getStrategy(), interval: '15m' });
     }
   }
 

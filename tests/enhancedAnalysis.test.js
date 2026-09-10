@@ -302,3 +302,52 @@ test('增强版复核 - 移动止损', () => {
 });
 
 console.log('\n🎉 增强版分析引擎测试全部通过！');
+
+// ── P5 回归：移动止损必须「提前保护」，不能等 2% 浮盈 ────────────────────────────
+//
+// 背景：P5 复盘发现旧逻辑用 `profit > 0.02`（价格涨 2%）作为移动止损开关。
+// 主止损是 2 ATR，实测 ATR/价格约 0.35%，即 1R ≈ 0.70% 价格，2% ≈ 2.9R，
+// 而实测盈利单平均 MFE 只有 1.91R —— 绝大多数订单永远触发不了移动止损，
+// 一路裸露到初始止损被扫掉。改为按 R 触发（0.4R）后，样本外胜率 41.5%→56.9%。
+// 本用例锁住「0.4R 即触发」这一行为，防止有人把阈值改回百分比。
+function flatMarket(entry, price, atr) {
+  const klines = [];
+  for (let i = 0; i < 60; i++) {
+    // 前 40 根在 entry 附近盘整造出可计算的 ATR，后 20 根走到 price
+    const p = i < 40 ? entry : entry + (price - entry) * ((i - 39) / 21);
+    klines.push({
+      openTime: Date.now() - (60 - i) * 60000,
+      open: p, high: p + atr * 0.4, low: p - atr * 0.4, close: p, volume: 1000, confirmed: true
+    });
+  }
+  return { symbol: 'BTCUSDT', interval: '1m', klines, marketProvider: 'okx' };
+}
+
+test('P5 移动止损：浮盈约 0.5R 就应提前保护（而非等 2%）', () => {
+  const entry = 100;
+  const atr = 1;                       // ATR=1
+  const stopLoss = entry - 2 * atr;    // 2ATR 止损 → risk = 2（1R = 2 价格）
+  // 浮盈 1.0 价格 = 0.5R，远不到 2%（2 价格），旧逻辑不会触发
+  const market = flatMarket(entry, entry + 1.0, atr);
+  const order = {
+    direction: 'OPEN_LONG', entry,
+    plan: { stopLoss, takeProfit: entry + 8 }
+  };
+  const result = enhancedProtectionReview(order, market);
+  assert.strictEqual(result.action, 'UPDATE_PROTECTION',
+    `浮盈 0.5R 必须触发移动止损，实际返回 ${result.action}（reason: ${result.reason}）`);
+  assert.ok(result.stopLoss > stopLoss, '止损应上移');
+  console.log('✓ P5 提前保护（0.5R）回归通过');
+});
+
+test('P5 移动止损：浮盈仅 0.2R 时应保持不动（避免过早锁死）', () => {
+  const entry = 100;
+  const atr = 1;
+  const stopLoss = entry - 2 * atr;    // 1R = 2 价格
+  const market = flatMarket(entry, entry + 0.4, atr); // 0.2R
+  const order = { direction: 'OPEN_LONG', entry, plan: { stopLoss, takeProfit: entry + 8 } };
+  const result = enhancedProtectionReview(order, market);
+  assert.strictEqual(result.action, 'HOLD',
+    `浮盈 0.2R 不应改变保护价，实际 ${result.action}`);
+  console.log('✓ P5 不过早锁死（0.2R）回归通过');
+});

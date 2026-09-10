@@ -19,6 +19,7 @@
     "pm2:restart": "npm run build && set \"PM2_HOME=%CD%\\.pm2\" && pm2 startOrRestart ecosystem.config.cjs --update-env",
     "pm2:stop": "set \"PM2_HOME=%CD%\\.pm2\" && pm2 stop nofx-api",
     "pm2:delete": "set \"PM2_HOME=%CD%\\.pm2\" && pm2 delete nofx-api",
+    "pm2:restart-safe": "npm run pm2:delete && npm run pm2:start",
     "pm2:status": "set \"PM2_HOME=%CD%\\.pm2\" && pm2 status",
     "pm2:logs": "set \"PM2_HOME=%CD%\\.pm2\" && pm2 logs",
     "check": "node --check server/index.js && node --check server/ai.js && node --check server/binanceClient.js && node --check server/binanceMarket.js && node --check server/binancePositionMonitor.js && node --check server/researchRoutes.js && node --check server/research.js && node --check server/store.js && node --check server/marketDb.js && node --check server/klineSync.js"

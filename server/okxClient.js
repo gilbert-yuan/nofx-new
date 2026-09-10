@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import { ProxyAgent, fetch } from 'undici';
 import { nextOpenTime } from './research.js';
+import { proxyHealth } from './core/proxyHealth.js';
 
 const OKX_BASE_URL = 'https://www.okx.com';
 
@@ -122,6 +123,20 @@ export class OkxClient {
     const query = isGet ? new URLSearchParams(clean(params)).toString() : '';
     const requestPath = `${path}${query ? `?${query}` : ''}`;
     const body = isGet ? '' : JSON.stringify(clean(params));
+
+    // 代理存活前置检查：代理宕机时直接快速失败，给出清晰提示，
+    // 避免走 ProxyAgent 后抛一堆难懂的 fetch failed，也避免 3 次重试空耗。
+    if (this.connectionMode === 'proxy' && !proxyHealth.isAlive()) {
+      const error = new Error(
+        `代理不可用（${this.proxyUrl || '127.0.0.1:7890'} 不可达），OKX 请求已快速失败。` +
+        '请检查本地 Clash 代理是否运行；代理恢复后自动重试。'
+      );
+      error.status = 502;
+      error.retryable = false;
+      error.proxyDown = true;
+      throw error;
+    }
+
     const headers = { 'Content-Type': 'application/json' };
     if (this.demo) headers['x-simulated-trading'] = '1';
     if (signed) {

@@ -253,7 +253,7 @@ async function loadAccount() {
   busy.value = true;
   error.value = '';
   try {
-    accountData.value = await api('/paper/account');
+    accountData.value = await api('/paper/account?view=summary');
   } catch (err) {
     error.value = err.message;
   } finally {
@@ -309,8 +309,12 @@ async function cancelOrder(orderId) {
 }
 
 // 查看订单详情
-function viewOrderDetail(order) {
+async function viewOrderDetail(order) {
   selectedOrder.value = order;
+  try {
+    const detail = await api(`/paper/orders/${encodeURIComponent(order.id)}`);
+    if (selectedOrder.value?.id === order.id) selectedOrder.value = detail;
+  } catch (err) { error.value = err.message; }
 }
 
 // 加载策略表现数据

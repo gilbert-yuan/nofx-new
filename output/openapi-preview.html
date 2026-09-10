@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>NOFX Lite · OpenAPI 文档预览</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  :root {
+    --bg: #0e1414;
+    --panel: #16201f;
+    --panel-2: #1d2a29;
+    --border: #2a3a38;
+    --text: #d8e3df;
+    --text-dim: #8a9d99;
+    --accent: #5eb8ff;
+    --green: #4caf50;
+    --red: #ff6b6b;
+    --yellow: #f0c674;
+    --purple: #b48ead;
+    --font-body: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+    --font-mono: "JetBrains Mono", "IBM Plex Mono", Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: var(--font-body); }
+  header {
+    padding: 24px 32px;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: baseline; justify-content: space-between; gap: 24px;
+  }
+  header h1 { margin: 0; font-size: 20px; }
+  header h1 span { color: var(--accent); }
+  header .meta { color: var(--text-dim); font-family: var(--font-mono); font-size: 12px; }
+  .layout { display: grid; grid-template-columns: 280px 1fr; min-height: calc(100vh - 73px); }
+  nav { border-right: 1px solid var(--border); padding: 20px 0; overflow-y: auto; }
+  nav .group { padding: 0 16px; margin-bottom: 18px; }
+  nav .group h3 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-dim); }
+  nav .group a {
+    display: block; padding: 5px 10px; font-size: 13px; color: var(--text); text-decoration: none;
+    border-radius: 4px; font-family: var(--font-mono);
+  }
+  nav .group a:hover { background: var(--panel); color: var(--accent); }
+  main { padding: 24px 32px; overflow-y: auto; max-width: 1100px; }
+  main h2 { font-size: 24px; margin: 0 0 8px; padding-top: 12px; border-bottom: 1px solid var(--border); padding-bottom: 12px; }
+  main h3 { font-size: 16px; margin: 24px 0 6px; color: var(--accent); font-family: var(--font-mono); }
+  main p.tagline { color: var(--text-dim); margin-top: 0; }
+  .endpoint {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: 14px 18px; margin: 10px 0 18px;
+  }
+  .endpoint .head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .method {
+    font-family: var(--font-mono); font-size: 11px; font-weight: 700;
+    padding: 3px 8px; border-radius: 4px; color: #0e1414; min-width: 56px; text-align: center;
+  }
+  .method.get { background: var(--accent); }
+  .method.post { background: var(--green); }
+  .method.put { background: var(--yellow); }
+  .method.delete { background: var(--red); }
+  .path { font-family: var(--font-mono); font-size: 14px; }
+  .summary { color: var(--text-dim); font-size: 13px; margin-top: 6px; }
+  .desc { color: var(--text); font-size: 13px; line-height: 1.6; margin-top: 8px; }
+  .params {
+    margin-top: 12px; padding: 12px; background: var(--panel-2); border-radius: 6px;
+    border: 1px solid var(--border); font-family: var(--font-mono); font-size: 12px;
+  }
+  .params .row { display: flex; gap: 12px; padding: 4px 0; border-bottom: 1px dashed var(--border); }
+  .params .row:last-child { border-bottom: none; }
+  .params .name { color: var(--yellow); min-width: 140px; }
+  .params .type { color: var(--purple); min-width: 110px; }
+  .params .desc { color: var(--text-dim); flex: 1; font-family: var(--font-body); font-size: 12px; }
+  code { background: var(--panel-2); padding: 2px 6px; border-radius: 4px; font-family: var(--font-mono); font-size: 12px; color: var(--accent); }
+  .example {
+    margin-top: 10px; padding: 12px; background: #0a1010; border-radius: 6px; border: 1px solid var(--border);
+    font-family: var(--font-mono); font-size: 12px; color: var(--text); white-space: pre-wrap; overflow-x: auto;
+  }
+  footer { padding: 24px 32px; border-top: 1px solid var(--border); color: var(--text-dim); font-size: 12px; }
+  .stat { display: inline-block; margin-right: 18px; }
+  .stat b { color: var(--accent); font-family: var(--font-mono); }
+</style>
+</head>
+<body>
+<header>
+  <h1>NOFX <span>·</span> OpenAPI v3 文档预览</h1>
+  <div class="meta">
+    <span class="stat"><b>53</b> endpoints</span>
+    <span class="stat"><b>12</b> tags</span>
+    <span class="stat"><b>36</b> schemas</span>
+    <span class="stat">源文件 <code>docs/openapi.yaml</code></span>
+  </div>
+</header>
+<div class="layout">
+  <nav id="nav"></nav>
+  <main id="main">
+    <h2>NOFX Lite API</h2>
+    <p class="tagline">v1.0.0 · 单进程 Express + PostgreSQL · 默认监听 <code>http://127.0.0.1:3100</code></p>
+    <p>本服务由 <code>server/index.js</code> 装配，业务路由分布在 5 个分层模块 + 1 个研究模块 + 1 个全局自动化模块。本页是 <code>docs/openapi.yaml</code> 的可视化摘要，详细字段、错误码、示例请直接打开 yaml。</p>
+    <p style="color:var(--text-dim)">约定：所有业务接口前缀 <code>/api</code>，通用错误响应体 <code>{ "error": "中文消息" }</code>，配置密钥字段（apiKey/secretKey/passphrase）始终以 <code>abcd...wxyz</code> 形式回显。</p>
+  </main>
+</div>
+<footer>
+  本页为离线渲染摘要；建议在 Swagger UI / Redoc / Stoplight 中打开 <code>docs/openapi.yaml</code> 获取完整交互。
+</footer>
+
+<script>
+const spec = {
+  tags: [
+    {
+      name: 'Health', summary: '服务存活探针',
+      ops: [
+        { method: 'GET', path: '/api/health', summary: '服务存活探针', desc: 'PM2 / 负载均衡器 / 启动脚本快速判断服务是否在线。',
+          params: [
+            { name: '返回', type: '{ ok, name }', desc: '例：{ ok: true, name: "nofx-lite" }' }
+          ] }
+      ]
+    },
+    {
+      name: 'Config', summary: '全局配置（币安/OKX 凭据、模型、交易员、定时同步）',
+      ops: [
+        { method: 'GET', path: '/api/config', summary: '读取当前配置（密钥字段脱敏）', desc: '从 data/config.json 读取完整配置，密钥字段已脱敏。',
+          params: [{ name: '返回', type: 'MaskedConfig', desc: 'binance/okx/model 字段的密钥值仅首尾 4 位' }] },
+        { method: 'PUT', path: '/api/config', summary: '更新配置（合并语义，保留未改动的密钥）', desc: '请求体按字段逐项 merge；marketSync 段会被立即重载 KlineSync。',
+          params: [{ name: 'body', type: 'ConfigPatch', desc: '传任意子字段；传脱敏密钥不会覆盖真值' }] }
+      ]
+    },
+    {
+      name: 'Strategy', summary: '研究策略描述（提示词、关注币种、周期）',
+      ops: [
+        { method: 'GET', path: '/api/strategy', summary: '读取研究策略描述' },
+        { method: 'PUT', path: '/api/strategy', summary: '写入策略描述（覆盖式写入）' }
+      ]
+    },
+    {
+      name: 'Binance', summary: '币安 USDⓈ-M 账户连接与复盘',
+      ops: [
+        { method: 'GET', path: '/api/binance/status', summary: '查询连接状态', desc: '账户权益、持仓数、最近一次轮询时间与错误信息。' },
+        { method: 'POST', path: '/api/binance/test', summary: '直连 Binance 拉取一次账户快照', desc: '凭据可用性验证；422 表示未填 API Key。' },
+        { method: 'POST', path: '/api/binance/review', summary: '拉最近 15m K 线对持仓做复盘', desc: '用最近一根 15m 收盘价刷新未实现盈亏与强平价。' }
+      ]
+    },
+    {
+      name: 'Market', summary: 'OKX/Binance 行情查询（合约列表、K 线）',
+      ops: [
+        { method: 'GET', path: '/api/market/symbols', summary: 'USDT 永续合约列表（带 1h 缓存）',
+          params: [{ name: 'query.search', type: 'string', desc: 'symbol / baseCoin 模糊匹配' }, { name: 'query.limit', type: '1-2000', desc: '默认 2000' }] },
+        { method: 'POST', path: '/api/market/symbols/refresh', summary: '强制刷新合约缓存' },
+        { method: 'GET', path: '/api/market/symbols/status', summary: '行情源缓存/健康状态' },
+        { method: 'GET', path: '/api/market/klines', summary: '拉取最新 K 线（OKX 公开数据，按需入库）',
+          params: [
+            { name: 'query.symbol', type: 'string', desc: '默认 BTCUSDT；BINANCE_ 前缀自动剥离' },
+            { name: 'query.interval', type: 'string', desc: '1m/5m/15m/1h/4h/1d 等 OKX bar 枚举，默认 15m' },
+            { name: 'query.limit', type: '20-200', desc: '默认 80' },
+            { name: 'query.endTime', type: 'int64 ms', desc: '必须 ≤ 当前时间，缺省=当下' }
+          ] }
+      ]
+    },
+    {
+      name: 'History', summary: '历史 K 线入库、查询、后台同步控制',
+      ops: [
+        { method: 'POST', path: '/api/history/fetch', summary: '一次性批量拉取 K 线入库', desc: '与 KlineSync.fetchSymbols 等价；后台定时同步在跑时返回 409。',
+          params: [{ name: 'body.symbols', type: 'string', desc: '逗号分隔；缺省或 ALL 取全部 USDT 永续' }, { name: 'body.interval', type: 'string', desc: '默认 15m' }] },
+        { method: 'GET', path: '/api/history/klines', summary: '查询已入库 K 线（PG market_klines）',
+          params: [{ name: 'query.symbol', type: 'string' }, { name: 'query.interval', type: 'string' }, { name: 'query.limit', type: '1-1000', desc: '默认 300' }] },
+        { method: 'GET', path: '/api/history/summary', summary: '行情库各 (symbol, interval) 存储概览' },
+        { method: 'GET', path: '/api/history/sync/status', summary: '后台同步状态' },
+        { method: 'POST', path: '/api/history/sync/start', summary: '开启后台定时同步' },
+        { method: 'POST', path: '/api/history/sync/stop', summary: '停止后台定时同步' }
+      ]
+    },
+    {
+      name: 'Analyses', summary: '研究快照（AI/本地引擎输出的批量决策记录）',
+      ops: [
+        { method: 'GET', path: '/api/analyses', summary: '快照列表',
+          params: [{ name: 'query.date', type: 'YYYY-MM-DD' }, { name: 'query.symbol', type: 'string' }, { name: 'query.limit', type: '1-100' }, { name: 'query.offset', type: '≥0' }] },
+        { method: 'GET', path: '/api/analyses/{id}', summary: '单条快照详情', desc: '404 = 未找到该分析记录。' }
+      ]
+    },
+    {
+      name: 'Research', summary: '信号回测与真实行情复算',
+      ops: [
+        { method: 'POST', path: '/api/market/analyze', summary: '单币种研究分析（长耗时 ≤30min）', desc: '并发锁保护；409 = 已有分析任务；scope.engine ∈ auto/local/local-mtf/ai。',
+          params: [{ name: 'body.symbol', type: 'string', desc: '必填，例 BTCUSDT' }, { name: 'body.scope', type: 'AnalyzeScope', desc: 'engine/interval/limit/maxSymbols/batchSize/symbols' }] },
+        { method: 'POST', path: '/api/market/analyze-range', summary: '按范围批量分析（最多 maxSymbols 个）' },
+        { method: 'POST', path: '/api/market/analyze-all', summary: '全市场分析（慎用，长可达 30 分钟）' },
+        { method: 'GET', path: '/api/research/performance', summary: '信号回测聚合（按策略/币种/方向分组）' },
+        { method: 'POST', path: '/api/research/performance/refresh', summary: '触发"取最新 K 线 + 重算"（长耗时）', desc: '并发锁：409 = 行情正在同步。' }
+      ]
+    },
+    {
+      name: 'Paper', summary: '模拟账户（订单、统计、复盘、策略优化）',
+      ops: [
+        { method: 'GET', path: '/api/paper/account', summary: '模拟账户当前快照' },
+        { method: 'GET', path: '/api/paper/plans', summary: '当前可下单的策略信号候选（OKX + eligible + 未过期）' },
+        { method: 'POST', path: '/api/paper/orders', summary: '提交一笔模拟订单',
+          params: [{ name: 'body', type: 'OrderSubmit', desc: 'symbol/direction/interval/entryPrice/stopLoss/takeProfit/quantity/analysisContext' }] },
+        { method: 'POST', path: '/api/paper/refresh', summary: '强制刷新一次行情并重算未实现盈亏' },
+        { method: 'POST', path: '/api/paper/orders/{id}/close', summary: '手动平掉一笔模拟订单' },
+        { method: 'GET', path: '/api/paper/optimize', summary: '基于历史成交给出策略调整建议' },
+        { method: 'GET', path: '/api/paper/statistics', summary: '完整统计（按币种/策略/引擎/小时/持仓桶/日 + 双触发占比）' },
+        { method: 'GET', path: '/api/paper/orders/{id}', summary: '查询单个订单详情' },
+        { method: 'GET', path: '/api/paper/orders/{id}/replay', summary: '单订单 K 线复盘（仅 closed）' },
+        { method: 'POST', path: '/api/paper/orders/replay-batch', summary: '批量 K 线复盘（按 ID 或过滤条件）',
+          params: [{ name: 'body.orderIds', type: 'string[]', desc: '与 filters 二选一' }, { name: 'body.filters', type: 'object', desc: 'symbol/direction/result/minNet/maxNet/limit' }] },
+        { method: 'GET', path: '/api/paper/strategy/optimize', summary: '按持仓时长给出 maxHoldBars 优化建议',
+          params: [{ name: 'query.currentMaxHoldBars', type: '10-500', desc: '默认 120' }] },
+        { method: 'POST', path: '/api/paper/strategy/apply-optimization', summary: '应用 maxHoldBars 优化（仅记录，下一轮生效）',
+          params: [{ name: 'body.maxHoldBars', type: '10-500', desc: '越界返回 422' }] }
+      ]
+    },
+    {
+      name: 'PaperAutomation', summary: '模拟账户后台巡检任务',
+      ops: [
+        { method: 'PUT', path: '/api/paper/automation', summary: '更新模拟账户自动巡检配置' },
+        { method: 'POST', path: '/api/paper/automation/{kind}', summary: '手动触发 scan / review（异步，202）',
+          params: [{ name: 'path.kind', type: 'enum', desc: 'scan | review；其他值 400' }] }
+      ]
+    },
+    {
+      name: 'Adaptive', summary: '自适应策略优化（币种/时段过滤、参数建议、报告）',
+      ops: [
+        { method: 'GET', path: '/api/adaptive/config', summary: '读取自适应配置' },
+        { method: 'PUT', path: '/api/adaptive/config', summary: '校验并写入自适应配置（422 = 校验失败）' },
+        { method: 'GET', path: '/api/adaptive/symbol-filter', summary: '币种表现筛选分析',
+          params: [{ name: 'query.symbols', type: 'string', desc: '显式传入；缺省用历史成交币种' }] },
+        { method: 'GET', path: '/api/adaptive/hour-analysis', summary: '高胜率时段识别（UTC 小时）' },
+        { method: 'GET', path: '/api/adaptive/current-hour-check', summary: '当前 UTC 小时是否建议交易' },
+        { method: 'GET', path: '/api/adaptive/symbol-params/{symbol}', summary: '单币种参数（止损/止盈/最大持仓）' },
+        { method: 'GET', path: '/api/adaptive/holding-optimization', summary: '持仓时长优化（ATR 止损/止盈 + maxHoldBars）' },
+        { method: 'GET', path: '/api/adaptive/report', summary: '综合报告（汇总 1-3）' },
+        { method: 'POST', path: '/api/adaptive/apply-optimization', summary: '应用覆盖参数（422 = 无有效参数）',
+          params: [{ name: 'body.maxHoldBars', type: '10-200' }, { name: 'body.stopLossATR', type: '1-5' }, { name: 'body.takeProfitATR', type: '1.5-10' }] },
+        { method: 'POST', path: '/api/adaptive/reset-overrides', summary: '清空覆盖，恢复默认' }
+      ]
+    },
+    {
+      name: 'Automation', summary: '全局自动化调度',
+      ops: [
+        { method: 'GET', path: '/api/automation/status', summary: '全局自动化系统状态' },
+        { method: 'PUT', path: '/api/automation/tasks/{taskName}', summary: '配置某个全局任务（klineSync / analysisCleanup / ...）' },
+        { method: 'POST', path: '/api/automation/tasks/{taskName}/trigger', summary: '手动触发指定任务（异步，202）' },
+        { method: 'POST', path: '/api/automation/{action}', summary: '启动 / 停止全局自动化',
+          params: [{ name: 'path.action', type: 'enum', desc: 'start | stop；其他值 400' }] }
+      ]
+    }
+  ]
+};
+
+// 渲染左侧导航 + 右侧端点
+const nav = document.getElementById('nav');
+const main = document.getElementById('main');
+
+for (const tag of spec.tags) {
+  const g = document.createElement('div');
+  g.className = 'group';
+  g.innerHTML = `<h3>${tag.name}</h3><div class="tagline" style="color:var(--text-dim);font-size:11px;margin-bottom:8px">${tag.summary}</div>`;
+  for (const op of tag.ops) {
+    const a = document.createElement('a');
+    a.href = '#' + op.path.replace(/[{}]/g, '');
+    a.textContent = `${op.method}  ${op.path}`;
+    g.appendChild(a);
+  }
+  nav.appendChild(g);
+}
+
+for (const tag of spec.tags) {
+  const h = document.createElement('h2');
+  h.id = 'tag-' + tag.name;
+  h.textContent = tag.name;
+  main.appendChild(h);
+  const p = document.createElement('p');
+  p.className = 'tagline';
+  p.textContent = tag.summary;
+  main.appendChild(p);
+
+  for (const op of tag.ops) {
+    const div = document.createElement('div');
+    div.className = 'endpoint';
+    div.id = op.path.replace(/[{}]/g, '');
+
+    const head = document.createElement('div');
+    head.className = 'head';
+    head.innerHTML = `<span class="method ${op.method.toLowerCase()}">${op.method}</span><span class="path">${op.path}</span>`;
+    div.appendChild(head);
+
+    if (op.summary) {
+      const s = document.createElement('div');
+      s.className = 'summary';
+      s.textContent = op.summary;
+      div.appendChild(s);
+    }
+    if (op.desc) {
+      const d = document.createElement('div');
+      d.className = 'desc';
+      d.textContent = op.desc;
+      div.appendChild(d);
+    }
+    if (op.params && op.params.length) {
+      const params = document.createElement('div');
+      params.className = 'params';
+      for (const pr of op.params) {
+        const row = document.createElement('div');
+        row.className = 'row';
+        row.innerHTML = `<div class="name">${pr.name}</div><div class="type">${pr.type}</div><div class="desc">${pr.desc || ''}</div>`;
+        params.appendChild(row);
+      }
+      div.appendChild(params);
+    }
+    main.appendChild(div);
+  }
+}
+</script>
+</body>
+</html>

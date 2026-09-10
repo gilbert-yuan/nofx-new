@@ -217,16 +217,21 @@ export class SimulatedAccountRepository {
     }
     if (!(await this.pool.query('SELECT 1 FROM simulated_accounts WHERE account_id=1')).rowCount) throw new Error('Normalized simulated account is not initialized');
   }
-  async readFrom(client) {
+  async readFrom(client, { summary = false, orderId } = {}) {
     const tables = {};
-    for (const def of allDefinitions) tables[def.name] = (await client.query(`SELECT * FROM ${def.name} WHERE account_id=1`)).rows;
+    const summaryTables = new Set(['simulated_accounts', 'simulated_orders', 'simulated_order_costs', 'simulated_order_plans', 'simulated_automation_settings', 'simulated_automation_jobs', 'simulated_account_extensions']);
+    for (const def of allDefinitions) {
+      if (summary && !summaryTables.has(def.name)) continue;
+      const filterOrder = orderId !== undefined && def.order;
+      tables[def.name] = (await client.query(`SELECT * FROM ${def.name} WHERE account_id=1${filterOrder ? ' AND order_id=$1' : ''}${summary && def.name === 'simulated_order_plans' ? " AND plan_kind='current'" : ''}`, filterOrder ? [orderId] : [])).rows;
+    }
     return hydrateAccount(tables);
   }
-  async read() {
+  async read(options) {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
-      const state = await this.readFrom(client);
+      const state = await this.readFrom(client, options);
       await client.query('COMMIT');
       return state;
     } catch (error) { await client.query('ROLLBACK'); throw error; } finally { client.release(); }

@@ -14,6 +14,13 @@ module.exports = {
       interpreter: 'node',
       autorestart: true,
       watch: false,
+      // 日志带时间戳：便于区分历史错误与当前错误（此前无时间戳，排障只能盲猜）。
+      log_date_format: 'YYYY-MM-DD HH:mm:ss',
+      // 防崩溃循环：连续崩溃达到上限后停止自启，避免无限 restart 占用端口/CPU。
+      max_restarts: 10,
+      min_uptime: '10s',
+      // 指数退避，崩溃后不要瞬间重试。
+      exp_backoff_restart_delay: 2000,
       env: {
         NODE_ENV: 'production',
         PORT: 3100,

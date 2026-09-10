@@ -5,10 +5,10 @@ import { LONG_ONLY } from './shared/strategyGuards.js';
 export const LOCAL_STRATEGY = Object.freeze({
   modelId: 'local-mtf-trend-atr-v2',
   maxEntryDistanceAtr: 1.0,  // 从1.5收紧至1.0，避免追高
-  maxHoldBars: 30,           // 回退至30：原50基于"45-49根100%胜率"的幸存者偏差（报告P1-2）
+  maxHoldBars: 120,          // 1m 主周期：默认持仓 120 根（2 小时）；P5 周期回退同步修正
   stopLossAtr: 2.5,
   takeProfitAtr: 4.0,
-  validForBars: 3
+  validForBars: 6            // 1m 主周期：6 根（6 分钟）内可成交；P5 周期回退同步修正
 });
 const MIN_REWARD_TO_RISK = 1.25;
 const validRows = rows => Array.isArray(rows) && rows.length >= 50 && rows.every(r =>
@@ -39,7 +39,7 @@ export function localAnalysis(market) {
     // 优化调整：
     // 2. 止损从 1.5 ATR 放宽到 2.5 ATR（减少过早止损）
     // 3. 止盈从 3 ATR 扩大到 4 ATR（匹配更大止损的盈亏比）
-    // 4. maxHoldBars 从 12 缩短到 30（实际平均持仓17根，给予适当缓冲）
+    // 4. 1m 主周期默认持有 120 根（2 小时）
     plan: { entryMin, entryMax, stopLoss: long ? entryMin - atr * LOCAL_STRATEGY.stopLossAtr : entryMax + atr * LOCAL_STRATEGY.stopLossAtr,
       takeProfit: long ? entryMax + atr * LOCAL_STRATEGY.takeProfitAtr : entryMin - atr * LOCAL_STRATEGY.takeProfitAtr, validForBars: LOCAL_STRATEGY.validForBars, maxHoldBars: LOCAL_STRATEGY.maxHoldBars } };
 }
@@ -140,7 +140,7 @@ export function localAnalysisMultiTimeframe(market, auxMarkets = {}, adaptivePar
   const stopLossATR = Math.min(3.5, Math.max(1, Number(adaptiveParams.stopLossATR ?? LOCAL_STRATEGY.stopLossAtr)));
   const requestedTargetATR = Math.min(6, Math.max(1.5, Number(adaptiveParams.takeProfitATR ?? LOCAL_STRATEGY.takeProfitAtr)));
   const takeProfitATR = Math.max(requestedTargetATR, Number((MIN_REWARD_TO_RISK * (stopLossATR + 0.7)).toFixed(2)));
-  const maxHoldBars = Math.min(200, Math.max(10, Math.round(Number(adaptiveParams.maxHoldBars ?? LOCAL_STRATEGY.maxHoldBars))));
+  const maxHoldBars = Math.min(200, Math.max(1, Math.round(Number(adaptiveParams.maxHoldBars ?? LOCAL_STRATEGY.maxHoldBars))));
   const adaptiveReason = adaptiveParams.reason || '';
 
   const reasonDetail = [

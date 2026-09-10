@@ -9,6 +9,7 @@ import cors from 'cors';
 import path from 'node:path';
 import fs from 'node:fs';
 import { Container } from './core/container.js';
+import { proxyHealth } from './core/proxyHealth.js';
 import { API } from '../shared/api-contract.js';
 import { createConfigRouter } from './routes/config.js';
 import { createBinanceRouter } from './routes/binance.js';
@@ -18,6 +19,13 @@ import { createHistoryRouter } from './routes/history.js';
 
 const container = new Container();
 await container.init();
+
+// 启动代理存活探针：行情依赖本地 Clash(127.0.0.1:7890) 转发 OKX，
+// 代理宕机时 okxClient 会快速失败、globalAutomation 跳过本轮，并在恢复后自动重试。
+const proxyUrl = process.env.OKX_PROXY_URL ?? (process.env.HTTPS_PROXY || process.env.HTTP_PROXY || 'http://127.0.0.1:7890');
+proxyHealth.configure(proxyUrl);
+proxyHealth.start();
+console.log(`[ProxyHealth] 代理探测已启动: ${proxyHealth.url}`);
 
 const app = express();
 app.use(cors({ origin: process.env.CORS_ORIGIN || 'http://127.0.0.1:5173' }));

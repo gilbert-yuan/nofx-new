@@ -6,16 +6,29 @@ export class ResearchStore {
     await this.pool.query(`CREATE TABLE IF NOT EXISTS research_records (
       id TEXT PRIMARY KEY, created_at TIMESTAMPTZ NOT NULL, record JSONB NOT NULL
     ); CREATE INDEX IF NOT EXISTS research_records_time ON research_records(created_at DESC);`);
+    await this.pool.query('CREATE INDEX CONCURRENTLY IF NOT EXISTS research_records_time_id_idx ON research_records(created_at DESC, id DESC)');
     for (const record of legacy.filter(r => r.researchOnly && r.id && r.at)) await this.save(record);
   }
   async save(record) {
     await this.pool.query('INSERT INTO research_records(id, created_at, record) VALUES($1,$2,$3) ON CONFLICT(id) DO NOTHING', [record.id, record.at, JSON.stringify(record)]);
   }
   async list({ date = '', symbol = '', limit = 100, offset = 0, snapshots = false } = {}) {
+    const params = [];
+    const conditions = [];
+    if (date) {
+      const start = new Date(`${date}T00:00:00.000Z`);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(start.getTime()) || start.toISOString().slice(0, 10) !== date) return [];
+      params.push(start, new Date(start.getTime() + 86400000));
+      conditions.push('created_at >= $1 AND created_at < $2');
+    }
+    if (symbol) {
+      params.push(symbol);
+      conditions.push(`(record->>'symbol' = $${params.length} OR record->'symbols' ? $${params.length})`);
+    }
+    params.push(limit, offset);
     const result = await this.pool.query(`SELECT ${snapshots ? 'record' : "record - 'market' - 'snapshot'"} AS record FROM research_records
-      WHERE ($1 = '' OR to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') = $1)
-      AND ($2 = '' OR record->>'symbol' = $2 OR record->'symbols' ? $2)
-      ORDER BY created_at DESC, id DESC LIMIT $3 OFFSET $4`, [date, symbol, limit, offset]);
+      ${conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''}
+      ORDER BY created_at DESC, id DESC LIMIT $${params.length - 1} OFFSET $${params.length}`, params);
     return result.rows.map(r => r.record);
   }
   async get(id) {

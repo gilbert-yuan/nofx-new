@@ -18,6 +18,7 @@ import { createSuperEnhancedAnalysis } from './superEnhancedAnalysis.js';
 import { analyzeMarkets, reviewPosition } from './ai.js';
 import { candleOpenAt, nextOpenTime, prepareMarket, createResearchRecord, MAIN_INTERVAL } from './research.js';
 import { TRAILING_RULE } from './shared/strategyGuards.js';
+import { proxyHealth } from './core/proxyHealth.js';
 
 export function selectAnalysisEngine(config = {}) {
   const analysis = config.analysis || {};
@@ -132,6 +133,11 @@ export class GlobalAutomation {
    * 任务1: 同步K线数据（使用OKX公共接口，无需API Key）
    */
   async syncKlines() {
+    // 代理宕机时跳过本轮：避免对全市场币种逐个抛 fetch failed，等代理恢复后下一轮自动重试。
+    if (!proxyHealth.isAlive()) {
+      console.warn('[GlobalAutomation] 代理不可用，跳过本轮 K线同步（OKX 行情中断）。');
+      return;
+    }
     const symbols = await this.market.perpetualUsdtContracts();
     console.log(`[GlobalAutomation] 开始同步 ${symbols.length} 个币种的K线...`);
 
@@ -178,6 +184,11 @@ export class GlobalAutomation {
    * 任务2: 定时分析行情并自动下单
    */
   async runAnalysis() {
+    // 代理宕机时跳过本轮分析，避免对全市场币种逐个刷 fetch failed。
+    if (!proxyHealth.isAlive()) {
+      console.warn('[GlobalAutomation] 代理不可用，跳过本轮行情分析（OKX 行情中断）。');
+      return;
+    }
     const config = await this.store.getConfig();
     const strategy = { ...await this.store.getStrategy(), interval: MAIN_INTERVAL };
     const engine = selectAnalysisEngine(config);

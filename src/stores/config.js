@@ -68,11 +68,15 @@ export const useConfigStore = defineStore('config', () => {
     return binanceApi.review();
   }
 
-  async function loadStatus() {
-    const results = await Promise.allSettled([marketApi.status(), historyApi.syncStatus(), binanceApi.status()]);
-    const refs = [symbolStatus, syncStatus, tradingStatus];
-    results.forEach((r, i) => { if (r.status === 'fulfilled') refs[i].value = r.value; });
-    statusError.value = results.find((r) => r.status === 'rejected')?.reason?.message || '';
+  let pendingStatus;
+  function loadStatus() {
+    if (pendingStatus) return pendingStatus;
+    pendingStatus = Promise.allSettled([marketApi.status(), historyApi.syncStatus(), binanceApi.status()]).then(results => {
+      const refs = [symbolStatus, syncStatus, tradingStatus];
+      results.forEach((r, i) => { if (r.status === 'fulfilled') refs[i].value = r.value; });
+      statusError.value = results.find((r) => r.status === 'rejected')?.reason?.message || '';
+    }).finally(() => { pendingStatus = null; });
+    return pendingStatus;
   }
 
   return {

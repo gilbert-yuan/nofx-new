@@ -6,14 +6,24 @@ export const RESEARCH_VERSION = 'closed-candle-plan-v1';
 export const PAPER_COSTS = Object.freeze({ feeBps: 6, slippageBps: 5, fundingBpsPer8h: 3, notional: 10 });
 const intervals = { '1m': '1', '3m': '3', '5m': '5', '15m': '15', '30m': '30', '1h': '60', '2h': '120', '4h': '240', '6h': '360', '12h': '720', '1d': 'D', '1w': 'W', '1M': 'M' };
 
-// 主交易周期：回退到 1m（2026-09-10 胜率复盘结论）。
-// 上一轮把 1m 升到 5m 的假设是「放大止损/止盈距离以降低成本占比」，但实盘模拟证伪：
-//   · 1m：2227 笔已平仓，胜率 22.8%，均单 -0.913 USDT
-//   · 5m： 235 笔已平仓，胜率 13.6%，均单 -3.727 USDT（按创建时间 09-09 21:00 起切换）
-// 5m 的 ATR 约为 1m 的 2~3 倍，止损距离被同步放大 → 单笔绝对亏损放大，而胜率反而下降，
-// 结果是把亏损速度加快了约 4 倍。周期切换的收益来自「信号质量」，不是「距离放大」。
+// 主交易周期（P5 复盘结论：回退到 1m）。
+//
+// 历史证据（均为 status='closed' 的真实模拟订单统计）：
+//   · 1m  ：2232 单，胜率 22.8%，均单 -0.913 USDT
+//   · 5m  ： 265 单，胜率 14.0%，均单 -3.690 USDT
+//   · 15m ：  54 单，胜率 14.8%，均单 -2.347 USDT
+// 两次「放大周期」的尝试（1m→5m、1m→15m）都被证伪，且都是「胜率下降 + 单笔亏损放大」
+// 的双重恶化。原因：周期放大并未提高信号质量，只是把 ATR 同步放大 ~2~4 倍，
+// 于是止损距离和单笔绝对亏损被等比放大；而 15m/5m 上每根 K 线要承担 3~15 倍的
+// 信息量，收盘确认反而更滞后，入场点更差。
+//
+// 1m 的高频噪声问题应该用「信号过滤器 + 出场管理」解决（见 enhancedAnalysis.js 的
+// MIN_ATR_PCT 波动率闸门 / 移动止损提前触发），而不是用放大周期这种粗放手段。
 // 回退只需改这一处（扫描/下单/复核全部走这个常量）。
 export const MAIN_INTERVAL = '1m';
+
+// 如需临时切回 15m 做对照实验，请同时把 enhancedAnalysis.js 的 NOFX_MIN_ATR_PCT
+// 从 0.003 重标到 ~0.010（15m 的 ATR/价格约为 1m 的 3 倍，沿用 1m 阈值会几乎不过滤）。
 
 export function toBybitInterval(interval) {
   if (!intervals[interval]) throw Object.assign(new Error(`不支持的周期：${interval}`), { status: 400 });

@@ -27,9 +27,13 @@ test('enhanced bearish signal survives validation, submits short and settles pro
     strategy: { interval: '15m' }, market: [market], result: { analyses: [signal] }, type: 'single', scope: { limit: 80 }, now });
   assert.equal(record.analyses[0].eligible, true, JSON.stringify(record.analyses[0].validationIssues));
   assert.equal(record.analyses[0].interval, '15m');
-  assert.equal(plan.maxHoldBars * bar, 2 * 3600000);
+  // P5：周期上限/有效期改为「按主周期根数」语义，不再硬编码 15m 的小时数。
+  // 断言改为「与引擎常量一致 + 换算后的挂单时间正确」，这样周期回退 1m 时不会假失败。
+  assert.equal(plan.maxHoldBars, 120);
+  assert.equal(plan.validForBars, 6);
   assert.equal(Date.parse(record.analyses[0].firstEntryAt), now + bar);
-  assert.equal(Date.parse(record.analyses[0].expiresAt), now + 2 * bar);
+  // 有效期从「首个可入场根」起算：firstEntryAt + validForBars 根。
+  assert.equal(Date.parse(record.analyses[0].expiresAt), now + (1 + plan.validForBars) * bar);
   const order = submitPaperOrder(initialPaperAccount(), record, { symbol: market.symbol, margin: 100, leverage: 2, automatic: true }, now);
   assert.equal(order.direction, 'OPEN_SHORT');
   const open = market.klines.at(-1).close;

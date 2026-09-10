@@ -1,0 +1,1630 @@
+openapi: 3.0.3
+info:
+  title: NOFX Lite API
+  version: 1.0.0
+  description: |
+    NOFX Lite 后端 API 文档（基于 OpenAPI v3.0.3）。
+
+    本服务是单进程 Express 应用，默认监听 `http://127.0.0.1:3100`，所有业务接口
+    前缀均为 `/api`。前端（Vue 3 + Vite）开发模式下通过 5173 → 3100 代理转发。
+
+    约定：
+      * 所有请求与响应均为 `application/json`，UTF-8 编码。
+      * 通用错误响应体：`{ "error": "人类可读中文消息" }`，HTTP 状态码随错误类型变化。
+      * 长耗时接口（`/api/market/analyze*`、`/api/research/performance/refresh`、
+        `/api/history/fetch`）单次运行可达数分钟，前端应按长轮询/进度条轮询处理。
+      * 写操作的请求体采用「合并语义」：未传入的字段不会清空既有配置（参见 `store.js#mergeConfig`）。
+      * 配置中的密钥字段（`binance.apiKey/secretKey`、`okx.apiKey/secretKey/passphrase`、
+        `model.apiKey`）始终以 `xxxx...xxxx` 形式回显，原值在 `maskConfig` 中屏蔽。
+
+servers:
+  - url: http://127.0.0.1:3100
+    description: 本地开发/生产（PM2 单进程）
+
+tags:
+  - name: Health
+    description: 服务存活探针
+  - name: Config
+    description: 全局配置（币安/OKX 凭据、模型、交易员、定时同步）
+  - name: Strategy
+    description: 研究策略描述（提示词、关注币种、周期）
+  - name: Binance
+    description: 币安 USDⓈ-M 账户连接与复盘
+  - name: Market
+    description: OKX/Binance 行情查询（合约列表、K 线）
+  - name: History
+    description: 历史 K 线入库、查询、后台同步控制
+  - name: Analyses
+    description: 研究快照（AI/本地引擎输出的批量决策记录）
+  - name: Research
+    description: 信号回测与真实行情复算
+  - name: Paper
+    description: 模拟账户（订单、统计、复盘、策略优化）
+  - name: PaperAutomation
+    description: 模拟账户后台巡检任务（scan / review）
+  - name: Adaptive
+    description: 自适应策略优化（币种/时段过滤、参数建议、报告）
+  - name: Automation
+    description: 全局自动化调度（任务配置、手动触发、启停）
+
+paths:
+  # ───────── Health ─────────
+  /api/health:
+    get:
+      tags: [Health]
+      summary: 服务存活探针
+      description: 用于 PM2 / 负载均衡器 / 启动脚本快速判断服务是否在线。
+      responses:
+        '200':
+          description: 服务在线
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, name]
+                properties:
+                  ok: { type: boolean, example: true }
+                  name: { type: string, example: nofx-lite }
+
+  # ───────── Config ─────────
+  /api/config:
+    get:
+      tags: [Config]
+      summary: 读取当前配置（密钥字段脱敏）
+      description: |
+        从 `data/config.json` 读取完整配置，并对所有 `apiKey`/`secretKey`/`passphrase`
+        字段做掩码处理（仅保留首尾 4 位）。前端无需自行处理脱敏。
+      responses:
+        '200':
+          description: 当前配置
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MaskedConfig' }
+        '500': { $ref: '#/components/responses/ServerError' }
+    put:
+      tags: [Config]
+      summary: 更新配置（合并语义，保留未改动的密钥）
+      description: |
+        请求体按字段逐项 merge 入当前配置；已脱敏的 `apiKey`/`secretKey` 会保留
+        原值（即 `xxxxxxxx...xxxxxxxx` 不会覆盖真值）。
+
+        当 `body.marketSync` 段被传入时，后端会立刻重新加载 `KlineSync`（订阅列表与间隔生效）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConfigPatch' }
+            example:
+              binance: { apiKey: 'newKey', secretKey: 'newSecret', testnet: true }
+              trader: { enabled: true, dryRun: true, maxLeverage: 3 }
+      responses:
+        '200':
+          description: 更新后的配置（已脱敏）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MaskedConfig' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  # ───────── Strategy ─────────
+  /api/strategy:
+    get:
+      tags: [Strategy]
+      summary: 读取研究策略描述
+      description: |
+        策略文件保存在 `data/strategy.json`，描述系统提示词、关注币种、K 线窗口等元数据。
+        实际下单规则由 `server/research.js` 中的常量控制，策略文件只控制 LLM 上下文。
+      responses:
+        '200':
+          description: 策略对象
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Strategy' }
+              examples:
+                default:
+                  value:
+                    name: 'OKX USDT perpetual contracts, 15-minute research'
+                    symbols: ['ALL']
+                    interval: '15m'
+                    klineLimit: 80
+                    systemPrompt: 'You are a cautious crypto futures market analyst...'
+                    rules: 'Use the configured candle interval...'
+        '500': { $ref: '#/components/responses/ServerError' }
+    put:
+      tags: [Strategy]
+      summary: 写入策略描述（覆盖式写入）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Strategy' }
+      responses:
+        '200':
+          description: 写入后的策略对象
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Strategy' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  # ───────── Binance ─────────
+  /api/binance/status:
+    get:
+      tags: [Binance]
+      summary: 查询当前 Binance 连接/账户状态
+      description: |
+        返回 `BinancePositionMonitor` 内部聚合：连接是否建立、账户权益、持仓数量、
+        最近一次轮询时间与错误信息。
+      responses:
+        '200':
+          description: 连接状态
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BinanceStatus' }
+        '500': { $ref: '#/components/responses/ServerError' }
+  /api/binance/test:
+    post:
+      tags: [Binance]
+      summary: 用当前配置直连 Binance 拉取一次账户快照
+      description: |
+        调用 `GET /fapi/v2/account`、`GET /fapi/v2/positionRisk`、
+        `GET /fapi/v1/positionSide/dual` 三接口验证凭据可用性，并返回持仓模式
+        （`hedge` 双向持仓 / `one-way` 单向）。
+      responses:
+        '200':
+          description: 测试成功
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, testnet, totalEquity, activePositions, positionMode]
+                properties:
+                  ok: { type: boolean, example: true }
+                  testnet: { type: boolean, description: 是否使用 testnet.fapi 域名 }
+                  totalEquity: { type: number, description: '钱包余额 (USDT)', example: 1024.5 }
+                  activePositions: { type: integer, description: 非零持仓数, example: 2 }
+                  positionMode:
+                    type: string
+                    enum: [hedge, one-way]
+                    description: '持仓模式：双向持仓 / 单向持仓'
+        '422':
+          description: 未填写 API Key / Secret
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: '请填写币安 API Key 和 Secret Key。' }
+        '500': { $ref: '#/components/responses/ServerError' }
+  /api/binance/review:
+    post:
+      tags: [Binance]
+      summary: 拉取最近 15m K 线对当前持仓做一轮复盘
+      description: |
+        触发 `positionMonitor.reviewAfterKlines({ interval: '15m' })`：用最近一根
+        15 分钟 K 线的收盘价刷新未实现盈亏与强平价，并把结果写入状态机。
+      responses:
+        '200':
+          description: 复盘结果
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JsonObject' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  # ───────── Market ─────────
+  /api/market/symbols:
+    get:
+      tags: [Market]
+      summary: 查询 USDT 永续合约列表
+      description: |
+        内部带 1 小时缓存；首次调用会触发 OKX 公开接口 `/api/v5/public/instruments`。
+        可按 `search`（symbol/baseCoin 模糊）和截断 `limit` 过滤。
+      parameters:
+        - in: query
+          name: search
+          schema: { type: string }
+          description: 模糊匹配 `symbol` 或 `baseCoin`
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 2000, default: 2000 }
+          description: 返回条目数上限
+      responses:
+        '200':
+          description: 合约数组
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/MarketSymbol' }
+              example:
+                - symbol: BTCUSDT
+                  baseCoin: BTC
+                  quoteCoin: USDT
+                  contractType: perpetual
+                  tickSize: '0.10'
+                  lotSize: '0.001'
+                  state: live
+        '500': { $ref: '#/components/responses/ServerError' }
+  /api/market/symbols/refresh:
+    post:
+      tags: [Market]
+      summary: 强制刷新合约缓存
+      responses:
+        '200':
+          description: 最新合约列表 + 缓存状态
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - type: object
+                    properties:
+                      symbols:
+                        type: array
+                        items: { $ref: '#/components/schemas/MarketSymbol' }
+                  - $ref: '#/components/schemas/CacheStatus'
+        '500': { $ref: '#/components/responses/ServerError' }
+  /api/market/symbols/status:
+    get:
+      tags: [Market]
+      summary: 读取行情源缓存/健康状态
+      responses:
+        '200':
+          description: 缓存状态
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CacheStatus' }
+              example:
+                provider: okx
+                cachedAt: '2026-09-10T08:30:00.000Z'
+                ttlMs: 3600000
+                proxyAlive: true
+  /api/market/klines:
+    get:
+      tags: [Market]
+      summary: 拉取最新 K 线（OKX 公开数据，按需入库）
+      description: |
+        一次最多返回 200 根；`endTime`（毫秒）不传则取到当前正在形成的那根。
+        入库前会自动剔除 `nextOpenTime > now` 的未收口 K 线，避免下游分析误用。
+      parameters:
+        - in: query
+          name: symbol
+          schema: { type: string, default: BTCUSDT }
+          description: '支持前缀剥离：`BINANCE_BTCUSDT` 自动归一为 `BTCUSDT`'
+        - in: query
+          name: interval
+          schema: { type: string, default: 15m }
+          description: '支持 `1m/5m/15m/1h/4h/1d` 等 OKX bar 枚举'
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 20, maximum: 200, default: 80 }
+        - in: query
+          name: endTime
+          schema: { type: integer, format: int64 }
+          description: '截止时间（毫秒），必须 ≤ 当前时间'
+      responses:
+        '200':
+          description: K 线数据
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [symbol, interval, rows, provider]
+                properties:
+                  symbol: { type: string, example: BTCUSDT }
+                  interval: { type: string, example: 15m }
+                  provider: { type: string, enum: [okx, binance], example: okx }
+                  rows:
+                    type: array
+                    items: { $ref: '#/components/schemas/KlineRow' }
+        '400':
+          description: endTime 不合法
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: '请选择不晚于当前时间的有效日期。' }
+
+  # ───────── History ─────────
+  /api/history/fetch:
+    post:
+      tags: [History]
+      summary: 一次性批量拉取 K 线入库
+      description: |
+        与 `KlineSync.fetchSymbols` 等价，但用作「即时一次性」入口；
+        内部会拒绝与后台定时同步并发执行。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                symbols:
+                  type: string
+                  description: 逗号分隔的币种列表；缺省或 `ALL` 取全部 USDT 永续
+                  example: 'BTCUSDT,ETHUSDT,SOLUSDT'
+                symbolsText:
+                  type: string
+                  description: 同 `symbols`，兼容字段
+                symbol:
+                  type: string
+                  description: 同 `symbols`，兼容字段
+                interval:
+                  type: string
+                  default: 15m
+                limit:
+                  type: integer
+                  minimum: 1
+                  maximum: 1000
+                  default: 80
+      responses:
+        '200':
+          description: 抓取结果统计
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FetchResult' }
+        '409':
+          description: 后台同步正在运行
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: 'K 线正在同步，可在行情面板查看进度。' }
+  /api/history/klines:
+    get:
+      tags: [History]
+      summary: 查询已入库的历史 K 线（从 PG `market_klines` 表）
+      parameters:
+        - in: query
+          name: symbol
+          schema: { type: string, default: BTCUSDT }
+        - in: query
+          name: interval
+          schema: { type: string, default: 15m }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 300 }
+      responses:
+        '200':
+          description: 历史 K 线
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [symbol, interval, rows]
+                properties:
+                  symbol: { type: string }
+                  interval: { type: string }
+                  rows:
+                    type: array
+                    items: { $ref: '#/components/schemas/KlineRow' }
+  /api/history/summary:
+    get:
+      tags: [History]
+      summary: 行情库各 (symbol, interval) 的存储概览
+      responses:
+        '200':
+          description: 概要
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HistorySummary' }
+  /api/history/sync/status:
+    get:
+      tags: [History]
+      summary: 当前后台 K 线同步状态
+      responses:
+        '200':
+          description: 同步状态
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SyncStatus' }
+  /api/history/sync/start:
+    post:
+      tags: [History]
+      summary: 开启后台 K 线定时同步
+      description: |
+        同步把 `config.marketSync.enabled = true` 持久化，并触发 `KlineSync.start()`。
+        周期与订阅范围由 `config.marketSync.symbolsText/interval/limit` 控制。
+      responses:
+        '200':
+          description: 启动后的状态
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SyncStatus' }
+  /api/history/sync/stop:
+    post:
+      tags: [History]
+      summary: 停止后台 K 线定时同步
+      responses:
+        '200':
+          description: 停止后的状态
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SyncStatus' }
+
+  # ───────── Analyses ─────────
+  /api/analyses:
+    get:
+      tags: [Analyses]
+      summary: 研究快照列表（按日期/币种过滤，分页）
+      parameters:
+        - in: query
+          name: date
+          schema: { type: string, description: 'YYYY-MM-DD' }
+        - in: query
+          name: symbol
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 100 }
+        - in: query
+          name: offset
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        '200':
+          description: 快照数组
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/AnalysisRecord' }
+  /api/analyses/{id}:
+    get:
+      tags: [Analyses]
+      summary: 单条研究快照详情
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: 快照详情
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AnalysisRecord' }
+        '404':
+          description: 未找到
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: '未找到该分析记录。' }
+
+  # ───────── Market analyze (research) ─────────
+  /api/market/analyze:
+    post:
+      tags: [Research]
+      summary: 单币种研究分析（长耗时，最长 30 分钟）
+      description: |
+        同步串行调用本地/AI 引擎对单个币种做研究分析。请求体支持：
+          * `symbol`：必填，USDT 永续合约名（如 `BTCUSDT`）。
+          * `scope.engine`：`auto | local | local-mtf | ai`。
+            - `auto`：模型可用则用 `ai`，否则回退 `local`。
+            - `local-mtf`：调用本地多周期（主周期 + 15m/1h/4h）增强引擎。
+            - `ai`：强制走 LLM，要求 `config.model.enabled && config.model.apiKey`。
+          * `scope.interval` / `scope.limit` / `scope.maxSymbols` / `scope.batchSize`：
+            覆盖策略默认值；`interval` 必须命中 OKX 支持的 bar。
+
+        并发约束：同一时间只允许一个分析任务运行；冲突时返回 409。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [symbol]
+              properties:
+                symbol:
+                  type: string
+                  example: BTCUSDT
+                scope:
+                  type: object
+                  properties:
+                    engine:
+                      type: string
+                      enum: [auto, local, local-mtf, ai]
+                      default: auto
+                    interval: { type: string, example: 15m }
+                    limit: { type: integer, minimum: 20, maximum: 200, default: 80 }
+                    maxSymbols: { type: integer, minimum: 1, maximum: 300, default: 20 }
+                    batchSize: { type: integer, minimum: 1, maximum: 20, default: 10 }
+                    symbols:
+                      type: array
+                      items: { type: string }
+                    symbolsText: { type: string }
+      responses:
+        '200':
+          description: 分析记录（无 snapshot/market 字段精简版）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AnalysisRecord' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409':
+          description: 已有分析任务在跑
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: '已有分析任务运行，请完成后再试。' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+  /api/market/analyze-range:
+    post:
+      tags: [Research]
+      summary: 按范围批量分析（最多 maxSymbols 个合约）
+      description: |
+        与单币种共用并发锁；`scope.symbols/symbolsText` 留空则扫描全部 USDT 永续，
+        `scope.maxSymbols` 控制最大条数，`scope.batchSize` 控制批次大小。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                scope: { $ref: '#/components/schemas/AnalyzeScope' }
+      responses:
+        '200':
+          description: 批量分析结果
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AnalysisRecord' }
+        '409':
+          description: 已有分析任务
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+  /api/market/analyze-all:
+    post:
+      tags: [Research]
+      summary: 全市场分析（慎用，长可达 30 分钟）
+      description: |
+        对所有 USDT 永续合约逐一分析，受 `maxSymbols` 与 `batchSize` 控制。
+        与 `analyze-range` 共用并发锁与失败聚合语义。
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                scope: { $ref: '#/components/schemas/AnalyzeScope' }
+      responses:
+        '200':
+          description: 全市场分析结果
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AnalysisRecord' }
+        '409': { $ref: '#/components/responses/ConflictAnalyze' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  # ───────── Research performance ─────────
+  /api/research/performance:
+    get:
+      tags: [Research]
+      summary: 信号回测聚合（按策略/币种/方向分组）
+      description: |
+        取最近 500 条分析记录，对每条 signal 用存档 K 线回放，
+        模拟从 `firstEntryAt` 到当前（或超时）的资金曲线。
+      parameters:
+        - in: query
+          name: date
+          schema: { type: string }
+        - in: query
+          name: symbol
+          schema: { type: string }
+      responses:
+        '200':
+          description: 回测结果
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PerformanceResult' }
+  /api/research/performance/refresh:
+    post:
+      tags: [Research]
+      summary: 触发一次"取最新 K 线 + 重算"（长耗时）
+      description: |
+        与 `GET /api/research/performance` 等价，但会按当前 `marketData` 行情源
+        补齐缺失窗口的 K 线。受同一时刻只能有一个 refresh 任务的并发锁保护。
+      responses:
+        '200':
+          description: 重算结果
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PerformanceResult' }
+        '409':
+          description: 行情正在同步
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: '模拟行情正在同步，请稍后重试。' }
+
+  # ───────── Paper ─────────
+  /api/paper/account:
+    get:
+      tags: [Paper]
+      summary: 模拟账户当前快照
+      responses:
+        '200':
+          description: 模拟账户状态
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PaperAccount' }
+  /api/paper/plans:
+    get:
+      tags: [Paper]
+      summary: 当前可下单的策略信号候选（OKX 行情 + 未过期 + eligible）
+      description: |
+        从最近 100 条分析记录中筛出 `marketProvider==='okx'`、
+        `eligible===true` 且 `expiresAt > now` 的信号，附 `recordId`、`at`。
+      responses:
+        '200':
+          description: 信号候选数组
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/PlanSignal' }
+  /api/paper/orders:
+    post:
+      tags: [Paper]
+      summary: 提交一笔模拟订单
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OrderSubmit' }
+      responses:
+        '200':
+          description: 新建订单
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PaperOrder' }
+  /api/paper/refresh:
+    post:
+      tags: [Paper]
+      summary: 强制刷新一次行情并按需重算未实现盈亏
+      responses:
+        '200':
+          description: 刷新后的账户/订单视图
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JsonObject' }
+  /api/paper/orders/{id}/close:
+    post:
+      tags: [Paper]
+      summary: 手动平掉一笔模拟订单
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: 平仓后的订单
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PaperOrder' }
+  /api/paper/optimize:
+    get:
+      tags: [Paper]
+      summary: 基于历史成交给出策略调整建议
+      responses:
+        '200':
+          description: 优化建议
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OptimizationResult' }
+  /api/paper/statistics:
+    get:
+      tags: [Paper]
+      summary: 完整统计分析（按币种/策略/引擎/小时/持仓桶/日聚合 + 双触发占比）
+      responses:
+        '200':
+          description: 统计结果
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PaperStatistics' }
+  /api/paper/orders/{id}:
+    get:
+      tags: [Paper]
+      summary: 查询单个订单详情
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: 订单详情（含 `analysisContext`）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PaperOrder' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/paper/orders/{id}/replay:
+    get:
+      tags: [Paper]
+      summary: 单订单 K 线复盘（仅 closed 订单）
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: 复盘数据
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderReplay' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/paper/orders/replay-batch:
+    post:
+      tags: [Paper]
+      summary: 批量 K 线复盘（按 ID 或过滤条件）
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                orderIds:
+                  type: array
+                  items: { type: string }
+                  description: '指定订单 ID 列表；与 `filters` 互斥（前者优先）'
+                filters:
+                  type: object
+                  properties:
+                    symbol: { type: string }
+                    direction:
+                      type: string
+                      enum: [OPEN_LONG, OPEN_SHORT]
+                    result: { type: string, enum: [win, loss] }
+                    minNet: { type: number }
+                    maxNet: { type: number }
+                    limit: { type: integer, minimum: 1 }
+      responses:
+        '200':
+          description: 批量复盘结果
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BatchReplayResult' }
+  /api/paper/strategy/optimize:
+    get:
+      tags: [Paper]
+      summary: 按订单持仓时长给出 maxHoldBars 优化建议
+      parameters:
+        - in: query
+          name: currentMaxHoldBars
+          schema: { type: integer, minimum: 10, maximum: 500, default: 120 }
+      responses:
+        '200':
+          description: 优化建议
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StrategyOptimization' }
+  /api/paper/strategy/apply-optimization:
+    post:
+      tags: [Paper]
+      summary: 应用 maxHoldBars 优化参数
+      description: |
+        仅记录到状态，下一次自动扫描时生效；不会立刻改写 `strategy.json`。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [maxHoldBars]
+              properties:
+                maxHoldBars:
+                  type: integer
+                  minimum: 10
+                  maximum: 500
+      responses:
+        '200':
+          description: 已应用
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  applied: { type: boolean }
+                  maxHoldBars: { type: integer }
+                  message: { type: string }
+                  timestamp: { type: string, format: date-time }
+        '422':
+          description: 参数越界
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  # ───────── PaperAutomation ─────────
+  /api/paper/automation:
+    put:
+      tags: [PaperAutomation]
+      summary: 更新模拟账户自动巡检配置
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: 由 `PaperAutomation.configure` 接受的任意键值
+              additionalProperties: true
+      responses:
+        '200':
+          description: 更新后的配置
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JsonObject' }
+  /api/paper/automation/{kind}:
+    post:
+      tags: [PaperAutomation]
+      summary: 手动触发一次 scan / review 任务（异步，返回 202）
+      parameters:
+        - in: path
+          name: kind
+          required: true
+          schema: { type: string, enum: [scan, review] }
+      responses:
+        '202':
+          description: 已接收
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accepted: { type: boolean }
+                  message: { type: string }
+        '400':
+          description: kind 不合法
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: '未知模拟任务。' }
+
+  # ───────── Adaptive ─────────
+  /api/adaptive/config:
+    get:
+      tags: [Adaptive]
+      summary: 读取自适应配置（来自模拟账户状态，否则取默认）
+      responses:
+        '200':
+          description: 配置对象
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdaptiveConfig' }
+    put:
+      tags: [Adaptive]
+      summary: 校验并写入自适应配置
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AdaptiveConfig' }
+      responses:
+        '200':
+          description: 写入结果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  config: { $ref: '#/components/schemas/AdaptiveConfig' }
+        '422':
+          description: 校验失败
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: '配置验证失败: ...' }
+  /api/adaptive/symbol-filter:
+    get:
+      tags: [Adaptive]
+      summary: 币种表现筛选分析
+      parameters:
+        - in: query
+          name: symbols
+          schema: { type: string }
+          description: 显式传入 `BTCUSDT,ETHUSDT,...`；不传则用历史成交过的全部币种
+      responses:
+        '200':
+          description: 筛选结果
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SymbolFilterResult' }
+  /api/adaptive/hour-analysis:
+    get:
+      tags: [Adaptive]
+      summary: 高胜率时段识别
+      responses:
+        '200':
+          description: 时段分析
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HourAnalysisResult' }
+  /api/adaptive/current-hour-check:
+    get:
+      tags: [Adaptive]
+      summary: 当前 UTC 小时是否建议交易
+      responses:
+        '200':
+          description: 决策
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CurrentHourCheck' }
+  /api/adaptive/symbol-params/{symbol}:
+    get:
+      tags: [Adaptive]
+      summary: 单币种自适应参数（止损/止盈/最大持仓）
+      parameters:
+        - in: path
+          name: symbol
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: 币种参数
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SymbolParams' }
+  /api/adaptive/holding-optimization:
+    get:
+      tags: [Adaptive]
+      summary: 持仓时长优化（ATR 止损/止盈 + maxHoldBars）
+      responses:
+        '200':
+          description: 优化建议
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HoldingOptimization' }
+  /api/adaptive/report:
+    get:
+      tags: [Adaptive]
+      summary: 自适应综合报告（汇总 1-3）
+      responses:
+        '200':
+          description: 报告
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdaptiveReport' }
+  /api/adaptive/apply-optimization:
+    post:
+      tags: [Adaptive]
+      summary: 应用 maxHoldBars/stopLossATR/takeProfitATR 覆盖
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                maxHoldBars: { type: integer, minimum: 10, maximum: 200 }
+                stopLossATR: { type: number, minimum: 1, maximum: 5 }
+                takeProfitATR: { type: number, minimum: 1.5, maximum: 10 }
+      responses:
+        '200':
+          description: 已应用
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  applied: { $ref: '#/components/schemas/AdaptiveOverrides' }
+                  message: { type: string }
+                  timestamp: { type: string, format: date-time }
+        '422':
+          description: 无有效参数
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /api/adaptive/reset-overrides:
+    post:
+      tags: [Adaptive]
+      summary: 清空覆盖，恢复默认
+      responses:
+        '200':
+          description: 已重置
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  message: { type: string }
+                  timestamp: { type: string, format: date-time }
+
+  # ───────── Automation ─────────
+  /api/automation/status:
+    get:
+      tags: [Automation]
+      summary: 全局自动化系统状态
+      responses:
+        '200':
+          description: 状态
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AutomationStatus' }
+  /api/automation/tasks/{taskName}:
+    put:
+      tags: [Automation]
+      summary: 配置某个全局任务（`klineSync` / `analysisCleanup` / ...）
+      parameters:
+        - in: path
+          name: taskName
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        '200':
+          description: 配置结果
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JsonObject' }
+  /api/automation/tasks/{taskName}/trigger:
+    post:
+      tags: [Automation]
+      summary: 手动触发指定任务（异步，202）
+      parameters:
+        - in: path
+          name: taskName
+          required: true
+          schema: { type: string }
+      responses:
+        '202':
+          description: 已接收
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string }
+                  task: { type: string }
+  /api/automation/{action}:
+    post:
+      tags: [Automation]
+      summary: 启动 / 停止全局自动化
+      parameters:
+        - in: path
+          name: action
+          required: true
+          schema: { type: string, enum: [start, stop] }
+      responses:
+        '200':
+          description: 操作成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string }
+        '400':
+          description: action 不合法
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+components:
+  responses:
+    ServerError:
+      description: 服务内部错误
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    BadRequest:
+      description: 请求参数不合法
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ConflictAnalyze:
+      description: 分析任务正在运行
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unprocessable:
+      description: 业务校验失败
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: 资源不存在
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string, example: '人类可读中文消息' }
+
+    JsonObject:
+      type: object
+      additionalProperties: true
+
+    # ───── Config ─────
+    MaskedConfig:
+      type: object
+      properties:
+        binance:
+          type: object
+          properties:
+            apiKey: { type: string, example: 'abcd...wxyz', description: '脱敏：仅首尾 4 位' }
+            secretKey: { type: string, example: 'abcd...wxyz' }
+            testnet: { type: boolean }
+        okx:
+          type: object
+          properties:
+            apiKey: { type: string, example: 'abcd...wxyz' }
+            secretKey: { type: string, example: 'abcd...wxyz' }
+            passphrase: { type: string, example: 'abcd...wxyz' }
+            demo: { type: boolean }
+            tdMode: { type: string, example: isolated }
+        model:
+          type: object
+          properties:
+            enabled: { type: boolean }
+            apiKey: { type: string, example: 'abcd...wxyz' }
+            baseUrl: { type: string }
+            model: { type: string, example: gpt-4o-mini }
+            maxConcurrentRequests: { type: integer, example: 5 }
+        trader:
+          type: object
+          properties:
+            exchange: { type: string, example: binance }
+            enabled: { type: boolean }
+            dryRun: { type: boolean }
+            scanIntervalSeconds: { type: integer, example: 900 }
+            quoteAsset: { type: string, example: USDT }
+            maxLeverage: { type: integer, example: 3 }
+            maxPositionNotionalPct: { type: number, example: 0.2 }
+            maxTotalNotionalPct: { type: number, example: 0.3 }
+            minConfidence: { type: number, example: 0.65 }
+            allowEntryOrders: { type: boolean }
+            allowCloseOrders: { type: boolean }
+            allowProtectionUpdates: { type: boolean }
+            entrySymbolsText: { type: string }
+            maxNewEntriesPerCycle: { type: integer, example: 1 }
+            maxPositionsToReview: { type: integer, example: 10 }
+            minProtectionMoveBps: { type: integer, example: 25 }
+        marketSync:
+          type: object
+          properties:
+            enabled: { type: boolean }
+            symbolsText: { type: string, example: 'ALL' }
+            interval: { type: string, example: 15m }
+            intervalSeconds: { type: integer, example: 900 }
+            limit: { type: integer, example: 80 }
+        tradeSync:
+          type: object
+          properties:
+            enabled: { type: boolean }
+            symbolsText: { type: string }
+            intervalSeconds: { type: integer }
+            limit: { type: integer }
+            initialLookbackDays: { type: integer }
+        analysis:
+          type: object
+          properties:
+            engine: { type: string, enum: [local, local-mtf, ai, enhanced, super] }
+        paperAutomationVersion: { type: integer }
+    ConfigPatch:
+      type: object
+      description: |
+        部分更新字段；后端逐层 merge，未出现字段保留旧值。密钥字段传脱敏值不会覆盖。
+      additionalProperties: true
+      example:
+        binance: { apiKey: 'newKey', secretKey: 'newSecret', testnet: true }
+        trader: { enabled: true, maxLeverage: 3 }
+
+    # ───── Strategy ─────
+    Strategy:
+      type: object
+      required: [name, symbols, interval, klineLimit, systemPrompt, rules]
+      properties:
+        name: { type: string }
+        symbols:
+          type: array
+          items: { type: string }
+          example: ['ALL']
+        interval: { type: string, example: 15m }
+        klineLimit: { type: integer, example: 80 }
+        systemPrompt: { type: string }
+        rules: { type: string }
+
+    # ───── Binance ─────
+    BinanceStatus:
+      type: object
+      properties:
+        connected: { type: boolean }
+        totalEquity: { type: number }
+        activePositions: { type: integer }
+        lastPollAt: { type: string, format: date-time }
+        error: { type: string, nullable: true }
+
+    # ───── Market ─────
+    MarketSymbol:
+      type: object
+      properties:
+        symbol: { type: string, example: BTCUSDT }
+        baseCoin: { type: string, example: BTC }
+        quoteCoin: { type: string, example: USDT }
+        contractType: { type: string, example: perpetual }
+        tickSize: { type: string, example: '0.10' }
+        lotSize: { type: string, example: '0.001' }
+        state: { type: string, example: live }
+    KlineRow:
+      type: object
+      required: [openTime, open, high, low, close, volume]
+      properties:
+        openTime: { type: integer, format: int64, description: 'K 线开盘毫秒时间戳' }
+        open: { type: number }
+        high: { type: number }
+        low: { type: number }
+        close: { type: number }
+        volume: { type: number }
+        quoteVolume: { type: number }
+        closeTime: { type: integer, format: int64 }
+    CacheStatus:
+      type: object
+      properties:
+        provider: { type: string, enum: [okx, binance] }
+        cachedAt: { type: string, format: date-time, nullable: true }
+        ttlMs: { type: integer }
+        proxyAlive: { type: boolean }
+
+    # ───── History ─────
+    FetchResult:
+      type: object
+      properties:
+        source: { type: string, enum: [okx, binance] }
+        inserted: { type: integer }
+        updated: { type: integer }
+        skipped: { type: integer }
+        failures:
+          type: array
+          items: { type: string }
+        durationMs: { type: integer }
+    HistorySummary:
+      type: object
+      properties:
+        symbols:
+          type: integer
+          description: 已入库的不同 (symbol, interval) 组合数
+        totalRows: { type: integer }
+        intervals:
+          type: array
+          items: { type: string }
+    SyncStatus:
+      type: object
+      properties:
+        running: { type: boolean }
+        symbolsText: { type: string }
+        interval: { type: string }
+        intervalSeconds: { type: integer }
+        progress: { type: integer, minimum: 0, maximum: 100 }
+        lastTickAt: { type: string, format: date-time, nullable: true }
+        lastError: { type: string, nullable: true }
+
+    # ───── Analyses / Research ─────
+    AnalysisSignal:
+      type: object
+      properties:
+        symbol: { type: string }
+        interval: { type: string }
+        eligible: { type: boolean }
+        confidence: { type: number, minimum: 0, maximum: 1 }
+        confidenceType: { type: string, example: rule_strength }
+        analysisEngine: { type: string, enum: [local, local-mtf, ai] }
+        positionRecommendation: { type: string, enum: [OPEN_LONG, OPEN_SHORT, HOLD] }
+        firstEntryAt: { type: string, format: date-time }
+        expiresAt: { type: string, format: date-time }
+        reasons:
+          type: array
+          items: { type: string }
+        risks:
+          type: array
+          items: { type: string }
+        invalidation: { type: string }
+        marketProvider: { type: string, enum: [okx, binance] }
+    AnalysisRecord:
+      type: object
+      properties:
+        id: { type: string }
+        at: { type: string, format: date-time }
+        type: { type: string, enum: [single, range, all] }
+        scope: { $ref: '#/components/schemas/AnalyzeScope' }
+        analysisEngine: { type: string }
+        analyses:
+          type: array
+          items: { $ref: '#/components/schemas/AnalysisSignal' }
+        error: { type: string, nullable: true }
+    AnalyzeScope:
+      type: object
+      properties:
+        interval: { type: string, example: 15m }
+        limit: { type: integer, minimum: 20, maximum: 200, example: 80 }
+        maxSymbols: { type: integer, minimum: 1, maximum: 300, example: 20 }
+        batchSize: { type: integer, minimum: 1, maximum: 20, example: 10 }
+        engine: { type: string, enum: [auto, local, local-mtf, ai] }
+        symbols:
+          type: array
+          items: { type: string }
+        symbolsText: { type: string }
+    PerformanceResult:
+      type: object
+      properties:
+        asOf: { type: string, format: date-time }
+        records: { type: integer }
+        truncated: { type: boolean }
+        excluded: { type: integer }
+        summary: { $ref: '#/components/schemas/PerformanceSummary' }
+        byStrategy:
+          type: array
+          items: { $ref: '#/components/schemas/PerformanceSummary' }
+        bySymbol:
+          type: array
+          items: { $ref: '#/components/schemas/PerformanceSummary' }
+        byDirection:
+          type: array
+          items: { $ref: '#/components/schemas/PerformanceSummary' }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/PerformanceItem' }
+        errors:
+          type: array
+          items: { type: string }
+    PerformanceSummary:
+      type: object
+      properties:
+        key: { type: string }
+        count: { type: integer }
+        wins: { type: integer }
+        losses: { type: integer }
+        winRate: { type: number, minimum: 0, maximum: 1 }
+        net: { type: number }
+        avgNet: { type: number }
+    PerformanceItem:
+      type: object
+      properties:
+        id: { type: string }
+        recordId: { type: string }
+        symbol: { type: string }
+        interval: { type: string }
+        direction: { type: string, enum: [OPEN_LONG, OPEN_SHORT, HOLD] }
+        strategyVersion: { type: string }
+        at: { type: string, format: date-time }
+        confidence: { type: number }
+        costs: { $ref: '#/components/schemas/JsonObject' }
+        evaluation: { $ref: '#/components/schemas/JsonObject' }
+
+    # ───── Paper ─────
+    PaperAccount:
+      type: object
+      properties:
+        balance: { type: number, description: '账户余额（USDT）' }
+        equity: { type: number, description: '账户权益（含未实现盈亏）' }
+        positions:
+          type: array
+          items: { $ref: '#/components/schemas/PaperOrder' }
+        ordersCount: { type: integer }
+        closedCount: { type: integer }
+        totalNet: { type: number }
+    PaperOrder:
+      type: object
+      properties:
+        id: { type: string }
+        symbol: { type: string }
+        direction:
+          type: string
+          enum: [OPEN_LONG, OPEN_SHORT]
+        interval: { type: string }
+        status:
+          type: string
+          enum: [pending, open, closed, cancelled]
+        entryPrice: { type: number }
+        markPrice: { type: number }
+        stopLoss: { type: number }
+        takeProfit: { type: number }
+        quantity: { type: number }
+        createdAt: { type: string, format: date-time }
+        markAt: { type: string, format: date-time }
+        exitAt: { type: string, format: date-time, nullable: true }
+        exitPrice: { type: number, nullable: true }
+        reason:
+          type: string
+          enum: [stop_loss, take_profit, timeout, liquidation, manual, ambiguous]
+        gross: { type: number }
+        fees: { type: number }
+        funding: { type: number }
+        net: { type: number }
+        heldBars: { type: integer }
+        ambiguousBar: { type: boolean, description: '同根 K 线同时触及止盈止损' }
+        analysisContext: { $ref: '#/components/schemas/JsonObject' }
+    OrderSubmit:
+      type: object
+      required: [symbol, direction, interval]
+      properties:
+        symbol: { type: string }
+        direction:
+          type: string
+          enum: [OPEN_LONG, OPEN_SHORT]
+        interval: { type: string, example: 15m }
+        entryPrice: { type: number, description: '缺省按当前 mark 价' }
+        stopLoss: { type: number }
+        takeProfit: { type: number }
+        quantity: { type: number }
+        analysisContext: { $ref: '#/components/schemas/JsonObject' }
+    PlanSignal:
+      allOf:
+        - $ref: '#/components/schemas/AnalysisSignal'
+        - type: object
+          properties:
+            recordId: { type: string }
+            at: { type: string, format: date-time }
+    OptimizationResult:
+      type: object
+      properties:
+        suggestions:
+          type: array
+          items: { $ref: '#/components/schemas/JsonObject' }
+        adjustments: { $ref: '#/components/schemas/JsonObject' }
+        timestamp: { type: string, format: date-time }
+    PaperStatistics:
+      type: object
+      properties:
+        summary: { $ref: '#/components/schemas/JsonObject' }
+        bySymbol:
+          type: array
+          items: { $ref: '#/components/schemas/JsonObject' }
+        byStrategy:
+          type: array
+          items: { $ref: '#/components/schemas/JsonObject' }
+        byEngine:
+          type: array
+          items: { $ref: '#/components/schemas/JsonObject' }
+        byHour:
+          type: array
+          items: { $ref: '#/components/schemas/JsonObject' }
+        byHoldingBars:
+          type: array
+          items: { $ref: '#/components/schemas/JsonObject' }
+        byDay:
+          type: array
+          items: { $ref: '#/components/schemas/JsonObject' }
+        ambiguousBar: { $ref: '#/components/schemas/JsonObject' }
+    OrderReplay:
+      type: object
+      properties:
+        orderId: { type: string }
+        symbol: { type: string }
+        interval: { type: string }
+        klines:
+          type: array
+          items: { $ref: '#/components/schemas/KlineRow' }
+        trades:
+          type: array
+          items: { $ref: '#/components/schemas/JsonObject' }
+        summary: { $ref: '#/components/schemas/JsonObject' }
+    BatchReplayResult:
+      type: object
+      properties:
+        total: { type: integer }
+        successes: { type: integer }
+        failures: { type: integer }
+        results:
+          type: array
+          items: { $ref: '#/components/schemas/OrderReplay' }
+    StrategyOptimization:
+      type: object
+      properties:
+        currentMaxHoldBars: { type: integer }
+        recommended: { $ref: '#/components/schemas/JsonObject' }
+        samples: { type: integer }
+        timestamp: { type: string, format: date-time }
+
+    # ───── Adaptive ─────
+    AdaptiveConfig:
+      type: object
+      properties:
+        symbolFilter:
+          type: object
+          properties:
+            enabled: { type: boolean }
+            minTrades: { type: integer }
+            minWinRate: { type: number }
+            maxDrawdown: { type: number }
+        hourFilter:
+          type: object
+          properties:
+            enabled: { type: boolean }
+            minTradesPerHour: { type: integer }
+            minWinRate: { type: number }
+        symbolLevelParams:
+          type: object
+          properties:
+            enabled: { type: boolean }
+            minSampleSize: { type: integer }
+    AdaptiveOverrides:
+      type: object
+      properties:
+        maxHoldBars: { type: integer, minimum: 10, maximum: 200 }
+        stopLossATR: { type: number, minimum: 1, maximum: 5 }
+        takeProfitATR: { type: number, minimum: 1.5, maximum: 10 }
+    SymbolFilterResult:
+      type: object
+      properties:
+        passed:
+          type: array
+          items: { type: string }
+        rejected:
+          type: array
+          items:
+            type: object
+            properties:
+              symbol: { type: string }
+              reason: { type: string }
+              winRate: { type: number }
+              trades: { type: integer }
+    HourAnalysisResult:
+      type: object
+      properties:
+        highProbHours:
+          type: array
+          items: { type: integer, description: 'UTC 小时 0-23' }
+        summary: { $ref: '#/components/schemas/JsonObject' }
+        hourStats:
+          type: array
+          items: { $ref: '#/components/schemas/JsonObject' }
+    CurrentHourCheck:
+      type: object
+      properties:
+        hour: { type: integer, description: 'UTC 小时 0-23', example: 8 }
+        shouldTrade: { type: boolean }
+        winRate: { type: number }
+        trades: { type: integer }
+        reason: { type: string }
+    SymbolParams:
+      type: object
+      properties:
+        symbol: { type: string }
+        stopLossATR: { type: number }
+        takeProfitATR: { type: number }
+        maxHoldBars: { type: integer }
+        sampleSize: { type: integer }
+        isFromDefaults: { type: boolean, description: '样本不足时回退到默认值' }
+    HoldingOptimization:
+      type: object
+      properties:
+        sufficient: { type: boolean }
+        message: { type: string }
+        sampleSize: { type: integer }
+        analysis: { $ref: '#/components/schemas/JsonObject' }
+        optimizedParams: { $ref: '#/components/schemas/AdaptiveOverrides' }
+        timestamp: { type: string, format: date-time }
+    AdaptiveReport:
+      type: object
+      properties:
+        summary: { $ref: '#/components/schemas/JsonObject' }
+        holdingOptimization: { $ref: '#/components/schemas/AdaptiveOverrides' }
+        hourAnalysis: { $ref: '#/components/schemas/JsonObject' }
+        symbolPerformance: { $ref: '#/components/schemas/JsonObject' }
+        config: { $ref: '#/components/schemas/AdaptiveConfig' }
+
+    # ───── Automation ─────
+    AutomationStatus:
+      type: object
+      properties:
+        running: { type: boolean }
+        tasks:
+          type: array
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              enabled: { type: boolean }
+              lastRunAt: { type: string, format: date-time, nullable: true }
+              lastError: { type: string, nullable: true }
+              nextRunAt: { type: string, format: date-time, nullable: true }

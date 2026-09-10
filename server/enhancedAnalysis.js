@@ -89,7 +89,40 @@ const REQUIRE_VOLUME_CONFIRM = true;
 // 组合效果（1m & ATR≥0.35% & RSI≥50）：n=572，胜率 22.8%→29.5%，均单 -0.91→-0.20U。
 // 调参：想更激进 → NOFX_MIN_ATR_PCT=0.004；交易过少 → 调回 0.0015。
 // 回滚全部三项：NOFX_MIN_ATR_PCT=0.0005 NOFX_MIN_RSI_LONG=40 NOFX_MAX_RSI_SHORT=60
-const MIN_ATR_PCT = numFromEnv('NOFX_MIN_ATR_PCT', 0.003, 0, 0.05);
+//
+// ── P5 更新（2026-09-10 晚）：下限 0.003 → 0.004，并新增「绝对+相对」双闸门 ──────
+// 本轮用「时间切分样本外验证」（前 60% 训练 / 后 40% 测试）重扫，只有波动率因子
+// 在训练/测试两段同时单调改善，其余多因子组合全部过拟合（训练 +0.46 → 测试 -0.29）。
+// 阈值扫描（配置 = 触发0.4R + trailAtr 2.5 + 3R止盈）：
+//     ≥0.30% 训练 45.7%/-0.927 | 测试 49.5%/-0.528  （保留 49.1%）
+//     ≥0.40% 训练 53.0%/-0.752 | 测试 56.6%/-0.182  （保留 34.6%）← 采用
+//     ≥0.50% 训练 57.7%/-0.379 | 测试 60.7%/+0.063  （保留 25.9%）
+//     ≥0.60% 训练 59.5%/+0.158 | 测试 61.1%/+0.338  （保留 19.2%，已转正）
+//
+// ⚠️ 上线后发现的重要问题（P5 二次校准）：
+//   上面的 0.40% 是在「历史成交样本」上标定的，而那段样本的市况波动率中位数约
+//   0.15%~0.25%。实测当前（09-10 14:00）全市场 1m 波动率中位数只有 0.085%，
+//   即当前市况的波动率只有标定时的约一半 —— 用 0.40% 绝对阈值，全市场 460 个币
+//   只有 3.9% 能通过，系统几乎完全停摆（实测 150 币仅出 0 单）。
+//   绝对阈值的内在缺陷：它把「分子（ATR）」和「分母（价格水平）」都写死了，
+//   但市场整体波动水平本身会随时间大幅漂移（隔夜 0.04% ↔ 活跃时段 0.15%）。
+//
+// 解决：改成「绝对下限 + 相对分位」双闸门，两者取较小值生效。
+//   · 绝对下限 NOFX_MIN_ATR_PCT（默认 0.0020）：硬性剔除最差的噪声带。
+//     历史数据显示 <0.15% 是灾难区（胜率 20.2%、均单 -2.45U），0.20% 已脱离该区。
+//   · 相对分位 NOFX_MIN_ATR_QUANTILE（默认 0.60）：在本轮扫描的候选币中，
+//     要求波动率排进前 40%（即高于 60% 分位）。市况清淡时自动降低绝对门槛，
+//     市况剧烈时自动抬高 —— 保证「永远只做当下相对活跃的那部分币」。
+//   双闸门等价于：「不低于噪声底线，且属于当下相对活跃品种」。
+//   这保留了原阈值想表达的「安静时不做单」语义，但不再因为市况整体变淡而停摆。
+//
+// 调参：想更激进 → NOFX_MIN_ATR_PCT=0.004 NOFX_MIN_ATR_QUANTILE=0.8；
+//       想更保守 → NOFX_MIN_ATR_QUANTILE=0.4（只做波动率上半区）。
+// 回滚全部：NOFX_MIN_ATR_PCT=0.0005 NOFX_MIN_ATR_QUANTILE=0 \
+//           NOFX_MIN_RSI_LONG=40 NOFX_MAX_RSI_SHORT=60
+const MIN_ATR_PCT = numFromEnv('NOFX_MIN_ATR_PCT', 0.002, 0, 0.05);
+// 相对分位闸门（0 = 关闭）。需要在「同批候选」上下文中生效，见 makeVolatilityGate。
+const MIN_ATR_QUANTILE = numFromEnv('NOFX_MIN_ATR_QUANTILE', 0.6, 0, 0.95);
 // 波动率上限（原值 0.08 保持不变，极端行情直接回避）
 const MAX_ATR_PCT = 0.08;
 // 多单要求的最低 RSI（原 40）
@@ -98,8 +131,52 @@ const MIN_RSI_LONG = numFromEnv('NOFX_MIN_RSI_LONG', 50, 0, 100);
 const MAX_RSI_SHORT = numFromEnv('NOFX_MAX_RSI_SHORT', 55, 0, 100);
 // ── P4 新增结束 ──────────────────────────────────────────────────────────────
 
-// 持仓复核：盈利触发阈值（保持不变）
-const TRAIL_PROFIT_TRIGGER = 0.02;
+// 持仓复核：盈利触发阈值（P5 修正）。
+//
+// 旧值 0.02（价格变动 2%）是 P5 复盘发现的最大单点缺陷：
+// 主止损距离是 2 ATR，实测 ATR/价格中位数约 0.35%，即 1R ≈ 2×0.35% = 0.70% 价格。
+// 因此 2% 的浮盈相当于 2.9R —— 绝大多数订单根本走不到（实测盈利单平均 MFE 才 1.91R），
+// 移动止损形同虚设，订单一直裸露在初始止损上，直到被扫掉。
+//
+// 改为「按 R 触发」：浮盈达到 0.4R 即开始保护。时间切分样本外验证（vol>=0.40% 子集）：
+//   触发 1.0R：训练胜率 41.5% / 测试 43.8%
+//   触发 0.4R：训练胜率 56.9% / 测试 58.9%  ← 采用
+//   触发 0.2R：训练胜率 62.8% / 测试 63.3%（胜率更高但均单更差，因过早离场吃不到趋势）
+// 0.4R 在「胜率」与「均单净盈亏」之间取得平衡（训练 -0.581 / 测试 -0.271，均优于基准）。
+// 注意：0.4R 触发的前提是 2ATR 止损；若改 stopR 需同步重标该值。
+const TRAIL_PROFIT_TRIGGER = 0.02;          // 保留：仅作为「已明显盈利」的兜底语义（见下）
+const TRAIL_TRIGGER_R = numFromEnv('NOFX_TRAIL_TRIGGER_R', 0.4, 0.05, 3.0);
+
+/**
+ * 判断是否应该启动移动止损（提前保护）。
+ *
+ * 双通道，任一满足即触发：
+ *   1. R 通道（主）：浮盈 >= TRAIL_TRIGGER_R × R，R = 入场价到初始止损的距离。
+ *      这是 P5 新增的主力通道，让保护在「小而快的反转」前生效。
+ *   2. 百分比通道（兼容）：浮盈 > 2%，保留原语义，避免在 R 极小（止损很近）时过于敏感。
+ *
+ * @returns {{fire: boolean, detail: string}}
+ */
+function shouldFireTrailing(order, close, atr, long) {
+  const entry = Number(order.entry);
+  const stop = Number(order.plan?.stopLoss);
+  const profit = long ? (close - entry) / entry : (entry - close) / entry;
+  const pctFire = profit > TRAIL_PROFIT_TRIGGER;
+
+  let rFire = false, rDetail = 'R未知';
+  if (Number.isFinite(entry) && Number.isFinite(stop)) {
+    const riskDist = Math.abs(entry - stop);
+    if (riskDist > 0) {
+      const r = (long ? close - entry : entry - close) / riskDist;
+      rFire = r >= TRAIL_TRIGGER_R;
+      rDetail = `浮盈 ${r.toFixed(2)}R（触发线 ${TRAIL_TRIGGER_R}R）`;
+    }
+  }
+  return {
+    fire: rFire || pctFire,
+    detail: `${rDetail}${pctFire ? ' / 已超 2% 兜底线' : ''}`
+  };
+}
 // 移动止损 / 顺势扩展止盈 / 盈亏平衡位参数 — 跨引擎共享常量（见 server/shared/strategyGuards.js）。
 // 局部分解便于阅读：TRAIL_STOP_ATR=TRAILING_RULE.stopAtr, TRAIL_TP_ATR=TRAILING_RULE.extendTpAtr。
 const TRAIL_STOP_ATR = TRAILING_RULE.stopAtr;
@@ -699,9 +776,10 @@ export function enhancedAnalysis(market) {
       takeProfit1,
       takeProfit2,
       takeProfit3,
-      // P4 周期回退：主周期已由 5m 回退到 1m（见 research.js MAIN_INTERVAL），
-      // 根数须同步还原，否则 6 分钟入场窗口会缩成 2 分钟、2 小时持仓上限会缩成 24 分钟。
-      // 6根@1m=6min 入场窗口；120根@1m=2h 持仓上限（与 5m 时代的 2根/24根 等时）。
+      // 1m 主周期：下单后 6 根（6 分钟）内可成交，最多持仓 120 根（2 小时）。
+      // P5 修正：周期回退 1m 后，这两个值必须同步回退（此前被改成 15m 口径的 1/8，
+      // 换算成 1m 只有 1 分钟有效、8 分钟最大持仓 —— 订单几乎来不及走完就被超时平掉，
+      // 直接解释了 750 笔 expired 与「活不过 14 根」的高占比）。
       validForBars: 6,
       maxHoldBars: 120,
       riskRewardRatio,
@@ -798,8 +876,10 @@ export function enhancedProtectionReview(order, market) {
   let newStopLoss = order.plan.stopLoss;
   let newTakeProfit = order.plan.takeProfit;
 
-  if (profit > TRAIL_PROFIT_TRIGGER) {
-    // 盈利超过阈值，启用移动止损（距离参数化，见文件顶部 P3 参数区）
+  const fireTrail = shouldFireTrailing(order, close, atr, long);
+
+  if (fireTrail.fire) {
+    // 达到「提前保护」触发条件，启用移动止损（距离参数化，见文件顶部 P3 参数区）
     if (long) {
       // 多头：止损移至成本或盈利保护位
       const breakEvenStop = order.entry + atr * 0.2;
@@ -818,12 +898,12 @@ export function enhancedProtectionReview(order, market) {
       newTakeProfit = Math.min(order.plan.takeProfit, close - atr * TRAIL_TP_ATR);
     }
   } else {
-    // 未盈利超过2%：保持初始保护价格，不再收紧止损。
+    // 未达到提前保护触发条件：保持初始保护价格，不再收紧止损。
     // 历史复盘显示旧逻辑在未盈利时按 close±1.8ATR 持续收紧止损，
     // 会把初始止损棘轮式推向现价，入场几分钟内即被1m噪声扫出。
     return {
       action: 'HOLD',
-      reason: '持仓未盈利超过2%，保持初始保护价格，避免噪声止损。',
+      reason: `浮盈未达保护触发位（${fireTrail.detail}），保持初始保护价格，避免噪声止损。`,
       trendScore: trendStrength.score
     };
   }
