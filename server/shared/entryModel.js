@@ -9,6 +9,13 @@
  *   pullbackAtr 由趋势评分映射：评分越高→回调越浅（越急于入场），评分越低→回调越深（越耐心等更好价）。
  *
  * Unfilled orders remain pending until filled or cancelled.
+ *
+ * ⚠️ P9 标定（2026-09-11，50 币×30 天 1m 回测 459 笔 + 时间切分样本外验证）：
+ *   默认值 0.3/1.5 实测是**负期望的主要来源** —— 浅回调把任意小回撤都当买点，
+ *   成交即逆势，持仓 ≤5 根被止损的订单就占了总亏损的 75%。
+ *   生产环境已由 ecosystem.config.cjs 覆盖为 SHALLOW=1.5 / DEEP=2.0（深度区间 1.5~2.0 ATR）：
+ *   胜率 31.4%→45.1%、净亏 −757.7→−266.8U，且后 40% 样本外段改善更强。
+ *   代码默认值此处**保持 0.3/1.5 不变**，以便「删掉 ecosystem 里的三行」即完整回滚。
  */
 
 const PULLBACK_ATR_DEEP = Number(process.env.NOFX_PULLBACK_ATR_DEEP ?? 1.5);     // 低评分时的回撤深度(ATR)

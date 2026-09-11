@@ -164,8 +164,11 @@ const REQUIRE_VOLUME_CONFIRM = true;
 // 调参：想更激进 → NOFX_MIN_ATR_PCT=0.004；想更保守 → 调回 0.0005。
 // 回滚全部：NOFX_MIN_ATR_PCT=0.0005 NOFX_MIN_RSI_LONG=40 NOFX_MAX_RSI_SHORT=60
 const MIN_ATR_PCT = numFromEnv('NOFX_MIN_ATR_PCT', 0.002, 0, 0.05);
-// 波动率上限（原值 0.08 保持不变，极端行情直接回避）
-const MAX_ATR_PCT = 0.08;
+// 波动率上限（原为硬编码 0.08）。P9 改为可配置，默认值不变、行为零变化。
+// 依据（2026-09-11，50 币×30 天 1m 回测 459 笔）：入场 atrPct ≥1.0% 的 33 笔净 −212U
+// （PF 0.26，其中 ≥2% 的 21 笔胜率仅 4.8%），而全场净亏 −757.7U —— 高波动是最集中的
+// 亏损带，且旧上限 8% 形同虚设。下调即「极端波动直接回避」。
+const MAX_ATR_PCT = numFromEnv('NOFX_MAX_ATR_PCT', 0.08, 0.001, 0.5);
 // 多单要求的最低 RSI（原 40）
 const MIN_RSI_LONG = numFromEnv('NOFX_MIN_RSI_LONG', 50, 0, 100);
 // 空单允许的最高 RSI（原 60）
