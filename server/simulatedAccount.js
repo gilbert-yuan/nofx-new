@@ -2,6 +2,7 @@ import { fetchContinuousKlines } from './continuousKlines.js';
 import { randomUUID } from 'node:crypto';
 import { candleOpenAt, nextOpenTime, validCandle, PAPER_COSTS } from './research.js';
 import { recommendedLeverage } from './localAnalysis.js';
+import { RISK_RULE } from './shared/strategyGuards.js';
 import { createAccountSimulator } from './tradingSimulator.js';
 import { analyzeClosedOrders, generateStrategyAdjustments } from './strategyOptimizer.js';
 import { SimulatedAccountRepository } from './simulatedAccountRepository.js';
@@ -37,7 +38,11 @@ export function submitPaperOrder(state, record, input, now = Date.now()) {
   const first = Math.max(Date.parse(signal.firstEntryAt), nextOpenTime(candleOpenAt(now, signal.interval), signal.interval));
   if (!Number.isFinite(first)) fail('分析计划的入场时间无效，请重新分析。');
   const margin = Number(input.margin ?? 100), leverage = Number(input.leverage ?? signal.recommendedLeverage ?? recommendedLeverage(signal.plan, signal.positionRecommendation));
-  if (!Number.isFinite(margin) || margin < 1 || margin > 100000 || !Number.isInteger(leverage) || leverage < 1 || leverage > 5) fail('保证金须为 1～100000 USDT，杠杆须为 1～5 的整数。');
+  // 杠杆上限必须与全局配置 RISK_RULE.maxLeverage 一致（由 NOFX_MAX_LEVERAGE 驱动）。
+  // 此前此处硬编码 5，P12 把 NOFX_MAX_LEVERAGE 提到 12 后脱节，导致被推荐 ~10x 的
+  // 币种（如 IOSTUSDT）在模拟下单时被误拒。改读单一事实源，避免再次漂移。
+  const maxLev = RISK_RULE.maxLeverage;
+  if (!Number.isFinite(margin) || margin < 1 || margin > 100000 || !Number.isInteger(leverage) || leverage < 1 || leverage > maxLev) fail(`保证金须为 1～100000 USDT，杠杆须为 1～${maxLev} 的整数。`);
   if (!state.unlimitedCapital && state.orders.filter(active).length >= 20) fail('最多同时持有 20 个模拟挂单或持仓。');
   if (!state.unlimitedCapital && state.orders.some(o => active(o) && o.symbol === input.symbol)) fail('该币种已有模拟挂单或持仓。');
   const plan = { ...signal.plan, stopLoss: Number(input.stopLoss ?? signal.plan.stopLoss), takeProfit: Number(input.takeProfit ?? signal.plan.takeProfit) };
