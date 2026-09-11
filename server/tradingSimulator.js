@@ -6,7 +6,7 @@
  */
 
 import { nextOpenTime, validCandle, PAPER_COSTS } from './research.js';
-import { PARTIAL_TP, partialTpLevels, netBreakEvenBps } from './shared/strategyGuards.js';
+import { PARTIAL_TP, SMART_EXIT, partialTpLevels, netBreakEvenBps } from './shared/strategyGuards.js';
 
 /**
  * 交易模拟器配置
@@ -139,6 +139,13 @@ export class TradingSimulator {
     // 只看**已收盘** K 线，不使用未来数据，回测/实盘口径一致。
     const smartExit = plan?.smartExit;
     const barLevelMaExit = !!smartExit && smartExit.barLevel !== false && Number.isFinite(smartExit.maBreakAtr);
+    // 根级最小持仓保护（P8，2026-09-11）：与复核层 enhancedProtectionReview 同口径 ——
+    // 入场后 minHoldBars 根内禁止「均线失守」平仓（优先 plan 快照，旧订单回退全局
+    // NOFX_SMART_MIN_HOLD）。止损/止盈/分批/超时不受影响。
+    // 依据：50 币×30 天回测 52% 订单成交后 1 根内即被根级均线失守平掉。
+    const barMinHoldBars = Number.isFinite(smartExit?.minHoldBars)
+      ? smartExit.minHoldBars
+      : SMART_EXIT.minHoldBars;
     let maSeries = null;
     let atrSeries = null;
     if (barLevelMaExit) {
@@ -318,7 +325,7 @@ export class TradingSimulator {
               : NaN;
             const maxR = Number.isFinite(smartExit.maExitMaxProfitR) ? smartExit.maExitMaxProfitR : 0.4;
             const belowLine = !Number.isFinite(profitR) || profitR < maxR;
-            if (invalidated && deviated && belowLine) {
+            if (invalidated && deviated && belowLine && held >= barMinHoldBars) {
               realized.fills = tpStage;
               const settled = this._settle(
                 order,

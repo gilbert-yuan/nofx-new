@@ -847,7 +847,10 @@ export function enhancedAnalysis(market) {
         barLevel: SMART_EXIT.barLevelMaExit,
         maPeriod: 20,
         maBreakAtr: SMART_EXIT.maBreakAtr,
-        maExitMaxProfitR: SMART_EXIT.maExitMaxProfitR
+        maExitMaxProfitR: SMART_EXIT.maExitMaxProfitR,
+        // 根级/复核层共用的最小持仓保护（NOFX_SMART_MIN_HOLD）；固化进计划保证口径自洽，
+        // tradingSimulator 根级判定对旧订单回退读全局 SMART_EXIT.minHoldBars。
+        minHoldBars: SMART_EXIT.minHoldBars
       },
       maxHoldBars: 120,
       riskRewardRatio,
