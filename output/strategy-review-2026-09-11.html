@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NOFX 策略评估 · 2026-09-11</title>
+<style>
+  :root {
+    --bg: #FBFAF7; --panel: #FFFFFF; --line: #E7E4DC;
+    --ink: #1F1F1D; --ink2: #5F5E5A; --ink3: #8A8880;
+    --pos: #A32D2D; --neg: #3B6D11; --warn: #854F0B;
+    --mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif; line-height: 1.65; }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 48px 28px 72px; }
+  h1 { font-size: 22px; font-weight: 500; margin: 0 0 6px; letter-spacing: -.01em; }
+  .meta { color: var(--ink3); font-size: 13px; margin-bottom: 32px; }
+  h2 { font-size: 15px; font-weight: 500; margin: 36px 0 12px; }
+  p { margin: 0 0 10px; font-size: 14px; }
+  .verdict { background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--neg);
+    border-radius: 8px; padding: 18px 20px; margin-bottom: 8px; }
+  .verdict b { font-weight: 500; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+  .card .k { font-size: 12px; color: var(--ink2); }
+  .card .v { font-size: 21px; font-weight: 500; font-family: var(--mono); margin-top: 4px; }
+  .card .s { font-size: 12px; color: var(--ink3); margin-top: 2px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 4px; }
+  th, td { text-align: right; padding: 7px 10px; border-bottom: 1px solid var(--line); }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--ink2); font-weight: 500; font-size: 12px; background: #F6F4EF; }
+  td.num { font-family: var(--mono); }
+  .pos { color: var(--pos); } .neg { color: var(--neg); } .warn { color: var(--warn); }
+  .tag { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 20px;
+    background: #F1EFE8; color: var(--ink2); font-family: var(--mono); }
+  ul { margin: 6px 0 10px; padding-left: 20px; font-size: 14px; }
+  li { margin-bottom: 5px; }
+  .note { background: #FBF7EC; border: 1px solid #EFE3C6; border-radius: 8px; padding: 14px 18px; font-size: 13px; }
+  .disc { margin-top: 40px; padding-top: 16px; border-top: 1px solid var(--line);
+    font-size: 12px; color: var(--ink3); }
+  code { font-family: var(--mono); font-size: 12px; background: #F1EFE8; padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>NOFX 模拟盘策略评估</h1>
+  <div class="meta">2026-09-11 01:40 (+08) · 数据源：生产库 <span class="tag">simulated_orders</span> · 口径：已平仓订单按 created_at 归期</div>
+
+  <div class="verdict">
+    <b>结论：P6「禁空」方向正确，最近 8 小时数据已验证；除此之外不建议现在再叠加任何新调整。</b>
+    最近 8 小时多单 +40.3U（37 笔 · 胜率 54.1%），空单 −208.1U（70 笔 · 胜率 24.3%）。
+    系统整体的净亏损几乎全部来自空单，而禁空正好切掉这一段。但禁空落地仅约 30 分钟、尚无平仓样本，
+    且 24 小时聚合里多单仍被早间时段拖成负数，因此现在动参数属于无依据调参。
+  </div>
+
+  <h2>一、最新挂单实况</h2>
+  <ul>
+    <li>当前活跃挂单仅 <b>1–2 笔，且全部为多单</b>（限价挂单，禁空已生效）。最近 1 小时内标的在 PEPE → LDO → SPX 之间轮换。</li>
+    <li>最新一笔 SPXUSDT：限价 <code>0.48619</code>，止损 <code>0.48295</code>，主止盈 <code>0.50005</code>，净盈亏比 2.93，最大持仓 120 根。</li>
+    <li>该挂单的 <code>reviewHistory</code> 显示已被重新定价一次（0.48739 → 0.48619），属正常复核行为，但会造成标的轮换、占用活动额度。</li>
+    <li><span class="tag">GTC 已确认生效</span> 近 6 小时出现的 19 笔 <code>expired</code> 全为遗留数据（均带过期时间且从未成交），最后一笔停在 09-10 14:41Z，之后再无过期。新挂单 <code>expires_at</code> 为空。</li>
+  </ul>
+
+  <h2>二、最近窗口实况</h2>
+  <div class="cards">
+    <div class="card"><div class="k">近 4 小时净额</div><div class="v neg">−71.9U</div><div class="s">49 笔 · 胜率 32.7%</div></div>
+    <div class="card"><div class="k">近 6 小时净额</div><div class="v neg">−167.5U</div><div class="s">98 笔 · 胜率 33.7%</div></div>
+    <div class="card"><div class="k">近 8 小时净额</div><div class="v neg">−167.7U</div><div class="s">107 笔 · 胜率 34.6%</div></div>
+    <div class="card"><div class="k">近 24 小时净额</div><div class="v neg">−866.8U</div><div class="s">364 笔 · 胜率 25.3%</div></div>
+  </div>
+
+  <h2>三、多空分向（近 8 小时，已平仓）</h2>
+  <table>
+    <thead><tr><th>方向</th><th>笔数</th><th>胜率</th><th>净额</th><th>均单</th></tr></thead>
+    <tbody>
+      <tr><td>多单 LONG</td><td class="num">37</td><td class="num">54.1%</td><td class="num pos">+40.3U</td><td class="num pos">+1.09U</td></tr>
+      <tr><td>空单 SHORT</td><td class="num">70</td><td class="num">24.3%</td><td class="num neg">−208.1U</td><td class="num neg">−2.97U</td></tr>
+      <tr><td><b>合计</b></td><td class="num"><b>107</b></td><td class="num"><b>34.6%</b></td><td class="num neg"><b>−167.7U</b></td><td class="num neg"><b>−1.57U</b></td></tr>
+    </tbody>
+  </table>
+  <p style="margin-top:12px">同一窗口按平仓原因拆开，亏损高度集中：</p>
+  <table>
+    <thead><tr><th>原因 × 方向</th><th>笔数</th><th>净额</th></tr></thead>
+    <tbody>
+      <tr><td>LONG · 止盈 take_profit</td><td class="num">4</td><td class="num pos">+85.0U</td></tr>
+      <tr><td>LONG · 手动 manual</td><td class="num">8</td><td class="num pos">+8.4U</td></tr>
+      <tr><td>SHORT · 超时 timeout</td><td class="num">6</td><td class="num neg">−5.4U</td></tr>
+      <tr><td>SHORT · 智能退出 smart_exit_ma</td><td class="num">3</td><td class="num neg">−5.8U</td></tr>
+      <tr><td>SHORT · 手动 manual</td><td class="num">5</td><td class="num neg">−13.2U</td></tr>
+      <tr><td>LONG · 止损 stop_loss</td><td class="num">24</td><td class="num neg">−50.4U</td></tr>
+      <tr><td>SHORT · 止损 stop_loss</td><td class="num">56</td><td class="num neg">−183.7U</td></tr>
+    </tbody>
+  </table>
+
+  <h2>四、需要留意的两点</h2>
+  <ul>
+    <li><b>24 小时聚合有严重时段偏差，不能直接当结论。</b> 09-10 早间（本地 09:00–13:00）出现过密集下单（单小时 25–35 笔）且胜率低至 4–9%，把 24 小时口径的多单拖成 −512.9U。若只看该口径，会误判成「多单也在大亏」而得出手单该一起砍的错误结论。近 8 小时口径才是当前有效的。</li>
+    <li><b>多单止损仍偏紧。</b> 近 8 小时多单止损 24 笔、胜率却有 45.8%，净额仍为 −50.4U —— 说明多单「赢的时候赢得少、输的时候输得多」，止损距离与止盈目标的几何关系仍有优化空间。但样本未达 100 笔门槛，暂不动手。</li>
+  </ul>
+
+  <h2>五、建议</h2>
+  <ul>
+    <li><b>维持现状，不动参数。</b> 禁空刚上线、平仓样本为 0；近期多单样本 37 笔 &lt; 100 笔门槛。此时任何新过滤/门槛调整都是噪声驱动的。</li>
+    <li><b>先攒样本。</b> 按近期约 37 笔多单 / 8 小时的节奏，累计 100 笔平仓样本约需 1 天，届时再评估多单是否稳定为正。</li>
+    <li><b>下一轮评估的候选（先记录，不执行）：</b> 多单止损距离 / 入场回调深度的微调。相关旋钮：<code>NOFX_STOP_ATR</code>、<code>NOFX_PULLBACK_ATR_DEEP|SHALLOW</code>、<code>NOFX_MIN_STOP_PCT</code>。</li>
+    <li><b>改动前必做：</b> 止损倍数与盈亏比闸门强耦合（<code>k ≥ MIN_RR + 0.5(MIN_RR−1)/stopAtr</code>），单独调 <code>NOFX_STOP_ATR</code> 会触发 RR 闸门静默停摆；先跑 <code>scripts/_test_exit_logic.mjs</code> 与一条能出单的合成行情。</li>
+    <li><b>运维小项：</b> 活跃挂单在标的间轮换并被重新定价，会占用活动订单额度（上限 20 笔）。若额度吃紧，可临时降低扫描频率或清理长期未触价挂单。</li>
+  </ul>
+
+  <h2>六、追加：取消单与「挂单后复核/改价」分析（01:47 补）</h2>
+
+  <div class="verdict" style="border-left-color: var(--warn)">
+    <b>最关键的事实：01:12 禁空上线后创建的 18 笔订单，100% 被取消、成交 0 笔。</b>
+    对照紧邻的禁空前 40 分钟仍有 4 笔成交、2 笔取消。也就是说，系统当前事实上处于「只挂单、不成交」的停摆状态。
+  </div>
+
+  <h3 style="font-size:14px;font-weight:500;margin:20px 0 8px">取消原因（signal.reason 原文）</h3>
+  <table>
+    <thead><tr><th>原因</th><th>笔数</th><th>性质</th></tr></thead>
+    <tbody>
+      <tr><td>成交量不足（量比 0.27~0.80 &lt; 0.8），等待量能确认</td><td class="num">≈12</td><td>软门槛 · 每根 K 线重算 · 抖动</td></tr>
+      <tr><td>波动率过低（0.193% &lt; 0.20%），震荡市不做趋势单</td><td class="num">1</td><td>软门槛 · 抖动</td></tr>
+      <tr><td>其余（趋势评分 / 追高 / 方向不匹配等）</td><td class="num">≈5</td><td>—</td></tr>
+    </tbody>
+  </table>
+  <p style="margin-top:10px">
+    <b>根因不是方向反转，而是「量比」这道门在 0.8 附近抖动。</b>
+    下单瞬间量比 ≥0.8（合格），几分钟后掉到 0.71、0.74、0.78、0.79（不合格）→ 立刻取消。
+    量比是每根 1m K 线重算的指标，在门槛线附近必然来回穿越。
+  </p>
+
+  <h3 style="font-size:14px;font-weight:500;margin:20px 0 8px">反事实：如果这些单不取消会怎样</h3>
+  <p>对这 18 笔按原限价、原止损止盈、maxHoldBars=120 逐根回放 1m K 线：</p>
+  <table>
+    <thead><tr><th>结局</th><th>笔数</th><th>合计盈亏</th></tr></thead>
+    <tbody>
+      <tr><td>触价成交后<b>止损</b></td><td class="num">4</td><td class="num neg">−18.57U</td></tr>
+      <tr><td>触价成交后<b>仍持仓</b>（截至统计时点浮盈）</td><td class="num">9</td><td class="num pos">+9.02U</td></tr>
+      <tr><td>始终<b>未触价</b></td><td class="num">5</td><td class="num">0</td></tr>
+      <tr><td><b>合计</b>（13 笔成交，72%）</td><td class="num"><b>18</b></td><td class="num neg"><b>−9.55U</b></td></tr>
+    </tbody>
+  </table>
+  <p style="margin-top:10px">
+    读法：取消机制确实躲开了 4 笔止损（约 −18.6U），所以<b>「一律不取消」是错的</b>；
+    但它同时也砍掉了 9 笔浮盈单，代价是<b>系统零成交</b>。净效果在当前窗口约为 +9.6U，样本仅 18 笔，不足以作为定论。
+  </p>
+
+  <h3 style="font-size:14px;font-weight:500;margin:20px 0 8px">改价（repriced）是否有价值：没有</h3>
+  <ul>
+    <li>全量 16 次改价，<b>全部落在最终被取消的 7 笔单上</b>——没有一次救回任何一笔。</li>
+    <li>同一标的在 10 分钟内被改价 3–4 次（RAVEUSDT ×4、SYRUPUSDT ×3、IOSTUSDT ×3），改价幅度约 0.25%–0.9%（相对止损距离 R≈0.67%，相当于 0.4–1.3 个 R）—— 幅度不小，纯属抖动。</li>
+    <li>代码上每次改价会同时重置 <code>order.initialPlan</code> 与 <code>order.protectionRevisions = []</code>，等于清掉保护历史。</li>
+    <li>每笔挂单平均被复核 <b>4.9 次</b>（最多 14 次），而 positionReview 每 10 秒一轮 —— 开销主要在拉 K 线。</li>
+  </ul>
+
+  <h3 style="font-size:14px;font-weight:500;margin:20px 0 8px">结论：要不要改</h3>
+  <ul>
+    <li><b>不改</b>：评分门槛、止损距离、止盈倍数等核心参数 —— 样本不足（&lt;100 笔）。</li>
+    <li><b>要改（工程层，非策略参数）：</b>
+      <ul>
+        <li>取消加<b>迟滞/宽限</b>：不要一轮不合格就取消。建议「方向反转」立即取消，而「量能/波动率」这类软门槛需连续 N 轮或持续 M 分钟不合格才取消。</li>
+        <li><b>关掉改价（repriced）</b>：挂单挂出后不再改价，只有「保留」或「取消」两种结果。</li>
+        <li>复核间隔可从 10 秒放宽到 30–60 秒，省掉大量 K 线请求。</li>
+      </ul>
+    </li>
+  </ul>
+
+  <h2>七、已实施的改动（02:15 落库并重启生效）</h2>
+
+  <table>
+    <thead><tr><th>文件</th><th>改动</th></tr></thead>
+    <tbody>
+      <tr><td><code>server/shared/strategyGuards.js</code></td><td style="text-align:left">新增 <code>PENDING_REVIEW</code> 单一事实源（沿项目既有 env 回滚惯例）</td></tr>
+      <tr><td><code>server/shared/pendingReview.js</code></td><td style="text-align:left">取消拆两级 + 默认不改价；新增 <code>HELD_INELIGIBLE</code> 动作</td></tr>
+      <tr><td><code>server/globalAutomation.js</code></td><td style="text-align:left">新增 <code>task.graced</code> 计数器</td></tr>
+      <tr><td><code>src/components/AutomationTasks.vue</code></td><td style="text-align:left">任务卡展示「撤单 / 宽限保留 / 改价」三个计数</td></tr>
+      <tr><td><code>tests/twoTaskAutomation.test.js</code></td><td style="text-align:left">改价测试改为「不改价」；新增方向反转、宽限、计数清零 3 组用例</td></tr>
+    </tbody>
+  </table>
+
+  <h3 style="font-size:14px;font-weight:500;margin:20px 0 8px">新行为</h3>
+  <ul>
+    <li><b>方向反转 → 立即取消</b>（推荐方向变成相反的开仓方向）。这是唯一不打折的取消条件。</li>
+    <li><b>软门槛不合格 → 进入宽限</b>：连续 240 轮 <i>或</i> 持续 30 分钟才取消，动作记为 <code>held_ineligible</code>，挂单保留。</li>
+    <li><b>信号重新合格 → 计数清零</b>，下次不合格从 1 重新数。</li>
+    <li><b>挂出后不再改价</b>：<code>NOFX_PENDING_NO_REPRICE</code> 默认开，价格与杠杆锁定（旧改价逻辑保留作回退）。</li>
+  </ul>
+
+  <div class="note" style="background:#FCEBEB;border-color:#F7C1C1">
+    <b>踩坑：轮数阈值差点形同虚设。</b>初版把 <code>graceRounds</code> 设为 6，上线后实测
+    <b>6 轮只撑了 1.2 分钟</b> —— positionReview 是 10 秒一轮，「轮数」完全不是时间的好代理，
+    结果 SNXXUSDT 依旧在第 6 轮被取消。已改为 240 轮（≈56 分钟）作安全阀，实际由 30 分钟的时间阈值触发。
+  </div>
+
+  <h3 style="font-size:14px;font-weight:500;margin:20px 0 8px">回滚旋钮</h3>
+  <table>
+    <thead><tr><th>环境变量</th><th>默认</th><th>作用</th></tr></thead>
+    <tbody>
+      <tr><td><code>NOFX_PENDING_NO_REPRICE</code></td><td class="num">true</td><td style="text-align:left">false = 回退旧改价行为</td></tr>
+      <tr><td><code>NOFX_PENDING_CANCEL_ON_REVERSAL</code></td><td class="num">true</td><td style="text-align:left">false = 方向反转也走宽限（仅对照实验用）</td></tr>
+      <tr><td><code>NOFX_PENDING_GRACE_ROUNDS</code></td><td class="num">240</td><td style="text-align:left">安全阀；勿设太小</td></tr>
+      <tr><td><code>NOFX_PENDING_GRACE_MIN</code></td><td class="num">30</td><td style="text-align:left">实际生效的宽限时长（分钟）</td></tr>
+    </tbody>
+  </table>
+
+  <h3 style="font-size:14px;font-weight:500;margin:20px 0 8px">上线后验证</h3>
+  <ul>
+    <li>测试：<code>node --test tests/*.test.js</code> → <b>136 通过 / 0 失败</b>（改前基线一致）。</li>
+    <li>实测观察到 <code>held_ineligible</code>：「第 1/6 轮不合格，宽限期内保留挂单…量比 0.66 &lt; 0.8」，挂单被保留 —— 正是此前会被秒删的场景。</li>
+    <li>实测观察到「信号仍然合格，保留原挂单（挂出后不改价）」—— 改价已停。</li>
+    <li>进程：<code>nofx-api</code> online，restarts 0，HTTP 200，日志无异常。</li>
+    <li><b>待观察</b>：改动后近 8 分钟系统未产出新挂单（行情侧合格信号为 0），「成交率是否恢复」需等下一批挂单样本再确认。</li>
+  </ul>
+
+  <div class="note">
+    <b>说明：</b>本报告是对本机模拟盘真实成交记录做的归因分析（live attribution），
+    不是对市场行情的策略回测。数据来自项目自身数据库，非外部行情源，
+    因此不涉及前视偏差；但样本量小（取消单 18 笔、改价 16 次）、窗口仅 40 分钟，
+    结论随行情风格切换会失效；反事实模拟按「原限价成交 + 原止损止盈」回放，未计入滑点与资金费。
+  </div>
+
+  <div class="disc">
+    ⚠️ 以上内容由 AI 基于公开信息整理生成，仅供参考，不构成任何投资建议或个股推荐。投资有风险，决策需谨慎。
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,247 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>50 币 × 30 天回测报告 · 当前线上策略</title>
+<style>
+:root{--bg:#f7f7f5;--card:#fff;--ink:#1a1a1a;--sub:#6b6b6b;--line:#e5e5e0;--up:#d32f2f;--down:#1e8e3e;--accent:#2f5fd0}
+*{box-sizing:border-box}
+body{margin:0;padding:32px 24px 64px;background:var(--bg);color:var(--ink);
+  font-family:"IBM Plex Sans","PingFang SC","Microsoft YaHei",-apple-system,sans-serif;font-size:14px;line-height:1.6}
+.wrap{max-width:1080px;margin:0 auto}
+h1{font-size:24px;margin:0 0 4px;font-weight:650}
+.sub{color:var(--sub);margin-bottom:24px;font-size:13px}
+h2{font-size:16px;margin:32px 0 12px;font-weight:650;padding-bottom:6px;border-bottom:1px solid var(--line)}
+h3{font-size:14px;margin:20px 0 8px;font-weight:600;color:var(--sub)}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:8px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+.card .k{font-size:12px;color:var(--sub);margin-bottom:4px}
+.card .v{font-size:22px;font-weight:650;font-variant-numeric:tabular-nums}
+.card .m{font-size:12px;color:var(--sub);margin-top:2px}
+.up{color:var(--up)}.down{color:var(--down)}
+table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden;font-size:13px}
+th,td{padding:8px 10px;text-align:right;border-bottom:1px solid var(--line);font-variant-numeric:tabular-nums}
+th{background:#faf9f7;font-weight:600;color:var(--sub);font-size:12px;text-align:right}
+th:first-child,td:first-child{text-align:left}
+tbody tr:last-child td{border-bottom:none}
+tbody tr:hover{background:#fbfaf7}
+.chart{width:100%;height:auto;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:8px}
+.grid{stroke:#eee;stroke-width:1}.zero{stroke:#bbb;stroke-width:1;stroke-dasharray:4 4}
+.line{fill:none;stroke:var(--accent);stroke-width:2}
+.area{fill:rgba(47,95,208,.10);stroke:none}
+.axis{font-size:10px;fill:#999}
+.bars{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+.bar-row{display:grid;grid-template-columns:110px 1fr 80px 150px;gap:10px;align-items:center;padding:3px 0;font-size:12px}
+.bar-label{color:var(--sub);font-variant-numeric:tabular-nums}
+.bar-track{background:#f0efec;border-radius:4px;height:14px;overflow:hidden}
+.bar-fill{display:block;height:100%;border-radius:4px}
+.bar-fill.up{background:var(--up)}.bar-fill.down{background:var(--down)}
+.bar-val{text-align:right;font-variant-numeric:tabular-nums;font-weight:600}
+.bar-meta{color:var(--sub);font-size:11px}
+.note{background:#fffdf5;border:1px solid #f0e6c8;border-radius:10px;padding:12px 16px;font-size:13px;color:#5c5230}
+.note b{color:#3d3career}
+ul{margin:6px 0 0 18px;padding:0}li{margin:3px 0}
+.vs{color:#999;font-size:11px}
+#concl li{margin:6px 0}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:820px){.two{grid-template-columns:1fr}.bar-row{grid-template-columns:80px 1fr 70px}}
+</style></head><body><div class="wrap">
+
+<h1>50 币 × 近 30 天 1m 回测 · 当前线上策略</h1>
+<div class="sub">数据源 OKX USDT 永续（2026-08-12 ~ 2026-09-11，UTC+8）·
+随机抽样 seed=20260911 · 每币 43200 根 1m K 线 · 生成于 2026-09-11 04:15:19</div>
+
+<div class="cards">
+  <div class="card"><div class="k">净盈亏</div><div class="v down">-900.8 U</div><div class="m">489 笔已平仓</div></div>
+  <div class="card"><div class="k">胜率</div><div class="v">15.5%</div><div class="m">76 胜 / 413 负</div></div>
+  <div class="card"><div class="k">均单净盈亏</div><div class="v down">-1.842 U</div><div class="m">保证金 100U/单</div></div>
+  <div class="card"><div class="k">盈亏比(PF)</div><div class="v">0.18</div><div class="m">毛利/毛亏</div></div>
+  <div class="card"><div class="k">最大回撤</div><div class="v down">901.1 U</div><div class="m">按平仓时序</div></div>
+  <div class="card"><div class="k">挂单成交率</div><div class="v">77.9%</div><div class="m">628 挂 / 139 撤</div></div>
+</div>
+
+<h2>核心结论</h2>
+<div class="note" id="concl">
+<ul>
+<li><b>整体：</b>489 笔成交订单，净 -900.8 U（均单 -1.842 U），胜率 15.5%，最大回撤 901.1 U。<b>当前参数下是净亏损的。</b></li>
+<li><b>失血点：</b>出场原因中净亏损最大的是 <b>smart_exit</b>（327 笔，净 -591.9 U，均单 -1.810 U，平均只持仓 4.1 根）。</li>
+<li><b>持仓过短：</b>355 笔（72.6%）在 5 根（5 分钟）内就被平掉；盈利单持仓中位数 8 根，亏损单 1 根。</li>
+<li><b>挂单成交率：</b>628 笔挂单中 139 笔被撤（22.1%），最终成交 77.9%。撤单 100% 来自「软门槛连续不合格满 30 分钟」（波动率/量比在 1m 上抖动）。</li>
+<li><b>可改进方向：</b>A 关掉智能退出 → 净 -719.1 U / 均单 -1.581 U；B 均线失守放宽到 2 ATR → 净 -786.4 U / 均单 -1.673 U；C 最小持仓 15 根 → 净 -805.0 U / 均单 -1.731 U；D 最小持仓 5 根 → 净 -875.2 U / 均单 -1.827 U；E 挂单不被软门槛撤 → 净 -898.6 U / 均单 -1.741 U。</li>
+</ul>
+</div>
+
+<h2>一、钱是怎么来的（又是怎么没的）</h2>
+<table><thead><tr><th>口径</th><th>金额 / 数值</th><th>说明</th></tr></thead><tbody><tr><td class="">毛收益（价格变动）</td><td class="down">-618.0 U</td><td class="down">方向判断本身就在亏钱</td></tr><tr><td class="">手续费</td><td class="down">-282.1 U</td><td class="">0.577 U/单（双边 6bps）</td></tr><tr><td class="">资金费</td><td class="down">-0.7 U</td><td class="">0.001 U/单</td></tr><tr><td class="">净盈亏</td><td class="down">-900.8 U</td><td class="down">均单 -1.842 U</td></tr><tr><td class="">平均盈利单</td><td class="up">2.67 U</td><td class="">15.5% 的单盈利</td></tr><tr><td class="">平均亏损单</td><td class="down">-2.67 U</td><td class="">413 笔</td></tr></tbody></table>
+
+<div class="note" style="margin-top:12px">
+<b>一句话结论：</b>本样本净亏损 900.8 U，均单 -1.842 U。
+毛收益 -618.0 U （方向判断本身就是负贡献），摩擦成本（手续费+资金费）吞掉 282.8 U
+。
+平均持仓 5.1 根（5 分钟）。
+</div>
+
+<h2>二、权益曲线（按平仓时间累计，UTC+8）</h2>
+<svg viewBox="0 0 900 220" class="chart">
+    <line x1="50" y1="30.0" x2="880" y2="30.0" class="grid"/><text x="44" y="34.0" class="axis" text-anchor="end">0</text><line x1="50" y1="110.0" x2="880" y2="110.0" class="grid"/><text x="44" y="114.0" class="axis" text-anchor="end">-451</text><line x1="50" y1="190.0" x2="880" y2="190.0" class="grid"/><text x="44" y="194.0" class="axis" text-anchor="end">-901</text>
+    <line x1="50" y1="30.0" x2="880" y2="30.0" class="zero"/>
+    <polyline points="50,30.0 50.0,30.5 52.1,30.9 72.0,31.3 74.5,31.8 81.7,31.7 81.8,32.5 97.3,32.8 97.5,33.0 97.8,33.1 98.8,33.4 111.5,34.3 115.2,34.5 118.3,34.8 121.2,35.4 125.4,35.7 127.5,36.1 128.9,36.5 140.1,36.9 155.9,37.6 165.9,37.2 170.0,38.8 171.2,38.9 179.2,39.6 183.5,40.1 201.3,39.9 208.2,39.6 209.4,39.7 209.7,39.0 214.8,39.4 221.3,40.2 232.4,40.9 235.4,41.9 248.3,42.1 255.6,42.0 256.5,42.8 259.9,43.3 260.3,43.6 260.7,43.6 262.1,43.9 262.3,44.1 263.1,45.2 264.9,45.5 268.6,44.7 271.9,44.9 272.0,45.0 272.0,45.1 272.2,45.9 272.2,46.1 272.2,46.4 272.7,47.1 277.2,47.4 281.2,47.6 282.8,47.3 283.1,47.5 284.7,47.8 284.9,48.0 285.6,48.6 285.9,48.4 289.5,49.3 289.7,49.8 290.5,50.2 293.5,50.5 293.7,50.8 293.7,51.2 294.8,51.7 294.9,52.1 295.6,52.3 295.6,51.2 295.8,51.8 296.9,52.3 297.4,52.3 298.0,52.5 301.2,52.3 301.7,52.7 302.3,53.0 302.6,53.7 303.3,54.0 303.4,54.0 304.8,53.5 305.0,54.0 305.2,54.8 305.6,55.0 306.4,55.4 307.2,55.7 307.3,56.0 308.4,56.3 309.7,56.7 309.9,56.8 310.0,57.1 310.3,57.6 311.9,57.9 312.4,58.1 312.5,58.4 312.5,57.8 312.6,57.0 313.1,58.1 314.2,58.0 314.2,58.9 314.6,59.1 316.0,58.4 316.5,58.0 317.4,58.2 318.3,57.9 318.9,57.9 318.9,58.5 320.5,58.1 320.7,58.7 320.7,58.7 320.9,59.1 321.7,58.7 322.2,58.4 322.6,59.1 323.3,59.7 324.2,59.8 324.3,60.3 325.2,59.0 325.8,59.3 326.5,58.9 326.6,58.4 327.2,57.8 328.1,58.0 328.2,57.1 328.6,57.6 328.7,57.7 328.7,58.6 329.3,58.8 329.5,59.4 329.9,60.0 330.1,60.4 330.5,61.1 331.3,61.3 332.3,61.7 332.4,61.9 333.4,62.3 333.8,62.6 334.5,63.7 334.6,64.0 336.2,64.4 336.3,64.8 336.3,66.0 337.3,66.8 337.3,67.2 337.4,67.4 337.4,68.0 337.6,68.8 337.8,69.2 338.4,69.5 338.5,69.7 338.7,70.5 338.7,71.3 338.8,71.5 339.9,71.9 340.0,71.3 341.3,71.6 341.7,72.0 342.9,72.3 343.2,72.5 344.5,74.3 344.9,75.1 344.9,75.6 345.0,76.0 345.0,75.8 345.3,76.1 345.7,75.3 349.8,74.5 350.6,73.9 351.7,74.1 352.5,74.7 354.1,74.9 354.1,75.1 356.4,75.4 358.9,75.8 359.0,76.6 359.6,77.2 361.6,77.7 363.1,78.2 363.1,78.5 363.4,78.6 363.4,78.9 363.4,80.7 364.2,81.3 364.6,81.8 364.9,82.0 366.2,82.4 367.1,83.8 368.3,84.1 368.4,84.4 369.2,85.3 369.4,85.5 370.2,87.4 370.7,87.9 372.0,88.1 372.1,88.5 372.7,88.7 372.9,89.0 373.8,89.3 374.7,89.6 375.3,90.4 375.8,90.9 375.8,91.2 376.6,91.4 377.1,90.7 377.8,92.0 378.5,92.8 380.4,94.1 381.0,94.2 381.9,94.3 382.4,94.4 383.0,94.8 383.0,95.2 383.1,95.9 383.6,96.1 385.1,96.5 385.4,96.8 385.5,97.0 386.0,99.7 386.6,100.1 386.6,100.6 387.4,101.1 389.0,101.5 390.9,102.3 391.3,102.1 392.8,102.7 394.5,102.9 394.7,103.2 396.7,103.4 398.1,103.6 398.2,103.8 398.2,104.1 399.3,104.4 399.5,104.6 399.7,104.6 399.7,104.7 400.0,105.7 401.2,105.9 401.4,106.2 401.5,106.5 401.5,106.5 402.5,106.7 402.8,106.3 403.0,106.8 403.5,107.1 403.8,107.6 403.8,106.6 403.9,106.9 403.9,107.4 405.0,107.8 407.0,108.6 407.1,108.9 409.0,109.2 414.9,109.4 414.9,109.5 416.3,110.4 416.7,110.7 416.7,111.0 419.3,110.2 419.3,113.0 420.1,113.1 422.4,113.2 426.0,114.9 428.7,115.3 430.6,116.6 430.7,117.7 430.9,117.7 431.1,118.0 431.4,119.4 432.3,119.7 432.4,120.0 439.7,120.2 441.7,121.6 442.3,121.2 444.7,122.0 445.4,122.3 455.3,122.1 457.6,121.8 457.7,122.1 457.9,122.3 457.9,122.9 459.3,123.8 459.8,125.4 465.9,125.9 466.4,126.3 467.3,126.5 467.4,126.7 467.8,127.2 469.0,127.3 469.7,127.6 469.7,128.3 470.9,128.9 471.0,129.2 476.2,129.4 476.8,129.7 477.1,130.2 479.4,130.4 479.5,130.9 482.2,131.1 484.9,131.5 485.3,131.8 485.4,131.9 485.8,132.7 486.0,132.2 486.4,132.3 486.9,132.6 487.4,132.8 488.6,132.2 489.2,132.4 491.1,132.2 493.8,132.5 494.8,132.8 502.7,133.1 504.5,133.2 505.9,132.9 509.8,133.1 511.6,133.9 513.0,135.7 514.2,135.5 514.2,136.0 514.8,135.8 516.8,136.1 519.6,136.4 530.1,137.7 532.9,136.9 543.3,140.4 556.7,140.7 558.3,141.6 560.5,141.3 563.2,141.7 564.1,140.8 567.4,141.2 571.0,141.2 571.2,140.7 572.1,141.1 572.1,141.4 572.8,141.7 578.9,143.3 580.7,143.9 592.5,144.4 592.6,144.6 595.4,145.8 596.2,146.3 597.4,146.6 599.8,145.1 600.4,145.4 601.8,145.5 603.2,145.8 608.2,146.0 611.3,146.0 611.6,146.2 611.7,146.5 612.1,146.6 612.9,146.6 613.2,146.7 615.3,147.0 615.4,147.2 619.1,147.5 620.3,147.8 620.3,148.0 621.4,148.2 624.6,148.5 624.8,148.6 625.0,149.1 626.1,149.4 626.3,149.7 627.4,149.2 628.0,149.6 630.2,150.2 630.5,150.4 634.3,150.2 634.3,150.5 635.4,150.8 635.4,151.1 637.5,150.4 639.6,150.7 639.8,150.9 643.7,151.0 644.7,151.4 645.1,151.8 650.6,151.2 651.3,151.7 651.6,151.8 654.7,152.3 655.4,152.5 656.9,153.3 657.3,152.2 662.3,152.5 665.0,153.3 665.3,153.6 666.5,154.2 669.2,154.4 672.7,154.6 673.9,155.0 677.3,155.1 678.1,155.2 679.1,155.8 679.1,156.0 680.6,156.0 680.8,156.8 681.6,156.1 681.6,156.4 681.8,156.7 682.3,157.4 683.1,157.7 683.8,159.4 705.2,160.2 706.4,160.7 707.2,161.2 709.2,162.6 711.6,163.4 719.5,162.8 724.4,163.0 726.8,163.8 727.5,164.0 728.7,164.9 734.7,165.1 737.8,165.2 741.2,164.8 747.2,165.1 747.5,165.6 748.4,166.0 748.9,166.3 751.0,167.2 753.5,167.4 755.6,167.3 755.9,167.7 756.4,168.4 757.4,168.8 759.3,169.1 762.6,169.4 763.6,171.1 771.8,170.9 774.6,171.9 777.3,172.2 779.5,172.5 781.6,172.5 783.6,172.8 785.1,172.9 785.6,173.7 787.9,175.0 788.6,175.3 789.2,175.6 789.2,175.3 791.4,175.9 792.9,176.3 794.1,176.5 797.1,175.7 801.7,176.4 802.3,177.2 803.0,178.0 804.0,178.7 804.8,179.2 805.3,181.0 807.2,181.4 808.5,180.6 810.5,180.2 811.9,179.5 812.2,180.3 813.2,180.5 813.4,180.3 813.5,180.7 815.1,180.9 817.3,181.5 818.6,181.8 818.9,182.3 819.7,182.8 819.9,182.5 820.4,182.7 820.4,182.9 822.9,183.2 823.0,183.5 829.8,183.8 830.5,185.5 830.9,186.2 832.9,186.5 835.4,185.6 837.0,185.9 838.5,186.0 843.6,186.3 844.0,187.0 848.1,187.3 848.2,187.6 848.2,188.1 850.6,188.1 860.1,188.8 860.4,189.5 867.2,189.7 873.6,190.0 873.6,189.4 874.5,189.7 880.0,189.9 880.0,30.0" class="area"/>
+    <polyline points="50.0,30.5 52.1,30.9 72.0,31.3 74.5,31.8 81.7,31.7 81.8,32.5 97.3,32.8 97.5,33.0 97.8,33.1 98.8,33.4 111.5,34.3 115.2,34.5 118.3,34.8 121.2,35.4 125.4,35.7 127.5,36.1 128.9,36.5 140.1,36.9 155.9,37.6 165.9,37.2 170.0,38.8 171.2,38.9 179.2,39.6 183.5,40.1 201.3,39.9 208.2,39.6 209.4,39.7 209.7,39.0 214.8,39.4 221.3,40.2 232.4,40.9 235.4,41.9 248.3,42.1 255.6,42.0 256.5,42.8 259.9,43.3 260.3,43.6 260.7,43.6 262.1,43.9 262.3,44.1 263.1,45.2 264.9,45.5 268.6,44.7 271.9,44.9 272.0,45.0 272.0,45.1 272.2,45.9 272.2,46.1 272.2,46.4 272.7,47.1 277.2,47.4 281.2,47.6 282.8,47.3 283.1,47.5 284.7,47.8 284.9,48.0 285.6,48.6 285.9,48.4 289.5,49.3 289.7,49.8 290.5,50.2 293.5,50.5 293.7,50.8 293.7,51.2 294.8,51.7 294.9,52.1 295.6,52.3 295.6,51.2 295.8,51.8 296.9,52.3 297.4,52.3 298.0,52.5 301.2,52.3 301.7,52.7 302.3,53.0 302.6,53.7 303.3,54.0 303.4,54.0 304.8,53.5 305.0,54.0 305.2,54.8 305.6,55.0 306.4,55.4 307.2,55.7 307.3,56.0 308.4,56.3 309.7,56.7 309.9,56.8 310.0,57.1 310.3,57.6 311.9,57.9 312.4,58.1 312.5,58.4 312.5,57.8 312.6,57.0 313.1,58.1 314.2,58.0 314.2,58.9 314.6,59.1 316.0,58.4 316.5,58.0 317.4,58.2 318.3,57.9 318.9,57.9 318.9,58.5 320.5,58.1 320.7,58.7 320.7,58.7 320.9,59.1 321.7,58.7 322.2,58.4 322.6,59.1 323.3,59.7 324.2,59.8 324.3,60.3 325.2,59.0 325.8,59.3 326.5,58.9 326.6,58.4 327.2,57.8 328.1,58.0 328.2,57.1 328.6,57.6 328.7,57.7 328.7,58.6 329.3,58.8 329.5,59.4 329.9,60.0 330.1,60.4 330.5,61.1 331.3,61.3 332.3,61.7 332.4,61.9 333.4,62.3 333.8,62.6 334.5,63.7 334.6,64.0 336.2,64.4 336.3,64.8 336.3,66.0 337.3,66.8 337.3,67.2 337.4,67.4 337.4,68.0 337.6,68.8 337.8,69.2 338.4,69.5 338.5,69.7 338.7,70.5 338.7,71.3 338.8,71.5 339.9,71.9 340.0,71.3 341.3,71.6 341.7,72.0 342.9,72.3 343.2,72.5 344.5,74.3 344.9,75.1 344.9,75.6 345.0,76.0 345.0,75.8 345.3,76.1 345.7,75.3 349.8,74.5 350.6,73.9 351.7,74.1 352.5,74.7 354.1,74.9 354.1,75.1 356.4,75.4 358.9,75.8 359.0,76.6 359.6,77.2 361.6,77.7 363.1,78.2 363.1,78.5 363.4,78.6 363.4,78.9 363.4,80.7 364.2,81.3 364.6,81.8 364.9,82.0 366.2,82.4 367.1,83.8 368.3,84.1 368.4,84.4 369.2,85.3 369.4,85.5 370.2,87.4 370.7,87.9 372.0,88.1 372.1,88.5 372.7,88.7 372.9,89.0 373.8,89.3 374.7,89.6 375.3,90.4 375.8,90.9 375.8,91.2 376.6,91.4 377.1,90.7 377.8,92.0 378.5,92.8 380.4,94.1 381.0,94.2 381.9,94.3 382.4,94.4 383.0,94.8 383.0,95.2 383.1,95.9 383.6,96.1 385.1,96.5 385.4,96.8 385.5,97.0 386.0,99.7 386.6,100.1 386.6,100.6 387.4,101.1 389.0,101.5 390.9,102.3 391.3,102.1 392.8,102.7 394.5,102.9 394.7,103.2 396.7,103.4 398.1,103.6 398.2,103.8 398.2,104.1 399.3,104.4 399.5,104.6 399.7,104.6 399.7,104.7 400.0,105.7 401.2,105.9 401.4,106.2 401.5,106.5 401.5,106.5 402.5,106.7 402.8,106.3 403.0,106.8 403.5,107.1 403.8,107.6 403.8,106.6 403.9,106.9 403.9,107.4 405.0,107.8 407.0,108.6 407.1,108.9 409.0,109.2 414.9,109.4 414.9,109.5 416.3,110.4 416.7,110.7 416.7,111.0 419.3,110.2 419.3,113.0 420.1,113.1 422.4,113.2 426.0,114.9 428.7,115.3 430.6,116.6 430.7,117.7 430.9,117.7 431.1,118.0 431.4,119.4 432.3,119.7 432.4,120.0 439.7,120.2 441.7,121.6 442.3,121.2 444.7,122.0 445.4,122.3 455.3,122.1 457.6,121.8 457.7,122.1 457.9,122.3 457.9,122.9 459.3,123.8 459.8,125.4 465.9,125.9 466.4,126.3 467.3,126.5 467.4,126.7 467.8,127.2 469.0,127.3 469.7,127.6 469.7,128.3 470.9,128.9 471.0,129.2 476.2,129.4 476.8,129.7 477.1,130.2 479.4,130.4 479.5,130.9 482.2,131.1 484.9,131.5 485.3,131.8 485.4,131.9 485.8,132.7 486.0,132.2 486.4,132.3 486.9,132.6 487.4,132.8 488.6,132.2 489.2,132.4 491.1,132.2 493.8,132.5 494.8,132.8 502.7,133.1 504.5,133.2 505.9,132.9 509.8,133.1 511.6,133.9 513.0,135.7 514.2,135.5 514.2,136.0 514.8,135.8 516.8,136.1 519.6,136.4 530.1,137.7 532.9,136.9 543.3,140.4 556.7,140.7 558.3,141.6 560.5,141.3 563.2,141.7 564.1,140.8 567.4,141.2 571.0,141.2 571.2,140.7 572.1,141.1 572.1,141.4 572.8,141.7 578.9,143.3 580.7,143.9 592.5,144.4 592.6,144.6 595.4,145.8 596.2,146.3 597.4,146.6 599.8,145.1 600.4,145.4 601.8,145.5 603.2,145.8 608.2,146.0 611.3,146.0 611.6,146.2 611.7,146.5 612.1,146.6 612.9,146.6 613.2,146.7 615.3,147.0 615.4,147.2 619.1,147.5 620.3,147.8 620.3,148.0 621.4,148.2 624.6,148.5 624.8,148.6 625.0,149.1 626.1,149.4 626.3,149.7 627.4,149.2 628.0,149.6 630.2,150.2 630.5,150.4 634.3,150.2 634.3,150.5 635.4,150.8 635.4,151.1 637.5,150.4 639.6,150.7 639.8,150.9 643.7,151.0 644.7,151.4 645.1,151.8 650.6,151.2 651.3,151.7 651.6,151.8 654.7,152.3 655.4,152.5 656.9,153.3 657.3,152.2 662.3,152.5 665.0,153.3 665.3,153.6 666.5,154.2 669.2,154.4 672.7,154.6 673.9,155.0 677.3,155.1 678.1,155.2 679.1,155.8 679.1,156.0 680.6,156.0 680.8,156.8 681.6,156.1 681.6,156.4 681.8,156.7 682.3,157.4 683.1,157.7 683.8,159.4 705.2,160.2 706.4,160.7 707.2,161.2 709.2,162.6 711.6,163.4 719.5,162.8 724.4,163.0 726.8,163.8 727.5,164.0 728.7,164.9 734.7,165.1 737.8,165.2 741.2,164.8 747.2,165.1 747.5,165.6 748.4,166.0 748.9,166.3 751.0,167.2 753.5,167.4 755.6,167.3 755.9,167.7 756.4,168.4 757.4,168.8 759.3,169.1 762.6,169.4 763.6,171.1 771.8,170.9 774.6,171.9 777.3,172.2 779.5,172.5 781.6,172.5 783.6,172.8 785.1,172.9 785.6,173.7 787.9,175.0 788.6,175.3 789.2,175.6 789.2,175.3 791.4,175.9 792.9,176.3 794.1,176.5 797.1,175.7 801.7,176.4 802.3,177.2 803.0,178.0 804.0,178.7 804.8,179.2 805.3,181.0 807.2,181.4 808.5,180.6 810.5,180.2 811.9,179.5 812.2,180.3 813.2,180.5 813.4,180.3 813.5,180.7 815.1,180.9 817.3,181.5 818.6,181.8 818.9,182.3 819.7,182.8 819.9,182.5 820.4,182.7 820.4,182.9 822.9,183.2 823.0,183.5 829.8,183.8 830.5,185.5 830.9,186.2 832.9,186.5 835.4,185.6 837.0,185.9 838.5,186.0 843.6,186.3 844.0,187.0 848.1,187.3 848.2,187.6 848.2,188.1 850.6,188.1 860.1,188.8 860.4,189.5 867.2,189.7 873.6,190.0 873.6,189.4 874.5,189.7 880.0,189.9" class="line"/>
+    <text x="50.0" y="210" class="axis" text-anchor="middle">08/12</text><text x="257.5" y="210" class="axis" text-anchor="middle">08/19</text><text x="465.0" y="210" class="axis" text-anchor="middle">08/27</text><text x="672.5" y="210" class="axis" text-anchor="middle">09/03</text><text x="880.0" y="210" class="axis" text-anchor="middle">09/11</text>
+  </svg>
+
+<h2>三、出场原因：钱主要丢在哪</h2>
+<table><thead><tr><th>出场原因</th><th>笔数</th><th>占比</th><th>胜率</th><th>净盈亏 U</th><th>均单 U</th><th>平均持仓</th></tr></thead><tbody><tr><td class="">smart_exit</td><td class="">327</td><td class="">66.9%</td><td class="">5.5%</td><td class="down">-591.9</td><td class="down">-1.810</td><td class="">4.1</td></tr><tr><td class="">stop_loss</td><td class="">159</td><td class="">32.5%</td><td class="">34.6%</td><td class="down">-328.3</td><td class="down">-2.065</td><td class="">7.2</td></tr><tr><td class="">take_profit</td><td class="">3</td><td class="">0.6%</td><td class="">100.0%</td><td class="up">19.4</td><td class="up">6.462</td><td class="">3.3</td></tr></tbody></table>
+
+<h2>四、持仓时长：盈利是否需要时间</h2>
+<table><thead><tr><th>持仓根数</th><th>笔数</th><th>胜率</th><th>净盈亏 U</th><th>均单 U</th></tr></thead><tbody><tr><td class=""><5 根</td><td class="">355</td><td class="">6.8%</td><td class="down">-897.3</td><td class="down">-2.528</td></tr><tr><td class="">5~15</td><td class="">99</td><td class="">34.3%</td><td class="down">-24.3</td><td class="down">-0.246</td></tr><tr><td class="">15~30</td><td class="">21</td><td class="">52.4%</td><td class="up">15.8</td><td class="up">0.754</td></tr><tr><td class="">30~45</td><td class="">7</td><td class="">42.9%</td><td class="up">1.0</td><td class="up">0.140</td></tr><tr><td class="">45~75</td><td class="">5</td><td class="">80.0%</td><td class="up">11.7</td><td class="up">2.336</td></tr><tr><td class="">75~120</td><td class="">2</td><td class="">0.0%</td><td class="down">-7.6</td><td class="down">-3.823</td></tr></tbody></table>
+
+<h2>五、方向 / 分批止盈</h2>
+<div class="two">
+<div><table><thead><tr><th>方向</th><th>笔数</th><th>胜率</th><th>净盈亏 U</th><th>均单 U</th></tr></thead><tbody><tr><td class="">多</td><td class="">489</td><td class="">15.5%</td><td class="down">-900.8</td><td class="down">-1.842</td></tr></tbody></table></div>
+<div><table><thead><tr><th>分批止盈</th><th>笔数</th><th>胜率</th><th>净盈亏 U</th><th>均单 U</th></tr></thead><tbody><tr><td class="">分批 0 次</td><td class="">399</td><td class="">1.8%</td><td class="down">-1072.0</td><td class="down">-2.687</td></tr><tr><td class="">分批 1 次</td><td class="">59</td><td class="">64.4%</td><td class="up">45.8</td><td class="up">0.777</td></tr><tr><td class="">分批 2 次</td><td class="">31</td><td class="">100.0%</td><td class="up">125.3</td><td class="up">4.043</td></tr></tbody></table></div>
+</div>
+
+<h2>六、入场特征：什么样的信号赚钱</h2>
+<h3>按波动率（ATR/价格）</h3>
+<table><thead><tr><th>波动率</th><th>笔数</th><th>胜率</th><th>净盈亏 U</th><th>均单 U</th></tr></thead><tbody><tr><td class="">0.15~0.25%</td><td class="">164</td><td class="">10.4%</td><td class="down">-272.4</td><td class="down">-1.661</td></tr><tr><td class="">0.25~0.40%</td><td class="">180</td><td class="">13.9%</td><td class="down">-270.2</td><td class="down">-1.501</td></tr><tr><td class="">0.40~0.60%</td><td class="">80</td><td class="">28.7%</td><td class="down">-108.4</td><td class="down">-1.355</td></tr><tr><td class="">≥0.60%</td><td class="">65</td><td class="">16.9%</td><td class="down">-249.8</td><td class="down">-3.843</td></tr></tbody></table>
+<h3>按趋势评分</h3>
+<table><thead><tr><th>评分</th><th>笔数</th><th>胜率</th><th>净盈亏 U</th><th>均单 U</th></tr></thead><tbody><tr><td class=""><72</td><td class="">2</td><td class="">50.0%</td><td class="up">0.3</td><td class="up">0.137</td></tr><tr><td class="">72~76</td><td class="">8</td><td class="">0.0%</td><td class="down">-19.8</td><td class="down">-2.472</td></tr><tr><td class="">76~80</td><td class="">43</td><td class="">25.6%</td><td class="down">-54.2</td><td class="down">-1.261</td></tr><tr><td class="">80~85</td><td class="">186</td><td class="">16.1%</td><td class="down">-326.2</td><td class="down">-1.754</td></tr><tr><td class="">≥85</td><td class="">250</td><td class="">13.6%</td><td class="down">-500.8</td><td class="down">-2.003</td></tr></tbody></table>
+<h3>按挂单等待时长（挂出→成交）</h3>
+<table><thead><tr><th>等待</th><th>笔数</th><th>胜率</th><th>净盈亏 U</th><th>均单 U</th></tr></thead><tbody><tr><td class=""><2 分钟</td><td class="">131</td><td class="">13.0%</td><td class="down">-366.5</td><td class="down">-2.798</td></tr><tr><td class="">2~10</td><td class="">224</td><td class="">15.2%</td><td class="down">-397.6</td><td class="down">-1.775</td></tr><tr><td class="">10~30</td><td class="">117</td><td class="">17.1%</td><td class="down">-126.5</td><td class="down">-1.081</td></tr><tr><td class="">≥30</td><td class="">17</td><td class="">29.4%</td><td class="down">-10.2</td><td class="down">-0.600</td></tr></tbody></table>
+
+<h2>七、时段分布（本地 UTC+8）</h2>
+<div class="bars"><div class="bar-row"><span class="bar-label">00:00</span>
+      <span class="bar-track"><span class="bar-fill down" style="width:64.5%"></span></span>
+      <span class="bar-val down">-48.3U</span>
+      <span class="bar-meta">n=34 胜率 24%</span></div><div class="bar-row"><span class="bar-label">01:00</span>
+      <span class="bar-track"><span class="bar-fill down" style="width:38.9%"></span></span>
+      <span class="bar-val down">-29.1U</span>
+      <span class="bar-meta">n=21 胜率 19%</span></div><div class="bar-row"><span class="bar-label">02:00</span>
+      <span class="bar-track"><span class="bar-fill down" style="width:21.3%"></span></span>
+      <span class="bar-val down">-15.9U</span>
+      <span class="bar-meta">n=15 胜率 20%</span></div><div class="bar-row"><span class="bar-label">03:00</span>
+      <span class="bar-track"><span class="bar-fill down" style="width:25.4%"></span></span>
+      <span class="bar-val down">-19.0U</span>
+      <span class="bar-meta">n=15 胜率 13%</span></div><div class="bar-row"><span class="bar-label">04:00</span>
+      <span class="bar-track"><span class="bar-fill up" style="width:5.7%"></span></span>
+      <span class="bar-val up">4.3U</span>
+      <span class="bar-meta">n=7 胜率 43%</span></div><div class="bar-row"><span class="bar-label">05:00</span>
+      <span class="bar-track"><span class="bar-fill down" style="width:35.8%"></span></span>
+      <span class="bar-val down">-26.8U</span>
+      <span class="bar-meta">n=18 胜率 11%</span></div><div class="bar-row"><span class="bar-label">06:00</span>
+      <span class="bar-track"><span class="bar-fill down" style="width:28.3%"></span></span>
+      <span class="bar-val down">-21.2U</span>
+      <span class="bar-meta">n=14 胜率 14%</span></div><div class="bar-row"><span class="bar-label">07:00</span>
+      <span class="bar-track"><span class="bar-fill down" style="width:52.2%"></span></span>
+      <span class="bar-val down">-39.0U</span>
+      <span class="bar-meta">n=16 胜率 6%</span></div><div class="bar-row"><span class="bar-label">08:00</span>
+      <span class="bar-track"><span class="bar-fill down" style="width:100.0%"></span></span>
+      <span class="bar-val down">-74.8U</span>
+      <span class="bar-meta">n=26 胜率 15%</span></div><div class="bar-row"><span class="bar-label">09:00</span>
+      <span class="bar-track"><span class="bar-fill down" style="width:60.6%"></span></span>
+      <span class="bar-val down">-45.3U</span>
+      <span class="bar-meta">n=19 胜率 11%</span></div><div class="bar-row"><span class="bar-label">10:00</span>
+      <span class="bar-track"><span class="bar-fill down" style="width:66.0%"></span></span>
+      <span class="bar-val down">-49.4U</span>
+      <span class="bar-meta">n=19 胜率 5%</span></div><div class="bar-row"><span class="bar-label">11:00</span>
+      <span class="bar-track"><span class="bar-fill down" style="width:43.9%"></span></span>
+      <span class="bar-val down">-32.8U</span>
+      <span class="bar-meta">n=13 胜率 0%</span></div><div class="bar-row"><span class="bar-label">12:00</span>
+      <span class="bar-track"><span class="bar-fill down" style="width:66.6%"></span></span>
+      <span class="bar-val down">-49.8U</span>
+      <span class="bar-meta">n=20 胜率 20%</span></div><div class="bar-row"><span class="bar-label">13:00</span>
+      <span class="bar-track"><span class="bar-fill down" style="width:59.3%"></span></span>
+      <span class="bar-val down">-44.4U</span>
+      <span class="bar-meta">n=18 胜率 6%</span></div><div class="bar-row"><span class="bar-label">14:00</span>
+      <span class="bar-track"><span class="bar-fill down" style="width:45.0%"></span></span>
+      <span class="bar-val down">-33.7U</span>
+      <span class="bar-meta">n=22 胜率 9%</span></div><div class="bar-row"><span class="bar-label">15:00</span>
+      <span class="bar-track"><span class="bar-fill down" style="width:30.2%"></span></span>
+      <span class="bar-val down">-22.6U</span>
+      <span class="bar-meta">n=17 胜率 29%</span></div><div class="bar-row"><span class="bar-label">16:00</span>
+      <span class="bar-track"><span class="bar-fill down" style="width:22.4%"></span></span>
+      <span class="bar-val down">-16.8U</span>
+      <span class="bar-meta">n=22 胜率 23%</span></div><div class="bar-row"><span class="bar-label">17:00</span>
+      <span class="bar-track"><span class="bar-fill down" style="width:59.7%"></span></span>
+      <span class="bar-val down">-44.7U</span>
+      <span class="bar-meta">n=21 胜率 14%</span></div><div class="bar-row"><span class="bar-label">18:00</span>
+      <span class="bar-track"><span class="bar-fill down" style="width:63.9%"></span></span>
+      <span class="bar-val down">-47.8U</span>
+      <span class="bar-meta">n=18 胜率 6%</span></div><div class="bar-row"><span class="bar-label">19:00</span>
+      <span class="bar-track"><span class="bar-fill down" style="width:14.4%"></span></span>
+      <span class="bar-val down">-10.8U</span>
+      <span class="bar-meta">n=18 胜率 22%</span></div><div class="bar-row"><span class="bar-label">20:00</span>
+      <span class="bar-track"><span class="bar-fill down" style="width:75.7%"></span></span>
+      <span class="bar-val down">-56.6U</span>
+      <span class="bar-meta">n=27 胜率 19%</span></div><div class="bar-row"><span class="bar-label">21:00</span>
+      <span class="bar-track"><span class="bar-fill down" style="width:64.1%"></span></span>
+      <span class="bar-val down">-47.9U</span>
+      <span class="bar-meta">n=24 胜率 13%</span></div><div class="bar-row"><span class="bar-label">22:00</span>
+      <span class="bar-track"><span class="bar-fill down" style="width:99.4%"></span></span>
+      <span class="bar-val down">-74.4U</span>
+      <span class="bar-meta">n=35 胜率 11%</span></div><div class="bar-row"><span class="bar-label">23:00</span>
+      <span class="bar-track"><span class="bar-fill down" style="width:72.0%"></span></span>
+      <span class="bar-val down">-53.9U</span>
+      <span class="bar-meta">n=30 胜率 23%</span></div></div>
+
+<h2>八、币种表现</h2>
+<table><thead><tr><th>币种</th><th>24h 成交额</th><th>挂单</th><th>撤单</th><th>成交</th><th>胜率</th><th>净盈亏 U</th><th>均单 U</th></tr></thead><tbody><tr><td class="">THETAUSDT</td><td class="">2.7e+7</td><td class="">2</td><td class="">1</td><td class="">1</td><td class="">100.0%</td><td class="up">4.6</td><td class="up">4.567</td></tr><tr><td class="">MASKUSDT</td><td class="">2.4e+5</td><td class="">3</td><td class="">1</td><td class="">2</td><td class="">50.0%</td><td class="up">1.7</td><td class="up">0.839</td></tr><tr><td class="">SHIBUSDT</td><td class="">2.0e+14</td><td class="">5</td><td class="">2</td><td class="">3</td><td class="">33.3%</td><td class="up">0.7</td><td class="up">0.245</td></tr><tr><td class="">HBARUSDT</td><td class="">4.7e+8</td><td class="">2</td><td class="">0</td><td class="">2</td><td class="">50.0%</td><td class="up">0.5</td><td class="up">0.244</td></tr><tr><td class="">LINEAUSDT</td><td class="">3.9e+8</td><td class="">2</td><td class="">0</td><td class="">2</td><td class="">50.0%</td><td class="up">0.2</td><td class="up">0.079</td></tr><tr><td class="">SKYUSDT</td><td class="">9.2e+7</td><td class="">2</td><td class="">1</td><td class="">1</td><td class="">0.0%</td><td class="down">-0.4</td><td class="down">-0.446</td></tr><tr><td class="">YGGUSDT</td><td class="">1.3e+6</td><td class="">2</td><td class="">1</td><td class="">1</td><td class="">0.0%</td><td class="down">-2.8</td><td class="down">-2.815</td></tr><tr><td class="">ZETAUSDT</td><td class="">8.5e+6</td><td class="">2</td><td class="">0</td><td class="">2</td><td class="">0.0%</td><td class="down">-2.9</td><td class="down">-1.475</td></tr><tr><td class="">SANDUSDT</td><td class="">8.0e+6</td><td class="">7</td><td class="">1</td><td class="">6</td><td class="">33.3%</td><td class="down">-3.5</td><td class="down">-0.583</td></tr><tr><td class="">BCHUSDT</td><td class="">3.8e+5</td><td class="">3</td><td class="">1</td><td class="">2</td><td class="">0.0%</td><td class="down">-4.1</td><td class="down">-2.071</td></tr><tr><td class="">HOODUSDT</td><td class="">4.3e+6</td><td class="">5</td><td class="">1</td><td class="">4</td><td class="">25.0%</td><td class="down">-4.3</td><td class="down">-1.071</td></tr><tr><td class="">SYRUPUSDT</td><td class="">6.8e+6</td><td class="">6</td><td class="">3</td><td class="">3</td><td class="">0.0%</td><td class="down">-5.6</td><td class="down">-1.854</td></tr><tr><td class="">SLXUSDT</td><td class="">1.8e+7</td><td class="">4</td><td class="">2</td><td class="">2</td><td class="">0.0%</td><td class="down">-5.9</td><td class="down">-2.950</td></tr><tr><td class="">ZAMAUSDT</td><td class="">2.3e+8</td><td class="">6</td><td class="">1</td><td class="">5</td><td class="">20.0%</td><td class="down">-6.1</td><td class="down">-1.223</td></tr><tr><td class="">INJUSDT</td><td class="">7.4e+5</td><td class="">26</td><td class="">7</td><td class="">19</td><td class="">21.1%</td><td class="down">-7.2</td><td class="down">-0.380</td></tr><tr><td class="">YFIUSDT</td><td class="">1.2e+3</td><td class="">2</td><td class="">0</td><td class="">2</td><td class="">0.0%</td><td class="down">-8.2</td><td class="down">-4.084</td></tr><tr><td class="">MAGICUSDT</td><td class="">1.2e+6</td><td class="">6</td><td class="">0</td><td class="">6</td><td class="">33.3%</td><td class="down">-8.5</td><td class="down">-1.414</td></tr><tr><td class="">MRVLUSDT</td><td class="">3.6e+4</td><td class="">7</td><td class="">3</td><td class="">4</td><td class="">0.0%</td><td class="down">-10.0</td><td class="down">-2.499</td></tr><tr><td class="">QTUMUSDT</td><td class="">3.7e+4</td><td class="">5</td><td class="">2</td><td class="">3</td><td class="">0.0%</td><td class="down">-10.4</td><td class="down">-3.481</td></tr><tr><td class="">1INCHUSDT</td><td class="">4.2e+7</td><td class="">6</td><td class="">1</td><td class="">5</td><td class="">0.0%</td><td class="down">-11.2</td><td class="down">-2.237</td></tr><tr><td class="">HMSTRUSDT</td><td class="">2.2e+10</td><td class="">9</td><td class="">1</td><td class="">8</td><td class="">25.0%</td><td class="down">-14.4</td><td class="down">-1.797</td></tr><tr><td class="">AVAXUSDT</td><td class="">7.3e+5</td><td class="">11</td><td class="">4</td><td class="">7</td><td class="">0.0%</td><td class="down">-16.0</td><td class="down">-2.279</td></tr><tr><td class="">DOTUSDT</td><td class="">2.3e+6</td><td class="">26</td><td class="">6</td><td class="">20</td><td class="">20.0%</td><td class="down">-16.6</td><td class="down">-0.831</td></tr><tr><td class="">ZBCNUSDT</td><td class="">3.8e+9</td><td class="">3</td><td class="">0</td><td class="">3</td><td class="">0.0%</td><td class="down">-17.9</td><td class="down">-5.975</td></tr><tr><td class="">CHZUSDT</td><td class="">1.1e+7</td><td class="">8</td><td class="">3</td><td class="">5</td><td class="">0.0%</td><td class="down">-18.0</td><td class="down">-3.591</td></tr><tr><td class="">FLOKIUSDT</td><td class="">2.4e+10</td><td class="">7</td><td class="">4</td><td class="">3</td><td class="">0.0%</td><td class="down">-18.2</td><td class="down">-6.057</td></tr><tr><td class="">ALGOUSDT</td><td class="">3.3e+6</td><td class="">10</td><td class="">3</td><td class="">7</td><td class="">0.0%</td><td class="down">-18.9</td><td class="down">-2.698</td></tr><tr><td class="">ETCUSDT</td><td class="">5.2e+7</td><td class="">12</td><td class="">2</td><td class="">10</td><td class="">0.0%</td><td class="down">-20.8</td><td class="down">-2.075</td></tr><tr><td class="">2ZUSDT</td><td class="">1.2e+8</td><td class="">17</td><td class="">4</td><td class="">13</td><td class="">7.7%</td><td class="down">-25.6</td><td class="down">-1.966</td></tr><tr><td class="">XPLUSDT</td><td class="">3.8e+6</td><td class="">10</td><td class="">1</td><td class="">9</td><td class="">0.0%</td><td class="down">-27.6</td><td class="down">-3.069</td></tr><tr><td class="">SOLUSDT</td><td class="">7.4e+6</td><td class="">24</td><td class="">7</td><td class="">17</td><td class="">0.0%</td><td class="down">-29.2</td><td class="down">-1.718</td></tr><tr><td class="">FILUSDT</td><td class="">3.5e+7</td><td class="">37</td><td class="">7</td><td class="">30</td><td class="">23.3%</td><td class="down">-35.7</td><td class="down">-1.189</td></tr><tr><td class="">MUUSDT</td><td class="">1.4e+5</td><td class="">22</td><td class="">5</td><td class="">17</td><td class="">17.6%</td><td class="down">-36.8</td><td class="down">-2.167</td></tr><tr><td class="">AI16ZUSDT</td><td class="">3.7e+8</td><td class="">8</td><td class="">1</td><td class="">7</td><td class="">0.0%</td><td class="down">-45.8</td><td class="down">-6.541</td></tr><tr><td class="">AXSUSDT</td><td class="">1.1e+5</td><td class="">11</td><td class="">2</td><td class="">9</td><td class="">0.0%</td><td class="down">-53.5</td><td class="down">-5.947</td></tr><tr><td class="">ETHUSDT</td><td class="">1.5e+7</td><td class="">62</td><td class="">8</td><td class="">54</td><td class="">24.1%</td><td class="down">-53.6</td><td class="down">-0.993</td></tr><tr><td class="">XRPUSDT</td><td class="">2.1e+8</td><td class="">54</td><td class="">10</td><td class="">44</td><td class="">9.1%</td><td class="down">-61.9</td><td class="down">-1.407</td></tr><tr><td class="">LITUSDT</td><td class="">2.2e+8</td><td class="">43</td><td class="">12</td><td class="">31</td><td class="">16.1%</td><td class="down">-62.7</td><td class="down">-2.023</td></tr><tr><td class="">OPUSDT</td><td class="">5.6e+7</td><td class="">40</td><td class="">7</td><td class="">33</td><td class="">12.1%</td><td class="down">-108.3</td><td class="down">-3.280</td></tr><tr><td class="">ENAUSDT</td><td class="">3.1e+6</td><td class="">107</td><td class="">20</td><td class="">87</td><td class="">20.7%</td><td class="down">-135.9</td><td class="down">-1.562</td></tr></tbody></table>
+
+<h2>九、与实盘对照（同一策略、同一数据库，近 5 天逐日）</h2>
+<table><thead><tr><th>日期(UTC+8)</th><th>笔数</th><th>胜率</th><th>均单 U</th><th>净盈亏 U</th><th>平均持仓</th><th>止损</th><th>止盈</th><th>超时</th><th>智能退出*</th></tr></thead><tbody><tr><td class="">09-11</td><td class="">17</td><td class="">5.9%</td><td class="down">-2.971</td><td class="down">-50.5</td><td class="">8.0</td><td class="">10</td><td class="">0</td><td class="">0</td><td class="">7</td></tr><tr><td class="">09-10</td><td class="">402</td><td class="">26.1%</td><td class="down">-2.163</td><td class="down">-869.5</td><td class="">21.2</td><td class="">189</td><td class="">6</td><td class="">194</td><td class="">13</td></tr><tr><td class="">09-09</td><td class="">2284</td><td class="">22.3%</td><td class="down">-1.036</td><td class="down">-2365.2</td><td class="">13.1</td><td class="">2003</td><td class="">263</td><td class="">18</td><td class="">0</td></tr><tr><td class="">09-08</td><td class="">17</td><td class="">29.4%</td><td class="down">-0.887</td><td class="down">-15.1</td><td class="">15.4</td><td class="">13</td><td class="">4</td><td class="">0</td><td class="">0</td></tr></tbody></table>
+<div class="note" style="margin-top:10px">
+* 实盘里「智能退出真平仓」走的是 <code>simulation.close()</code>，reason 记为 <b>manual</b>；根级均线失守记为 <b>smart_exit_ma</b>。两者合并在最后一列。<br>
+近 7 天实盘整体：2720 笔，胜率 22.8%，均单 -1.213 U，净 -3300.4 U，平均持仓 14.3 根。
+</div>
+
+<h2>十、挂单为何没成交</h2>
+<table><thead><tr><th>撤单原因归类</th><th>笔数</th><th>占比</th></tr></thead><tbody><tr><td class="">软门槛连续不合格 30 分钟</td><td class="">139</td><td class="">100.0%</td></tr></tbody></table>
+<div class="note" style="margin-top:10px">撤单明细样例（最近 5 条）：<ul><li>XRPUSDT 多 存活 31 分钟 · 连续 31 轮 / 持续 30.0 分钟不合格，已达宽限上限（240 轮 或 30 分钟），取消挂单。原因：波动率过低（0.186% &lt; 0.20%），震荡市不做趋势单。</li><li>XRPUSDT 多 存活 31 分钟 · 连续 31 轮 / 持续 30.0 分钟不合格，已达宽限上限（240 轮 或 30 分钟），取消挂单。原因：波动率过低（0.190% &lt; 0.20%），震荡市不做趋势单。</li><li>XRPUSDT 多 存活 33 分钟 · 连续 31 轮 / 持续 30.0 分钟不合格，已达宽限上限（240 轮 或 30 分钟），取消挂单。原因：波动率过低（0.063% &lt; 0.20%），震荡市不做趋势单。</li><li>YGGUSDT 多 存活 31 分钟 · 连续 31 轮 / 持续 30.0 分钟不合格，已达宽限上限（240 轮 或 30 分钟），取消挂单。原因：成交量不足（量比0.00 &lt; 0.8），等待量能确认。</li><li>ZAMAUSDT 多 存活 31 分钟 · 连续 31 轮 / 持续 30.0 分钟不合格，已达宽限上限（240 轮 或 30 分钟），取消挂单。原因：波动率过低（0.052% &lt; 0.20%），震荡市不做趋势单。</li></ul></div>
+
+<h2>十一、对照实验：问题出在哪一环</h2>
+<table><thead><tr><th>实验组</th><th>成交</th><th>胜率</th><th>净盈亏 U</th><th>均单 U</th><th>毛收益 U</th><th>平均持仓</th><th>≤1 根平仓</th><th>止损占比</th></tr></thead><tbody><tr><td class=""><b>当前线上配置（基准）</b></td><td class="">489</td><td class="">15.5%</td><td class="down">-900.8</td><td class="down">-1.842</td><td class="down">-618.0</td><td class="">5.1</td><td class="">52.1%</td><td class="">32.5%</td></tr><tr><td class="">A 关掉智能退出<br><span class="vs">NOFX_SMART_EXIT=false</span></td><td class="">455</td><td class="">33.6%</td><td class="down">-719.1</td><td class="down">-1.581</td><td class="down">-454.1</td><td class="">20.8</td><td class="">15.6%</td><td class="">95.4%</td></tr><tr><td class="">B 均线失守放宽到 2 ATR<br><span class="vs">NOFX_SMART_MA_ATR=2.0</span></td><td class="">470</td><td class="">24.5%</td><td class="down">-786.4</td><td class="down">-1.673</td><td class="down">-513.7</td><td class="">11.1</td><td class="">31.7%</td><td class="">53.6%</td></tr><tr><td class="">C 最小持仓 15 根<br><span class="vs">实验开关（需改代码）</span></td><td class="">465</td><td class="">28.8%</td><td class="down">-805.0</td><td class="down">-1.731</td><td class="down">-534.8</td><td class="">13.6</td><td class="">15.3%</td><td class="">72.3%</td></tr><tr><td class="">D 最小持仓 5 根<br><span class="vs">实验开关（需改代码）</span></td><td class="">479</td><td class="">21.1%</td><td class="down">-875.2</td><td class="down">-1.827</td><td class="down">-597.1</td><td class="">7.8</td><td class="">15.2%</td><td class="">48.9%</td></tr><tr><td class="">E 挂单不被软门槛撤<br><span class="vs">NOFX_PENDING_GRACE_MIN=480</span></td><td class="">516</td><td class="">16.5%</td><td class="down">-898.6</td><td class="down">-1.741</td><td class="down">-601.0</td><td class="">4.9</td><td class="">58.1%</td><td class="">32.2%</td></tr></tbody></table>
+<div class="note" style="margin-top:10px">
+<b>A 关掉智能退出</b>：净 -719.1U（+181.7），均单 -1.581U（+0.262），胜率 33.6%，毛收益 -454.1U，平均持仓 20.8 根。<br><b>B 均线失守放宽到 2 ATR</b>：净 -786.4U（+114.4），均单 -1.673U（+0.169），胜率 24.5%，毛收益 -513.7U，平均持仓 11.1 根。<br><b>C 最小持仓 15 根</b>：净 -805.0U（+95.8），均单 -1.731U（+0.111），胜率 28.8%，毛收益 -534.8U，平均持仓 13.6 根。<br><b>D 最小持仓 5 根</b>：净 -875.2U（+25.6），均单 -1.827U（+0.015），胜率 21.1%，毛收益 -597.1U，平均持仓 7.8 根。<br><b>E 挂单不被软门槛撤</b>：净 -898.6U（+2.2），均单 -1.741U（+0.101），胜率 16.5%，毛收益 -601.0U，平均持仓 4.9 根。
+<br><b>读法：</b>「毛收益」= 扣费前的价格盈亏，它衡量<b>方向判断本身有没有 edge</b>；「净盈亏」与它的差额就是摩擦成本。
+五组实验里没有任何一组把毛收益转正 —— 说明<b>过早离场是放大器，不是病根</b>：修掉它能少亏约 20%，但策略在 1m 上的方向判断本身没有正期望。
+</div>
+
+<h2>十二、口径与假设</h2>
+<div class="note">
+<b>与线上一致的部分（全部直接复用生产代码，未重写策略）：</b>
+<ul>
+<li>信号：<code>enhancedAnalysis()</code>，主周期 1m、窗口 80 根、engine=enhanced（与 data/config.json 一致）</li>
+<li>参数：<code>NOFX_LONG_ONLY=true</code>（禁空）、<code>NOFX_MIN_TREND_SCORE=70</code>（与 ecosystem.config.cjs 一致）</li>
+<li>入场：限价挂单 <code>entryLimit</code>（按评分预测回调价），信号在 bar[i] 收盘产生、最早 bar[i+2] 触价成交</li>
+<li>挂单复核：方向反转立即撤 / 软门槛连续不合格满 30 分钟撤（<code>applyPendingReview</code>）</li>
+<li>持仓复核：移动止损 R 阶梯 + 智能退出（<code>enhancedProtectionReview</code> + <code>applyPaperProtectionReview</code>）</li>
+<li>结算：分批止盈（TP1 1R 平 40% / TP2 2R 平 40%）、止损/止盈/根级均线失守/120 根超时（<code>tradingSimulator</code>）</li>
+<li>风控：每单保证金 100 U、杠杆 <code>recommendedLeverage</code>（≤5x）、同币种同时 1 单、平仓冷却 30 分钟 / 止损后 60 分钟</li>
+<li>成本：手续费 6bps、滑点 5bps、资金费 3bps/8h</li>
+</ul>
+<b>回测特有的简化（会带来偏差，结论需打折看）：</b>
+<ul>
+<li>资金无限：不模拟账户余额与 20 笔活动订单上限，因此<b>低估了资金竞争与并发占用</b>的影响</li>
+<li>撮合简化：限价单按「当根最低价触达」成交，未模拟队列/部分成交；同根双触发按实盘同一套保守规则处理</li>
+<li>K 线缺口用前收平盘补齐（1m 无成交的分钟），极端低流动币的成交价可能偏乐观</li>
+<li>复核频率：每根收盘复核一次；线上 positionReview 每 10 秒一轮（1m 内约 6 次），移动止损精度略低</li>
+</ul>
+</div>
+
+<h2>十三、下一步建议（按性价比排序）</h2>
+<div class="note">
+<ol>
+<li><b>先止血：给「均线失守」加最小持仓保护。</b>当前 52.1% 的订单在成交后 1 根内就被平掉——
+挂单是「等回调」的限价单，成交意味着价格已经回落，恰好落在「跌破 MA20 超 1 ATR」的退出条件上，等于<b>入场即触发出场</b>。
+实验 C（最小持仓 15 根）把胜率从 15.5% 提到 28.8%、少亏约 -96 U；
+实验 B（<code>NOFX_SMART_MA_ATR=2.0</code>，不改代码）也能拿到约 -114 U 的改善。<b>后者是零代码改动，建议先上。</b></li>
+<li><b>别指望靠出场修好整个策略。</b>即使完全关掉智能退出（实验 A，胜率 33.6%），毛收益仍为 -454 U——
+方向判断在 1m 上本身是负期望。出场问题只是把亏损放大了约 25%。</li>
+<li><b>摩擦成本占比要盯住。</b>手续费 0.577 U/单，占均单亏损的 31.3%。
+继续降频（提高 <code>NOFX_MIN_TREND_SCORE</code> / <code>NOFX_MIN_ATR_PCT</code>）可以直接省手续费，但会同步减少盈利机会，需重新累计 ≥100 笔再评估。</li>
+<li><b>挂单撤单不是主要矛盾。</b>实验 E（挂单不被软门槛撤）多成交 27 笔，净盈亏几乎没变——
+被撤的那批单本来也不赚钱，不必优先处理。</li>
+<li><b>换周期要谨慎。</b>历史已两次证伪 5m/15m（胜率与均单双恶化）。若要做，建议先用本报告的同一套脚本跑 50 币 × 30 天做预筛，再上灰度。</li>
+</ol>
+</div>
+
+</div></body></html>

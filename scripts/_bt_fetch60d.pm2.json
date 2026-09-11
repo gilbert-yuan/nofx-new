@@ -1,0 +1,17 @@
+{
+  "name": "nofx-fetch60d",
+  "script": "C:\\Users\\Administrator\\.workbuddy\\binaries\\node\\versions\\22.22.2-3\\node.exe",
+  "args": ["D:\\UGit\\nofx-new\\scripts\\_bt_fetch2.mjs"],
+  "cwd": "D:\\UGit\\nofx-new",
+  "env": {
+    "BT_DAYS": "60",
+    "BT_COUNT": "100",
+    "BT_SEG": "4",
+    "BT_WORKERS": "3",
+    "BT_RPS": "6",
+    "BT_SEED": "20260911"
+  },
+  "log_file": "D:\\UGit\\nofx-new\\data\\backtest\\fetch60d-pm2.log",
+  "error_file": "D:\\UGit\\nofx-new\\data\\backtest\\fetch60d-pm2.err",
+  "max_memory_restart": "1G"
+}
