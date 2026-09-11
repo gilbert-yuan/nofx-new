@@ -94,7 +94,7 @@ async function fetchSegment(instId, segStart, segEnd, globalEnd) {
     if (minT <= segStart) break;
     if (minT >= cursor) break;
     cursor = minT;
-    if (pages > 220) break;
+    if (pages > 400) break;
   }
   return byTime;
 }
