@@ -11,6 +11,7 @@ import { MarketDb } from '../marketDb.js';
 import { KlineSync } from '../klineSync.js';
 import { registerResearchRoutes } from '../researchRoutes.js';
 import { GlobalAutomation, registerGlobalAutomationRoutes } from '../globalAutomation.js';
+import { createStrategiesRouter } from '../routes/strategies.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..', '..');
@@ -62,6 +63,8 @@ export class Container {
     });
     this.klineSync.automation = this.globalAutomation;
     registerGlobalAutomationRoutes(app, this.globalAutomation);
+    // 策略管理：勾选启用 / 覆盖参数（运行时即 GlobalAutomation 里的策略运行时）
+    app.use(createStrategiesRouter({ strategies: this.globalAutomation.strategies, store: this.store }));
     return this.globalAutomation;
   }
 

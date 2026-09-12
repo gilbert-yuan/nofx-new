@@ -217,11 +217,14 @@ export const PARTIAL_TP = Object.freeze({
  * 严格晚于（劣于）主止盈的档位会被丢弃 —— 那种档位永远轮不到触发，
  * 主止盈会先成交，留着只会让「已实现盈亏」分摊逻辑多出一条死分支。
  *
- * @param {{long:boolean, entry:number, riskUnit:number, mainTakeProfit?:number}} p
+ * @param {{long:boolean, entry:number, riskUnit:number, mainTakeProfit?:number, rule?:object}} p
+ *   rule 可选：策略级分批止盈配置（订单 plan.exitRules.partialTp）。
+ *   不传则回退全局 PARTIAL_TP —— 保证旧订单 / 回测脚本行为不变。
  * @returns {Array<{stage:number, price:number, closePct:number, r:number}>} 按 stage 升序
  */
-export function partialTpLevels({ long, entry, riskUnit, mainTakeProfit }) {
-  if (!PARTIAL_TP.enabled) return [];
+export function partialTpLevels({ long, entry, riskUnit, mainTakeProfit, rule }) {
+  const cfg = rule || PARTIAL_TP;
+  if (!cfg.enabled) return [];
   const r = Number(riskUnit);
   const base = Number(entry);
   if (!Number.isFinite(base) || !Number.isFinite(r) || r <= 0) return [];
@@ -234,9 +237,83 @@ export function partialTpLevels({ long, entry, riskUnit, mainTakeProfit }) {
     if (Number.isFinite(main) && main > 0 && (long ? !(price < main) : !(price > main))) return;
     levels.push({ stage, price, closePct, r: rMultiple });
   };
-  push(1, PARTIAL_TP.tp1R, PARTIAL_TP.tp1ClosePct);
-  push(2, PARTIAL_TP.tp2R, PARTIAL_TP.tp2ClosePct);
+  push(1, cfg.tp1R, cfg.tp1ClosePct);
+  push(2, cfg.tp2R, cfg.tp2ClosePct);
   return levels;
+}
+
+/**
+ * 归一化「策略级分批止盈配置」：把订单 plan 上可能残缺的快照补全为完整配置。
+ * 订单来自旧版本（无 plan.exitRules）时整体回退全局 PARTIAL_TP。
+ * @param {object} [partialTp] plan.exitRules.partialTp
+ */
+export function resolvePartialTpRule(partialTp) {
+  if (!partialTp || typeof partialTp !== 'object') return PARTIAL_TP;
+  return {
+    enabled: partialTp.enabled !== false,
+    tp1R: Number.isFinite(partialTp.tp1R) ? partialTp.tp1R : PARTIAL_TP.tp1R,
+    tp2R: Number.isFinite(partialTp.tp2R) ? partialTp.tp2R : PARTIAL_TP.tp2R,
+    tp1ClosePct: Number.isFinite(partialTp.tp1ClosePct) ? partialTp.tp1ClosePct : PARTIAL_TP.tp1ClosePct,
+    tp2ClosePct: Number.isFinite(partialTp.tp2ClosePct) ? partialTp.tp2ClosePct : PARTIAL_TP.tp2ClosePct,
+    moveStopToBreakEven: partialTp.moveStopToBreakEven === true
+  };
+}
+
+/**
+ * 归一化「策略级移动止损配置」：把残缺快照按档位补全（ladder 逐档合并）。
+ * @param {object} [trailing] plan.exitRules.trailing
+ */
+export function resolveTrailingRule(trailing) {
+  if (!trailing || typeof trailing !== 'object') return TRAILING_RULE;
+  const pick = (v, fallback) => (Number.isFinite(v) ? v : fallback);
+  const ladder = Array.isArray(trailing.ladder) && trailing.ladder.length
+    ? TRAILING_RULE.ladder.map((base, i) => {
+      const item = trailing.ladder[i] || {};
+      return { atR: pick(item.atR, base.atR), trailR: pick(item.trailR, base.trailR), lockR: pick(item.lockR, base.lockR) };
+    })
+    : TRAILING_RULE.ladder;
+  return {
+    triggerR: pick(trailing.triggerR, TRAILING_RULE.triggerR),
+    profitTriggerPct: pick(trailing.profitTriggerPct, TRAILING_RULE.profitTriggerPct),
+    extendTpAtr: pick(trailing.extendTpAtr, TRAILING_RULE.extendTpAtr),
+    lockMinRoomAtr: pick(trailing.lockMinRoomAtr, TRAILING_RULE.lockMinRoomAtr),
+    useBreakEven: trailing.useBreakEven === true,
+    breakEvenFloorAtr: pick(trailing.breakEvenFloorAtr, TRAILING_RULE.breakEvenFloorAtr),
+    breakEvenCostBufferBps: pick(trailing.breakEvenCostBufferBps, TRAILING_RULE.breakEvenCostBufferBps),
+    ladder
+  };
+}
+
+/**
+ * 归一化「策略级智能退出配置」（均线失守 / RSI 极值 / MACD 背离 + 最小持仓保护）。
+ * @param {object} [smartExit] plan.exitRules.smartExit（兼容旧的 plan.smartExit）
+ */
+export function resolveSmartExitRule(smartExit) {
+  if (!smartExit || typeof smartExit !== 'object') return SMART_EXIT;
+  const pick = (v, fallback) => (Number.isFinite(v) ? v : fallback);
+  return {
+    enabled: smartExit.enabled !== false,
+    barLevel: smartExit.barLevel !== false,
+    maPeriod: Number.isInteger(smartExit.maPeriod) && smartExit.maPeriod > 1 ? smartExit.maPeriod : 20,
+    maBreakAtr: pick(smartExit.maBreakAtr, SMART_EXIT.maBreakAtr),
+    maExitMaxProfitR: pick(smartExit.maExitMaxProfitR, SMART_EXIT.maExitMaxProfitR),
+    tpMinR: pick(smartExit.tpMinR, SMART_EXIT.tpMinR),
+    minHoldBars: pick(smartExit.minHoldBars, SMART_EXIT.minHoldBars)
+  };
+}
+
+/**
+ * 从订单计划里取出该订单**所属策略**的三组出场规则。
+ * 单一出口：交易模拟器与两个复核函数都用它，保证「订单按自己策略的规则出场」。
+ * @param {object} [plan] order.plan
+ */
+export function exitRulesFor(plan) {
+  const exitRules = plan?.exitRules;
+  return {
+    trailing: resolveTrailingRule(exitRules?.trailing),
+    smartExit: resolveSmartExitRule(exitRules?.smartExit || plan?.smartExit),
+    partialTp: resolvePartialTpRule(exitRules?.partialTp)
+  };
 }
 
 // ─────────────────────── 风险几何（止损口径 / 杠杆） ───────────────────────
@@ -327,20 +404,24 @@ export function profitRFrom({ long, entry, close, riskUnit }) {
  * 真实净保本线（bps，占价格的万分比）。
  * 往返成本 = 开仓费 + 平仓费 + 双边滑点 ≈ 2 × (feeBps + slippageBps)。
  * @param {{feeBps?:number, slippageBps?:number}} [costs]
+ * @param {object} [rule] 策略级移动止损配置（不传则用全局 TRAILING_RULE 的缓冲值）
  */
-export function netBreakEvenBps(costs) {
+export function netBreakEvenBps(costs, rule) {
   const fee = Number(costs?.feeBps ?? 6);
   const slip = Number(costs?.slippageBps ?? 5);
-  return 2 * (fee + slip) + TRAILING_RULE.breakEvenCostBufferBps;
+  const buffer = Number((rule || TRAILING_RULE).breakEvenCostBufferBps);
+  return 2 * (fee + slip) + (Number.isFinite(buffer) ? buffer : TRAILING_RULE.breakEvenCostBufferBps);
 }
 
 /**
  * 按浮盈（R 倍数）取当前生效的跟踪档位。
  * @param {number} profitR 浮盈，单位 R
+ * @param {object} [rule] 策略级移动止损配置（不传则用全局 TRAILING_RULE.ladder）
  */
-export function trailStepFor(profitR) {
-  let step = TRAILING_RULE.ladder[0];
-  for (const item of TRAILING_RULE.ladder) if (Number.isFinite(profitR) && profitR >= item.atR) step = item;
+export function trailStepFor(profitR, rule) {
+  const ladder = (rule || TRAILING_RULE).ladder || TRAILING_RULE.ladder;
+  let step = ladder[0];
+  for (const item of ladder) if (Number.isFinite(profitR) && profitR >= item.atR) step = item;
   return step;
 }
 
@@ -362,11 +443,13 @@ export function trailStepFor(profitR) {
  * @param {number} p.profitR  当前浮盈（R 倍数）
  * @param {number} [p.baseStop] 历史最紧止损
  * @param {{feeBps?:number,slippageBps?:number}} [p.costs]
+ * @param {object} [p.rule] 策略级移动止损配置（不传则用全局 TRAILING_RULE）
  * @returns {{stop:number, step:object, trailStop:number, lockStop:number|null, reversed:boolean}}
  *          reversed=true 表示算出的止损已越过现价（异常情形，调用方应判为无效并保持原值）
  */
-export function computeTrailStop({ long, entry, close, atr, riskUnit, profitR, baseStop, costs }) {
-  const step = trailStepFor(profitR);
+export function computeTrailStop({ long, entry, close, atr, riskUnit, profitR, baseStop, costs, rule }) {
+  const cfg = rule || TRAILING_RULE;
+  const step = trailStepFor(profitR, cfg);
   const sign = long ? 1 : -1;
   const candidates = [];
   if (Number.isFinite(baseStop) && baseStop > 0) candidates.push(baseStop);
@@ -377,20 +460,20 @@ export function computeTrailStop({ long, entry, close, atr, riskUnit, profitR, b
   let lockStop = null;
   if (step.lockR > 0 && Number.isFinite(riskUnit) && riskUnit > 0) {
     // 锁盈位取「档位要求」与「成本保本线」的较优者（对多头取较大值 = 更紧）
-    const costDist = entry * netBreakEvenBps(costs) / 10000;
+    const costDist = entry * netBreakEvenBps(costs, cfg) / 10000;
     const byStep = entry + sign * step.lockR * riskUnit;
     const byCost = entry + sign * costDist;
     const wanted = long ? Math.max(byStep, byCost) : Math.min(byStep, byCost);
     // 留白检查：锁盈位距现价不得小于 lockMinRoomAtr×ATR，否则本档锁盈失效
     const room = long ? close - wanted : wanted - close;
-    if (room >= TRAILING_RULE.lockMinRoomAtr * atr) {
+    if (room >= cfg.lockMinRoomAtr * atr) {
       lockStop = wanted;
       candidates.push(wanted);
     }
   }
 
-  if (TRAILING_RULE.useBreakEven) {
-    candidates.push(entry + sign * TRAILING_RULE.breakEvenFloorAtr * atr);
+  if (cfg.useBreakEven) {
+    candidates.push(entry + sign * cfg.breakEvenFloorAtr * atr);
   }
 
   const valid = candidates.filter(v => Number.isFinite(v) && v > 0);

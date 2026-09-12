@@ -2,6 +2,8 @@
  * 策略优化器 - 根据成交记录优化本地策略参数
  */
 
+import { isStopReason, isTakeProfitReason } from '../shared/closeReasons.js';
+
 /**
  * 分析已平仓订单，提取优化建议
  */
@@ -79,8 +81,10 @@ function generateSuggestions(orders, stats) {
   const suggestions = [];
 
   // 1. 止损止盈分析
-  const stopLossHit = orders.filter(o => o.reason === 'stop_loss');
-  const takeProfitHit = orders.filter(o => o.reason === 'take_profit');
+  // 按「类」统计：移动止损 / 保本止损同属止损，分批止盈同属止盈。
+  // 细分平仓理由后若仍只认 `stop_loss` 字面量，这里会系统性少算一大半止损单。
+  const stopLossHit = orders.filter(o => isStopReason(o.reason));
+  const takeProfitHit = orders.filter(o => isTakeProfitReason(o.reason));
   const timeout = orders.filter(o => o.reason === 'timeout');
 
   if (stopLossHit.length > 0) {

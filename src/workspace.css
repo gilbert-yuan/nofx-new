@@ -120,56 +120,6 @@
   border-left-color: var(--brand-primary);
 }
 
-/* 市场状态面板 */
-.market-status {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  border: 1px solid var(--border-primary);
-  background: var(--bg-elevated);
-  border-radius: 8px;
-  margin-bottom: 28px;
-  overflow: hidden;
-  box-shadow: var(--shadow-sm);
-}
-.market-status > div {
-  position: relative;
-  padding: 16px 18px;
-  border-right: 1px solid var(--border-secondary);
-}
-.market-status > div:last-of-type { border-right: 0; }
-.market-status strong {
-  font-size: 18px;
-  font-variant-numeric: tabular-nums;
-  font-weight: 650;
-  color: var(--text-primary);
-}
-.market-status small {
-  font-size: 12px;
-  font-weight: 400;
-  color: var(--text-tertiary);
-}
-.market-status p {
-  color: var(--text-tertiary);
-  font: 11px/1.7 var(--font-mono);
-  margin-top: 7px;
-}
-.market-status button {
-  position: absolute;
-  right: 14px;
-  bottom: 15px;
-  padding: 6px 8px;
-  font-size: 11px;
-}
-.market-status .status-error {
-  grid-column: 1 / -1;
-  padding: 12px 18px;
-  color: var(--danger);
-  border-top: 1px solid var(--border-primary);
-  margin: 0;
-  overflow-wrap: anywhere;
-  background: var(--danger-bg);
-}
-
 /* 工作台标题 */
 .workbench-hero h2 {
   font-family: var(--font-mono);
@@ -231,7 +181,6 @@
 
 /* 面板卡片 */
 .chart-panel,
-.analysis-panel,
 .range-panel,
 .ai-settings {
   border-color: var(--border-primary);
@@ -242,33 +191,6 @@
 .chart-panel { padding: 18px 20px; }
 .chart-toolbar strong { color: var(--text-primary); }
 .chart-toolbar { color: var(--text-tertiary); }
-
-/* 批量分析折叠面板 */
-.batch-analysis {
-  margin-bottom: 20px;
-  border: 1px solid var(--border-primary);
-  border-radius: 6px;
-  background: var(--bg-elevated);
-}
-.batch-analysis summary {
-  padding: 15px 18px;
-  font-size: 13px;
-  font-weight: 650;
-  cursor: pointer;
-  color: var(--text-primary);
-}
-.batch-analysis summary span {
-  margin-left: 12px;
-  color: var(--text-tertiary);
-  font-weight: 400;
-  font-size: 11px;
-}
-.batch-analysis .range-panel {
-  margin: 0;
-  border: 0;
-  border-top: 1px solid var(--border-primary);
-  box-shadow: none;
-}
 
 /* 模式标签 */
 .mode-pill {
@@ -432,14 +354,6 @@
   font-size: 20px;
 }
 
-.market-status {
-  margin-bottom: 22px;
-  border-radius: 6px;
-}
-.market-status > div { padding: 12px 16px; }
-.market-status strong { font-size: 15px; }
-.market-status p { margin-top: 4px; }
-
 .workbench-hero { padding: 4px 0 22px; }
 .workbench-hero h2 {
   font-size: 36px;
@@ -518,13 +432,7 @@
   outline: 3px solid var(--brand-bg);
 }
 
-/* 研究布局 */
-.research-layout {
-  display: grid;
-  grid-template-columns: minmax(0, 1.8fr) minmax(300px, 1fr);
-  gap: 18px;
-  align-items: start;
-}
+/* 工作区主列：K 线 + 历史记录 */
 .market-column { min-width: 0; }
 
 /* 增强图表 */
@@ -620,25 +528,7 @@
 
 .enhanced-chart .chart-loading { min-height: 300px; }
 
-/* 研究面板 */
-.research-panel {
-  padding: 20px;
-  border-top: 3px solid var(--brand-primary);
-}
-.research-panel .section-head {
-  flex-direction: row;
-  align-items: center;
-  margin-bottom: 18px;
-}
-.research-panel h2 {
-  font-size: 18px;
-  color: var(--text-primary);
-}
-.research-panel h3 {
-  font-size: 13px;
-  margin: 0;
-  color: var(--text-primary);
-}
+/* 徽标 */
 .research-badge {
   border: 1px solid var(--border-primary);
   background: var(--bg-tertiary);
@@ -647,22 +537,6 @@
   font-size: 10px;
   border-radius: 4px;
   white-space: nowrap;
-}
-.research-panel .result-grid { display: block; }
-.research-panel .result-card {
-  border: 0;
-  padding: 0;
-  overflow-wrap: anywhere;
-  background: transparent;
-}
-.research-panel .result-card .result-top strong {
-  font-family: var(--font-mono);
-  font-size: 18px;
-  color: var(--text-primary);
-}
-.research-panel .result-card p {
-  line-height: 1.9;
-  color: var(--text-secondary);
 }
 
 /* 空状态 */
@@ -695,48 +569,6 @@
   font: 40px var(--font-mono);
   color: var(--text-muted);
 }
-
-/* 研究历史 */
-.research-history {
-  margin-top: 24px;
-  padding-top: 18px;
-  border-top: 1px solid var(--border-primary);
-}
-.research-history .history-row {
-  grid-template-columns: minmax(0, 1fr) auto;
-  background: var(--bg-elevated);
-  border-bottom-color: var(--border-secondary);
-}
-.history-date {
-  display: grid;
-  gap: 4px;
-  font-size: 10px;
-  color: var(--text-tertiary);
-}
-.history-date input {
-  min-width: 0;
-  max-width: 150px;
-  padding: 5px;
-  font-size: 11px;
-  color-scheme: light dark;
-}
-.research-history > .muted {
-  font-size: 12px;
-  line-height: 1.8;
-  color: var(--text-tertiary);
-}
-
-/* 批量分析 */
-.batch-analysis .scope-grid {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-}
-.batch-analysis input,
-.batch-analysis select {
-  width: 100%;
-  min-width: 0;
-}
-.batch-analysis summary { line-height: 1.8; }
-.batch-analysis summary span { display: inline-block; }
 
 /* 信号计划 */
 .signal-plan {
@@ -796,17 +628,7 @@
 .candle-picker small { font-size: 10px; }
 
 /* ========== 响应式 ========== */
-@media (min-width: 1600px) {
-  .research-layout {
-    grid-template-columns: minmax(0, 2fr) 380px;
-  }
-}
-
 @media (max-width: 1200px) {
-  .market-status button {
-    position: static;
-    margin-top: 10px;
-  }
   .trading-layout {
     grid-template-columns: minmax(0, 1fr) 270px;
   }
@@ -815,14 +637,9 @@
 }
 
 @media (max-width: 1180px) {
-  .research-layout {
-    grid-template-columns: minmax(0, 1fr);
-  }
-  .research-panel .research-empty { min-height: 170px; }
   .window-strip { gap: 16px; }
   .workbench-hero { flex-wrap: wrap; }
   .quote-actions { gap: 12px; }
-  .market-status button { position: static; }
 }
 
 @media (max-width: 980px) {
@@ -862,13 +679,6 @@
   .main-content {
     padding: 18px 12px 40px;
   }
-  .market-status { margin-bottom: 20px; }
-  .market-status > div { padding: 13px 10px; }
-  .market-status strong { font-size: 15px; }
-  .market-status button {
-    font-size: 10px;
-    padding: 6px;
-  }
   .workbench-hero { gap: 15px; }
   .workbench-hero .primary { width: auto; }
   .quote-actions {
@@ -895,8 +705,6 @@
   }
   .window-strip strong { font-size: 14px; }
   .chart-footnote { font-size: 10px; }
-  .research-panel { padding: 16px; }
-  .market-status > div { padding: 12px; }
 }
 
 @media (max-width: 430px) {
@@ -904,47 +712,16 @@
   .symbol-list {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
-  .market-status { grid-template-columns: 1fr; }
-  .market-status > div {
-    border-right: 0;
-    border-bottom: 1px solid var(--border-primary);
-  }
-  .market-status button {
-    position: absolute;
-    bottom: 18px;
-  }
   .last-price { font-size: 17px; }
   .brand-lockup { flex-basis: 100%; }
 
   .chart-plot { grid-template-columns: minmax(0, 1fr) 68px; }
   .price-axis { font-size: 9px; }
-  .batch-analysis .scope-grid { grid-template-columns: 1fr; }
   .candle-readout {
     gap: 6px 10px;
     font-size: 10px;
   }
   .top-nav { gap: 18px; }
-  .research-panel .result-grid { min-width: 0; }
-}
-
-@media (max-width: 430px) {
-  .market-status > div {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
-    column-gap: 12px;
-  }
-  .market-status > div > .eyebrow,
-  .market-status > div > strong,
-  .market-status > div > p {
-    grid-column: 1;
-  }
-  .market-status > div > button {
-    grid-column: 2;
-    grid-row: 1 / 4;
-    align-self: center;
-    margin: 0;
-  }
-  .market-status p { font-size: 10px; }
 }
 
 /* 减少动画偏好 */

@@ -6,7 +6,35 @@
  */
 
 import { nextOpenTime, validCandle, PAPER_COSTS } from './research.js';
-import { PARTIAL_TP, SMART_EXIT, partialTpLevels, netBreakEvenBps } from './shared/strategyGuards.js';
+import { SMART_EXIT, partialTpLevels, netBreakEvenBps, exitRulesFor } from './shared/strategyGuards.js';
+import { normalizeCloseReason } from '../shared/closeReasons.js';
+
+/**
+ * 判定止损的细分来源（初始 / 移动 / 保本）——「平仓理由可统计」的关键。
+ *
+ * 改造前所有止损一律写 `stop_loss`，2243 笔里根本分不清
+ * 「一进场就打初始止损」（策略失效）与「赚到钱后移动止损被打掉」（保护生效），
+ * 这两者对策略调优的意义完全相反。
+ *
+ * @param {{long:boolean, stopLoss:number, initialStop:number, entry:number, breakEvenDist:number}} p
+ * @returns {'stop_loss'|'trailing_stop'|'break_even_stop'}
+ */
+function classifyStopReason({ long, stopLoss, initialStop, entry, breakEvenDist }) {
+  const usable = [stopLoss, initialStop, entry].every(v => Number.isFinite(v) && v > 0);
+  if (!usable) return 'stop_loss';
+
+  // 容差取价格的 1e-6：保护价经 JSON 往返与浮点运算后会有极小漂移
+  const eps = entry * 1e-6;
+  const moved = long ? stopLoss > initialStop + eps : stopLoss < initialStop - eps;
+  if (!moved) return 'stop_loss';
+
+  // 保本线：分批止盈把止损抬到「净保本价」，命中它说明这笔不亏不赚
+  if (Number.isFinite(breakEvenDist) && breakEvenDist > 0) {
+    const beStop = long ? entry + breakEvenDist : entry - breakEvenDist;
+    if (Math.abs(stopLoss - beStop) <= entry * 2e-4) return 'break_even_stop';
+  }
+  return 'trailing_stop';
+}
 
 /**
  * 交易模拟器配置
@@ -100,12 +128,24 @@ export class TradingSimulator {
     const direction = long ? 1 : -1;
     const plan = order.plan;
 
+    // ── 订单所属策略的出场规则（多策略化）──────────────────────────────────
+    // 下单时 enhancedAnalysis 把该策略的三组出场规则快照进 plan.exitRules；
+    // 结算从此处读取，因此「多策略并存时每单按自己策略的规则出场」。
+    // 旧订单 / 非 enhanced 引擎的计划没有快照 → exitRulesFor 自动回退全局默认值。
+    const exitRules = exitRulesFor(plan);
+    // 但「根级均线失守」必须沿用改造前的开关语义：只有计划里**确实固化了**智能退出
+    // 快照才启用。否则 resolveSmartExitRule 在无快照时返回全局 SMART_EXIT（barLevel
+    // 默认 true），会让 local 引擎的订单被凭空打开根级均线失守 —— 静默改变持仓节奏。
+    const hasSmartExitSnapshot = !!(plan?.exitRules?.smartExit || plan?.smartExit);
+
     // 状态变量
     let time = order.startTime;
     let entry = order.entry ?? null;
     let entryTime = order.entryTime ?? null;
     let held = order.heldBars || 0;
     let adverse = 0;
+    // 本轮成交是否由**限价单**触发（决定成交当根的出场判定口径，见 _checkExit）
+    let entryViaLimit = false;
 
     // ── 分批止盈状态（跨轮续跑：从 order 恢复）────────────────────────────
     // 全部用**标量**而不是 fills[] 数组：simulated_order_extensions 按 path 逐字段
@@ -137,7 +177,7 @@ export class TradingSimulator {
     // 1m 周期下平均要晚 2~3 根才动作，趋势已反转的浮亏单被多扛了几分钟。
     // 现按计划里固化的 smartExit 配置，在每根已收盘 K 线上判定；复核周期仅作兜底。
     // 只看**已收盘** K 线，不使用未来数据，回测/实盘口径一致。
-    const smartExit = plan?.smartExit;
+    const smartExit = hasSmartExitSnapshot ? exitRules.smartExit : null;
     const barLevelMaExit = !!smartExit && smartExit.barLevel !== false && Number.isFinite(smartExit.maBreakAtr);
     // 根级最小持仓保护（P8，2026-09-11）：与复核层 enhancedProtectionReview 同口径 ——
     // 入场后 minHoldBars 根内禁止「均线失守」平仓（优先 plan 快照，旧订单回退全局
@@ -193,6 +233,7 @@ export class TradingSimulator {
         const entryResult = this._tryEntry(row, protection, direction, order.costs);
         if (entryResult) {
           entry = entryResult.price;
+          entryViaLimit = entryResult.limit === true;
           entryTime = time;
           order.quantity = order.notional / entry;
           order.entryFee = order.notional * order.costs.feeBps / 10000;
@@ -238,7 +279,7 @@ export class TradingSimulator {
           const riskUnit = Number(order.plan?.riskUnit) > 0
             ? Number(order.plan.riskUnit)
             : Math.abs(entry - Number(order.initialPlan?.stopLoss ?? protection.stopLoss));
-          tpLevels = partialTpLevels({ long, entry, riskUnit, mainTakeProfit: protection.takeProfit });
+          tpLevels = partialTpLevels({ long, entry, riskUnit, mainTakeProfit: protection.takeProfit, rule: exitRules.partialTp });
         }
         while (tpStage < tpLevels.length) {
           const level = tpLevels[tpStage];
@@ -272,8 +313,8 @@ export class TradingSimulator {
           realized.fills = tpStage;
 
           // 分批成交后，把剩余仓位止损抬到净保本线（含往返成本 + 缓冲），锁成无风险
-          if (PARTIAL_TP.moveStopToBreakEven) {
-            const costDist = entry * netBreakEvenBps(costs) / 10000;
+          if (exitRules.partialTp.moveStopToBreakEven) {
+            const costDist = entry * netBreakEvenBps(costs, exitRules.trailing) / 10000;
             const beStop = long ? entry + costDist : entry - costDist;
             const nextFloor = Number.isFinite(order.tpStopFloor) && order.tpStopFloor > 0
               ? (long ? Math.max(order.tpStopFloor, beStop) : Math.min(order.tpStopFloor, beStop))
@@ -284,13 +325,25 @@ export class TradingSimulator {
         }
 
         // 检查出场条件
+        // 传 stopCtx 让 _checkExit 能细分「初始止损 / 移动止损 / 保本止损」与「整仓止盈 / 分批止盈」
         const exitResult = this._checkExit(
           row,
           { ...protection, stopLoss: workingStop },
           entry,
           held,
           direction,
-          order.liquidationPrice
+          order.liquidationPrice,
+          {
+            initialStop: Number(order.initialPlan?.stopLoss) || Number(order.plan?.stopLoss) || 0,
+            tpStage,
+            entry,
+            long,
+            // 成交当根且由限价单成交 → 启用「保护优先」的保守判定（见 _checkExit）
+            entryBar: entryViaLimit && held === 1,
+            breakEvenDist: exitRules.partialTp.moveStopToBreakEven
+              ? entry * netBreakEvenBps(order.costs, exitRules.trailing) / 10000
+              : 0
+          }
         );
 
         if (exitResult) {
@@ -476,7 +529,8 @@ export class TradingSimulator {
         ? slipped > protection.stopLoss && slipped < protection.takeProfit
         : slipped < protection.stopLoss && slipped > protection.takeProfit;
       if (!valid) return null;
-      return { price: slipped };
+      // limit: true —— 标记「本根由限价触发」，成交当根的出场判定要按保护优先走保守口径
+      return { price: slipped, limit: true };
     }
 
     // 兼容旧计划：下一根开盘价必须在入场区间内（近似市价）
@@ -501,9 +555,29 @@ export class TradingSimulator {
   /**
    * 检查出场条件
    */
-  _checkExit(row, protection, entry, held, direction, liquidationPrice) {
+  /**
+   * 检查出场条件
+   * @param {object} row 当前 K 线
+   * @param {object} protection 当前生效保护价（stopLoss 已含分批保本抬升）
+   * @param {number} entry 成交价
+   * @param {number} held 已持仓根数
+   * @param {number} direction 1 多 / -1 空
+   * @param {number} [liquidationPrice] 强平价
+   * @param {{initialStop?:number, tpStage?:number, entry?:number, long?:boolean, breakEvenDist?:number}} [ctx]
+   *        出场细分上下文：用于给出可统计的平仓理由（见 classifyStopReason）
+   */
+  _checkExit(row, protection, entry, held, direction, liquidationPrice, ctx = {}) {
     const long = direction === 1;
     const { stopLoss, takeProfit, maxHoldBars } = protection;
+    const stopReason = classifyStopReason({
+      long,
+      stopLoss,
+      initialStop: Number(ctx.initialStop) || 0,
+      entry: Number(ctx.entry) || entry,
+      breakEvenDist: Number(ctx.breakEvenDist) || 0
+    });
+    // 已分批减仓过的单，最后一批了结记「分批止盈」，与整仓止盈区分开
+    const tpReason = Number(ctx.tpStage) > 0 ? 'partial_take_profit' : 'take_profit';
 
     // 1. 爆仓检查（如果启用）
     if (this.config.enableLiquidation && liquidationPrice) {
@@ -534,19 +608,30 @@ export class TradingSimulator {
     const hitStop = long ? row.low <= stopLoss : row.high >= stopLoss;
     const hitTarget = long ? row.high >= takeProfit : row.low <= takeProfit;
 
+    // ⚠️ 限价单的成交当根：成交价与当根开盘价**没有因果关系** —— 当根开盘发生在成交之前。
+    // 旧实现在这里沿用「开盘已越过止盈 → 按开盘价以止盈结算」，而该分支在非限价路径
+    // 根本不可达（那里的 entry≈open 且强约束 open < takeProfit），于是它**只在限价成交时
+    // 被触发**：开盘价（高于止盈）被当成了我们的出场价，凭空造出 +0.2%~+5% 的假盈利
+    // （2026-09-12 在 90 天回测里实测到 avgWin 5.8% 这种不可能的数字）。
+    // 当根无法得知「成交后」的价格路径，按全系统既有约定取最坏情况：保护优先 ——
+    // 触到止损就按止损结算，止盈与超时留到下一根起判定。
+    if (ctx.entryBar) {
+      return hitStop ? { reason: stopReason, price: stopLoss, ambiguous: true } : null;
+    }
+
     if (hitStop && hitTarget) {
       // P1-1：同根K线双触发时，若当根开盘已越过止盈，按更优价以止盈结算
       // （"先止盈后回踩"的单不应被记成止损，避免系统性压低胜率）
       const openedBeyondTarget = long ? row.open >= takeProfit : row.open <= takeProfit;
       if (openedBeyondTarget) {
         return {
-          reason: 'take_profit',
+          reason: tpReason,
           price: long ? Math.max(row.open, takeProfit) : Math.min(row.open, takeProfit),
           ambiguous: true
         };
       }
       const stopPrice = long ? Math.min(row.open, stopLoss) : Math.max(row.open, stopLoss);
-      return { reason: 'stop_loss', price: stopPrice, ambiguous: true };
+      return { reason: stopReason, price: stopPrice, ambiguous: true };
     }
 
     if (hitStop) {
@@ -556,7 +641,7 @@ export class TradingSimulator {
         : Math.max(row.open, stopLoss);
 
       return {
-        reason: 'stop_loss',
+        reason: stopReason,
         price: stopPrice,
         ambiguous: false
       };
@@ -565,7 +650,7 @@ export class TradingSimulator {
     // 3. 止盈检查
     if (hitTarget) {
       return {
-        reason: 'take_profit',
+        reason: tpReason,
         price: takeProfit,
         ambiguous: false
       };
@@ -623,7 +708,8 @@ export class TradingSimulator {
 
     return {
       status: 'closed',
-      reason: exitResult.reason,
+      // 落库必须是稳定机器码（便于统计）；未知值兜底为 manual
+      reason: normalizeCloseReason(exitResult.reason),
       entry,
       exit,
       entryAt: new Date(entryTime).toISOString(),

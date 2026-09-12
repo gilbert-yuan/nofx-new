@@ -5,16 +5,16 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { LOCAL_STRATEGY, localAnalysisMultiTimeframe, recommendedLeverage } from './localAnalysis.js';
+import { LOCAL_STRATEGY, recommendedLeverage } from './localAnalysis.js';
 import { getAdaptiveConfig } from './adaptiveConfig.js';
 import { filterSymbolsByPerformance, getAdaptiveParametersForSymbol, shouldTradeAtCurrentHour } from './adaptiveFilters.js';
-import { enhancedAnalysis, enhancedProtectionReview } from './enhancedAnalysis.js';
 import { createSuperEnhancedAnalysis } from './superEnhancedAnalysis.js';
-import { analyzeMarkets, reviewPosition } from './ai.js';
 import { nextOpenTime, prepareMarket, createResearchRecord, MAIN_INTERVAL } from './research.js';
-import { localProtectionReview, applyPaperProtectionReview } from './shared/protectionReview.js';
+import { applyPaperProtectionReview } from './shared/protectionReview.js';
 import { proxyHealth } from './core/proxyHealth.js';
 import { applyPendingReview, HELD_INELIGIBLE } from './shared/pendingReview.js';
+import { createStrategyRuntime } from './strategies/index.js';
+import { normalizeCloseReason, isStopReason } from '../shared/closeReasons.js';
 
 // ── 同币种冷却（2026-09-11 优化：由「仅止损后」扩展到「任意平仓后」）────────
 // 依据：2711 笔真实成交 + 真实 1m K 线回放，统一出场（2ATR 止损/3R 止盈/1R 后移动 1.5ATR/120 根）。
@@ -51,10 +51,17 @@ export class GlobalAutomation {
     this.store = store;
     this.owner = randomUUID();
     this.superAnalysis = createSuperEnhancedAnalysis({ store });
+    // 多策略运行时：启用集与参数覆盖来自 data/strategies.json；
+    // 首次运行按 config.analysis.engine 推导默认启用集（enhanced → enhanced-trend-v1），保证升级平滑。
+    this.strategies = createStrategyRuntime({ store, resolveEngine: selectAnalysisEngine });
 
+    // 每轮结束到下一轮开始的等待时间（2026-09-12 老板要求整体提速 10 倍：60s→6s、10s→1s）。
+    // ⚠️ 调度器有 inFlight 去重（executeTask）：上一轮没跑完时新一跳会复用同一个 promise，
+    //    所以间隔小于单轮耗时不会造成并发堆积，只是变成「跑完就接下一轮」。
+    // ⚠️ 调度下限是 1000ms（见 updateTask 校验），勿再往下调。
     this.tasks = {
-      klineSync: { enabled: true, interval: 60000, lastRun: null, running: false },
-      positionReview: { enabled: true, interval: 10000, lastRun: null, running: false }
+      klineSync: { enabled: true, interval: 6000, lastRun: null, running: false },
+      positionReview: { enabled: true, interval: 1000, lastRun: null, running: false }
     };
     this.inFlight = new Map();
 
@@ -68,6 +75,11 @@ export class GlobalAutomation {
       totalReviews: 0,
       errors: []
     };
+  }
+
+  /** 策略分析/复核共用的依赖注入（策略定义里通过 ctx.deps 取用） */
+  strategyDeps() {
+    return { superAnalysis: this.superAnalysis, store: this.store };
   }
 
   /**
@@ -168,35 +180,52 @@ export class GlobalAutomation {
     progress.symbol = null;
   }
 
-  async runAnalysis({ symbols: requestedSymbols, preparedMarket, submit = true, interval = MAIN_INTERVAL, shouldContinue = () => true, context = {} } = {}) {
+  /**
+   * 行情分析（多策略）：遍历「已启用策略」，每个策略用自己的参数独立扫描候选币种。
+   *
+   * 改造要点（2026-09-11 老板需求）：
+   *   · 启用哪些策略由 data/strategies.json 决定（前端「策略管理」页勾选）；
+   *   · 每个策略用**自己的参数**跑分析，产出的信号带 strategyId，订单落库时一并固化；
+   *   · 同一币种若被多个策略看中，只有优先级最高的那个能成交（沿用「同币种不重复开仓」风控）。
+   *
+   * @param {object} [options]
+   * @param {Array}  [options.strategies] 显式指定策略（挂单复核时只跑该订单所属策略）
+   */
+  async runAnalysis({ symbols: requestedSymbols, preparedMarket, submit = true, interval = MAIN_INTERVAL,
+    shouldContinue = () => true, context = {}, strategies: explicitStrategies } = {}) {
     // 代理宕机时跳过本轮分析，避免对全市场币种逐个刷 fetch failed。
     if (!proxyHealth.isAlive()) {
       console.warn('[GlobalAutomation] 代理不可用，跳过本轮行情分析（OKX 行情中断）。');
-      return;
+      return [];
     }
     const config = context.config ??= await this.store.getConfig();
-    const strategy = { ...(context.strategy ??= await this.store.getStrategy()), interval };
-    const engine = selectAnalysisEngine(config);
+    const strategyPrompt = context.strategyPrompt ??= await this.store.getStrategy();
+    // ⚠️ 启用集**不缓存**：syncKlines 整轮（全市场数百币种、数分钟）共用同一个 context，
+    // 若在这里按轮缓存，前端「策略管理」勾选/改参后要等下一整轮才生效（体验上像"没反应"）。
+    // 每币种重读一次 data/strategies.json（小文件、毫秒级）换来「勾选后下一币种即生效」。
+    const enabledStrategies = explicitStrategies || await this.strategies.enabled(config);
+    if (!enabledStrategies.length) {
+      console.warn('[GlobalAutomation] ⚠️ 未启用任何策略，本轮不做分析。请到「策略管理」勾选至少一个策略。');
+      return [];
+    }
 
-    console.log(`[GlobalAutomation] 开始行情分析，使用 ${engine} 模式...`);
+    console.log(`[GlobalAutomation] 开始行情分析，启用策略：${enabledStrategies.map(s => s.id).join(', ')}`);
 
     let symbols = requestedSymbols || (await this.market.perpetualUsdtContracts()).map(s => s.symbol);
     const signals = [];
     const runId = randomUUID();
     const failures = [];
 
-    // P3 修复：币种过滤原先整段写在 engine === 'local' 分支里，engine='enhanced'/'super' 时
-    // 根本不会执行（而且样本还按 strategyModel === LOCAL_STRATEGY.modelId 过滤，
-    // enhanced 下单的 modelId 是 `${engine}-rules-v1`，导致样本恒为 0、过滤器永远不生效）。
-    // 现在改为：任何引擎都先读取状态并做一次基于"全部已平仓订单"的负期望值币种拉黑。
+    // P3 修复：币种黑名单不再依赖引擎分支，任何策略都先做一次「负期望值币种拉黑」。
     const state = context.state ??= this.simulation.read ? await this.simulation.read() : { orders: [] };
     const adaptiveConfig = getAdaptiveConfig(state.adaptiveConfig);
     const adaptiveOverrides = state.adaptiveOverrides || {};
-    // 自适应参数（止盈止损 ATR 等）只信任本地策略自身样本，避免用别的引擎结果调本地参数。
+    // 自适应参数只信任「同一模型 id 的本地策略样本」，避免用别的引擎结果调本地参数。
+    const localModelIds = new Set(enabledStrategies.filter(s => s.engine === 'local').map(s => s.modelId));
     const localHistory = (state.orders || []).filter(order =>
-      order.status === 'closed' && order.analysisContext?.strategyModel === LOCAL_STRATEGY.modelId
+      order.status === 'closed' && localModelIds.has(order.analysisContext?.strategyModel)
     );
-    // 币种黑名单则用全部引擎的已平仓样本：一个币长期亏钱，与它是哪个引擎下单无关。
+    // 币种黑名单则用全部策略的已平仓样本：一个币长期亏钱，与它是哪个策略下单无关。
     const filterHistory = (state.orders || []).filter(order => order.status === 'closed');
 
     const symbolFilter = filterSymbolsByPerformance(symbols, filterHistory, {
@@ -209,42 +238,85 @@ export class GlobalAutomation {
         .map(f => `${f.symbol}(${Number(f.avgNet || 0).toFixed(2)}U/单, 样本${f.count})`).join(', ')}`);
     }
 
-    if (engine === 'local') {
-      const hourCheck = shouldTradeAtCurrentHour(new Date().getUTCHours(), localHistory, {
-        ...adaptiveConfig.hourFilter,
-        enabled: adaptiveConfig.hourFilter.enabled && localHistory.length >= adaptiveConfig.hourFilter.minOrdersToActivate
-      });
-      if (!hourCheck.shouldTrade) {
-        console.log(`[GlobalAutomation] 本地策略跳过本轮扫描：${hourCheck.reason}`);
-        return;
-      }
-    }
-
-    // 超级增强版：预筛选
-    if (engine === 'super') {
-      const preFilter = await this.superAnalysis.preFilter(symbols);
-      symbols = preFilter.filtered;
-      console.log(`[GlobalAutomation] 预筛选: ${preFilter.removed}个币种被过滤`);
-      if (preFilter.reasons) {
-        console.log(`[GlobalAutomation] 过滤原因: 市值${preFilter.reasons.lowMarketCap}, 流动性${preFilter.reasons.lowLiquidity}, 波动${preFilter.reasons.extremeVolatility}`);
-      }
-    }
-
-    let analyzed = 0;
-    let eligible = 0;
-    let submitted = 0;
-    let failed = 0;
-    // P3 可观测性：记录本轮被各道闸门挡掉的数量，用于区分"正常降频"与"门槛过严导致 0 开单"。
-    // 注意 reason 取的是各道 wait() 的首个拦截原因，因此每个币种最多计一次（最靠前的那道闸）。
+    const totals = { analyzed: 0, eligible: 0, submitted: 0, failed: 0 };
+    // P3 可观测性：区分"正常降频"与"门槛过严导致 0 开单"。每币种最多计一次（最靠前的那道闸）。
     const blockedBy = { score: 0, volume: 0, riskReward: 0 };
+
+    for (const strategy of enabledStrategies) {
+      if (!shouldContinue()) break;
+      let candidates = symbols;
+
+      // 策略级候选预筛选（如超级增强的市值 / 流动性过滤）
+      if (strategy.prefilter) {
+        try {
+          const result = await strategy.prefilter(symbols, { deps: this.strategyDeps(), config, state });
+          if (Array.isArray(result?.filtered)) {
+            console.log(`[GlobalAutomation][${strategy.id}] 预筛选: ${symbols.length - result.filtered.length} 个币种被过滤`);
+            if (result.reasons) {
+              console.log(`[GlobalAutomation][${strategy.id}] 过滤原因: 市值${result.reasons.lowMarketCap}, 流动性${result.reasons.lowLiquidity}, 波动${result.reasons.extremeVolatility}`);
+            }
+            candidates = result.filtered;
+          }
+        } catch (error) {
+          console.warn(`[GlobalAutomation][${strategy.id}] 预筛选失败，跳过本轮该策略: ${error.message}`);
+          continue;
+        }
+      }
+
+      // 时段过滤：只对本地规则引擎有意义，且只信任本地策略自己的样本。
+      if (strategy.engine === 'local') {
+        const hourCheck = shouldTradeAtCurrentHour(new Date().getUTCHours(), localHistory, {
+          ...adaptiveConfig.hourFilter,
+          enabled: adaptiveConfig.hourFilter.enabled && localHistory.length >= adaptiveConfig.hourFilter.minOrdersToActivate
+        });
+        if (!hourCheck.shouldTrade) {
+          console.log(`[GlobalAutomation][${strategy.id}] 跳过本轮扫描：${hourCheck.reason}`);
+          continue;
+        }
+      }
+
+      const outcome = await this.scanWithStrategy({
+        strategy, symbols: candidates, preparedMarket, submit, interval, shouldContinue,
+        config, strategyPrompt, runId, state, adaptiveConfig, adaptiveOverrides, localHistory
+      });
+      totals.analyzed += outcome.analyzed;
+      totals.eligible += outcome.eligible;
+      totals.submitted += outcome.submitted;
+      totals.failed += outcome.failed;
+      failures.push(...outcome.failures);
+      signals.push(...outcome.signals);
+      for (const key of Object.keys(blockedBy)) blockedBy[key] += outcome.blockedBy[key];
+    }
+
+    this.stats.totalAnalyzed += totals.analyzed;
+    this.stats.totalOrders += totals.submitted;
+
+    console.log(`[GlobalAutomation] 分析完成: 已分析 ${totals.analyzed}, 合格 ${totals.eligible}, 已下单 ${totals.submitted}, 失败 ${totals.failed}`);
+    // P3 漏斗日志：候选 → 各闸拦截 → 合格 → 下单。用于一眼判断是"降频生效"还是"被过滤光了"。
+    console.log(`[GlobalAutomation][漏斗] 候选${symbols.length}×策略${enabledStrategies.length} 已分析${totals.analyzed} | 评分不足${blockedBy.score} `
+      + `量能不足${blockedBy.volume} 盈亏比不足${blockedBy.riskReward} | 合格${totals.eligible} 下单${totals.submitted}`);
+    if (!requestedSymbols && symbols.length === 0) {
+      console.warn('[GlobalAutomation][告警] 币种过滤后候选为 0 —— 过滤器可能把所有币种都拉黑了，请检查自适应过滤样本！');
+    } else if (!requestedSymbols && totals.analyzed > 0 && totals.eligible === 0) {
+      console.warn(`[GlobalAutomation][告警] 本轮 0 个合格信号 —— 门槛可能过严（候选${symbols.length}/已分析${totals.analyzed}），`
+        + `请核对上面漏斗计数；可在「策略管理」下调对应策略的评分门槛 / 盈亏比门槛。`);
+    }
+    if (requestedSymbols && failures.length) throw new Error(failures.map(item => `${item.symbol}: ${item.error}`).join('; '));
+    return signals;
+  }
+
+  /** 单个策略的扫描循环：逐批（20 币）分析 → 合格即按该策略挂单。 */
+  async scanWithStrategy({ strategy, symbols, preparedMarket, submit, interval, shouldContinue,
+    config, strategyPrompt, runId, state, adaptiveConfig, adaptiveOverrides, localHistory }) {
+    const outcome = { analyzed: 0, eligible: 0, submitted: 0, failed: 0, failures: [], signals: [],
+      blockedBy: { score: 0, volume: 0, riskReward: 0 } };
     const tallyBlock = reason => {
       const text = String(reason || '');
-      if (text.includes('综合信号强度不足')) blockedBy.score++;
-      else if (text.includes('成交量不足')) blockedBy.volume++;
-      else if (text.includes('风险收益比不足')) blockedBy.riskReward++;
+      if (text.includes('综合信号强度不足')) outcome.blockedBy.score++;
+      else if (text.includes('成交量不足')) outcome.blockedBy.volume++;
+      else if (text.includes('风险收益比不足')) outcome.blockedBy.riskReward++;
     };
 
-    // 并行处理，每次处理20个币种（提高并发数）
     const batchSize = 20;
     for (let i = 0; i < symbols.length; i += batchSize) {
       if (!shouldContinue()) break;
@@ -252,194 +324,195 @@ export class GlobalAutomation {
 
       const results = await Promise.all(batch.map(async symbol => {
         try {
-          // 获取主周期K线
           const market = preparedMarket || await this.getFreshMarket(symbol, interval);
+          const analysis = await this.runStrategyAnalysis({
+            strategy, symbol, market, submit, interval, config, strategyPrompt,
+            state, adaptiveConfig, adaptiveOverrides, localHistory
+          });
 
-          // 使用多周期分析作为默认
-          let analysis;
-          if (engine === 'local') {
-            // 并行获取辅助周期数据
-            const auxMarketsPromises = [];
-            const intervals = ['15m', '1h', '4h'];
+          // 让出事件循环（2026-09-10 性能优化）：分析是重 CPU 计算，
+          // 20 个币的批在 Promise.all 里会把事件循环占满数秒，导致 /api/health 都要 2s+。
+          await new Promise(resolve => setImmediate(resolve));
+          if (!analysis) return { symbol, success: true, action: 'WAIT' };
+          outcome.analyzed++;
 
-            for (const interval of intervals) {
-              if (interval === market.interval) continue;
-              auxMarketsPromises.push(
-                this.getFreshMarket(symbol, interval)
-                  .then(m => ({ interval, market: m }))
-                  .catch(err => {
-                    console.warn(`[GlobalAutomation] 获取 ${symbol} ${interval} 失败:`, err.message);
-                    return null;
-                  })
-              );
-            }
-
-            const auxMarketsArray = await Promise.all(auxMarketsPromises);
-            if (!submit && auxMarketsArray.some(item => !item || item.market.partial)) {
-              throw new Error('Auxiliary market data incomplete; retaining pending order');
-            }
-            const auxMarkets = {};
-            for (const item of auxMarketsArray) {
-              if (item) auxMarkets[item.interval] = item.market;
-            }
-
-            // 辅助数据缺失时，多周期分析返回 WAIT。
-            const defaults = {
-              defaultStopLossATR: LOCAL_STRATEGY.stopLossAtr,
-              defaultTakeProfitATR: LOCAL_STRATEGY.takeProfitAtr,
-              defaultMaxHoldBars: LOCAL_STRATEGY.maxHoldBars,
-              minSampleSize: adaptiveConfig.symbolLevelParams.minSampleSize
-            };
-            const calculated = adaptiveConfig.symbolLevelParams.enabled
-              ? getAdaptiveParametersForSymbol(symbol, localHistory, defaults)
-              : { stopLossATR: defaults.defaultStopLossATR, takeProfitATR: defaults.defaultTakeProfitATR,
-                maxHoldBars: defaults.defaultMaxHoldBars, confidence: 0, reason: '币种级自适应参数未启用。' };
-            const adaptiveParams = {
-              ...calculated,
-              ...adaptiveOverrides,
-              confidence: Object.keys(adaptiveOverrides).length ? 1 : calculated.confidence,
-              reason: Object.keys(adaptiveOverrides).length ? '使用手工设定的自适应参数。' : calculated.reason
-            };
-            analysis = localAnalysisMultiTimeframe(market, auxMarkets, adaptiveParams);
-          } else if (engine === 'enhanced') {
-            analysis = enhancedAnalysis(market);
-          } else if (engine === 'super') {
-            analysis = await this.superAnalysis.analyze(market);
-          } else {
-            const result = await analyzeMarkets({ config, strategy, market: [market] });
-            if (result.error) throw new Error(result.error);
-            analysis = result.analyses?.[0];
+          // 策略可给计划补上自己的出场规则（如本地引擎原生不带 exitRules）。
+          if (typeof strategy.decoratePlan === 'function' && analysis.plan) {
+            analysis.plan = strategy.decoratePlan(analysis.plan, { params: strategy.params });
           }
 
-          // 让出事件循环（2026-09-10 性能优化）：enhancedAnalysis 是重 CPU 计算
-          // （MA/RSI/MACD/Ichimoku/DMI/Supertrend/OBV + 评分），20 个币的批在 Promise.all
-          // 里会把事件循环占满数秒，导致 /api/health 都要 2s+、静态文件 5s+。
-          // 每个币算完 setImmediate 一次，让 Express 能插队处理 HTTP 请求。
-          // 纯协作式调度，不改变任何结果，只影响时序。
-          await new Promise(resolve => setImmediate(resolve));
-
-          analyzed++;
-
-          // All engines use the same timing, price and cost validation as manual analysis.
+          // 所有策略共用同一套「时点 / 价格 / 成本」校验（createResearchRecord → normalizePlan）。
           const record = createResearchRecord({
-            config: engine === 'ai' ? config : { ...config, model: { model: engine === 'local' ? LOCAL_STRATEGY.modelId : `${engine}-rules-v1`, baseUrl: 'local://rules' } },
-            strategy, market: [market], result: { analyses: analysis ? [analysis] : [] },
-            type: 'single', scope: { interval, limit: 80, engine }
+            config: strategy.engine === 'ai'
+              ? config
+              : { ...config, model: { model: strategy.modelId, baseUrl: 'local://rules' } },
+            strategy: { ...strategyPrompt, interval },
+            market: [market],
+            result: { analyses: [analysis] },
+            type: 'single',
+            scope: { interval, limit: 80, engine: strategy.engine },
+            strategyId: strategy.id,
+            strategyName: strategy.name,
+            strategyParams: strategy.params
           });
-          Object.assign(record, { id: `auto-${runId}-${symbol}`, analysisEngine: engine, automationRunId: runId });
+          Object.assign(record, {
+            id: `auto-${runId}-${symbol}-${strategy.id}`,
+            analysisEngine: strategy.engine,
+            strategyId: strategy.id,
+            automationRunId: runId
+          });
           for (const signal of record.analyses) {
-            signal.analysisEngine = engine;
-            if (engine !== 'ai') signal.confidenceType = 'rule_strength';
+            signal.analysisEngine = strategy.engine;
+            signal.strategyId = strategy.id;
+            if (strategy.engine !== 'ai') signal.confidenceType = 'rule_strength';
           }
           if (!shouldContinue()) return;
           await this.archive.save(record);
-          analysis = record.analyses[0];
-          signals.push(analysis);
+          const signal = record.analyses[0];
+          outcome.signals.push(signal);
           if (!submit) return { symbol, success: true };
 
-          // P3：统计本轮被哪道闸门挡住（用于漏斗观测，不合格时才有拦截原因）
-          if (!(analysis.eligible && analysis.plan)) tallyBlock(analysis.reason);
+          // P3：统计本轮被哪道闸门挡住（不合格时才有拦截原因）
+          if (!(signal.eligible && signal.plan)) tallyBlock(signal.reason);
 
-          // 如果有合格的开仓建议，自动下单
-          if (analysis.eligible && analysis.plan && ['BUY', 'SELL'].includes(analysis.action)) {
-            eligible++;
-
-            try {
-              // 保存分析记录
-              const recordId = record.id;
-
-              // 同币种风控：已有未平仓订单不重复开仓；
-              // 止损后60分钟内冷却，避免同一趋势里反复止损（历史数据显示
-              // 37%的止损单在60分钟内同币种再次开单，53%订单集中于29个反复亏损币种）。
-              const simState = this.simulation.readLight ? await this.simulation.readLight()
-                : this.simulation.read ? await this.simulation.read() : { orders: [] };
-              const sameSymbol = (simState.orders || []).filter(o => o.symbol === symbol);
-              if (sameSymbol.some(o => o.status === 'pending' || o.status === 'open')) {
-                console.log(`[GlobalAutomation] ${symbol} 已有未平仓订单，跳过重复开仓`);
-                return { symbol, success: true, action: 'SKIP_DUPLICATE' };
-              }
-              const lastStopAt = sameSymbol
-                .filter(o => o.status === 'closed' && o.reason === 'stop_loss' && o.exitAt)
-                .map(o => Date.parse(o.exitAt))
-                .filter(t => Number.isFinite(t))
-                .sort((a, b) => b - a)[0];
-              // 任意平仓后的通用冷却（新增）：止盈/超时/手动平仓后同样不再立刻重进同一标的
-              const lastClosedAt = sameSymbol
-                .filter(o => o.status === 'closed' && o.exitAt)
-                .map(o => Date.parse(o.exitAt))
-                .filter(t => Number.isFinite(t))
-                .sort((a, b) => b - a)[0];
-              if (SYMBOL_COOLDOWN_MIN > 0 && lastClosedAt && Date.now() - lastClosedAt < SYMBOL_COOLDOWN_MIN * 60000) {
-                const waitedMin = ((Date.now() - lastClosedAt) / 60000).toFixed(1);
-                console.log(`[GlobalAutomation] ${symbol} 平仓后冷却期内（已等待 ${waitedMin}/${SYMBOL_COOLDOWN_MIN} 分钟），跳过开仓`);
-                return { symbol, success: true, action: 'SKIP_COOLDOWN' };
-              }
-              if (STOP_COOLDOWN_MIN > 0 && lastStopAt && Date.now() - lastStopAt < STOP_COOLDOWN_MIN * 60000) {
-                console.log(`[GlobalAutomation] ${symbol} 止损后${STOP_COOLDOWN_MIN}分钟冷却期内，跳过开仓`);
-                return { symbol, success: true, action: 'SKIP_COOLDOWN' };
-              }
-
-              // 自动提交模拟订单
-              const leverage = recommendedLeverage(analysis.plan, analysis.action === 'BUY' ? 'OPEN_LONG' : 'OPEN_SHORT');
-              if (!shouldContinue()) return;
-              await this.simulation.submit({
-                recordId,
-                symbol,
-                margin: 100,
-                leverage,
-                automatic: true
-              });
-
-              submitted++;
-              console.log(`[GlobalAutomation] ${symbol} 已提交 ${analysis.action} 订单，杠杆 ${leverage}x`);
-
-              // 显示评分和数据源
-              if (analysis.plan?.trendStrengthScore) {
-                console.log(`[GlobalAutomation] ${symbol} 趋势强度评分：${analysis.plan.trendStrengthScore}/100`);
-              }
-              if (engine === 'super' && analysis.plan?.dataSource) {
-                const sources = [];
-                if (analysis.plan.dataSource.coinGecko) sources.push('CoinGecko');
-                if (analysis.plan.dataSource.fearGreed) sources.push('F&G');
-                if (analysis.plan.dataSource.alphaVantage) sources.push('AlphaV');
-                console.log(`[GlobalAutomation] ${symbol} 数据源: ${sources.join(', ')}`);
-              }
-
-              return { symbol, success: true, action: analysis.action };
-            } catch (error) {
-              failed++;
-              console.error(`[GlobalAutomation] ${symbol} 下单失败:`, error.message);
-              return { symbol, error: error.message };
+          if (signal.eligible && signal.plan && ['BUY', 'SELL'].includes(signal.action)) {
+            outcome.eligible++;
+            const submission = await this.submitSignal({ symbol, signal, recordId: record.id, shouldContinue });
+            if (submission.action === 'SUBMITTED') outcome.submitted++;
+            if (submission.error) {
+              outcome.failed++;
+              outcome.failures.push({ symbol, error: submission.error });
             }
+            return submission;
           }
-
           return { symbol, success: true, action: 'WAIT' };
         } catch (error) {
-          failed++;
+          outcome.failed++;
           return { symbol, error: error.message };
         }
       }));
-      failures.push(...results.filter(result => result?.error));
+      outcome.failures.push(...results.filter(result => result?.error && !result.failures));
 
       // 避免请求过快
       await new Promise(resolve => setImmediate(resolve));
     }
+    return outcome;
+  }
 
-    this.stats.totalAnalyzed += analyzed;
-    this.stats.totalOrders += submitted;
+  /**
+   * 用某个策略分析单个币种。
+   * 辅助周期（auxMarkets）与币种级自适应参数按需准备，只有该策略真正需要时才拉取。
+   */
+  async runStrategyAnalysis({ strategy, symbol, market, submit, interval, config, strategyPrompt,
+    state, adaptiveConfig, adaptiveOverrides, localHistory }) {
+    const ctx = {
+      params: strategy.params,
+      config,
+      strategyPrompt,
+      interval,
+      state,
+      deps: this.strategyDeps()
+    };
 
-    console.log(`[GlobalAutomation] 分析完成: 已分析 ${analyzed}, 合格 ${eligible}, 已下单 ${submitted}, 失败 ${failed}`);
-    // P3 漏斗日志：候选 → 各闸拦截 → 合格 → 下单。用于一眼判断是"降频生效"还是"被过滤光了"。
-    console.log(`[GlobalAutomation][漏斗] 候选${symbols.length} 已分析${analyzed} | 评分不足${blockedBy.score} `
-      + `量能不足${blockedBy.volume} 盈亏比不足${blockedBy.riskReward} | 合格${eligible} 下单${submitted}`);
-    if (!requestedSymbols && symbols.length === 0) {
-      console.warn('[GlobalAutomation][告警] 币种过滤后候选为 0 —— 过滤器可能把所有币种都拉黑了，请检查自适应过滤样本！');
-    } else if (!requestedSymbols && analyzed > 0 && eligible === 0) {
-      console.warn(`[GlobalAutomation][告警] 本轮 0 个合格信号 —— 门槛可能过严（候选${symbols.length}/已分析${analyzed}），`
-        + `请核对上面漏斗计数；可临时下调 NOFX_MIN_TREND_SCORE / NOFX_MIN_RR 恢复出单。`);
+    if (strategy.needsAux?.length) {
+      const auxMarkets = {};
+      let incomplete = false;
+      for (const auxInterval of strategy.needsAux) {
+        if (auxInterval === market.interval) continue;
+        try {
+          const aux = await this.getFreshMarket(symbol, auxInterval);
+          if (!aux || aux.partial) incomplete = true;
+          if (aux) auxMarkets[auxInterval] = aux;
+        } catch (error) {
+          incomplete = true;
+          console.warn(`[GlobalAutomation] 获取 ${symbol} ${auxInterval} 失败:`, error.message);
+        }
+      }
+      // 复核挂单时（submit=false）辅助数据不完整就保持原挂单，不用残缺数据改判方向。
+      if (!submit && incomplete) throw new Error('Auxiliary market data incomplete; retaining pending order');
+      ctx.auxMarkets = auxMarkets;
     }
-    if (requestedSymbols && failures.length) throw new Error(failures.map(item => `${item.symbol}: ${item.error}`).join('; '));
-    return signals;
+
+    if (strategy.engine === 'local') {
+      const defaults = {
+        defaultStopLossATR: LOCAL_STRATEGY.stopLossAtr,
+        defaultTakeProfitATR: LOCAL_STRATEGY.takeProfitAtr,
+        defaultMaxHoldBars: LOCAL_STRATEGY.maxHoldBars,
+        minSampleSize: adaptiveConfig.symbolLevelParams.minSampleSize
+      };
+      const calculated = adaptiveConfig.symbolLevelParams.enabled
+        ? getAdaptiveParametersForSymbol(symbol, localHistory, defaults)
+        : { stopLossATR: defaults.defaultStopLossATR, takeProfitATR: defaults.defaultTakeProfitATR,
+          maxHoldBars: defaults.defaultMaxHoldBars, confidence: 0, reason: '币种级自适应参数未启用。' };
+      ctx.adaptiveParams = {
+        ...calculated,
+        ...adaptiveOverrides,
+        confidence: Object.keys(adaptiveOverrides).length ? 1 : calculated.confidence,
+        reason: Object.keys(adaptiveOverrides).length ? '使用手工设定的自适应参数。' : calculated.reason
+      };
+    }
+
+    const analysis = await strategy.analyze(market, ctx);
+    return analysis || null;
+  }
+
+  /**
+   * 风控闸门 + 按策略落单。
+   * 同币种未平仓不重复开仓；止损后 / 任意平仓后的冷却期同样拦截。
+   */
+  async submitSignal({ symbol, signal, recordId, shouldContinue }) {
+    try {
+      const simState = this.simulation.readLight ? await this.simulation.readLight()
+        : this.simulation.read ? await this.simulation.read() : { orders: [] };
+      const sameSymbol = (simState.orders || []).filter(o => o.symbol === symbol);
+      if (sameSymbol.some(o => o.status === 'pending' || o.status === 'open')) {
+        console.log(`[GlobalAutomation] ${symbol} 已有未平仓订单，跳过重复开仓`);
+        return { symbol, success: true, action: 'SKIP_DUPLICATE' };
+      }
+      // 止损类（含移动止损 / 保本止损）单独记一个更长的冷却。
+      // 此前只认 `stop_loss` 字面量，细分后移动止损会被漏掉，导致冷却失效。
+      const lastStopAt = sameSymbol
+        .filter(o => o.status === 'closed' && isStopReason(o.reason) && o.exitAt)
+        .map(o => Date.parse(o.exitAt))
+        .filter(t => Number.isFinite(t))
+        .sort((a, b) => b - a)[0];
+      // 任意平仓后的通用冷却：止盈/超时/手动平仓后同样不再立刻重进同一标的
+      const lastClosedAt = sameSymbol
+        .filter(o => o.status === 'closed' && o.exitAt)
+        .map(o => Date.parse(o.exitAt))
+        .filter(t => Number.isFinite(t))
+        .sort((a, b) => b - a)[0];
+      if (SYMBOL_COOLDOWN_MIN > 0 && lastClosedAt && Date.now() - lastClosedAt < SYMBOL_COOLDOWN_MIN * 60000) {
+        const waitedMin = ((Date.now() - lastClosedAt) / 60000).toFixed(1);
+        console.log(`[GlobalAutomation] ${symbol} 平仓后冷却期内（已等待 ${waitedMin}/${SYMBOL_COOLDOWN_MIN} 分钟），跳过开仓`);
+        return { symbol, success: true, action: 'SKIP_COOLDOWN' };
+      }
+      if (STOP_COOLDOWN_MIN > 0 && lastStopAt && Date.now() - lastStopAt < STOP_COOLDOWN_MIN * 60000) {
+        console.log(`[GlobalAutomation] ${symbol} 止损后${STOP_COOLDOWN_MIN}分钟冷却期内，跳过开仓`);
+        return { symbol, success: true, action: 'SKIP_COOLDOWN' };
+      }
+
+      // 自动提交模拟订单（带 strategyId，订单从此知道自己属于哪个策略）
+      const leverage = recommendedLeverage(signal.plan, signal.action === 'BUY' ? 'OPEN_LONG' : 'OPEN_SHORT');
+      if (!shouldContinue()) return { symbol, success: true, action: 'ABORTED' };
+      await this.simulation.submit({
+        recordId,
+        symbol,
+        margin: 100,
+        leverage,
+        automatic: true,
+        strategyId: signal.strategyId
+      });
+
+      console.log(`[GlobalAutomation][${signal.strategyId || 'strategy'}] ${symbol} 已提交 ${signal.action} 订单，杠杆 ${leverage}x`);
+      if (signal.plan?.trendStrengthScore) {
+        console.log(`[GlobalAutomation] ${symbol} 趋势强度评分：${signal.plan.trendStrengthScore}/100`);
+      }
+      return { symbol, success: true, action: 'SUBMITTED', strategyId: signal.strategyId };
+    } catch (error) {
+      console.error(`[GlobalAutomation] ${symbol} 下单失败:`, error.message);
+      return { symbol, error: error.message };
+    }
   }
 
   /**
@@ -459,7 +532,12 @@ export class GlobalAutomation {
     console.log(`[GlobalAutomation] 开始复核 ${openOrders.length} 个持仓...`);
 
     const config = await this.store.getConfig();
-    const engine = selectAnalysisEngine(config);
+    // 多策略：本轮把所有启用策略读一次，之后按「每个订单自己所属的策略」分派复核。
+    const strategies = await this.strategies.enabled(config);
+    if (!strategies.length) {
+      console.warn('[GlobalAutomation] ⚠️ 未启用任何策略，跳过本轮持仓复核。');
+      return;
+    }
 
     let reviewed = 0;
     const context = { config };
@@ -487,8 +565,10 @@ export class GlobalAutomation {
         if (!markets.has(key)) markets.set(key, await this.getFreshMarket(order.symbol, order.interval));
         const market = markets.get(key);
         if (!shouldContinue()) break;
+        // 该订单所属策略（订单落库时固化的 strategyId；老订单回退默认策略）。
+        const orderStrategy = this.strategies.resolveForOrder(order, strategies, config);
         if (order.status === 'pending') {
-          await this.reviewPendingOrder(order, market, shouldContinue, context);
+          await this.reviewPendingOrder(order, market, shouldContinue, context, orderStrategy);
           reviewed++;
           continue;
         }
@@ -499,31 +579,19 @@ export class GlobalAutomation {
           continue;
         }
 
-        // 生成复核建议
-        let proposal;
-        if (engine === 'local') {
-          proposal = localProtectionReview(order, market);
-        } else if (engine === 'enhanced') {
-          proposal = enhancedProtectionReview(order, market);
-        } else if (engine === 'super') {
-          proposal = await this.superAnalysis.reviewPosition(order, market);
-        } else {
-          const strategy = await this.store.getStrategy();
-          proposal = await reviewPosition({
-            config,
-            strategy: { ...strategy, interval: order.interval },
-            market,
-            position: {
-              symbol: order.symbol,
-              positionAmt: order.quantity * (order.direction === 'OPEN_LONG' ? 1 : -1),
-              entryPrice: order.entry,
-              markPrice: market.klines.at(-1).close,
-              stopLoss: order.plan.stopLoss,
-              takeProfit: order.plan.takeProfit,
-              simulated: true
-            }
-          });
+        // 生成复核建议 —— 调用**该订单所属策略**的复核实现，保证出场语义与下单时一致。
+        // 智能退出 / 移动止损 / 分批止盈的阈值都从 order.plan.exitRules 读（策略级快照）。
+        if (!orderStrategy) {
+          console.warn(`[GlobalAutomation] ${order.symbol} 找不到所属策略，跳过复核。`);
+          continue;
         }
+        if (orderStrategy.engine === 'ai') context.strategyPrompt ??= await this.store.getStrategy();
+        const proposal = await orderStrategy.review(order, market, {
+          config,
+          strategyPrompt: context.strategyPrompt,
+          interval: order.interval,
+          deps: this.strategyDeps()
+        });
 
         // ── 智能退出：真正执行平仓 ──────────────────────────────────────────
         // 此前 `proposal.action === 'CLOSE'` 只往 reviewHistory 记一条 close_suggested 就 return，
@@ -532,25 +600,31 @@ export class GlobalAutomation {
         // ⚠️ 行为变更：CLOSE 建议一旦命中，立即按最新标记价市价平仓，不再等待人工确认。
         if (!shouldContinue()) break;
         if (proposal.action === 'CLOSE') {
+          // 平仓理由：优先用复核层给的机器码（smart_exit_ma / rsi / macd）。
+          // 此前这里一律记 `manual`，26 笔智能退出在统计里全成了「手动平仓」，
+          // 完全看不出「趋势证伪 / 力竭了结」各占多少。
+          const closeReason = proposal.closeReason || normalizeCloseReason(proposal.reason);
           await this.simulation.mutateLight(state => {
             if (!shouldContinue()) return;
             const current = state.orders.find(o => o.id === order.id);
             if (!current || current.status !== 'open') return;
             current.reviewHistory = [...(current.reviewHistory || []), {
               at: new Date().toISOString(),
-              engine,
+              engine: orderStrategy.engine,
+              strategyId: orderStrategy.id,
               action: 'smart_exit',
               reason: proposal.reason,
+              closeReason,
               confidence: proposal.confidence,
               sentiment: proposal.sentiment
             }].slice(-50);
           });
 
-          // 真正的平仓动作：刷新行情后按 markPrice 以 manual 原因结算（与 /api/paper/orders/:id/close 同一原语）
+          // 真正的平仓动作：刷新行情后按 markPrice 以该理由结算（与 /api/paper/orders/:id/close 同一原语）
           if (!shouldContinue()) break;
-          await this.simulation.close(order.id, { refresh: false });
+          await this.simulation.close(order.id, { refresh: false, reason: closeReason });
           closed++;
-          console.log(`[GlobalAutomation] ${order.symbol} 智能退出平仓：${proposal.reason}`);
+          console.log(`[GlobalAutomation][${orderStrategy.id}] ${order.symbol} 智能退出平仓：${closeReason} — ${proposal.reason}`);
           reviewed++;
           continue;
         }
@@ -561,16 +635,16 @@ export class GlobalAutomation {
           const current = state.orders.find(o => o.id === order.id);
           if (!current || current.status !== 'open') return;
 
-          const report = applyPaperProtectionReview(current, proposal, Date.now(), engine);
+          const report = applyPaperProtectionReview(current, proposal, Date.now(), orderStrategy.engine);
           if (report.action === 'updated') {
             updated++;
-            console.log(`[GlobalAutomation] ${order.symbol} 止盈止损已更新`);
+            console.log(`[GlobalAutomation][${orderStrategy.id}] ${order.symbol} 止盈止损已更新`);
 
             // 如果是增强版或超级增强版，显示额外信息
-            if ((engine === 'enhanced' || engine === 'super') && proposal.profitPercent !== undefined) {
+            if ((orderStrategy.engine === 'enhanced' || orderStrategy.engine === 'super') && proposal.profitPercent !== undefined) {
               console.log(`[GlobalAutomation] ${order.symbol} 当前盈亏：${proposal.profitPercent.toFixed(2)}%`);
             }
-            if (engine === 'super' && proposal.sentiment) {
+            if (orderStrategy.engine === 'super' && proposal.sentiment) {
               console.log(`[GlobalAutomation] ${order.symbol} 市场情绪：${proposal.sentiment.classification}`);
             }
           } else {
@@ -600,10 +674,24 @@ export class GlobalAutomation {
    * 若交易所也提供不了足够多的已收盘K线（如新上币种），
    * 则降级返回已有的部分数据（partial: true），不再抛错。
    */
-  async reviewPendingOrder(order, market, shouldContinue = () => true, context = {}) {
+  /**
+   * 复核挂单：用**该挂单所属策略**重新分析，再走 pendingReview 规则决定保留 / 取消。
+   * 只跑该订单的策略，避免被其它策略的信号误判方向。
+   */
+  async reviewPendingOrder(order, market, shouldContinue = () => true, context = {}, strategy = null) {
     if (market.partial) return;
-    const signals = await this.runAnalysis({ symbols: [order.symbol], preparedMarket: market,
-      interval: order.interval, submit: false, shouldContinue, context });
+    const orderStrategy = strategy || this.strategies.resolveForOrder(order, [], context.config || {});
+    if (!orderStrategy) return;
+    const signals = await this.runAnalysis({
+      symbols: [order.symbol],
+      preparedMarket: market,
+      interval: order.interval,
+      submit: false,
+      shouldContinue,
+      // 用独立的 context 承载缓存，避免显式传入的 strategies 被上一轮的缓存覆盖
+      context: { config: context.config, state: context.state, strategyPrompt: context.strategyPrompt },
+      strategies: [orderStrategy]
+    });
     if (!shouldContinue()) return;
     return this.simulation.mutateLight(state => {
       if (!shouldContinue()) return;

@@ -12,7 +12,7 @@
  */
 
 import { candleOpenAt, nextOpenTime } from '../research.js';
-import { TRAILING_RULE, computeTrailStop, planRiskUnit, profitRFrom, reachedR } from './strategyGuards.js';
+import { exitRulesFor, computeTrailStop, planRiskUnit, profitRFrom, reachedR } from './strategyGuards.js';
 
 /**
  * 最近 N 根 K 线的平均真实波幅（ATR，Wilder 的 TR 简化平均）。
@@ -35,24 +35,32 @@ export function averageTrueRange(rows, period = 14) {
 }
 
 /**
- * 本地规则复核持仓：浮盈达到共享触发线（TRAILING_RULE.triggerR）才动保护价，
+ * 本地规则复核持仓：浮盈达到该订单所属策略的触发线（trailingRule.triggerR）才动保护价，
  * 避免把止损棘轮式推向现价、被 1m 噪声扫出。
  *
  * 2026-09-10 修正（Task #6 口径统一）：
  *   旧实现在这里硬编码「已盈利超过 2%」才动保护；而 enhanced 引擎用的是 0.4R。
  *   两者在 1m 上完全不是一回事（R≈0.8% → 0.4R≈0.32%，2%≈2.5R），
  *   于是「本地引擎的订单几乎从不启动移动止损、enhanced 的很早就启动」，
- *   两个引擎的保护行为长期分裂。现统一引用 TRAILING_RULE 的 R 口径触发线
- *   与 R 口径渐进阶梯，与 enhancedProtectionReview 完全同源。
+ *   两个引擎的保护行为长期分裂。现统一引用 R 口径触发线与 R 口径渐进阶梯。
+ *
+ * 多策略化（2026-09）：触发线 / 阶梯 / 扩盈距离不再直接读全局 TRAILING_RULE，
+ *   而是读**该订单所属策略**快照在 `order.plan.exitRules.trailing` 的规则；
+ *   旧订单无快照时 exitRulesFor 自动回退全局默认值，行为与改造前完全一致。
  *
  * @param {object} order   模拟订单（需 direction / entry / plan.stopLoss / plan.takeProfit）
  * @param {object} market  行情（需 klines）
+ * @param {object} [trailingRule] 策略级移动止损规则（订单所属策略的快照）。
+ *        不传则从 `order.plan.exitRules` 取；旧订单无快照时自动回退全局 TRAILING_RULE。
  * @returns {{action:'HOLD'|'UPDATE_PROTECTION', reason:string, stopLoss?:number, takeProfit?:number, confidence?:number}}
  */
-export function localProtectionReview(order, market) {
+export function localProtectionReview(order, market, trailingRule) {
   const rows = market.klines;
   const price = rows.at(-1).close;
   const atr = averageTrueRange(rows, 14);
+
+  // 订单所属策略的移动止损规则 —— 多策略并存时每单按自己策略的阶梯推进。
+  const rule = trailingRule || exitRulesFor(order?.plan).trailing;
 
   if (!(atr > 0)) return { action: 'HOLD', reason: '波动率无效，保留当前保护价格。' };
 
@@ -63,12 +71,12 @@ export function localProtectionReview(order, market) {
   const profitLabel = Number.isFinite(profitR) ? `${profitR.toFixed(2)}R` : 'R未知';
 
   // 双通道触发（与 enhanced 一致）：R 通道为主，百分比通道兜底极小 R 的情形。
-  const triggered = reachedR(profitR, TRAILING_RULE.triggerR)
-    || profit > TRAILING_RULE.profitTriggerPct;
+  const triggered = reachedR(profitR, rule.triggerR)
+    || profit > rule.profitTriggerPct;
   if (!triggered) {
     return {
       action: 'HOLD',
-      reason: `浮盈 ${profitLabel} 未达保护触发线（${TRAILING_RULE.triggerR}R / ${(TRAILING_RULE.profitTriggerPct * 100).toFixed(1)}%），保持初始保护价格，避免噪声止损。`
+      reason: `浮盈 ${profitLabel} 未达保护触发线（${rule.triggerR}R / ${(rule.profitTriggerPct * 100).toFixed(1)}%），保持初始保护价格，避免噪声止损。`
     };
   }
 
@@ -81,17 +89,18 @@ export function localProtectionReview(order, market) {
     riskUnit,
     profitR: Number.isFinite(profitR) ? profitR : 0,
     baseStop,
-    costs: order.costs
+    costs: order.costs,
+    rule
   });
 
   if (!Number.isFinite(trail.stop) || trail.reversed) {
     return { action: 'HOLD', reason: '保护计算异常（止损越过现价），保留当前保护价格。' };
   }
 
-  // 顺势扩盈距离：与 enhancedAnalysis 的 TRAIL_TP_ATR 取同一常量（extendTpAtr），只放宽不收窄。
+  // 顺势扩盈距离：与 enhancedAnalysis 的 TRAIL_TP_ATR 同源（rule.extendTpAtr），只放宽不收窄。
   const takeProfit = long
-    ? Math.max(Number(order.plan?.takeProfit) || 0, price + TRAILING_RULE.extendTpAtr * atr)
-    : Math.min(Number(order.plan?.takeProfit) || Infinity, price - TRAILING_RULE.extendTpAtr * atr);
+    ? Math.max(Number(order.plan?.takeProfit) || 0, price + rule.extendTpAtr * atr)
+    : Math.min(Number(order.plan?.takeProfit) || Infinity, price - rule.extendTpAtr * atr);
 
   const tightened = long ? trail.stop > baseStop : trail.stop < baseStop;
   if (!tightened) {

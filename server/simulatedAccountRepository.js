@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from 'node:util';
+import { queryDailyTrend } from './dailyTrend.js';
 
 // Every business field below is a real SQL column. Array members are child rows.
 // The two extension tables preserve null/empty containers and uncommon extra
@@ -253,6 +254,11 @@ async function insertRows(client, def, rows) {
 
 export class SimulatedAccountRepository {
   constructor(pool) { this.pool = pool; }
+  /**
+   * 每日趋势：单条 SQL 聚合出日级 14 项 + 汇总 8 项指标（见 dailyTrend.js）。
+   * 只读、不加载订单明细，代价与订单总量近乎无关。
+   */
+  async dailyTrend() { return queryDailyTrend(this.pool); }
   async init() {
     const result = await this.pool.query("SELECT to_regclass('simulated_accounts') AS accounts, to_regclass('simulated_account') AS legacy");
     if (!result.rows[0].accounts) {

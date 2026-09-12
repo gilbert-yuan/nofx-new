@@ -9,3 +9,9 @@ npm-debug.log*
 .workbuddy/
 # 根目录游离的服务运行日志
 /server*.log
+logs/
+scripts/
+output/
+.claude/
+.codegraph/
+.playwright-cli/

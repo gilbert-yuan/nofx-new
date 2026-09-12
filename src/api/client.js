@@ -27,6 +27,19 @@ export const strategyApi = {
   put: (body) => api(API.strategy.put, { method: 'PUT', body })
 };
 
+/** 策略管理（多策略体系）：启用勾选 + 参数覆盖 + 恢复默认 */
+export const strategiesApi = {
+  list: () => api(API.strategies.base),
+  detail: (id) => api(`${API.strategies.base}/${encodeURIComponent(id)}`),
+  update: (id, body) => api(`${API.strategies.base}/${encodeURIComponent(id)}`, { method: 'PUT', body }),
+  reset: (id) => api(`${API.strategies.base}/${encodeURIComponent(id)}/reset`, { method: 'POST' })
+};
+
+/** 模拟账户：每日趋势（服务端单条 SQL 聚合；refresh=true 走 POST 强制刷新） */
+export const paperApi = {
+  dailyTrend: (refresh = false) => api(API.paper.dailyTrend, refresh ? { method: 'POST' } : {})
+};
+
 export const binanceApi = {
   status: () => api(API.binance.status),
   test: () => api(API.binance.test, { method: 'POST' }),

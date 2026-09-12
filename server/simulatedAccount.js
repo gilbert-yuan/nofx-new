@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { candleOpenAt, nextOpenTime, validCandle, PAPER_COSTS } from './research.js';
 import { recommendedLeverage } from './localAnalysis.js';
 import { RISK_RULE } from './shared/strategyGuards.js';
+import { normalizeCloseReason, isStopReason, isTakeProfitReason } from '../shared/closeReasons.js';
 import { createAccountSimulator } from './tradingSimulator.js';
 import { analyzeClosedOrders, generateStrategyAdjustments } from './strategyOptimizer.js';
 import { SimulatedAccountRepository } from './simulatedAccountRepository.js';
@@ -52,10 +53,16 @@ export function submitPaperOrder(state, record, input, now = Date.now()) {
   if (!state.unlimitedCapital && margin + notional * PAPER_COSTS.feeBps / 10000 > accountSummary(state).available) fail('模拟可用余额不足。');
 
   // 保存完整的分析上下文，用于后续策略优化
+  // ⚠️ 多策略关键字段：strategyId 决定「这笔订单后续用哪个策略做持仓复核 / 出场判定」，
+  //    因此必须在**下单那一刻**固化，不能依赖运行时全局配置（配置改了也不会串味）。
+  const strategyId = input.strategyId || record.strategyId || signal.strategyId || null;
   const analysisContext = {
     signal: { ...signal }, // 完整的分析信号
-    strategyVersion: record.strategyVersion, // 策略版本哈希
+    strategyVersion: record.strategyVersion, // 策略版本哈希（含策略参数，见 research.js 快照）
     strategyModel: record.snapshot?.model || null,
+    strategyId, // 所属策略 id
+    strategyName: record.strategyName || record.snapshot?.strategyName || null,
+    strategyParams: record.strategyParams || record.snapshot?.strategyParams || null,
     analysisEngine: record.analysisEngine || signal.analysisEngine, // 分析引擎类型
     scope: record.scope, // 分析参数（limit, interval等）
     confidence: signal.confidence,
@@ -78,6 +85,8 @@ export function submitPaperOrder(state, record, input, now = Date.now()) {
 
 export function settlePaperOrder(order, price, reason, time, ambiguousBar = false) {
   const direction = order.direction === 'OPEN_LONG' ? 1 : -1;
+  // 落库统一为稳定机器码（便于统计）；中文长句归一到对应 code，未知兜底 manual
+  const closeReason = normalizeCloseReason(reason);
   const exit = price * (1 - direction * order.costs.slippageBps / 10000);
   const quantity = order.quantity;
 
@@ -103,7 +112,9 @@ export function settlePaperOrder(order, price, reason, time, ambiguousBar = fals
   const rawNet = (gross - entryFee - exitFee - funding) + prior.net;
   // Isolated simulated collateral: never debit more than reserved margin + entry fee.
   const net = Math.max(-order.margin - order.entryFee, rawNet);
-  Object.assign(order, { status: 'closed', exit, exitAt: new Date(time).toISOString(), reason,
+  Object.assign(order, { status: 'closed', exit, exitAt: new Date(time).toISOString(), reason: closeReason,
+    // 保留人工可读的原始说明（智能退出的中文详情），统计用 reason、审计用 detail
+    reasonDetail: typeof reason === 'string' && reason !== closeReason ? reason : '',
     gross: gross + prior.gross,
     fees: entryFee + exitFee + prior.fee,
     funding: funding + prior.funding,
@@ -205,6 +216,8 @@ export class SimulatedAccount {
     return { ...accountSummary(state), orders: state.orders, busy: this.busy, lastRunAt: this.lastRunAt, error: this.lastError };
   }
   async getOrder(id) { return (await this.repository.read({ orderId: id })).orders[0]; }
+  /** 每日趋势：纯 SQL 聚合，不把订单读进内存（见 server/dailyTrend.js） */
+  async dailyTrend() { return this.repository.dailyTrend(); }
   // 开仓只新增一个订单，不依赖历史订单明细
   async submit(input) { const record = await this.archive.get(String(input.recordId || '')); return this.mutateLight(state => submitPaperOrder(state, record, input)); }
   async refresh(options = {}) {
@@ -258,16 +271,22 @@ export class SimulatedAccount {
     return this.status();
   }
 
-  async close(id, { refresh = true } = {}) {
+  async close(id, { refresh = true, reason = 'manual' } = {}) {
     if (refresh) await this.refresh();
+    const closeReason = normalizeCloseReason(reason);
     // 只操作单个目标订单，不需要历史订单明细
     return this.mutateLight(state => {
       const order = state.orders.find(o => o.id === id);
       if (!order) fail('模拟订单不存在。');
-      if (order.status === 'pending') { order.status = 'cancelled'; return order; }
+      // 挂单未成交 → 撤销（此前不写 reason，统计里表现为「无理由消失」）
+      if (order.status === 'pending') {
+        order.status = 'cancelled';
+        order.reason = 'strategy_cancelled';
+        return order;
+      }
       if (order.status !== 'open') return order;
       if (order.error || Date.parse(order.markAt) !== candleOpenAt(Date.now(), order.interval)) fail('行情未更新，不能用过期价格模拟平仓，请先刷新。');
-      settlePaperOrder(order, order.markPrice, 'manual', Date.now());
+      settlePaperOrder(order, order.markPrice, closeReason, Date.now());
       return order;
     });
   }
@@ -317,9 +336,13 @@ export function registerSimulationRoutes(app, simulation) {
   };
   // statistics：fresh 60s / stale 600s
   const statisticsCache = { at: 0, value: undefined, pending: null };
+  // 每日趋势：纯 SQL 聚合（毫秒级），但仍做 30s 新鲜 / 300s 陈旧的后台刷新缓存，
+  // 避免首屏与页面切换重复打库。写操作主动失效，保证下单/平仓后立刻可见。
+  const dailyTrendHandler = memo(() => simulation.dailyTrend(), 30000, 300000);
   const invalidateReadCaches = () => {
     for (const h of accountHandlers.values()) h.invalidate();
     statisticsCache.at = 0; statisticsCache.value = undefined;
+    dailyTrendHandler.invalidate();
   };
 
   app.get('/api/paper/account', route(accountHandler));
@@ -373,6 +396,14 @@ export function registerSimulationRoutes(app, simulation) {
       try { statisticsCache.value = await computeStatistics(simulation); statisticsCache.at = Date.now(); return statisticsCache.value; }
       finally { statisticsCache.pending = null; }
     })();
+  }));
+
+  // 每日趋势（单条 SQL 聚合，多指标一次算出）。
+  // GET 走 stale-while-revalidate 缓存；POST 为「刷新」按钮：先失效再强制取最新。
+  app.get('/api/paper/daily-trend', route(dailyTrendHandler));
+  app.post('/api/paper/daily-trend', route(async () => {
+    dailyTrendHandler.invalidate();
+    return dailyTrendHandler({});
   }));
 
   // 统计计算抽离（供上面的缓存与未来的预计算复用）
@@ -523,9 +554,10 @@ export function registerSimulationRoutes(app, simulation) {
       // direction: OPEN_LONG / OPEN_SHORT / 其它
       if (order.direction === 'OPEN_LONG') bucket.longCount++;
       else if (order.direction === 'OPEN_SHORT') bucket.shortCount++;
-      // reason: stop_loss / take_profit / timeout / liquidation 等
-      if (order.reason === 'stop_loss') bucket.stoppedCount++;
-      else if (order.reason === 'take_profit') bucket.takeProfitCount++;
+      // reason: 平仓理由机器码（见 server/shared/closeReasons.js）
+      // 止损/止盈按「类」统计：移动止损、保本止损同属止损，分批止盈同属止盈
+      if (isStopReason(order.reason)) bucket.stoppedCount++;
+      else if (isTakeProfitReason(order.reason)) bucket.takeProfitCount++;
     }
 
     // 计算衍生字段 + 倒序（最近的在最前，方便前端展示）

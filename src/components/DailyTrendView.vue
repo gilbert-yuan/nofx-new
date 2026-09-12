@@ -2,7 +2,9 @@
 /**
  * DailyTrendView · 每日趋势
  *
- * 数据源：/api/paper/statistics → byDay（按 exitAt UTC+8 日期分桶）
+ * 数据源：GET/POST /api/paper/daily-trend → byDay（按 exitAt UTC+8 日期分桶）
+ *   —— 服务端用**单条 SQL** 一次聚合出日级 14 项 + 汇总 8 项指标（server/dailyTrend.js），
+ *      不再把全部已平仓订单拉进 Node 内存跑多遍 O(N) 统计。
  * 闭环：老板在「交易模拟」+ 历史分析里看出"今天某币种大亏"时，可以跳到本页
  *      倒查到当日是哪些信号源（symbol / engine / strategy）拖低了全天净收益。
  *
@@ -20,12 +22,16 @@
  * 零依赖：纯 Vue 3 + SVG，不引入 chart 库（保持和项目风格一致）。
  */
 import { ref, computed, onMounted, watch } from 'vue';
-import { api } from '../api.js';
+import { paperApi } from '../api/client.js';
+import { closeReasonLabel, closeReasonGroup } from '../../shared/closeReasons.js';
 
 const busy = ref(false);
 const error = ref('');
 const summary = ref(null);
 const byDay = ref([]);
+const byReason = ref([]);
+const generatedAt = ref('');
+const dataSource = ref('');
 
 // 展示行：倒序 + 累计衍生
 const rows = computed(() => {
@@ -56,9 +62,12 @@ async function load(refresh = false) {
   busy.value = true;
   error.value = '';
   try {
-    const data = await api('/paper/statistics', refresh ? { method: 'POST' } : {});
+    const data = await paperApi.dailyTrend(refresh);
     summary.value = data.summary || null;
     byDay.value = data.byDay || [];
+    byReason.value = data.byReason || [];
+    dataSource.value = data.source || '';
+    generatedAt.value = data.generatedAt ? new Date(data.generatedAt).toLocaleTimeString('zh-CN') : '';
   } catch (err) {
     error.value = err.message;
   } finally {
@@ -135,7 +144,12 @@ const axisTicks = computed(() => {
 
 function fmt(v) { return v === null || v === undefined ? '—' : Number(v).toFixed(2); }
 function pct(v) { return v === null || v === undefined ? '—' : (v * 100).toFixed(1) + '%'; }
-function reason(s) { return ({ stop_loss: '止损', take_profit: '止盈', timeout: '到期', liquidation: '爆仓' })[s] || s || '—'; }
+// 平仓理由标签与后端同一份字典（shared/closeReasons.js）
+function reason(s) { return closeReasonLabel(s) || s || '—'; }
+
+// 某理由占总平仓单数的比例
+const reasonTotal = computed(() => byReason.value.reduce((s, r) => s + (r.count || 0), 0));
+function reasonShare(r) { return reasonTotal.value ? (r.count || 0) / reasonTotal.value : 0; }
 
 onMounted(() => load());
 </script>
@@ -149,7 +163,10 @@ onMounted(() => load());
         <p>按出场日期统计每天的单数、净收益、胜率、毛收益和手续费——点开某天即可看到当日全部订单。</p>
       </div>
       <div class="history-filter">
-        <button class="ghost" :disabled="busy" @click="load()">{{ busy ? '加载中…' : '刷新' }}</button>
+        <span v-if="dataSource === 'sql'" class="daily-trend-source" title="服务端单条 SQL 一次聚合出全部日级指标">
+          SQL 聚合 · 单条查询{{ generatedAt ? ` · ${generatedAt}` : '' }}
+        </span>
+        <button class="ghost" :disabled="busy" @click="load(true)">{{ busy ? '加载中…' : '刷新' }}</button>
       </div>
     </div>
 
@@ -312,6 +329,45 @@ onMounted(() => load());
           </tr>
           <tr v-if="rows.desc.length === 0">
             <td colspan="10" class="muted">暂无数据</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- 平仓理由统计（同一条 SQL 顺带聚合，不额外请求） -->
+    <h2 class="performance-subtitle">平仓理由统计</h2>
+    <p class="muted" style="margin: -6px 0 10px;">
+      每种平仓理由各占多少单、胜率和净盈亏——判断「策略是被止损磨死的，还是根本走不到止盈」。
+    </p>
+    <div class="performance-table">
+      <table>
+        <thead>
+          <tr>
+            <th>平仓理由</th>
+            <th>单数</th>
+            <th>占比</th>
+            <th>胜率</th>
+            <th>平均收益</th>
+            <th>平均盈利</th>
+            <th>净盈亏</th>
+            <th>手续费</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="r in byReason" :key="r.reason">
+            <td>
+              <span class="close-reason" :data-group="closeReasonGroup(r.reason)">{{ reason(r.reason) }}</span>
+            </td>
+            <td>{{ r.count }}</td>
+            <td>{{ pct(reasonShare(r)) }}</td>
+            <td :class="r.winRate >= 0.5 ? 'profit' : 'loss'">{{ pct(r.winRate) }}</td>
+            <td :class="r.avgNet > 0 ? 'profit' : r.avgNet < 0 ? 'loss' : ''">{{ fmt(r.avgNet) }}</td>
+            <td>{{ fmt(r.avgWin) }}</td>
+            <td :class="r.totalNet > 0 ? 'profit' : r.totalNet < 0 ? 'loss' : ''">{{ fmt(r.totalNet) }}</td>
+            <td>−{{ fmt(r.totalFees) }}</td>
+          </tr>
+          <tr v-if="byReason.length === 0">
+            <td colspan="8" class="muted">暂无数据</td>
           </tr>
         </tbody>
       </table>

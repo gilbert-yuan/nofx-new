@@ -29,6 +29,18 @@ export const API = {
     put: '/api/strategy'
   },
 
+  // 策略管理（多策略体系）：列表 / 详情 / 更新（启用+参数）/ 恢复默认
+  // 带 :id 的路径由前端 api/client.js 用 `base` 拼接（契约只固化基址）
+  strategies: {
+    base: '/api/strategies'
+  },
+
+  // 模拟账户（paper）：每日趋势为单条 SQL 聚合（服务端 dailyTrend.js）
+  //   GET  → 缓存读取；POST → 强制刷新（前端「刷新」按钮）
+  paper: {
+    dailyTrend: '/api/paper/daily-trend'
+  },
+
   market: {
     symbols: '/api/market/symbols',
     refresh: '/api/market/symbols/refresh',

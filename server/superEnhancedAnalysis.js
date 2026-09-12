@@ -95,12 +95,14 @@ export class SuperEnhancedAnalysis {
 
   /**
    * 超级增强版分析（集成所有数据源）
+   * @param {object} market  行情
+   * @param {object} [params] 策略级参数覆盖（透传给底层 enhancedAnalysis）
    */
-  async analyze(market) {
+  async analyze(market, params) {
     await this.initAlphaVantage();
 
     // 1. 基础增强版分析
-    const baseAnalysis = enhancedAnalysis(market);
+    const baseAnalysis = enhancedAnalysis(market, params);
 
     // 如果基础分析就是WAIT，直接返回
     if (baseAnalysis.action === 'WAIT') {

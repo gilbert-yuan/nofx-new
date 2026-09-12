@@ -143,8 +143,34 @@ ul.signal-warning { padding-left: 28px; }
 .performance-table td { color: var(--text-primary); }
 .performance-table td strong { color: var(--text-primary); font-weight: 650; }
 
+/* ===== 平仓理由标签（交易模拟 / 每日趋势共用） =====
+   按分组着色：止盈绿、止损红、智能退出蓝、爆仓危险色。 */
+.close-reason {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-primary);
+}
+.close-reason[data-group='tp'] { background: var(--long-bg); color: var(--long); }
+.close-reason[data-group='sl'] { background: var(--short-bg); color: var(--short); }
+.close-reason[data-group='smart'] { background: var(--info-bg); color: var(--info); }
+.close-reason[data-group='risk'] { background: var(--danger-bg); color: var(--danger); }
+
 /* ===== Daily Trend View ===== */
 .daily-trend-metrics { margin-top: 18px; }
+.daily-trend-source {
+  align-self: center;
+  margin-right: 10px;
+  color: var(--text-tertiary);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
 .daily-trend-charts {
   position: relative;
   background: var(--bg-secondary);

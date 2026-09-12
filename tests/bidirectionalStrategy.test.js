@@ -39,11 +39,37 @@ test('enhanced bearish signal survives validation, submits short and settles pro
   const order = submitPaperOrder(initialPaperAccount(), record, { symbol: market.symbol, margin: 100, leverage: 2, automatic: true }, now);
   assert.equal(order.direction, 'OPEN_SHORT');
   const open = market.klines.at(-1).close;
-  // 限价挂单（空头）：需当根 high 触达 entryLimit 才成交；随后 low 跌破 takeProfit 止盈。
-  advancePaperOrder(order, [{ openTime: order.nextTime, open, high: plan.entryLimit + 0.1, low: plan.takeProfit - 0.1,
-    close: plan.takeProfit, volume: 1000, confirmed: true }], order.nextTime + bar);
+  // 限价挂单（空头）：需当根 high 触达 entryLimit 才成交。
+  // ⚠️ 成交当根**不做**止盈判定（见下一条用例）：当根开盘发生在成交之前，无法判定
+  //    「先成交后止盈」还是「先到止盈再被打上来成交」，按保护优先取保守口径。
+  //    故这里拆成两根：第 1 根成交，第 2 根 low 跌破 takeProfit 止盈。
+  // ⚠️ 空头限价成交价在当根开盘价**上方**，故 low 必须落在开盘价下方，
+  //    否则违反 validCandle（low ≤ min(open, close)）→ 直接判为 data_gap。
+  advancePaperOrder(order, [
+    { openTime: order.nextTime, open, high: plan.entryLimit + 0.1, low: open - 0.1,
+      close: plan.entryLimit, volume: 1000, confirmed: true },
+    { openTime: order.nextTime + bar, open: plan.takeProfit, high: plan.takeProfit + 0.1, low: plan.takeProfit - 0.2,
+      close: plan.takeProfit, volume: 1000, confirmed: true }
+  ], order.nextTime + 2 * bar);
   assert.equal(order.reason, 'take_profit');
   assert.ok(order.net > 0);
+});
+
+test('limit fill bar never books a take profit from the pre-fill opening price', () => {
+  // 回归用例（2026-09-12）：成交当根若开盘价已在止盈之外，旧实现会用「开盘价」结算止盈 ——
+  // 而开盘发生在限价成交之前，那笔钱从来不属于我们。90 天回测里该分支造出过 avgWin 5.8% 的假盈利。
+  const market = bearishMarket();
+  const signal = enhancedAnalysis(market);
+  const plan = signal.plan;
+  const now = 80 * bar;
+  const record = createResearchRecord({ config: { model: { model: 'enhanced-rules-v1', baseUrl: 'local://rules' } },
+    strategy: { interval: '15m' }, market: [market], result: { analyses: [signal] }, type: 'single', scope: { limit: 80 }, now });
+  const order = submitPaperOrder(initialPaperAccount(), record, { symbol: market.symbol, margin: 100, leverage: 2, automatic: true }, now);
+  // 一根「开盘已在止盈之下、随后被打到 entryLimit 才成交」的空头 K 线：两根事件同根，无法判定先后。
+  advancePaperOrder(order, [{ openTime: order.nextTime, open: plan.takeProfit - 0.5, high: plan.entryLimit + 0.1,
+    low: plan.takeProfit - 0.6, close: plan.entryLimit, volume: 1000, confirmed: true }], order.nextTime + bar);
+  assert.equal(order.status, 'open', '成交当根不应以开盘价结算止盈');
+  assert.notEqual(order.reason, 'take_profit');
 });
 
 test('enhanced analysis still allows bullish signals', () => {

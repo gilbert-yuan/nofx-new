@@ -1,5 +1,8 @@
 /** 通用展示格式化工具（账户/表现/复盘等多个视图共用，避免重复定义） */
 
+// 平仓理由字典与后端同一份定义（shared/closeReasons.js），避免前后端口径漂移
+import { closeReasonLabel, closeReasonGroup } from '../../shared/closeReasons.js';
+
 export function fmt(v) {
   return v === null || v === undefined ? '—' : Number(v).toFixed(2);
 }
@@ -22,14 +25,15 @@ export function statusLabel(s) {
   );
 }
 
+/**
+ * 平仓理由 → 中文标签。
+ * 走统一字典：新增/改名只在 shared/closeReasons.js 改一处，前后端同时生效。
+ */
 export function reasonLabel(s) {
-  return (
-    {
-      stop_loss: '止损',
-      strategy_cancelled: '策略撤单',
-      take_profit: '止盈',
-      timeout: '持有到期',
-      liquidation: '爆仓'
-    }[s] || ''
-  );
+  return closeReasonLabel(s);
+}
+
+/** 平仓理由 → 分组 id（tp / sl / smart / risk / time / manual），用于着色与归类筛选 */
+export function reasonGroup(s) {
+  return closeReasonGroup(s);
 }

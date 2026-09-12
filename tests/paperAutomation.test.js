@@ -78,7 +78,10 @@ test('protection revision applies only to a future unopened candle, preserving a
   advancePaperOrder(order, [candle(end, { low: 95 })], end + minute);
   assert.equal(order.status, 'open');
   advancePaperOrder(order, [candle(end + minute, { low: 97 })], end + 2 * minute);
-  assert.equal(order.reason, 'stop_loss'); assert.ok(Math.abs(order.exit - 98 * 0.9995) < 1e-9);
+  // 止损被 UPDATE_PROTECTION 从初始的 90 抬到 98 后被打掉 → 记「移动止损」而非「初始止损」。
+  // 平仓理由细分（2026-09-11）后这里从 stop_loss 变为 trailing_stop，
+  // 正是为了让「保护生效后被扫」与「一进场就打初始止损」在统计上可分。
+  assert.equal(order.reason, 'trailing_stop'); assert.ok(Math.abs(order.exit - 98 * 0.9995) < 1e-9);
 });
 
 test('review refuses wider stops, stale data, bad levels and weak AI proposals', () => {

@@ -23,21 +23,37 @@ const PULLBACK_ATR_SHALLOW = Number(process.env.NOFX_PULLBACK_ATR_SHALLOW ?? 0.3
 const SCORE_FLOOR = Number(process.env.NOFX_SCORE_FLOOR ?? 70);  // 入场门槛评分（与 NOFX_MIN_TREND_SCORE 对齐）
 const SCORE_CEIL = Number(process.env.NOFX_SCORE_CEIL ?? 100);
 
+/**
+ * 入场模型的默认参数（= 环境变量解析结果）。
+ * 多策略体系下作为「策略未覆盖时」的兜底；策略参数由 ENHANCED_PARAM_SCHEMA 提供。
+ */
+export const ENTRY_MODEL_DEFAULTS = Object.freeze({
+  deep: PULLBACK_ATR_DEEP,
+  shallow: PULLBACK_ATR_SHALLOW,
+  scoreFloor: SCORE_FLOOR,
+  scoreCeil: SCORE_CEIL
+});
+
 export function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 
 /**
  * 把趋势评分映射成回调深度（单位 ATR）。
  * 高分(t=1)→浅回调(PULLBACK_ATR_SHALLOW)，低分(t=0)→深回调(PULLBACK_ATR_DEEP)。
+ * @param {number} score
+ * @param {{deep:number, shallow:number, scoreFloor:number, scoreCeil:number}} [pullback]
+ *   策略级回调参数；不传则用环境变量解析出的默认值（旧行为完全不变）。
  */
-export function scoreToPullbackAtr(score) {
-  if (!Number.isFinite(score)) return (PULLBACK_ATR_DEEP + PULLBACK_ATR_SHALLOW) / 2;
-  const t = clamp((score - SCORE_FLOOR) / (SCORE_CEIL - SCORE_FLOOR), 0, 1);
-  return PULLBACK_ATR_DEEP + (PULLBACK_ATR_SHALLOW - PULLBACK_ATR_DEEP) * t;
+export function scoreToPullbackAtr(score, pullback = ENTRY_MODEL_DEFAULTS) {
+  const cfg = pullback || ENTRY_MODEL_DEFAULTS;
+  if (!Number.isFinite(score)) return (cfg.deep + cfg.shallow) / 2;
+  const span = cfg.scoreCeil - cfg.scoreFloor;
+  const t = span > 0 ? clamp((score - cfg.scoreFloor) / span, 0, 1) : 1;
+  return cfg.deep + (cfg.shallow - cfg.deep) * t;
 }
 
-/** 按评分算出预测回调最优限价 */
-export function computeEntryLimit({ close, atr, direction, score }) {
-  const depth = scoreToPullbackAtr(score);
+/** 按评分算出预测回调最优限价（pullback 可选传策略级参数） */
+export function computeEntryLimit({ close, atr, direction, score, pullback }) {
+  const depth = scoreToPullbackAtr(score, pullback);
   return direction === 'long' ? close - depth * atr : close + depth * atr;
 }
 
@@ -45,7 +61,8 @@ export function computeEntryLimit({ close, atr, direction, score }) {
  * 本地规则引擎没有 100 分趋势评分，用 |快线-慢线|/ATR 强度代理成 0~100，
  * 以便复用同一套评分→回调深度映射。趋势越清晰，代理评分越高，回调越浅。
  */
-export function trendProxyToScore(proxy) {
-  if (!Number.isFinite(proxy)) return SCORE_FLOOR;
-  return clamp(SCORE_FLOOR + (proxy - 0.3) * 20, SCORE_FLOOR, SCORE_CEIL);
+export function trendProxyToScore(proxy, pullback = ENTRY_MODEL_DEFAULTS) {
+  const cfg = pullback || ENTRY_MODEL_DEFAULTS;
+  if (!Number.isFinite(proxy)) return cfg.scoreFloor;
+  return clamp(cfg.scoreFloor + (proxy - 0.3) * 20, cfg.scoreFloor, cfg.scoreCeil);
 }

@@ -164,10 +164,16 @@ export function normalizePlan(raw, market, now, costs = PAPER_COSTS) {
   };
 }
 
-export function createResearchRecord({ config, strategy, market, result, type, scope, now = Date.now() }) {
+export function createResearchRecord({ config, strategy, market, result, type, scope, now = Date.now(),
+  strategyId = null, strategyName = null, strategyParams = null }) {
   const snapshot = { version: RESEARCH_VERSION, exchange: 'binance', marketProvider: market[0]?.marketProvider || 'binance', model: config.model.model,
     providerFingerprint: createHash('sha256').update(String(config.model.baseUrl || '')).digest('hex').slice(0, 16), temperature: 0.2,
-    strategy: { name: strategy.name, interval: strategy.interval, klineLimit: scope.limit, systemPrompt: strategy.systemPrompt, rules: strategy.rules }, costs: { ...PAPER_COSTS } };
+    strategy: { name: strategy.name, interval: strategy.interval, klineLimit: scope.limit, systemPrompt: strategy.systemPrompt, rules: strategy.rules }, costs: { ...PAPER_COSTS },
+    // 多策略：快照里带上策略标识与**全部量化参数**。
+    // ⚠️ 原先 strategyVersion 只哈希「提示词 + 模型 + 成本」，完全不含量化参数，
+    // 导致同一提示词、不同参数的策略无法区分。现把 strategyId / strategyParams 纳入快照，
+    // 于是「同一策略 id + 相同参数」才得到相同版本号，参数一变版本号立即变化。
+    ...(strategyId ? { strategyId, strategyName: strategyName || strategyId, strategyParams: strategyParams || null } : {}) };
   const strategyVersion = createHash('sha256').update(JSON.stringify(snapshot)).digest('hex').slice(0, 16);
   const incoming = result.analyses || [];
   const errors = [result.error];
@@ -180,5 +186,6 @@ export function createResearchRecord({ config, strategy, market, result, type, s
   if (incoming.some(raw => !market.some(m => m.symbol === String(raw.symbol || '').toUpperCase()))) errors.push('已丢弃非请求币种的模型结果');
   return { id: `analysis-${randomUUID()}`, at: new Date(now).toISOString(), type, symbol: type === 'single' ? market[0].symbol : undefined,
     symbols: market.map(m => m.symbol), interval: strategy.interval, scope, marketCount: market.length, klineCount: market[0]?.klines.length,
-    analyses, marketProvider: snapshot.marketProvider, error: errors.filter(Boolean).join(' | '), researchOnly: true, strategyVersion, snapshot, market };
+    analyses, marketProvider: snapshot.marketProvider, error: errors.filter(Boolean).join(' | '), researchOnly: true, strategyVersion, snapshot, market,
+    strategyId: strategyId || null, strategyName: strategyName || null, strategyParams: strategyParams || null };
 }

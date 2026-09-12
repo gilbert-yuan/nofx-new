@@ -76,12 +76,22 @@ const defaultState = {
   decisions: []
 };
 
+// 多策略体系：启用集 + 每个策略的参数覆盖。
+// enabled=null 表示「尚未初始化」，由 StrategyRuntime 按 config.analysis.engine 推导后落盘。
+const defaultStrategies = {
+  version: 1,
+  enabled: null,
+  overrides: {},
+  updatedAt: null
+};
+
 export class Store {
   constructor(dataDir) {
     this.dataDir = dataDir;
     this.configPath = path.join(dataDir, 'config.json');
     this.strategyPath = path.join(dataDir, 'strategy.json');
     this.statePath = path.join(dataDir, 'state.json');
+    this.strategiesPath = path.join(dataDir, 'strategies.json');
     this.writeQueues = new Map();
     this.stateQueue = Promise.resolve();
   }
@@ -91,6 +101,7 @@ export class Store {
     await this.ensureFile(this.configPath, defaultConfig);
     await this.ensureFile(this.strategyPath, defaultStrategy);
     await this.ensureFile(this.statePath, defaultState);
+    await this.ensureFile(this.strategiesPath, defaultStrategies);
     const current = await this.getConfig();
     if (current.trader?.exchange !== 'binance') {
       await this.saveConfig(mergeConfig(current, {
@@ -151,6 +162,15 @@ export class Store {
 
   saveStrategy(strategy) {
     return this.writeJson(this.strategyPath, strategy);
+  }
+
+  /** 多策略：启用集 + 参数覆盖（data/strategies.json） */
+  getStrategies() {
+    return this.readJson(this.strategiesPath);
+  }
+
+  saveStrategies(strategies) {
+    return this.writeJson(this.strategiesPath, strategies);
   }
 
   getState() {
