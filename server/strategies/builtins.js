@@ -11,20 +11,21 @@
 import { defineStrategy } from './registry.js';
 import { enhancedAnalysis, enhancedProtectionReview, ENHANCED_PARAM_SCHEMA, ENHANCED_DEFAULTS, buildExitRules } from '../enhancedAnalysis.js';
 import { localProtectionReview } from '../shared/protectionReview.js';
-import { analyzeMarkets, reviewPosition } from '../ai.js';
-import { pinFadeAnalysis, PIN_PARAM_SCHEMA } from '../pinFadeAnalysis.js';
+import { structureShortAnalysis, STRUCTURE_SHORT_PARAM_SCHEMA } from '../structureShortAnalysis.js';
+import { structureLongAnalysis, STRUCTURE_LONG_PARAM_SCHEMA } from '../structureLongAnalysis.js';
 
 /** 出场规则参数（移动止损 / 智能退出 / 分批止盈）—— 各策略共用同一套，避免重复定义。 */
 const EXIT_PARAM_SCHEMA = ENHANCED_PARAM_SCHEMA.filter(spec => spec.group === 'exit');
 
 /**
- * 插针回补专用出场规则参数：与 enhanced 同一套，唯一差别是「智能退出」默认关闭。
- * 理由：均线失守（close 跌破 MA20×N ATR）与「逆势接针」的前提直接冲突 ——
- * 插针发生时价格本来就在均线下方，逐根判定会把刚成交的单立刻砍掉。
- * 需要时可在「策略管理」页单独勾上，不影响其它策略。
+ * 「原生不带 exitRules 的策略」专用出场规则参数：与 enhanced 同一套，唯一差别是
+ * 「智能退出」默认关闭。这类策略自带形态失效止损（冲高高点上方 / 阻力上方 / 支撑下方），
+ * 均线失守类主动离场与「等回踩入场」的前提冲突 —— 刚挂单时价格本就在均线下方/上方，
+ * 逐根判定会把单砍掉。需要时可在「策略管理」页单独勾上，不影响其它策略。
+ * （沿用历史命名 PUMP_SHORT_EXIT_PARAM_SCHEMA：最初为冲高回落空引入，现由结构多空共用。）
  */
-const PIN_EXIT_PARAM_SCHEMA = EXIT_PARAM_SCHEMA.map(spec => spec.key === 'smartExitEnabled'
-  ? { ...spec, default: false, description: '均线失守 / RSI 极值 / MACD 背离三条主动离场规则的总开关。插针回补是逆势均值回归，「均线失守」与前提冲突，故本策略默认关闭。' }
+const PUMP_SHORT_EXIT_PARAM_SCHEMA = EXIT_PARAM_SCHEMA.map(spec => spec.key === 'smartExitEnabled'
+  ? { ...spec, default: false, description: '均线失守 / RSI 极值 / MACD 背离三条主动离场规则的总开关。本策略自带形态失效止损，主动离场默认关闭；需要时可在策略参数里单独勾上。' }
   : spec);
 
 /**
@@ -45,83 +46,70 @@ defineStrategy({
 });
 
 /**
- * 策略 2：超级增强（默认关闭）
- * 在增强趋势之上叠加 CoinGecko 市值/流动性、恐惧贪婪指数、AlphaVantage 等外部数据。
- * 需要注入宿主的 superAnalysis 实例（依赖 store），故通过 ctx.deps 提供。
+ * 策略 2：结构做空（默认关闭 —— 尚无回测证据，落地为对照实验）
+ * 引擎 structureShortAnalysis：移植 crypto-short-skill-node（老板 2026-09-14 提供）的多周期
+ * 做空规则 —— 4H 定方向（LH+LL 空头结构 + EMA 空头排列）、1H 定位置（阻力区反弹入场）、
+ * 15m 定确认（CHOCH+BOS 转弱），评分 ≥70 + 入场质量 ≥70 + 成本后净盈亏比 ≥1 才出手。
+ *
+ * ⚠️ 默认不启用：按「先证伪再落地」纪律，启用前需在 bf90 语料（1m 执行 + 派生
+ *   15m/1h/4h 决策序列）跑真实回测，并先 shadow 验证 ≥2 周。详见 server/structureShortAnalysis.js 文件头。
  */
 defineStrategy({
-  id: 'super-trend-v1',
-  name: '超级增强 v1',
-  description: '在增强趋势基础上叠加 CoinGecko 市值与流动性、恐惧贪婪指数、AlphaVantage 外部数据做二次过滤与权重调整。需要联网获取行情外数据。',
-  engine: 'super',
-  modelId: 'super-rules-v1',
-  priority: 30,
-  paramSchema: ENHANCED_PARAM_SCHEMA,
-  prefilter: (symbols, ctx = {}) => ctx.deps?.superAnalysis?.preFilter?.(symbols),
-  analyze: (market, ctx = {}) => ctx.deps.superAnalysis.analyze(market, ctx.params),
-  review: (order, market, ctx = {}) => ctx.deps.superAnalysis.reviewPosition(order, market)
-});
-
-/**
- * 策略 3：AI 模型（仅在配置了可用模型时才应勾选）
- * 交给大模型按提示词出研究结论，成本与不确定性最高，默认不启用。
- */
-defineStrategy({
-  id: 'ai-model-v1',
-  name: 'AI 模型分析',
-  description: '把行情与提示词交给已配置的大模型，由模型给出方向、入场区间、止损止盈与理由。需要模型已启用且填好 API Key。',
-  engine: 'ai',
-  modelId: 'ai-model-v1',
-  priority: 40,
-  paramSchema: [],
-  analyze: async (market, ctx = {}) => {
-    const result = await analyzeMarkets({
-      config: ctx.config,
-      strategy: { ...(ctx.strategyPrompt || {}), interval: ctx.interval || market.interval },
-      market: [market]
-    });
-    if (result?.error) throw new Error(result.error);
-    return result?.analyses?.[0] || { symbol: market.symbol, action: 'WAIT', confidence: 0, reason: '模型结果缺失。', plan: null };
-  },
-  review: (order, market, ctx = {}) => reviewPosition({
-    config: ctx.config,
-    strategy: { ...(ctx.strategyPrompt || {}), interval: order.interval },
-    market,
-    position: {
-      symbol: order.symbol,
-      positionAmt: order.quantity * (order.direction === 'OPEN_LONG' ? 1 : -1),
-      entryPrice: order.entry,
-      markPrice: market.klines.at(-1).close,
-      stopLoss: order.plan.stopLoss,
-      takeProfit: order.plan.takeProfit,
-      simulated: true
-    }
+  id: 'structure-short-v1',
+  name: '结构做空 v1（多周期）',
+  description: '【15m 计划周期】多周期结构化做空：4H 空头结构（LH+LL+EMA 排列）定方向、1H 阻力区定位置、'
+    + '15m CHOCH+BOS 定确认；评分与入场质量双门槛（默认 70/70），反弹进阻力区挂限价空，不追空。'
+    + '只做空 —— NOFX_LONG_ONLY 禁空政策的显式白名单例外。'
+    + '移植自 crypto-short-skill 规则引擎（适配 80 根窗口与本地数据字段）；'
+    + '⚠️ 尚无回测证据，默认关闭，启用前先回测 + shadow 验证。',
+  engine: 'structure-short',
+  modelId: 'structure-short-v1',
+  priority: 80,
+  // 信号需要三个周期：15m（确认 + 计划周期）、1h（结构/阻力）、4h（趋势/指标）
+  needsAux: ['15m', '1h', '4h'],
+  // 订单落在 15m 周期：maxHoldBars=96 根 = 24h
+  planInterval: '15m',
+  paramSchema: [...STRUCTURE_SHORT_PARAM_SCHEMA, ...PUMP_SHORT_EXIT_PARAM_SCHEMA],
+  analyze: (market, ctx = {}) => structureShortAnalysis(market, ctx),
+  // 本地规则复核：R 口径移动止损阶梯（方向对称，空头取 min 侧）
+  review: (order, market) => localProtectionReview(order, market),
+  // 引擎原生不带 exitRules，这里补一份「该策略的」出场规则（智能退出默认关闭）
+  decoratePlan: (plan, ctx = {}) => ({
+    ...plan,
+    exitRules: buildExitRules({ ...ENHANCED_DEFAULTS, ...(ctx.params || {}) })
   })
 });
 
 /**
- * 策略 4：插针回补（默认关闭）
- * 引擎 pinFadeAnalysis：主流币 1m 长下影插针 → 在影线内预埋限价买单 → 止损放针脚下方，吃回补反弹。
- *
- * ⚠️ 90 天 × 1m × 24 主流币、560 组参数网格实测：扣费前毛收益为正的仅 4/560 组（最好 +0.028%/笔），
- *   扣费后全部为负，中位数与样本外同样为负 —— 1m 插针后没有可提取的方向性 alpha。
- *   故 priority 排在最后且**默认不启用**；证据见 data/backtest/pin-study.json。
+ * 策略 9：结构做多（默认关闭 —— 尚无回测证据，落地为对照实验）
+ * 引擎 structureLongAnalysis：移植 crypto-long-skill-node（老板 2026-09-14 提供，与
+ * 结构做空同源的 多头镜像）—— 4H 定方向（HH+HL 多头结构 + EMA 多头排列）、1H 支撑区
+ * 定位置（回踩入场）、15m 多头 CHOCH+BOS 定确认；评分 ≥70 + 入场质量 ≥70 +
+ * 成本后净盈亏比 ≥1 才出手。与生产 enhanced-trend-v1 同向，同币种竞争由 priority
+ * 仲裁（本策略 85 排在其后）。
+ * ⚠️ 默认不启用：启用前需在 bf90 语料跑真实回测 + shadow 验证 ≥2 周。
+ *   详见 server/structureLongAnalysis.js 文件头。
  */
 defineStrategy({
-  id: 'pin-fade-v1',
-  name: '插针回补 v1',
-  description: '主流币 1 分钟长下影插针：针收盘后在影线内预埋限价买单（不追价），止损放针脚下方缓冲，'
-    + '止盈按 R 倍数（默认 2.5R），跌穿针脚即失效。只做多，天然满足禁空政策。'
-    + '⚠️ 90 天 1m 回测（24 主流币 / 560 组参数）扣费后为负期望，默认关闭，仅供对照实验。',
-  engine: 'pin',
-  modelId: 'pin-fade-v1',
-  priority: 50,
-  needsAux: [],
-  paramSchema: [...PIN_PARAM_SCHEMA, ...PIN_EXIT_PARAM_SCHEMA],
-  analyze: (market, ctx = {}) => pinFadeAnalysis(market, ctx.params),
-  // 本地规则复核：用该订单快照在 plan.exitRules 的移动止损阶梯推进保护价
+  id: 'structure-long-v1',
+  name: '结构做多 v1（多周期）',
+  description: '【15m 计划周期】多周期结构化做多：4H 多头结构（HH+HL+EMA 排列）定方向、1H 支撑区定位置、'
+    + '15m CHOCH+BOS 定确认；评分与入场质量双门槛（默认 70/70），回踩进支撑区挂限价多，不追涨。'
+    + '与 enhanced-trend-v1 同向，同币种竞争按优先级排在其后。'
+    + '移植自 crypto-long-skill 规则引擎（适配 80 根窗口与本地数据字段）；'
+    + '⚠️ 尚无回测证据，默认关闭，启用前先回测 + shadow 验证。',
+  engine: 'structure-long',
+  modelId: 'structure-long-v1',
+  priority: 85,
+  // 信号需要三个周期：15m（确认 + 计划周期）、1h（结构/支撑）、4h（趋势/指标）
+  needsAux: ['15m', '1h', '4h'],
+  // 订单落在 15m 周期：maxHoldBars=96 根 = 24h
+  planInterval: '15m',
+  paramSchema: [...STRUCTURE_LONG_PARAM_SCHEMA, ...PUMP_SHORT_EXIT_PARAM_SCHEMA],
+  analyze: (market, ctx = {}) => structureLongAnalysis(market, ctx),
+  // 本地规则复核：R 口径移动止损阶梯（方向对称，多头取 max 侧）
   review: (order, market) => localProtectionReview(order, market),
-  // 引擎原生不带 exitRules，这里补一份「该策略的」出场规则（含关闭的智能退出）
+  // 引擎原生不带 exitRules，这里补一份「该策略的」出场规则（智能退出默认关闭）
   decoratePlan: (plan, ctx = {}) => ({
     ...plan,
     exitRules: buildExitRules({ ...ENHANCED_DEFAULTS, ...(ctx.params || {}) })
@@ -131,14 +119,11 @@ defineStrategy({
 /**
  * 引擎 → 默认策略映射（用于首次运行时把既有 config.analysis.engine 平移为启用集）
  *
- * ⚠️ `local`（本地多周期 v1）已于 2026-09-12 下线，故此处**不再有 local 映射**：
- *    老配置里 `config.analysis.engine === 'local'` 时，运行时统一回落到 enhanced-trend-v1。
- *    `server/localAnalysis.js` 的引擎实现本身仍保留 —— 行情工作台的手动分析与旧版
- *    paperAutomation / researchRoutes 仍在用，删除策略不等于删除引擎。
+ * ⚠️ 历史下线记录：`local`（本地多周期 v1）2026-09-12 下线；`super`/`ai`/`pin`/
+ *    `pump-short` 注册策略 2026-09-14 应老板要求从注册表移除（引擎文件保留：
+ *    回测脚本与存量订单的 strategy_version 映射仍需引用）。这些引擎的旧配置
+ *    统一回落到 enhanced-trend-v1（runtime.defaultEnabled 的兜底行为）。
  */
 export const ENGINE_DEFAULT_STRATEGY = Object.freeze({
-  enhanced: 'enhanced-trend-v1',
-  super: 'super-trend-v1',
-  ai: 'ai-model-v1',
-  pin: 'pin-fade-v1'
+  enhanced: 'enhanced-trend-v1'
 });

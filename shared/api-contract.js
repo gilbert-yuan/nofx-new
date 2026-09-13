@@ -21,7 +21,11 @@ export const API = {
   binance: {
     status: '/api/binance/status',
     test: '/api/binance/test',
-    review: '/api/binance/review'
+    review: '/api/binance/review',
+    order: '/api/binance/order',
+    openOrders: '/api/binance/openOrders',
+    positions: '/api/binance/positions',
+    smoke: '/api/binance/smoke'
   },
 
   strategy: {
@@ -39,6 +43,12 @@ export const API = {
   //   GET  → 缓存读取；POST → 强制刷新（前端「刷新」按钮）
   paper: {
     dailyTrend: '/api/paper/daily-trend'
+  },
+
+  // 策略订单统计：全部/单策略 × 按天/按小时。
+  // 带 granularity 的查询参数由前端 statsApi 用 qs() 拼接（契约只固化基址）。
+  stats: {
+    base: '/api/strategy-stats'
   },
 
   market: {

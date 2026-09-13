@@ -11,16 +11,20 @@ import TradingView from './components/TradingView.vue';
 import BinanceSettings from './components/BinanceSettings.vue';
 import DailyTrendView from './components/DailyTrendView.vue';
 import StrategiesView from './components/StrategiesView.vue';
+import StrategyStatsView from './components/StrategyStatsView.vue';
+import AutomationView from './components/AutomationView.vue';
 
 // 配置/策略/状态集中到 store（前端唯一可信源）
 const configStore = useConfigStore();
 const { config, strategy } = configStore;
 const { tradingStatus, symbolStatus, syncStatus, savedMode, statusError } = storeToRefs(configStore);
-const loadStatus = () => configStore.loadStatus();
+// 后台标签页暂停轮询（与 AutomationTasks.vue 同款守卫）：不可见时浏览器已限流 timer，
+// 但请求仍会发出，白耗带宽。回到前台的下一次 tick 自动恢复。
+const loadStatus = () => { if (typeof document !== 'undefined' && document.hidden) return; configStore.loadStatus(); };
 
-// 前端已下线的视图：「历史分析」「模型设置」「自动化任务」（导航入口已移除）。
+// 前端已下线的视图：「历史分析」「模型设置」（导航入口已移除）。
 // 老书签 / 历史 URL 落到这些视图时回落到工作台，避免白屏。
-const AVAILABLE_VIEWS = ['workbench', 'trading', 'trading-simulation', 'strategies', 'daily-trend'];
+const AVAILABLE_VIEWS = ['workbench', 'trading', 'trading-simulation', 'strategies', 'strategy-stats', 'automation', 'daily-trend'];
 const normalizeView = view => (AVAILABLE_VIEWS.includes(view) ? view : 'workbench');
 
 const activeView = ref('workbench');
@@ -127,6 +131,7 @@ async function selectSymbol(symbol) {
     const result = await marketApi.klines({ symbol, interval, limit, endTime: chartDate.value ? new Date(chartDate.value).getTime() : undefined });
     if (requestId !== marketRequestId) return;
     state.rows = result.rows || [];
+    error.value = '';
   }, 'market');
 }
 async function fetchLatestKlines(interval = scope.interval) {
@@ -149,6 +154,12 @@ async function loadConfig() { await run(async () => { await configStore.load(); 
 async function saveBinanceSettings() { await run(async () => { await configStore.saveBinance(); message.value = '币安交易配置已保存'; }, 'settings'); }
 async function testBinance() { const result = await run(() => configStore.test(), 'settings'); if (result) message.value = `${result.testnet ? '测试网' : '实盘'}只读连接成功 · ${result.activePositions} 个持仓 · ${result.positionMode === 'hedge' ? '双向持仓（自动交易需切换为单向）' : '单向持仓'}`; }
 async function reviewBinance() { const result = await run(() => configStore.review(), 'settings'); if (result) { await loadStatus(); message.value = result.reason || `已复核 ${result.reviewed || 0} 个持仓，请查看执行记录`; } }
+const binanceSmokeResult = ref(null);
+async function smokeBinance(payload) {
+  const result = await run(() => configStore.smoke(payload), 'settings');
+  if (result) { binanceSmokeResult.value = result; message.value = `测试网冒烟通过 · ${result.symbol} 订单 ${result.orderId} 已撤`;
+  } else { binanceSmokeResult.value = null; }
+}
 function buildChart(rows) { if (!rows.length) return { width: 960, height: 430, candles: [], volumes: [], min: 0, max: 0 }; const width=960, priceHeight=300, volumeTop=325, volumeHeight=82, pad=18; const highs=rows.map(r=>Number(r.high)), lows=rows.map(r=>Number(r.low)), max=Math.max(...highs), min=Math.min(...lows), span=(max-min || Math.max(Math.abs(max)*0.001, Number.EPSILON)), maxVolume=Math.max(...rows.map(r=>Number(r.volume)),1), step=(width-pad*2)/rows.length, bodyWidth=Math.max(2,step*.62), y=(price)=>pad+((max-price)/span)*(priceHeight-pad*2); return { width, height:430, min, max, candles:rows.map((row,index)=>{ const open=Number(row.open), close=Number(row.close), x=pad+index*step+step/2, openY=y(open), closeY=y(close); return { x, wickY1:y(Number(row.high)), wickY2:y(Number(row.low)), bodyX:x-bodyWidth/2, bodyY:Math.min(openY,closeY), bodyWidth, bodyHeight:Math.max(1,Math.abs(openY-closeY)), color:close>=open?'var(--chart-up)':'var(--chart-down)' }; }), volumes:rows.map((row,index)=>{ const height=Number(row.volume)/maxVolume*volumeHeight; return { x:pad+index*step+step/2-bodyWidth/2, y:volumeTop+volumeHeight-height, width:bodyWidth, height, color:Number(row.close)>=Number(row.open)?'var(--chart-volume-up)':'var(--chart-volume-down)' }; }) }; }
 let statusTimer;
 </script>
@@ -173,8 +184,10 @@ let statusTimer;
         }" :active-symbol="activeSymbol" :interval="scope.interval" :rows="state.rows" :chart="chart" :market-loading="isMarketLoading" :kline-sync-loading="isKlineSyncLoading" :scope="scope" @refresh="selectSymbol(activeSymbol)" @fetch-latest="fetchLatestKlines" />
         <TradingView v-else-if="activeView === 'trading-simulation'" />
         <StrategiesView v-else-if="activeView === 'strategies'" />
+        <StrategyStatsView v-else-if="activeView === 'strategy-stats'" />
+        <AutomationView v-else-if="activeView === 'automation'" />
         <DailyTrendView v-else-if="activeView === 'daily-trend'" />
-        <BinanceSettings v-else-if="activeView === 'trading'" :binance="config.binance" :trader="config.trader" :status="tradingStatus" :saved-mode="savedMode" :loading="Boolean(loadingAreas.settings)" @save="saveBinanceSettings" @test="testBinance" @review="reviewBinance" />
+        <BinanceSettings v-else-if="activeView === 'trading'" :binance="config.binance" :trader="config.trader" :status="tradingStatus" :saved-mode="savedMode" :loading="Boolean(loadingAreas.settings)" :smoke-result="binanceSmokeResult" @save="saveBinanceSettings" @test="testBinance" @review="reviewBinance" @smoke="smokeBinance" />
       </main></div>
   </div>
 </template>

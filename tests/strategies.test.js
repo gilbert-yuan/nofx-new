@@ -44,12 +44,12 @@ test('空串清除备注，且不影响其它策略的备注', async () => {
   const store = makeStore();
   const rt = runtime(store);
   await rt.update('enhanced-trend-v1', { notes: '做多' }, {});
-  await rt.update('super-trend-v1', { notes: '备用' }, {});
+  await rt.update('structure-long-v1', { notes: '备用' }, {});
   await rt.update('enhanced-trend-v1', { notes: '' }, {});
 
   const list = await rt.list({});
   assert.equal(list.strategies.find((s) => s.id === 'enhanced-trend-v1').notes, '');
-  assert.equal(list.strategies.find((s) => s.id === 'super-trend-v1').notes, '备用');
+  assert.equal(list.strategies.find((s) => s.id === 'structure-long-v1').notes, '备用');
   assert.equal('enhanced-trend-v1' in store.value.notes, false);
 });
 
@@ -58,13 +58,12 @@ test('读状态丢弃脏备注（数字 / 数组 / 空串）而不是抛错', as
     version: 1,
     enabled: ['enhanced-trend-v1'],
     overrides: {},
-    notes: { 'enhanced-trend-v1': '做多', 'pin-fade-v1': 123, 'ai-model-v1': '', 'super-trend-v1': ['x'] }
+    notes: { 'enhanced-trend-v1': '做多', 'structure-short-v1': 123, 'structure-long-v1': '', 'already-removed-v1': ['x'] }
   });
   const list = await runtime(store).list({});
   assert.equal(list.strategies.find((s) => s.id === 'enhanced-trend-v1').notes, '做多');
-  assert.equal(list.strategies.find((s) => s.id === 'pin-fade-v1').notes, '');
-  assert.equal(list.strategies.find((s) => s.id === 'ai-model-v1').notes, '');
-  assert.equal(list.strategies.find((s) => s.id === 'super-trend-v1').notes, '');
+  assert.equal(list.strategies.find((s) => s.id === 'structure-short-v1').notes, '');
+  assert.equal(list.strategies.find((s) => s.id === 'structure-long-v1').notes, '');
 });
 
 test('notes 不是数组时（旧文件结构）也能安全读取', async () => {

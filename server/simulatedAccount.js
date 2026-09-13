@@ -35,10 +35,21 @@ export function submitPaperOrder(state, record, input, now = Date.now()) {
   const existing = state.orders.find(o => o.recordId === record?.id && o.symbol === input.symbol);
   if (existing) return existing;
   if (!signal?.eligible || !signal.plan || !['OPEN_LONG', 'OPEN_SHORT'].includes(signal.positionRecommendation)) fail('该分析为观望或没有有效开仓计划，不能模拟下单。');
-  if ((signal.marketProvider || record.marketProvider) !== 'okx') fail('请使用当前 OKX 行情重新分析后模拟下单。');
+  const marketProvider = signal.marketProvider || record.marketProvider;
+  if (!['binance', 'okx'].includes(marketProvider)) fail('分析行情来源无效，请重新分析后模拟下单。');
   const first = Math.max(Date.parse(signal.firstEntryAt), nextOpenTime(candleOpenAt(now, signal.interval), signal.interval));
   if (!Number.isFinite(first)) fail('分析计划的入场时间无效，请重新分析。');
-  const margin = Number(input.margin ?? 100), leverage = Number(input.leverage ?? signal.recommendedLeverage ?? recommendedLeverage(signal.plan, signal.positionRecommendation));
+  // 保证金三档来源：显式 input.margin（手动下单）> autoMarginPct（自动化按当前权益比例复利 sizing）
+  // > 默认 100。autoMarginPct 来自 NOFX_AUTO_MARGIN_PCT（默认 0.05）：bf90 回测显示 5% 权益/笔
+  // 在三条参数流上均稳健（1.5~2.5×/90d，MDD<6%），而固定 100U 在 100U 账户下连一单都开不出。
+  let margin;
+  if (input.margin != null && input.margin !== '') margin = Number(input.margin);
+  else if (input.autoMarginPct != null) {
+    const equity = accountSummary(state).equity ?? 0;
+    margin = Math.floor(equity * Number(input.autoMarginPct) * 100) / 100;
+  } else margin = 100;
+  if (input.autoMarginPct != null && margin < 1) fail(`账户权益过低，按 ${(input.autoMarginPct * 100).toFixed(1)}% 自动仓位不足 1 USDT，跳过开仓。`);
+  const leverage = Number(input.leverage ?? signal.recommendedLeverage ?? recommendedLeverage(signal.plan, signal.positionRecommendation));
   // 杠杆上限必须与全局配置 RISK_RULE.maxLeverage 一致（由 NOFX_MAX_LEVERAGE 驱动）。
   // 此前此处硬编码 5，P12 把 NOFX_MAX_LEVERAGE 提到 12 后脱节，导致被推荐 ~10x 的
   // 币种（如 IOSTUSDT）在模拟下单时被误拒。改读单一事实源，避免再次漂移。
@@ -74,7 +85,7 @@ export function submitPaperOrder(state, record, input, now = Date.now()) {
     dataAsOf: signal.dataAsOf // 行情时间戳
   };
 
-  const order = { id: randomUUID(), recordId: record.id, symbol: signal.symbol, interval: signal.interval, marketProvider: 'okx',
+  const order = { id: randomUUID(), recordId: record.id, symbol: signal.symbol, interval: signal.interval, marketProvider,
     direction: signal.positionRecommendation, status: 'pending', margin, leverage, notional, plan, initialPlan: { ...plan }, costs: { ...PAPER_COSTS },
     automatic: input.automatic === true, protectionRevisions: [], reviewHistory: [],
     analysisContext, // 新增：完整分析上下文
@@ -213,13 +224,35 @@ export class SimulatedAccount {
     // 收益：跳过 ~9 万行 simulated_order_extensions 的拉取与 hydrate，把每次轮询从 3-8s 压到亚秒级。
     // 想要某笔已平仓订单的完整明细，用 GET /api/paper/orders/:id（走 read({orderId})）。
     const state = summary ? await this.repository.read({ summary: true }) : await this.readLight();
-    return { ...accountSummary(state), orders: state.orders, busy: this.busy, lastRunAt: this.lastRunAt, error: this.lastError };
+    return { ...accountSummary(state), orders: state.orders, busy: this.busy, lastRunAt: this.lastRunAt, error: this.lastError,
+      autoMarginPct: Math.min(1, Math.max(0.01, Number(process.env.NOFX_AUTO_MARGIN_PCT ?? 0.05))) };
   }
   async getOrder(id) { return (await this.repository.read({ orderId: id })).orders[0]; }
+  /** 设置初始金额（重定账户基期；已有订单的浮动/已实现盈亏继续叠加在新基数上）。
+   *  输入初始金额即视为进入有限资金模式（自动关闭 unlimitedCapital，除非显式传 true）——
+   *  否则 equity 恒为 null，autoMarginPct 无法按权益缩放。 */
+  async setCapital({ initialBalance, unlimitedCapital } = {}) {
+    const v = Number(initialBalance);
+    if (!Number.isFinite(v) || v < 1 || v > 1000000) fail('初始金额须为 1～1000000 USDT。');
+    return this.mutateLight(state => {
+      state.initialBalance = v;
+      state.unlimitedCapital = unlimitedCapital === true;
+      return { initialBalance: state.initialBalance, unlimitedCapital: state.unlimitedCapital };
+    });
+  }
   /** 每日趋势：纯 SQL 聚合，不把订单读进内存（见 server/dailyTrend.js） */
   async dailyTrend() { return this.repository.dailyTrend(); }
   // 开仓只新增一个订单，不依赖历史订单明细
-  async submit(input) { const record = await this.archive.get(String(input.recordId || '')); return this.mutateLight(state => submitPaperOrder(state, record, input)); }
+  async submit(input) {
+    const record = await this.archive.get(String(input.recordId || ''));
+    const signal = record?.analyses?.find(item => item.symbol === input.symbol);
+    const provider = signal?.marketProvider || record?.marketProvider;
+    if (this.market?.provider && provider !== this.market.provider) {
+      const label = this.market.provider === 'binance' ? 'Binance' : 'OKX';
+      fail('请使用当前 ' + label + ' 行情重新分析后模拟下单。');
+    }
+    return this.mutateLight(state => submitPaperOrder(state, record, input));
+  }
   async refresh(options = {}) {
     while (this.refreshPromise) await this.refreshPromise.catch(() => {});
     const work = this.refreshOrders(options);
@@ -241,6 +274,18 @@ export class SimulatedAccount {
       for (const orders of groups.values()) {
         if (!shouldContinue()) break;
         const first = orders.reduce((a, b) => a.nextTime < b.nextTime ? a : b);
+        if (first.marketProvider !== this.market.provider) {
+          const message = '行情来源已从 ' + (first.marketProvider === 'okx' ? 'OKX' : first.marketProvider)
+            + ' 切换为 ' + (this.market.provider === 'binance' ? 'Binance Spot' : this.market.provider)
+            + '；旧订单不会使用不同交易所的 K 线推进，请取消并重新分析后下单。';
+          await this.mutateLight(current => {
+            for (const snapshot of orders) {
+              const order = current.orders.find(item => item.id === snapshot.id);
+              if (order && active(order) && order.nextTime === snapshot.nextTime) order.error = message;
+            }
+          });
+          continue;
+        }
         const rows = [];
         let failure;
         try {
@@ -347,9 +392,10 @@ export function registerSimulationRoutes(app, simulation) {
 
   app.get('/api/paper/account', route(accountHandler));
   app.get('/api/paper/plans', route(async () => (await simulation.archive.list({ limit: 100 })).flatMap(record => (record.analyses || [])
-    .filter(s => s.eligible && s.marketProvider === 'okx')
+    .filter(s => s.eligible && s.marketProvider === 'binance')
     .map(s => ({ ...s, recordId: record.id, at: record.at })))));
   app.post('/api/paper/orders', route(async req => { const r = await simulation.submit(req.body || {}); invalidateReadCaches(); return r; }));
+  app.put('/api/paper/capital', route(async req => { const r = await simulation.setCapital(req.body || {}); invalidateReadCaches(); return r; }));
   app.post('/api/paper/refresh', route(async () => { const r = await simulation.refresh(); invalidateReadCaches(); return r; }));
   app.post('/api/paper/orders/:id/close', route(async req => { const r = await simulation.close(req.params.id); invalidateReadCaches(); return r; }));
 

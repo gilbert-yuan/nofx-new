@@ -1,7 +1,9 @@
 <script setup>
-defineProps({ binance: Object, trader: Object, loading: Boolean, status: Object, savedMode: String });
-defineEmits(['save', 'test', 'review']);
+import { reactive } from 'vue';
+defineProps({ binance: Object, trader: Object, loading: Boolean, status: Object, savedMode: String, smokeResult: Object });
+defineEmits(['save', 'test', 'review', 'smoke']);
 const stateName = value => ({ ok: '已完成', disabled: '未启用', blocked: '待配置', error: '失败', attention: '需要检查', skipped: '已跳过', dry_run: '模拟指令', sent: '已提交', held: '保持', rejected: '已拦截', proposed: '建议', uncertain: '需核对成交' }[value] || value || '尚未运行');
+const smoke = reactive({ symbol: 'BTCUSDT', quantity: 0.002 });
 </script>
 <template>
   <div class="trading-layout">
@@ -37,6 +39,18 @@ const stateName = value => ({ ok: '已完成', disabled: '未启用', blocked: '
         <p class="muted">比例 0.2 表示账户权益的 20%；置信度是模型自评，不代表实际胜率。实盘发单需要关闭“仅生成模拟指令”。</p>
       </fieldset>
       <div class="button-row"><button class="primary" @click="$emit('save')" :disabled="loading">保存币安配置</button><button class="ghost" @click="$emit('test')" :disabled="loading">测试已保存的连接</button></div>
+      <fieldset class="settings-group"><legend>测试网冒烟验证</legend>
+        <div class="model-grid">
+          <label>验证币种<input v-model="smoke.symbol" placeholder="BTCUSDT" /></label>
+          <label>下单数量<input v-model.number="smoke.quantity" type="number" min="0.001" step="0.001" /></label>
+        </div>
+        <p class="muted">一键冒烟：以现价 50% 的远价挂 BUY 限价单（不可能成交）→ 查挂单 → 撤单 → 复核，验证签名鉴权/下单/查询/撤单全链路。需先保存 API Key。</p>
+        <div class="button-row"><button class="secondary" @click="$emit('smoke', { symbol: smoke.symbol.trim().toUpperCase(), quantity: smoke.quantity })" :disabled="loading">运行冒烟测试</button></div>
+        <ol v-if="smokeResult?.steps" class="smoke-steps">
+          <li v-for="step in smokeResult.steps" :key="step.name" :class="{ failed: !step.ok }"><b>{{ step.name }}</b><span v-if="step.ok">✓ {{ typeof step.detail === 'object' ? JSON.stringify(step.detail) : step.detail }}</span><span v-else class="failed-text">✗ {{ step.error }}</span></li>
+        </ol>
+        <p v-if="smokeResult && !smokeResult.ok" class="failed-text">冒烟未通过：{{ smokeResult.error }}</p>
+      </fieldset>
     </section>
     <aside class="execution-panel">
       <span class="eyebrow">POSITION REVIEW</span><h2>持仓复核</h2>
@@ -49,3 +63,9 @@ const stateName = value => ({ ok: '已完成', disabled: '未启用', blocked: '
     </aside>
   </div>
 </template>
+<style scoped>
+.smoke-steps { margin: 10px 0 0; padding-left: 4px; list-style: none; font-size: 12px; display: grid; gap: 6px; }
+.smoke-steps li { display: flex; flex-direction: column; gap: 2px; color: var(--text-secondary); }
+.smoke-steps li.failed b { color: var(--danger, #e5484d); }
+.failed-text { color: var(--danger, #e5484d); font-size: 12px; }
+</style>

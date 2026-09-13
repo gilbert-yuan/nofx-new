@@ -2,7 +2,9 @@ import { createStrategyRuntime, listStrategies } from '../server/strategies/inde
 
 // 回归（2026-09-12）：defineStrategy 必须原样保留 decoratePlan / prefilter 这类**可选钩子**。
 // 此前 decoratePlan 在归一化时被丢弃，导致自动化里「补该策略出场规则」的分支恒不执行。
-const mustKeepHooks = ['pin-fade-v1'];
+// 凡「原生引擎不带 exitRules、靠 decoratePlan 补出场规则」的策略都进这里
+// （2026-09-14 起：两个 structure 策略；pin / pump-short 注册已移除）。
+const mustKeepHooks = ['structure-short-v1', 'structure-long-v1'];
 let hookFail = 0;
 for (const id of mustKeepHooks) {
   const def = listStrategies().find((s) => s.id === id);
@@ -18,24 +20,26 @@ const mkStore = () => ({
 });
 
 let switchFail = 0;
-const expectEngine = { enhanced: 'enhanced-trend-v1', super: 'super-trend-v1', ai: 'ai-model-v1', pin: 'pin-fade-v1' };
+// 注册表总数随新增策略自增：用 listStrategies().length 作为期望，避免硬编码随加策略失效。
+const totalExpect = (await listStrategies()).length;
+const expectEngine = { enhanced: 'enhanced-trend-v1' };
 for (const [engine, expected] of Object.entries(expectEngine)) {
   const rt = createStrategyRuntime({ store: mkStore(), resolveEngine: () => engine });
   const res = await rt.list({ analysis: { engine } });
   const on = res.strategies.filter((x) => x.enabled).map((x) => x.id);
-  const ok = res.strategies.length === 4 && on.join(',') === expected;
-  console.log(`${ok ? 'PASS' : 'FAIL'}  engine=${engine} → enabled=[${on.join(',')}] total=${res.strategies.length}`);
+  const ok = res.strategies.length === totalExpect && on.join(',') === expected;
+  console.log(`${ok ? 'PASS' : 'FAIL'}  engine=${engine} → enabled=[${on.join(',')}] total=${res.strategies.length}/${totalExpect}`);
   if (!ok) switchFail++;
 }
 
-// 回归（2026-09-12）：本地多周期 v1 下线后，老配置遗留的 engine='local'
+// 回归（2026-09-12/14）：已下线引擎（local / super / ai / pin / pump-short）的旧配置
 // 必须回落到 enhanced-trend-v1，而不是「一个策略都不启用」。
-{
-  const rt = createStrategyRuntime({ store: mkStore(), resolveEngine: () => 'local' });
-  const res = await rt.list({ analysis: { engine: 'local' } });
+for (const engine of ['local', 'super', 'ai', 'pin', 'pump-short']) {
+  const rt = createStrategyRuntime({ store: mkStore(), resolveEngine: () => engine });
+  const res = await rt.list({ analysis: { engine } });
   const on = res.strategies.filter((x) => x.enabled).map((x) => x.id).join(',');
   const ok = on === 'enhanced-trend-v1';
-  console.log(`${ok ? 'PASS' : 'FAIL'}  已下线引擎 local 回落 enhanced-trend-v1 (enabled=[${on}])`);
+  console.log(`${ok ? 'PASS' : 'FAIL'}  已下线引擎 ${engine} 回落 enhanced-trend-v1 (enabled=[${on}])`);
   if (!ok) switchFail++;
 }
 

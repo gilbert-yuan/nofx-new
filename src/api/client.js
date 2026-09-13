@@ -40,10 +40,17 @@ export const paperApi = {
   dailyTrend: (refresh = false) => api(API.paper.dailyTrend, refresh ? { method: 'POST' } : {})
 };
 
+/** 策略订单统计：全部/单策略 × 按天/按小时 */
+export const statsApi = {
+  get: (granularity = 'day') => api(`${API.stats.base}${qs({ granularity })}`)
+};
+
 export const binanceApi = {
   status: () => api(API.binance.status),
   test: () => api(API.binance.test, { method: 'POST' }),
-  review: () => api(API.binance.review, { method: 'POST' })
+  review: () => api(API.binance.review, { method: 'POST' }),
+  /** 一键冒烟：远价限价单 → 查单 → 撤单，全链路验证（零成交风险） */
+  smoke: (body) => api(API.binance.smoke, { method: 'POST', body })
 };
 
 export const marketApi = {

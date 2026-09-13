@@ -9,9 +9,12 @@ import { isolatedSimulatedDatabase } from './helpers/simulatedDatabase.js';
 const bar = 900000, now = 10 * bar;
 const candle = (time, overrides = {}) => ({ openTime: time, open: 100, high: 101, low: 99, close: 100, volume: 10, confirmed: true, ...overrides });
 function record(short = false) {
-  return { id: short ? 'short' : 'long', marketProvider: 'okx', analyses: [{ symbol: 'BTCUSDT', marketProvider: 'okx', interval: '15m', eligible: true,
+  return { id: short ? 'short' : 'long', marketProvider: 'binance', analyses: [{ symbol: 'BTCUSDT', marketProvider: 'binance', interval: '15m', eligible: true,
     positionRecommendation: short ? 'OPEN_SHORT' : 'OPEN_LONG', firstEntryAt: new Date(11 * bar).toISOString(), expiresAt: new Date(14 * bar).toISOString(), recommendedLeverage: 3,
-    plan: { entryMin: 99, entryMax: 101, stopLoss: short ? 110 : 90, takeProfit: short ? 80 : 120, maxHoldBars: 12 } }] };
+    // 显式关闭分批止盈：本文件断言的是「整笔止盈」的老费率/ROI 算术；
+    // 分批出场自身的行为在 bidirectional/paperAutomation 等用例覆盖。
+    plan: { entryMin: 99, entryMax: 101, stopLoss: short ? 110 : 90, takeProfit: short ? 80 : 120, maxHoldBars: 12,
+      exitRules: { partialTp: { enabled: false } } } }] };
 }
 function order(short = false, input = {}) {
   const state = initialPaperAccount();
@@ -26,6 +29,9 @@ test('paper reservation is funded, idempotent and refuses invalid plans without 
   almost(accountSummary(state).available, 10000 - 100 - 0.18);
   assert.equal(submitPaperOrder(state, record(), { symbol: 'BTCUSDT' }, now).id, o.id);
   assert.equal(state.orders.length, 1);
+  const binanceRecord = record(); binanceRecord.marketProvider = 'binance'; binanceRecord.analyses[0].marketProvider = 'binance';
+  const binanceOrder = submitPaperOrder(initialPaperAccount(), binanceRecord, { symbol: 'BTCUSDT' }, now);
+  assert.equal(binanceOrder.marketProvider, 'binance');
   for (const input of [{ margin: 10001 }, { margin: -1 }, { leverage: 6 }, { leverage: NaN }, { stopLoss: 105 }, { takeProfit: 95 }]) assert.throws(() => order(false, input));
   const late = submitPaperOrder(initialPaperAccount(), record(), { symbol: 'BTCUSDT' }, 14 * bar);
   assert.equal(late.status, 'pending');
@@ -37,6 +43,21 @@ test('paper reservation is funded, idempotent and refuses invalid plans without 
   assert.throws(() => submitPaperOrder(initialPaperAccount(), invalid, { symbol: 'BTCUSDT' }, now), /观望/);
 });
 
+test('old-provider orders are isolated instead of replayed with Binance candles', async () => {
+  const { o } = order();
+  o.marketProvider = 'okx';
+  const state = { initialBalance: 10000, orders: [o] };
+  const simulation = Object.create(SimulatedAccount.prototype);
+  Object.assign(simulation, {
+    market: { provider: 'binance', klines: async () => { throw new Error('must not fetch cross-provider candles'); } },
+    readLight: async () => state,
+    mutateLight: async fn => fn(state),
+    status: async () => ({ orders: state.orders })
+  });
+  await simulation.refreshOrders();
+  assert.match(o.error, /旧订单不会使用不同交易所的 K 线推进/);
+  assert.equal(o.status, 'pending');
+});
 test('pending orders retain reserves and can fill after a legacy entry deadline', () => {
   const { state, o } = order();
   o.expiresAt = new Date(14 * bar).toISOString();
@@ -166,5 +187,47 @@ test('key-free HTTP order submit, duplicate retry, cancel and refresh preserve t
     assert.equal((await post(`/orders/${first.id}/close`)).status, 'cancelled');
     const result = await post('/refresh');
     assert.equal(result.balance, 10000); assert.equal(result.available, 10000); assert.equal(result.orders.length, 1); assert.equal(result.openCount, 0);
+  } finally { if (server) await new Promise(resolve => server.close(resolve)); await db.close(); }
+});
+
+test('autoMarginPct sizes margin from current equity and compounds with the account', () => {
+  // 10000U 默认账户 × 5% = 500 保证金
+  const { state, o } = order(false, { autoMarginPct: 0.05, margin: undefined, leverage: 3 });
+  assert.equal(o.margin, 500);
+  assert.equal(o.notional, 1500);
+  // 显式 margin 优先于 autoMarginPct
+  const explicit = submitPaperOrder(initialPaperAccount(), record(), { symbol: 'BTCUSDT', margin: 100, autoMarginPct: 0.05, leverage: 3 }, now);
+  assert.equal(explicit.margin, 100);
+  // 权益过小：自动仓位不足 1U 时明确拒绝
+  const tiny = initialPaperAccount(); tiny.initialBalance = 10;
+  assert.throws(() => submitPaperOrder(tiny, record(), { symbol: 'BTCUSDT', autoMarginPct: 0.05, leverage: 3 }, now), /不足 1 USDT/);
+  // 浮动盈亏计入权益：持仓浮盈 100 → 权益 10100 → 下一单 505
+  state.orders[0].status = 'open'; state.orders[0].entry = 100; state.orders[0].quantity = 10;
+  state.orders[0].notional = 1000; state.orders[0].unrealized = 100; state.orders[0].entryFee = 0;
+  const rec2 = { ...record(), id: 'long-2', analyses: [{ ...record().analyses[0], symbol: 'ETHUSDT' }] };
+  const o2 = submitPaperOrder(state, rec2, { symbol: 'ETHUSDT', autoMarginPct: 0.05, leverage: 3 }, now);
+  assert.equal(o2.margin, Math.floor(10100 * 0.05 * 100) / 100);
+});
+
+test('PUT /api/paper/capital re-bases initial balance and persists it', { skip: process.env.RESEARCH_DB_TEST !== '1' }, async () => {
+  const db = await isolatedSimulatedDatabase();
+  let server;
+  try {
+    const pool = db.pool;
+    const sim = new SimulatedAccount({ pool });
+    await sim.init();
+    const app = express(); app.use(express.json()); registerSimulationRoutes(app, sim);
+    app.use((error, req, res, next) => res.status(error.status || 500).json({ error: error.message }));
+    await new Promise(resolve => { server = app.listen(0, '127.0.0.1', resolve); });
+    const url = `http://127.0.0.1:${server.address().port}/api/paper`;
+    const put = async (path, body) => { const r = await fetch(url + path, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }); assert.equal(r.status, 200); return r.json(); };
+    const bad = await fetch(url + '/capital', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ initialBalance: 0 }) });
+    assert.equal(bad.status, 400);
+    const result = await put('/capital', { initialBalance: 100 });
+    assert.equal(result.initialBalance, 100);
+    const status = await (await fetch(url + '/account')).json();
+    assert.equal(status.initialBalance, 100); assert.equal(status.balance, 100);
+    const restored = new SimulatedAccount({ pool }); await restored.init();
+    assert.equal((await restored.status()).initialBalance, 100);
   } finally { if (server) await new Promise(resolve => server.close(resolve)); await db.close(); }
 });

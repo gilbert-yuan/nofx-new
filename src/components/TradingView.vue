@@ -159,6 +159,29 @@ async function submitOrder() {
   }
 }
 
+// 设置初始金额（重定账户基期，自动仓位按权益比例随之缩放）
+const capitalInput = ref('');
+const showCapitalForm = ref(false);
+async function setCapital() {
+  const v = Number(capitalInput.value);
+  if (!Number.isFinite(v) || v < 1) {
+    error.value = '请输入有效的初始金额（≥1 USDT）';
+    return;
+  }
+  busy.value = true;
+  error.value = '';
+  try {
+    await api('/paper/capital', { method: 'PUT', body: { initialBalance: v } });
+    showCapitalForm.value = false;
+    capitalInput.value = '';
+    await loadAccount();
+  } catch (err) {
+    error.value = err.message;
+  } finally {
+    busy.value = false;
+  }
+}
+
 // 取消订单
 async function cancelOrder(orderId) {
   if (!confirm('确定取消此订单？')) return;
@@ -246,6 +269,11 @@ onMounted(() => {
           <strong>{{ fmt(accountData.available) }}</strong>
           <small>净收益 <span :class="accountData.net > 0 ? 'profit' : accountData.net < 0 ? 'loss' : ''">{{ fmt(accountData.net) }}</span></small>
         </article>
+        <article class="summary-metric">
+          <span>总权益</span>
+          <strong>{{ fmt(accountData.equity) }}</strong>
+          <small>初始金额 {{ fmt(accountData.initialBalance) }} · 自动仓位 {{ fmt(accountData.equity * (accountData.autoMarginPct ?? 0.05)) }}/笔</small>
+        </article>
         <article v-if="orderStats" class="summary-metric">
           <span>胜率</span>
           <strong :class="orderStats.winRate >= 0.5 ? 'profit' : 'loss'">{{ pct(orderStats.winRate) }}</strong>
@@ -258,7 +286,20 @@ onMounted(() => {
         <button class="ghost" :disabled="busy" @click="showOrderForm = !showOrderForm">
           {{ showOrderForm ? '取消下单' : '新建模拟订单' }}
         </button>
+        <button class="ghost" :disabled="busy" @click="showCapitalForm = !showCapitalForm; capitalInput = accountData.initialBalance">
+          {{ showCapitalForm ? '取消设置' : '设置初始金额' }}
+        </button>
       </div>
+
+      <!-- 初始金额设置 -->
+      <form v-if="showCapitalForm" class="capital-form" @submit.prevent="setCapital">
+        <label>
+          初始金额（USDT）
+          <input v-model="capitalInput" type="number" min="1" step="1" placeholder="例如 100" required>
+        </label>
+        <button class="primary" type="submit" :disabled="busy">保存</button>
+        <small style="align-self:center;">保存后自动仓位 = 总权益 × 自动仓位比例，随盈亏复利缩放。</small>
+      </form>
 
       <!-- 订单分段：持仓+待入场 / 已平仓 -->
       <div class="order-scope-switch">
@@ -539,6 +580,38 @@ onMounted(() => {
 </template>
 
 <style scoped>
+.capital-form {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 12px 0;
+  padding: 14px 16px;
+  border: 1px solid var(--border-primary);
+  border-radius: 10px;
+  background: var(--bg-card);
+}
+
+.capital-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+
+.capital-form input {
+  width: 140px;
+  padding: 7px 10px;
+  border: 1px solid var(--border-primary);
+  border-radius: 8px;
+  background: var(--bg-primary, transparent);
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.capital-form small { color: var(--text-tertiary); }
+
 .order-scope-switch {
   display: flex;
   gap: 8px;

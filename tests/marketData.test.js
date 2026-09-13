@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { BinanceSpotMarket, marketStorageSymbol } from '../server/marketData.js';
+import { BinanceMarket } from '../server/binanceMarket.js';
+import { marketStorageSymbol } from '../server/marketData.js';
 import { fetchContinuousKlines } from '../server/continuousKlines.js';
 import { KlineSync } from '../server/klineSync.js';
 import { ResearchStore } from '../server/researchStore.js';
@@ -9,53 +10,53 @@ import { BinancePositionMonitor, compatibleMarketPrice } from '../server/binance
 
 const bar = 900000;
 const raw = t => [t, '100', '105', '95', '102', '10', t + bar - 1, '1020', '100', '5', '510', '0'];
-const response = payload => ({ ok: true, status: 200, statusText: 'OK', json: async () => payload });
 
+// 合约行情源的下游依赖 BinanceClient（exchangeInfo / klines），测试用桩客户端替代真实网络。
 function fixture(count = 705) {
-  const calls = [], all = Array.from({ length: count }, (_, i) => raw(i * bar));
-  const fetchImpl = async url => {
-    const parsed = new URL(url);
-    const params = parsed.searchParams;
-    calls.push({ path: parsed.pathname, args: Object.fromEntries(params) });
-    if (parsed.pathname.endsWith('/exchangeInfo')) return response({ symbols: [
-      { symbol: 'BTCUSDT', baseAsset: 'BTC', quoteAsset: 'USDT', status: 'TRADING', isSpotTradingAllowed: true },
-      { symbol: 'OLDUSDT', baseAsset: 'OLD', quoteAsset: 'USDT', status: 'BREAK', isSpotTradingAllowed: true },
-      { symbol: 'HIDDENUSDT', baseAsset: 'HIDDEN', quoteAsset: 'USDT', status: 'TRADING', isSpotTradingAllowed: false }
-    ] });
-    const start = params.has('startTime') ? Number(params.get('startTime')) : undefined;
-    const end = params.has('endTime') ? Number(params.get('endTime')) : undefined;
-    const limit = Number(params.get('limit'));
-    let rows = all.filter(row => (start == null || row[0] >= start) && (end == null || row[0] <= end));
-    if (start == null) rows = rows.slice(-limit); else rows = rows.slice(0, limit);
-    return response(rows);
+  const all = Array.from({ length: count }, (_, i) => raw(i * bar));
+  let exchangeCalls = 0;
+  const client = {
+    exchangeInfo: async () => {
+      exchangeCalls++;
+      return { symbols: [
+        { symbol: 'BTCUSDT', baseAsset: 'BTC', quoteAsset: 'USDT', status: 'TRADING', contractType: 'PERPETUAL', marginAsset: 'USDT', filters: [] },
+        { symbol: 'OLDUSDT', baseAsset: 'OLD', quoteAsset: 'USDT', status: 'BREAK', contractType: 'PERPETUAL', marginAsset: 'USDT' },
+        { symbol: 'QUARTERUSDT', baseAsset: 'Q', quoteAsset: 'USDT', status: 'TRADING', contractType: 'CURRENT_QUARTER', marginAsset: 'USDT' }
+      ] };
+    },
+    klines: async ({ startTime, endTime, limit }) => {
+      const start = startTime == null ? undefined : Number(startTime);
+      const end = endTime == null ? undefined : Number(endTime);
+      let rows = all.filter(row => (start == null || row[0] >= start) && (end == null || row[0] <= end));
+      rows = start == null ? rows.slice(-limit) : rows.slice(0, limit);
+      return rows;
+    }
   };
-  return { market: new BinanceSpotMarket({ fetchImpl, requestSpacingMs: 0 }), calls };
+  return { market: new BinanceMarket({ client }), exchangeCalls: () => exchangeCalls };
 }
 
-test('Binance Spot symbols coalesce and candles normalize base volume', async () => {
-  const { market, calls } = fixture();
-  await Promise.all([market.spotUsdtContracts(), market.spotUsdtContracts()]);
-  assert.deepEqual(await market.spotUsdtSymbols(), ['BTCUSDT']);
-  assert.equal(calls.length, 1);
+test('Binance Futures symbols drop non-perpetual contracts and coalesce refreshes', async () => {
+  const { market, exchangeCalls } = fixture();
+  await Promise.all([market.perpetualUsdtContracts(), market.perpetualUsdtContracts()]);
+  assert.deepEqual(await market.perpetualUsdtSymbols(), ['BTCUSDT']);
+  assert.equal(exchangeCalls(), 1);
   const rows = await market.klines({ symbol: 'BTCUSDT', limit: 1 });
   assert.equal(rows[0].volume, 10);
   assert.equal(rows[0].quoteVolume, 1020);
   assert.equal(rows[0].tradeCount, 100);
   assert.equal(market.status().provider, 'binance');
-  assert.equal(market.status().marketType, 'spot');
-  await assert.rejects(market.klines({ symbol: 'BTC-USDT' }), /现货币种/);
+  assert.equal(market.status().marketType, 'futures');
+  assert.equal(market.storageSymbol('BTCUSDT'), 'BINANCE_BTCUSDT');
+  await assert.rejects(market.klines({ symbol: 'BTC-USDT' }), /USDT 合约/);
 });
 
-test('Binance forward pagination preserves inclusive start/end over multiple pages', async () => {
-  const { market, calls } = fixture();
+test('Binance Futures klines honour inclusive start/end and normalize rows', async () => {
+  const { market } = fixture();
   const rows = await market.klines({ symbol: 'BTCUSDT', limit: 305, startTime: 100 * bar, endTime: 405 * bar - 1 });
   assert.equal(rows.length, 305);
   assert.equal(rows[0].openTime, 100 * bar);
   assert.equal(rows.at(-1).openTime, 404 * bar);
   assert.ok(rows.every((r, i) => !i || r.openTime - rows[i - 1].openTime === bar));
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].path, '/api/v3/klines');
-  assert.equal(Number(calls[0].args.startTime), 100 * bar);
 });
 
 test('continuous catch-up honours Binance provider page size and resumes entire gap', async () => {
@@ -64,6 +65,14 @@ test('continuous catch-up honours Binance provider page size and resumes entire 
   await fetchContinuousKlines({ client: market, symbol: 'BTCUSDT', interval: '15m', startTime: 0, now: 705 * bar, savePage: async rows => pages.push(rows) });
   assert.deepEqual(pages.map(page => page.length), [705]);
   assert.equal(pages.at(-1).at(-1).openTime, 704 * bar);
+});
+
+test('continuous catch-up refuses to loop when provider yields no rows', async () => {
+  const market = new BinanceMarket({ client: { exchangeInfo: async () => ({ symbols: [] }), klines: async () => [] } });
+  await assert.rejects(
+    fetchContinuousKlines({ client: market, symbol: 'BTCUSDT', interval: '15m', startTime: 0, now: 10 * bar, savePage: async () => {} }),
+    /缺少|没有已收盘 K 线/
+  );
 });
 
 test('sync and archive use Binance provider namespace', async () => {
@@ -105,10 +114,4 @@ test('position review obtains reference candles from Binance public provider', a
   assert.equal(key, 'BINANCE_BTCUSDT');
   assert.equal(compatibleMarketPrice(data, 101), true);
   assert.equal(compatibleMarketPrice(data, 200), true);
-});
-
-test('provider pagination cannot loop forever on repeated boundaries', async () => {
-  const { market } = fixture();
-  market.fetchImpl = async () => response([raw(10 * bar), raw(10 * bar)]);
-  await assert.rejects(market.klines({ symbol: 'BTCUSDT', limit: 2, startTime: 0 }), /未前进/);
 });

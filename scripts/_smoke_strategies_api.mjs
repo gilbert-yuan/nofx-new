@@ -29,22 +29,20 @@ const check = (label, cond, extra = '') => { console.log(`${cond ? 'PASS' : 'FAI
 
 let s, r, list;
 [s, list] = await get('/api/strategies');
-check('GET /api/strategies 200 且含 4 个策略', s === 200 && list.strategies.length === 4, `total=${list.strategies.length}`);
+check('GET /api/strategies 200 且含 3 个策略', s === 200 && list.strategies.length === 3, `total=${list.strategies.length}`);
 check('默认仅启用 enhanced-trend-v1', JSON.stringify(list.enabled) === '["enhanced-trend-v1"]', JSON.stringify(list.enabled));
 const enh = list.strategies.find((x) => x.id === 'enhanced-trend-v1');
 check('带 paramSchema(48) 与 defaults', enh.paramSchema.length === 48 && enh.defaults.maxHoldBars === 120);
 
-// 第 5 个策略 pin-fade-v1（插针回补）：参数模式 = PIN_PARAM_SCHEMA(15) + 出场规则 schema，
-// 且「智能退出」默认关闭（均线失守与逆势接针前提冲突）。
-const pin = list.strategies.find((x) => x.id === 'pin-fade-v1');
-check('注册 pin-fade-v1（默认未启用）', !!pin && pin.enabled === false && pin.engine === 'pin');
-check('pin 出场规则「智能退出」默认关闭',
-  pin.paramSchema.find((x) => x.key === 'smartExitEnabled')?.default === false);
-check('pin 参数模式含 majorsOnly/entryLimit 关键项',
-  ['majorsOnly', 'wickAtrMin', 'pullbackDepth', 'takeProfitR'].every((k) => pin.paramSchema.some((x) => x.key === k)));
+// 2026-09-14：super/ai/pin/pump-short 的注册已移除，注册表只剩 3 个策略。
+const slong = list.strategies.find((x) => x.id === 'structure-long-v1');
+check('注册 structure-long-v1（默认未启用，15m 计划周期）',
+  !!slong && slong.enabled === false && slong.engine === 'structure-long' && slong.planInterval === '15m');
+check('structure-long 出场规则「智能退出」默认关闭',
+  slong.paramSchema.find((x) => x.key === 'smartExitEnabled')?.default === false);
 
-[s, list] = await send('PUT', '/api/strategies/super-trend-v1', { enabled: true, params: { maxHoldBars: 45 } });
-check('PUT 启用 super-trend-v1 + 覆盖 maxHoldBars', s === 200 && list.strategy.enabled === true && list.strategy.params.maxHoldBars === 45, JSON.stringify(list.strategy.params.maxHoldBars));
+[s, list] = await send('PUT', '/api/strategies/structure-long-v1', { enabled: true });
+check('PUT 启用 structure-long-v1', s === 200 && list.strategy.enabled === true);
 
 [, list] = await get('/api/strategies');
 check('启用集变为 2 个', list.enabled.length === 2, JSON.stringify(list.enabled));
@@ -60,11 +58,15 @@ check('未知策略 404', s === 404, r.error);
 [s, r] = await send('PUT', '/api/strategies/local-mtf-v1', { enabled: true });
 check('已下线策略 local-mtf-v1 返回 404', s === 404, r.error);
 
+// 回归（2026-09-14）：pump-fade-short-v1 注册已移除，同样必须 404。
+[s, r] = await send('PUT', '/api/strategies/pump-fade-short-v1', { enabled: true });
+check('已移除策略 pump-fade-short-v1 返回 404', s === 404, r.error);
+
 [s, r] = await send('PUT', '/api/strategies/enhanced-trend-v1', {});
 check('空 patch 400', s === 400, r.error);
 
-[s, r] = await send('POST', '/api/strategies/super-trend-v1/reset', {});
-check('reset 恢复默认但保留启用', s === 200 && r.strategy.params.maxHoldBars === 120 && r.strategy.enabled === true, `maxHoldBars=${r.strategy.params.maxHoldBars} enabled=${r.strategy.enabled}`);
+[s, r] = await send('POST', '/api/strategies/structure-long-v1/reset', {});
+check('reset 恢复默认但保留启用', s === 200 && r.strategy.params.maxHoldBars === slong.defaults.maxHoldBars && r.strategy.enabled === true, `maxHoldBars=${r.strategy.params.maxHoldBars} enabled=${r.strategy.enabled}`);
 
 [s, r] = await get('/api/strategies/nope');
 check('GET 未知策略 404', s === 404, r.error);

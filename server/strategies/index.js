@@ -12,5 +12,6 @@ export { defineStrategy, listStrategies, getStrategy, hasStrategy, resolveParams
 export { createStrategyRuntime, StrategyRuntime } from './runtime.js';
 export { ENGINE_DEFAULT_STRATEGY } from './builtins.js';
 
-// 副作用：注册内置策略（enhanced-trend-v1 / super-trend-v1 / ai-model-v1 / pin-fade-v1）
+// 副作用：注册内置策略（enhanced-trend-v1 / structure-short-v1 / structure-long-v1；
+// super/ai/pin/pump-short 的注册已于 2026-09-14 移除，引擎文件保留）
 import './builtins.js';

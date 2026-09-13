@@ -26,9 +26,6 @@ export class MarketDb {
         PRIMARY KEY (symbol, interval, open_time)
       );
 
-      CREATE INDEX IF NOT EXISTS idx_market_klines_lookup
-        ON market_klines (symbol, interval, open_time);
-
       CREATE TABLE IF NOT EXISTS account_trades (
         symbol TEXT NOT NULL,
         trade_id BIGINT NOT NULL,
@@ -144,6 +141,12 @@ export class MarketDb {
   }
 
   async summary() {
+    // 30s 缓存：该查询对 market_klines（720 万行）做全表 GROUP BY，实测 2~5s 顺序扫；
+    // K 线摘要秒级变化无业务意义，缓存后前端 /history 从秒级降到毫秒级。
+    const now = Date.now();
+    if (this._summaryCache && now - this._summaryAt < 30_000) {
+      return this._summaryCache.map(row => ({ ...row }));
+    }
     const result = await this.pool.query(`
         SELECT
           symbol,
@@ -155,7 +158,10 @@ export class MarketDb {
         GROUP BY symbol, interval
         ORDER BY symbol, interval
       `);
-    return result.rows.map(normalizePgRow);
+    const rows = result.rows.map(normalizePgRow);
+    this._summaryCache = rows;
+    this._summaryAt = now;
+    return rows.map(row => ({ ...row }));
   }
 
   async getKlineResumeTime({ symbol, interval }) {

@@ -3,6 +3,22 @@ import assert from 'node:assert/strict';
 import { advancePaperOrder, submitPaperOrder, initialPaperAccount, accountSummary } from '../server/simulatedAccount.js';
 import { candleOpenAt, normalizePlan, prepareMarket, PAPER_COSTS, MAIN_INTERVAL, nextOpenTime } from '../server/research.js';
 import { GlobalAutomation } from '../server/globalAutomation.js';
+import { defineStrategy } from '../server/strategies/registry.js';
+
+// 2026-09-14：super-trend-v1 的注册已从 builtins.js 移除。本文件需要一个「分析器可注入」
+// 的策略来测自动化的归档/下单漏斗，故注册一个与原 super 策略同构的测试专用策略
+//（analyze / prefilter 都走 ctx.deps 注入），并通过 store 显式启用它。
+defineStrategy({
+  id: 'test-inject-v1',
+  name: '测试注入策略',
+  description: '仅测试用：分析器通过 ctx.deps.superAnalysis 注入。',
+  engine: 'super',
+  modelId: 'test-inject-v1',
+  priority: 99,
+  analyze: (market, ctx = {}) => ctx.deps.superAnalysis.analyze(market, ctx.params),
+  review: (order, market, ctx = {}) => ctx.deps.superAnalysis.reviewPosition(order, market),
+  prefilter: (symbols, ctx = {}) => ctx.deps?.superAnalysis?.preFilter?.(symbols)
+});
 
 const bar = 60000;
 const candle = (n, fields = {}) => ({ openTime: n * bar, open: 100, high: 101, low: 99, close: 100, volume: 10, confirmed: true, ...fields });
@@ -82,7 +98,13 @@ test('analysis windows respect small requested limits and tolerate at most two m
 test('global automation archives all signals and only submits normalized, fresh plans', async () => {
   const records = new Map(), submitted = [];
   const automation = new GlobalAutomation({
-    store: { getConfig: async () => ({ model: {}, analysis: { useSuperEnhanced: true } }), getStrategy: async () => ({ interval: '15m', rules: 'test' }) },
+    store: {
+      getConfig: async () => ({ model: {}, analysis: { useSuperEnhanced: true } }),
+      getStrategy: async () => ({ interval: '15m', rules: 'test' }),
+      // 显式启用测试注入策略（缺省推导会落到 enhanced-trend-v1 的真实引擎）
+      getStrategies: async () => ({ version: 1, enabled: ['test-inject-v1'], overrides: {}, notes: {}, updatedAt: null }),
+      saveStrategies: async (s) => s
+    },
     market: { perpetualUsdtContracts: async () => ['BTCUSDT', 'SHORTUSDT', 'BADUSDT', 'OLDUSDT', 'WAITUSDT'].map(symbol => ({ symbol })) },
     marketDb: {}, archive: { save: async record => records.set(record.id, record) },
     simulation: { submit: async input => {

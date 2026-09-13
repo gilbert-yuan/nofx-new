@@ -10,7 +10,17 @@ export class ResearchStore {
     for (const record of legacy.filter(r => r.researchOnly && r.id && r.at)) await this.save(record);
   }
   async save(record) {
-    await this.pool.query('INSERT INTO research_records(id, created_at, record) VALUES($1,$2,$3) ON CONFLICT(id) DO NOTHING', [record.id, record.at, JSON.stringify(record)]);
+    // 写库前剥离读路径从不消费的大对象（单条 25KB JSON → ~1.5KB）：
+    // 1. record.market —— 每币 80 根 K 线数组，重建走 archive.candles()（market_klines 表），
+    //    submitPaperOrder/performance() 都只用 analyses/snapshot 小字段。
+    // 2. snapshot.strategy 的 systemPrompt/rules 长文 —— strategyVersion 哈希在
+    //    createResearchRecord 里落库前已固化，之后无人再读（保留 name/interval/klineLimit 供排查）。
+    const { market, ...light } = record;
+    if (light.snapshot?.strategy) {
+      const { systemPrompt, rules, ...slimStrategy } = light.snapshot.strategy;
+      light.snapshot = { ...light.snapshot, strategy: slimStrategy };
+    }
+    await this.pool.query('INSERT INTO research_records(id, created_at, record) VALUES($1,$2,$3) ON CONFLICT(id) DO NOTHING', [light.id, light.at, JSON.stringify(light)]);
   }
   async list({ date = '', symbol = '', limit = 100, offset = 0, snapshots = false } = {}) {
     const params = [];

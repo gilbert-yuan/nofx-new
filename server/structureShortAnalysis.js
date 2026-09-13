@@ -1,0 +1,277 @@
+/**
+ * 结构做空引擎（Structure-Short，多周期）
+ * —— server/strategies/builtins.js 注册的第 8 个内置策略引擎（engine = 'structure-short'）
+ *
+ * 来源（2026-09-14）：老板提供的 crypto-short-skill-node.zip（Binance U 本位永续的
+ * 「4H 找空头趋势 → 等反弹 → 1H 找压力 → 15m 确认转弱 → 再开空」确定性规则引擎）。
+ * 移植其 rules.md 的决策顺序与评分权重，适配 NOFX 自动化运行时（见下方「适配点」）。
+ *
+ * 决策闸门（照搬 references/rules.md，顺序即优先级）：
+ *   1. 数据不足 → WAIT
+ *   2. 4H 强上涨趋势（结构 BULLISH 且 EMA20>EMA50）→ WAIT（禁空）
+ *   3. 空头评分 < bearishScoreMin（默认 70）→ WAIT
+ *   4. 价格低于 4H EMA20 超过 extendedAtr×ATR → WAIT（过度延伸，禁追空）
+ *   5. 入场质量 < entryQualityMin（默认 70）→ WAIT
+ *   6. 成本后净盈亏比 < 1 → WAIT（pump-short 同源闸门）
+ *   7. 无 15m CHOCH+BOS 确认 → WAIT
+ *   8. 全部通过 → SELL（限价空单挂在 1H 阻力位下方，等反弹入场）
+ *
+ * 评分权重（照搬 rules.md「Score weights」，结构满分 85）：
+ *   4H 趋势 20 / 1H 结构 15 / 15m 确认 10 / 阻力汇合或假突破 10 / EMA 空头排列 10 /
+ *   量能 10 / 盈亏比（≥3R +10，≥2R +7）
+ *
+ * 入场质量（50 基础）：近阻力 +15 / CHOCH +12 / BOS +8 / 假突破 +10 /
+ *   过度延伸 −35 / RSI<30 超卖 −20 / ATR 分位 >0.9 高波动 −15
+ *
+ * ⚠️ 适配点（与原 skill 的差异，均为运行时约束所致，已写入信号披露）：
+ *   1. 实时行情窗口固定 80 根（globalAutomation.getFreshMarket → prepareMarket limit:80）：
+ *      4H EMA200 不可用 → 趋势/排列判定降为 price<EMA20<EMA50；强上涨阻挡 =
+ *      4H 结构 BULLISH 且 EMA20>EMA50。
+ *   2. 衍生品数据（funding/OI/多空比/BTC 环境）自动化不提供 → 原评分中
+ *      funding 5 / OI 5 / BTC 5 三项剔除，BTC BULLISH 的 −15 惩罚同样不生效
+ *      （max 100 → 85；阈值默认 70 保持 skill 原值）。
+ *   3. 库内 K 线无 takerBuyVolume → 量能成分 = 15m 最新收盘 K 线「放量收阴」
+ *      （volumeRatio > 1.1 且 close < open）。
+ *   4. 计划周期 = 15m（planInterval），订单止损止盈按 15m 根数口径结算；
+ *      信号用 needsAux=['15m','1h','4h'] 拉取的多周期辅助行情。
+ *   5. RR 闸门换成项目统一的「成本后净盈亏比 ≥ 1」（含手续费/滑点/资金费），
+ *      原 skill 的静态 1:2 阈值由 takeProfitR 默认 2R 承接。
+ *
+ * ⚠️ 尚无回测证据：按项目纪律（先证伪再落地），本策略**默认不启用**，落地为可参数化的
+ *    对照实验；启用前请在 bf90 语料上跑真实回测（1m 执行 + 派生 15m/1h/4h 决策序列），
+ *    并先 shadow 验证 ≥2 周。结构做空是趋势跟随形态，与已证伪的「插针回补/4h 冲高回落」
+ *    逻辑族不同，但同样必须过成本关。
+ *
+ * 参数化约定与 pinFadeAnalysis / pumpFadeShortAnalysis 一致：默认值只作未传参兜底，
+ * 策略级覆盖走 data/strategies.json 的 overrides（前端「策略管理」页）。
+ */
+import { PAPER_COSTS } from './research.js';
+import { marketStructure, summarize, isFiniteCandle, summarizeStructure } from './shared/marketStructure.js';
+
+/** 规则强度说明（写进信号的 risk 字段；⚠️ 尚无回测证据，默认关闭） */
+const RISK_NOTE = '结构做空（多周期）：4H 定方向、1H 定位置、15m 定确认，反弹进阻力区才开空，不追空。'
+  + '⚠️ 移植自 crypto-short-skill 规则引擎，尚未在 bf90 语料回测，默认关闭；规则分数是信号强度，不是胜率。';
+
+/** 参数默认值（字段与 STRUCTURE_SHORT_PARAM_SCHEMA 一一对应） */
+export const STRUCTURE_SHORT_DEFAULTS = Object.freeze({
+  // 评分/质量闸门（skill 原值 70/70）
+  bearishScoreMin: 70,
+  entryQualityMin: 70,
+  // 过度延伸：价格低于 4H EMA20 超过 N×ATR 禁追空（skill：2 ATR → WAIT_FOR_PULLBACK）
+  extendedAtr: 2,
+  // 入场：限价 = 1H 阻力 − N×ATR4h（skill entryZone 下沿 0.25 ATR）
+  entryBufAtr: 0.25,
+  // 止损：1H 阻力 + N×ATR4h（skill 0.35 ATR）；R 绝对下限兜底成本
+  stopBufferAtr: 0.35,
+  minStopPct: 0.008,
+  // 止盈：入场 − N×R（skill 的 tp2 = 2R，RR 阈值 1:2 由默认值承接）
+  takeProfitR: 2.0,
+  // 持仓约束（15m 根：96 根 = 24h；计划校验上限 120 根）
+  maxHoldBars: 96
+});
+
+const numSpec = (key, label, group, min, max, step, description) =>
+  ({ key, label, group, type: 'number', default: STRUCTURE_SHORT_DEFAULTS[key], min, max, step, description });
+
+/** 参数模式（不含出场规则 —— 出场规则在 builtins.js 展开 EXIT_PARAM_SCHEMA） */
+export const STRUCTURE_SHORT_PARAM_SCHEMA = Object.freeze([
+  numSpec('bearishScoreMin', '空头评分门槛', 'filter', 40, 90, 1,
+    '低于门槛观望。结构满分 85（4H 20 + 1H 15 + 15m 确认 10 + 阻力 10 + EMA 10 + 量能 10 + RR 10），skill 原值 70。'),
+  numSpec('entryQualityMin', '入场质量门槛', 'filter', 40, 90, 1,
+    '低于门槛视为位置不好（离阻力太远/过度延伸/超卖），宁可等反弹。skill 原值 70。'),
+  numSpec('extendedAtr', '过度延伸门槛（ATR）', 'filter', 0.5, 5, 0.1,
+    '价格低于 4H EMA20 超过 N×ATR 视为跌过头，禁止追空（skill：2 ATR → WAIT_FOR_PULLBACK）。'),
+  numSpec('entryBufAtr', '入场位缓冲（ATR）', 'entry', 0, 2, 0.05,
+    '限价 = 1H 阻力 − N×ATR4h。0.25 = skill 原值（反弹进入阻力区下沿即挂空）。'),
+  numSpec('takeProfitR', '止盈（R）', 'protection', 1, 10, 0.1,
+    '止盈 = 入场 − N×R。skill 的 tp2 口径 = 2R（对应 1:2 盈亏比要求）。'),
+  numSpec('stopBufferAtr', '止损缓冲（ATR）', 'risk', 0, 3, 0.05,
+    '止损 = 1H 阻力 + N×ATR4h。0.35 = skill 原值（阻力被有效突破即逻辑失效）。'),
+  numSpec('minStopPct', '最小止损（价格比例）', 'risk', 0, 0.05, 0.001,
+    'R 的绝对下限，兜底成本约束（低于它时止损距离被抬高）。'),
+  numSpec('maxHoldBars', '最长持仓（15m 根）', 'position', 10, 120, 1,
+    '超时未触发的订单按收盘价结算。96 根 = 24h（计划校验上限 120 根 = 30h）。')
+]);
+
+/** 解析策略参数：默认值为底，overrides 逐字段覆盖（越界回退默认并告警） */
+export function resolveStructureShortParams(overrides) {
+  const params = { ...STRUCTURE_SHORT_DEFAULTS };
+  if (!overrides || typeof overrides !== 'object') return params;
+  for (const spec of STRUCTURE_SHORT_PARAM_SCHEMA) {
+    const raw = overrides[spec.key];
+    if (raw === undefined || raw === null || raw === '') continue;
+    const value = Number(raw);
+    if (Number.isFinite(value) && value >= spec.min && value <= spec.max) params[spec.key] = value;
+    else console.warn(`[structureShortAnalysis] 策略参数 ${spec.key}=${raw} 非法（需在 ${spec.min}~${spec.max}），回退默认值 ${spec.default}`);
+  }
+  return params;
+}
+
+/* ------------------------------------------------------------------ */
+/* 指标与结构：已抽至 shared/marketStructure.js（与结构做多引擎共用）      */
+/* ------------------------------------------------------------------ */
+
+/* ------------------------------------------------------------------ */
+/* 分析入口                                                            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 结构做空分析：返回与其它引擎同构的信号对象（action: 'SELL' | 'WAIT'）。
+ * @param {{symbol:string, interval:string, klines:Array}} market  自动化主周期行情（1m）；
+ *   挂单复核路径（reviewPendingOrder）直接传 15m 行情（market.interval === '15m'）
+ * @param {object} [ctx]  策略上下文：多周期行情取 ctx.auxMarkets['15m'|'1h'|'4h']
+ * @param {{feeBps?:number, slippageBps?:number, fundingBpsPer8h?:number}} [costs]
+ */
+export function structureShortAnalysis(market, ctx = {}, costs = PAPER_COSTS) {
+  // 计划周期固定 15m（builtins 声明 planInterval='15m'）：订单与止损止盈按 15m 根数结算。
+  const PLAN_TF = '15m';
+  const source15 = market?.interval === PLAN_TF ? market : ctx?.auxMarkets?.[PLAN_TF];
+  const source1h = ctx?.auxMarkets?.['1h'];
+  const source4h = ctx?.auxMarkets?.['4h'];
+  const p = resolveStructureShortParams(ctx?.params);
+  const rows15 = Array.isArray(source15?.klines) ? source15.klines : [];
+  const rows1h = Array.isArray(source1h?.klines) ? source1h.klines : [];
+  const rows4h = Array.isArray(source4h?.klines) ? source4h.klines : [];
+
+  const windowInfo = {
+    interval: PLAN_TF,
+    bars: { '15m': rows15.length, '1h': rows1h.length, '4h': rows4h.length },
+    dataAsOf: source15?.dataAsOf || null
+  };
+  const wait = (reason, extra = {}) => ({
+    symbol: market?.symbol, action: 'WAIT', confidence: 0, reason, risk: RISK_NOTE, plan: null,
+    trend: windowInfo, ...extra
+  });
+
+  // 闸门 1：数据不足（4H 至少 55 根才够 EMA50 + 摆动结构；1H/15m 至少 30 根）
+  if (!source4h || !source1h) {
+    return wait('未获取到 1h/4h 辅助行情（needsAux=["15m","1h","4h"] 未就绪），本轮观望。');
+  }
+  const MIN = { '15m': 30, '1h': 30, '4h': 55 };
+  for (const [tf, rows] of [['15m', rows15], ['1h', rows1h], ['4h', rows4h]]) {
+    if (rows.length < MIN[tf]) {
+      return wait(`结构做空需要至少 ${MIN[tf]} 根已收盘 ${tf} K 线（实时窗口固定 80 根），实际 ${rows.length} 根。`);
+    }
+  }
+  if (!rows15.every(isFiniteCandle) || !rows1h.every(isFiniteCandle) || !rows4h.every(isFiniteCandle)) {
+    return wait('K 线存在坏打印（OHLC 非法），本轮观望。');
+  }
+
+  const s4 = marketStructure(rows4h), s1 = marketStructure(rows1h), s15 = marketStructure(rows15);
+  const i4 = summarize(rows4h);
+  const i15 = summarize(rows15);
+  if (!(i4.atr > 0) || !(i4.ema20 != null && i4.ema50 != null)) {
+    return wait('4H 指标未就绪（ATR/EMA 无效），本轮观望。');
+  }
+  const last15 = rows15.at(-1);
+  const distanceAtr = (i4.price - i4.ema20) / i4.atr;
+
+  // 闸门 2：4H 强上涨趋势禁空（rules.md 第 2 关；EMA200 不可用 → 结构+均线组合判定）
+  if (s4.trend === 'BULLISH' && i4.ema20 > i4.ema50) {
+    return wait(`4H 强上涨趋势（结构 BULLISH + EMA20>EMA50），禁空。`, { structure: summarizeStructure(s4, s1, s15) });
+  }
+
+  // 近阻力（skill：1H 阻力在 1.2×ATR4h 内）与假突破
+  const nearResistance = s1.resistance != null && Math.abs(i4.price - s1.resistance) <= 1.2 * i4.atr;
+  // 量能（适配：库内无 takerBuyVolume → 15m 放量收阴）
+  const volBearish = last15.close < last15.open && i15.volumeRatio > 1.1;
+
+  // 计划（先算再打分：RR 加分进总分，与 skill 顺序一致）
+  const resistance = s1.resistance ?? s4.resistance ?? last15.close + 0.8 * i4.atr;
+  const entryLimit = Math.max(last15.close, resistance - p.entryBufAtr * i4.atr);
+  let stopDistance = (resistance + p.stopBufferAtr * i4.atr) - entryLimit;
+  stopDistance = Math.max(stopDistance, p.minStopPct * entryLimit);
+  const stopLoss = entryLimit + stopDistance;
+  const takeProfit = entryLimit - p.takeProfitR * stopDistance;
+  const grossRR = p.takeProfitR;
+
+  // 成本后盈亏比（与 research.normalizePlan 判定同源；成本 = 2×(费+滑) + 资金费）
+  const hours = p.maxHoldBars * 15 / 60;
+  const costPct = (2 * (costs.feeBps + costs.slippageBps) + costs.fundingBpsPer8h * hours / 8) / 10000;
+  const costAbs = entryLimit * costPct;
+  const netReward = (entryLimit - takeProfit) - costAbs;
+  const netRisk = stopDistance + costAbs;
+  const netRewardRisk = netRisk > 0 ? netReward / netRisk : 0;
+
+  // 评分（结构满分 85；衍生品/BTC 成分不可用已剔除，见文件头适配点 2）
+  let score = 0;
+  const reasons = [];
+  if (s4.trend === 'BEARISH') { score += 20; reasons.push('4H 形成 LH+LL'); }
+  if (s1.trend === 'BEARISH') { score += 15; reasons.push('1H 空头结构'); }
+  if (s15.chochBearish && s15.bosBearish) { score += 10; reasons.push('15m CHOCH+BOS 确认'); }
+  if (nearResistance || s15.failedBreakout) { score += 10; reasons.push(nearResistance ? '价格接近 1H 阻力' : '15m 假突破'); }
+  if (i4.price < i4.ema20 && i4.ema20 < i4.ema50) { score += 10; reasons.push('4H EMA 空头排列'); }
+  if (volBearish) { score += 10; reasons.push(`15m 放量收阴（量比 ${i15.volumeRatio.toFixed(2)}）`); }
+  if (grossRR >= 3) { score += 10; } else if (grossRR >= 2) { score += 7; }
+  score = Math.max(0, Math.min(85, score));
+
+  // 入场质量（skill 口径）
+  let entryQuality = 50;
+  if (nearResistance) entryQuality += 15;
+  if (s15.chochBearish) entryQuality += 12;
+  if (s15.bosBearish) entryQuality += 8;
+  if (s15.failedBreakout) entryQuality += 10;
+  if (distanceAtr < -2) entryQuality -= 35;
+  if (i4.rsi != null && i4.rsi < 30) entryQuality -= 20;
+  if (i4.atrPct > 0.9) entryQuality -= 15;
+  entryQuality = Math.max(0, Math.min(100, entryQuality));
+
+  // 闸门 3：评分不足
+  if (score < p.bearishScoreMin) {
+    return wait(`空头评分 ${score} 低于门槛 ${p.bearishScoreMin}（${reasons.length ? reasons.join('；') : '无合格结构成分'}）。`,
+      { structure: summarizeStructure(s4, s1, s15), score, entryQuality });
+  }
+  // 闸门 4：过度延伸禁追空（skill：> 2 ATR 低于 EMA20 → WAIT_FOR_PULLBACK）
+  if (distanceAtr <= -p.extendedAtr) {
+    return wait(`价格低于 4H EMA20 达 ${Math.abs(distanceAtr).toFixed(2)}×ATR（≥ ${p.extendedAtr}），跌势过度延伸，禁止追空，等反弹。`,
+      { structure: summarizeStructure(s4, s1, s15), score, entryQuality });
+  }
+  // 闸门 5：入场质量不足
+  if (entryQuality < p.entryQualityMin) {
+    return wait(`入场质量 ${entryQuality} 低于门槛 ${p.entryQualityMin}，当前位置不适合开空。`,
+      { structure: summarizeStructure(s4, s1, s15), score, entryQuality });
+  }
+  // 闸门 6：成本后净盈亏比
+  if (!(netRewardRisk >= 1)) {
+    const minTpR = stopDistance > 0 ? 1 + 2 * costAbs / stopDistance : Infinity;
+    return wait(`成本后盈亏比 ${netRewardRisk.toFixed(2)} 低于 1（止盈 ${p.takeProfitR}R 太近，`
+      + `当前止损距离 ${(stopDistance / entryLimit * 100).toFixed(3)}% 下需 ≥ ${minTpR.toFixed(2)}R），不出手。`,
+      { structure: summarizeStructure(s4, s1, s15), score, entryQuality });
+  }
+  // 闸门 7：15m 确认（rules.md 最后一关：CHOCH + BOS）
+  if (!(s15.chochBearish && s15.bosBearish)) {
+    return wait(`方向与位置合格（评分 ${score} / 质量 ${entryQuality}），但缺 15m CHOCH+BOS 转弱确认，等待确认后再开空。`,
+      { structure: summarizeStructure(s4, s1, s15), score, entryQuality });
+  }
+
+  const confidence = Math.max(0, Math.min(0.95, score / 100));
+  const reason = `结构做空（4H→1H→15m）：${reasons.join('；')}；`
+    + `评分 ${score}/85、入场质量 ${entryQuality}/100、4H RSI ${i4.rsi == null ? 'NA' : i4.rsi.toFixed(1)}、`
+    + `距 4H EMA20 ${distanceAtr.toFixed(2)}×ATR；`
+    + `在 1H 阻力 ${resistance.toPrecision(6)} 下方 ${p.entryBufAtr}ATR 挂限价空 ${entryLimit.toPrecision(6)} 等反弹，`
+    + `止损 ${stopLoss.toPrecision(6)}（+${p.stopBufferAtr}ATR / R=${(stopDistance / entryLimit * 100).toFixed(3)}%），`
+    + `止盈 ${takeProfit.toPrecision(6)}（${p.takeProfitR}R，成本后净盈亏比 ${netRewardRisk.toFixed(2)}），`
+    + `15m 持仓上限 ${p.maxHoldBars} 根 = ${(p.maxHoldBars * 15 / 60).toFixed(0)}h。`
+    + `失效条件：15m 收盘有效突破 ${stopLoss.toPrecision(6)}。`;
+
+  return {
+    symbol: market.symbol,
+    action: 'SELL',
+    confidence,
+    reason,
+    risk: RISK_NOTE,
+    score,
+    entryQuality,
+    structure: summarizeStructure(s4, s1, s15),
+    trend: windowInfo,
+    plan: {
+      entryMin: entryLimit - 0.15 * i4.atr,
+      entryMax: entryLimit + 0.15 * i4.atr,
+      entryLimit,
+      stopLoss,
+      takeProfit,
+      riskUnit: stopDistance,
+      maxHoldBars: Math.round(p.maxHoldBars)
+    }
+  };
+}

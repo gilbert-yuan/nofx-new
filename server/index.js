@@ -16,6 +16,7 @@ import { createBinanceRouter } from './routes/binance.js';
 import { createStrategyRouter } from './routes/strategy.js';
 import { createMarketRouter } from './routes/market.js';
 import { createHistoryRouter } from './routes/history.js';
+import { createStatsRouter } from './routes/stats.js';
 
 const container = new Container();
 await container.init();
@@ -25,7 +26,8 @@ await container.init();
 const proxyUrl = process.env.OKX_PROXY_URL ?? (process.env.HTTPS_PROXY || process.env.HTTP_PROXY || 'http://127.0.0.1:7890');
 proxyHealth.configure(proxyUrl);
 await proxyHealth.check();
-console.log(`[ProxyHealth] 初始探测完成，后续由自动任务检查: ${proxyHealth.url}`);
+proxyHealth.start(); // 30s 周期探测维持缓存；自动任务只读 isAlive()，不再每次强制拨号
+console.log(`[ProxyHealth] 初始探测完成，后续每 30s 自动探测: ${proxyHealth.url}`);
 
 const app = express();
 app.use(cors({ origin: process.env.CORS_ORIGIN || 'http://127.0.0.1:5173' }));
@@ -40,6 +42,7 @@ app.use(createBinanceRouter(container));
 app.use(createStrategyRouter(container));
 app.use(createMarketRouter(container));
 app.use(createHistoryRouter(container));
+app.use(createStatsRouter(container));
 
 // 研究 / 全局自动化（既有模块化路由）
 await container.registerResearch(app);

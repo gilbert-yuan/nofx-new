@@ -41,6 +41,7 @@ test('symbols use exchangeInfo only; cache coalesces refreshes and candles do no
 
 test('Binance request signing uses the selected environment and correct algo/close parameters', async () => {
   const client = new BinanceClient({ apiKey: 'fake', secretKey: 'fake', testnet: true });
+  client.timeOffset = 0; // 跳过时间同步，避免多一次 request 调用
   const calls = [];
   client.request = async (url, options) => { calls.push({ url: new URL(url), options }); return { ok: true, text: async () => '{"algoId":1}' }; };
   await client.protectionOrder({ symbol: 'BTCUSDT', side: 'SELL', type: 'STOP_MARKET', triggerPrice: 90, clientAlgoId: 'nofx123' });
@@ -53,6 +54,113 @@ test('Binance request signing uses the selected environment and correct algo/clo
   assert.equal(calls[0].url.searchParams.get('workingType'), 'MARK_PRICE');
   assert.equal(calls[0].url.searchParams.get('signature').length, 64);
   assert.equal(calls[1].url.searchParams.get('reduceOnly'), 'true');
+});
+
+test('limit order and cancel target testnet fapi with correct signed parameters', async () => {
+  const client = new BinanceClient({ apiKey: 'fake', secretKey: 'fake', testnet: true });
+  client.timeOffset = 0; // 跳过时间同步
+  const calls = [];
+  client.request = async (url, options) => { calls.push({ url: new URL(url), options }); return { ok: true, text: async () => '{"orderId":1}' }; };
+  await client.limitOrder({ symbol: 'BTCUSDT', side: 'BUY', quantity: 0.002, price: 25000.5 });
+  await client.cancelOrder({ symbol: 'BTCUSDT', orderId: 42 });
+  assert.match(calls[0].url.hostname, /binancefuture/);
+  assert.equal(calls[0].url.pathname, '/fapi/v1/order');
+  assert.equal(calls[0].url.searchParams.get('type'), 'LIMIT');
+  assert.equal(calls[0].url.searchParams.get('timeInForce'), 'GTC');
+  assert.equal(calls[0].url.searchParams.get('price'), '25000.5');
+  assert.equal(calls[0].url.searchParams.get('quantity'), '0.002');
+  assert.equal(calls[1].url.pathname, '/fapi/v1/order');
+  assert.equal(calls[1].options.method, 'DELETE');
+  assert.equal(calls[1].url.searchParams.get('orderId'), '42');
+});
+
+test('testnet smoke walks place→query→cancel→recheck and rolls back on failure', async () => {
+  const { createBinanceRouter } = await import('../server/routes/binance.js');
+  const storeStub = { getConfig: async () => ({ binance: { apiKey: 'k', secretKey: 's', testnet: true } }) };
+  // asyncHandler 是 fire-and-forget（.catch(next) 不返回 promise），
+  // 测试里用 deferred 等 res.json / next 真正被调。
+  const callHandler = (clientStub, body) => new Promise((resolve, reject) => {
+    const router = createBinanceRouter({ store: storeStub, positionMonitor: {}, clientFactory: () => clientStub });
+    const handler = router.stack.find(l => l.route?.path === '/api/binance/smoke').route.stack[0].handle;
+    const lastRes = { json: null, status: 200 };
+    handler({ body }, {
+      json: async (b) => { lastRes.json = b; resolve(lastRes); return b; },
+      status(code) { lastRes.status = code; return this; }
+    }, (e) => reject(e));
+  });
+
+  // ── 成功路径：挂单 → 查到 → 撤单 → 复核（5 步全过）──
+  let calls = [];
+  let openList = [{ orderId: 7, price: '50000', status: 'NEW' }];
+  const goodClient = {
+    hasCredentials: () => true,
+    price: async () => ({ price: '100000' }),
+    limitOrder: async ({ price }) => { calls.push(['place', price]); return { orderId: 7 }; },
+    openOrders: async () => openList,
+    cancelOrder: async ({ orderId }) => { calls.push(['cancel', orderId]); openList = openList.filter(o => o.orderId !== orderId); return { orderId }; }
+  };
+  const res1 = await callHandler(goodClient, { symbol: 'BTCUSDT' });
+  assert.equal(res1.json.ok, true);
+  assert.equal(res1.json.steps.length, 5);
+  assert.ok(res1.json.steps.every(s => s.ok), '所有步骤应为 ok');
+  assert.equal(res1.json.steps[1].detail.orderId, 7);
+  assert.deepEqual(calls[1], ['cancel', 7]); // 第 4 步撤单
+  assert.equal(Math.abs(calls[0][1] - 50000) < 0.01, true); // 远价 = 现价 × 0.5
+
+  // ── 失败路径：查单不到挂单 → 兜底撤单，不留残留 ──
+  calls = [];
+  const badClient = {
+    hasCredentials: () => true,
+    price: async () => ({ price: '100000' }),
+    limitOrder: async () => ({ orderId: 8 }),
+    openOrders: async () => [],
+    cancelOrder: async ({ orderId }) => { calls.push(['rollback', orderId]); return { orderId }; }
+  };
+  const res2 = await callHandler(badClient, { symbol: 'BTCUSDT' });
+  assert.equal(res2.json.ok, false);
+  assert.equal(res2.status, 502);
+  assert.equal(res2.json.steps.filter(s => !s.ok).length, 1); // 只在查单一步断掉
+  assert.deepEqual(calls, [['rollback', 8]]); // 兜底撤单已执行
+});
+
+test('smoke rejects before trading when credentials are missing', async () => {
+  const { createBinanceRouter } = await import('../server/routes/binance.js');
+  const storeStub = { getConfig: async () => ({ binance: { apiKey: '', secretKey: '', testnet: true } }) };
+  let traded = false;
+  const router = createBinanceRouter({
+    store: storeStub, positionMonitor: {},
+    clientFactory: () => ({ hasCredentials: () => false, limitOrder: async () => { traded = true; } })
+  });
+  const handler = router.stack.find(l => l.route?.path === '/api/binance/smoke').route.stack[0].handle;
+  const error = await new Promise((resolve) => {
+    handler({ body: { symbol: 'BTCUSDT' } }, {
+      json: async (b) => { resolve(null); return b; },
+      status() { return this; }
+    }, (e) => resolve(e));
+  });
+  assert.ok(error, '应走 next 抛错');
+  assert.equal(error.status, 422);
+  assert.match(error.message, /API Key/);
+  assert.equal(traded, false);
+});
+
+test('clock skew (-1021) resyncs server time and retries the signed request once', async () => {
+  const client = new BinanceClient({ apiKey: 'fake', secretKey: 'fake', testnet: true });
+  client.timeOffset = 0;
+  const calls = [];
+  client.request = async (url, options) => {
+    calls.push(url);
+    if (calls.length === 1) {
+      const error = new Error('Binance 400: Timestamp for this request is outside of the recvWindow.');
+      error.status = 400; error.code = -1021;
+      return { ok: false, text: async () => JSON.stringify({ code: -1021, msg: 'Timestamp for this request is outside of the recvWindow.' }) };
+    }
+    return { ok: true, text: async () => JSON.stringify({ orderId: 9 }) };
+  };
+  const order = await client.marketOrder({ symbol: 'BTCUSDT', side: 'BUY', quantity: 0.001 });
+  assert.equal(order.orderId, 9);
+  assert.equal(calls.length, 3, '调用序列：首次下单(-1021) → syncTime → 重试下单');
+  assert.equal(client.timeOffset !== undefined, true, '重试前应重新同步偏移量');
 });
 
 test('base-asset quantities and TP/SL obey Binance filters; invalid numbers never pass', () => {

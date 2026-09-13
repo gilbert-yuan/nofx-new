@@ -68,6 +68,11 @@ export const useConfigStore = defineStore('config', () => {
     return binanceApi.review();
   }
 
+  /** 测试网一键冒烟：远价限价单 → 查单 → 撤单（零成交风险全链路验证） */
+  async function smoke(payload) {
+    return binanceApi.smoke(payload);
+  }
+
   let pendingStatus;
   function loadStatus() {
     if (pendingStatus) return pendingStatus;
@@ -81,6 +86,6 @@ export const useConfigStore = defineStore('config', () => {
 
   return {
     config, strategy, tradingStatus, symbolStatus, syncStatus, savedMode, statusError,
-    load, saveAi, saveBinance, test, review, loadStatus
+    load, saveAi, saveBinance, test, review, smoke, loadStatus
   };
 });

@@ -171,7 +171,7 @@ test('refresh pulls paginated active-order candles, ignores closed symbols and u
     pending({ id: 'p2', nextTime: now - 2 * minute }), pending({ id: 'closed', symbol: 'ETHUSDT', status: 'closed', net: 12 })] };
   const sim = new SimulatedAccount({ pool: {}, marketDb: { saveKlines: async input => saved.push(input) },
     archive: { candles: () => { throw Error('Must not rely on stale local-only candles'); } },
-    market: { maxPageSize: 2, storageSymbol: symbol => `OKX_PUBLIC_${symbol}`,
+    market: { provider: 'okx', maxPageSize: 2, storageSymbol: symbol => `OKX_PUBLIC_${symbol}`,
       klines: async args => {
         calls.push(args);
         return Array.from({ length: 2 }, (_, i) => candle(args.startTime + i * minute, { low: 97, close: 104 }));

@@ -1,15 +1,24 @@
 import crypto from 'node:crypto';
 import { fetch, ProxyAgent } from 'undici';
 
-const FUTURES_BASE_URL = 'https://fapi.binance.com';
+// ⚠️ 合约基址不用 fapi.binance.com：该域名对**受限地区**直接返回 451（本机代理出口即受限地区，实测）。
+// 币安官网前端的 /fapi/v1/* 边缘路由（www.binance.com）提供**同一套合约接口**且不被地区封锁
+// （实测 exchangeInfo/klines/ping 均 200），故公开行情与合约交易统一走 www.binance.com。
+// 如需回官方域可用 BINANCE_FUTURES_BASE 覆盖。
+const FUTURES_BASE_URL = process.env.BINANCE_FUTURES_BASE || 'https://www.binance.com';
 const FUTURES_TESTNET_BASE_URL = 'https://testnet.binancefuture.com';
+// ⭐ Demo Trading（demo.binance.com，统一模拟盘，已取代 Spot/Futures Testnet）的合约 REST 基址。
+// Demo key 在 demo.binance.com 的 API 管理页创建，同时适配现货(demo-api)与合约(demo-fapi)。
+const FUTURES_DEMO_BASE_URL = 'https://demo-fapi.binance.com';
 
 export class BinanceClient {
-  constructor({ apiKey = '', secretKey = '', testnet = true, proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY } = {}) {
+  constructor({ apiKey = '', secretKey = '', testnet = true, demo = false, proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY } = {}) {
     this.apiKey = apiKey;
     this.secretKey = secretKey;
-    this.baseUrl = testnet ? FUTURES_TESTNET_BASE_URL : FUTURES_BASE_URL;
+    // demo 优先于 testnet（testnet 为遗留环境）
+    this.baseUrl = demo ? FUTURES_DEMO_BASE_URL : (testnet ? FUTURES_TESTNET_BASE_URL : FUTURES_BASE_URL);
     this.testnet = testnet;
+    this.demo = demo;
     this.dispatcher = proxyUrl ? new ProxyAgent(proxyUrl) : undefined;
   }
 
@@ -80,6 +89,24 @@ export class BinanceClient {
     });
   }
 
+  async limitOrder({ symbol, side, quantity, price, timeInForce = 'GTC', reduceOnly = false, clientOrderId }) {
+    return this.signedRequest('POST', '/fapi/v1/order', {
+      symbol,
+      side,
+      type: 'LIMIT',
+      quantity,
+      price,
+      timeInForce,
+      reduceOnly,
+      newClientOrderId: clientOrderId,
+      newOrderRespType: 'RESULT'
+    });
+  }
+
+  async cancelOrder({ symbol, orderId }) {
+    return this.signedRequest('DELETE', '/fapi/v1/order', { symbol, orderId });
+  }
+
   async positionMode() { return this.signedRequest('GET', '/fapi/v1/positionSide/dual'); }
   async openOrders(symbol) { return this.signedRequest('GET', '/fapi/v1/openOrders', { symbol }); }
   async openAlgoOrders(symbol) { return this.signedRequest('GET', '/fapi/v1/openAlgoOrders', { symbol }); }
@@ -102,7 +129,7 @@ export class BinanceClient {
           await delay(350 * 2 ** attempt);
           continue;
         }
-        return parseBinanceResponse(res);
+        return await parseBinanceResponse(res);
       } catch (error) {
         lastError = error;
         if (Number(error.status) !== 502 || attempt === 2) throw error;
@@ -112,14 +139,16 @@ export class BinanceClient {
     throw lastError;
   }
 
-  async signedRequest(method, endpoint, params = {}) {
+  async signedRequest(method, endpoint, params = {}, retried = false) {
     if (!this.hasCredentials()) {
       throw new Error('Binance API key and secret are required.');
     }
+    // 本机时钟与币安服务器可能偏差数秒 → recvWindow 报错；首次签名前同步一次偏移量
+    if (this.timeOffset === undefined) await this.syncTime();
 
     const signedParams = {
       ...params,
-      timestamp: Date.now(),
+      timestamp: Date.now() + this.timeOffset,
       recvWindow: 5000
     };
     const query = new URLSearchParams(cleanParams(signedParams)).toString();
@@ -138,7 +167,27 @@ export class BinanceClient {
       },
       endpoint
     );
-    return parseBinanceResponse(res);
+    try {
+      return await parseBinanceResponse(res);
+    } catch (error) {
+      // -1021 时钟偏差：重新同步偏移后重试一次
+      if (error.code === -1021 && !retried) {
+        this.timeOffset = undefined;
+        return this.signedRequest(method, endpoint, params, true);
+      }
+      throw error;
+    }
+  }
+
+  /** 同步本地时钟与币安服务器的偏移量（毫秒） */
+  async syncTime() {
+    try {
+      const t = await this.publicRequest('/fapi/v1/time');
+      this.timeOffset = (Number(t.serverTime) || Date.now()) - Date.now();
+    } catch {
+      this.timeOffset = 0;
+    }
+    return this.timeOffset;
   }
 
   async request(url, options, endpoint) {
@@ -186,6 +235,7 @@ async function parseBinanceResponse(res) {
     }
     const responseError = new Error(`Binance ${res.status}: ${msg}`);
     responseError.status = res.status;
+    if (body.code !== undefined) responseError.code = body.code;
     throw responseError;
   }
   return body;

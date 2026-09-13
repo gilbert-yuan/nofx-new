@@ -1,97 +1,85 @@
-// 参数扫描器（2026-09-11）
-//
-// 自动循环：每组参数跑一次 50 币×30 天回测，输出净盈亏/胜率/笔数。
-// 用于系统化定位"能让策略转正"的参数组合（用户诉求：直至收益为正）。
-//
+// 参数网格扫参运行器（2026-09-13 重写；旧版指向已删语料已废弃）：
+// 逐 cell 调 _bt_live.mjs（分片并行），汇总各 cell 审计指标并排名。
 // 用法：
-//   node scripts/_bt_sweep.mjs <baseEnv> <paramSweepSpec>
-//   例：node scripts/_bt_sweep.mjs "NOFX_LONG_ONLY=true" "MIN_TREND_SCORE:75,80,85;PULLBACK_SHALLOW:0.5,0.8,1.0;MIN_ATR_PCT:0.003,0.004"
-//
-// 输出：每组一行汇总到 stdout，并写 data/backtest/sweep-YYYY-MM-DD-HHMM.json。
-//
-// 复用 _bt_run.mjs：env 变量即配置；BT_OUT 切换结果文件。50 币约 50s/组。
-
+//   node scripts/_bt_sweep.mjs --preset pump               # pump-short 全量 15m 网格（每 cell ~12s）
+//   node scripts/_bt_sweep.mjs --preset enhanced           # enhanced 1m 单轴网格（LIVE_SAMPLE=120）
+//   node scripts/_bt_sweep.mjs --cells '<JSON数组>'        # 自定义 cell
+//   SWEEP_SAMPLE=0 SWEEP_IV=15m SWEEP_WORKERS=8 可覆盖采样/周期/并行
+// cell 形状：{ tag, overrides?, env? }  overrides → BT_PARAM_OVERRIDES；env → 进程环境变量注入
 import { spawnSync } from 'node:child_process';
-import { readdirSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import { join } from 'node:path';
+import fs from 'node:fs';
 
-const DIR = 'data/backtest';
-const KDIR = join(DIR, 'klines');
-const NODE = process.execPath;
-const SCRIPT = 'scripts/_bt_run.mjs';
+const arg = (name) => {
+  const i = process.argv.indexOf(`--${name}`);
+  return i >= 0 ? process.argv[i + 1] : undefined;
+};
+const preset = arg('preset');
+const IV = process.env.SWEEP_IV || (preset === 'pump' ? '15m' : '1m');
+const SAMPLE = process.env.SWEEP_SAMPLE ?? (preset === 'pump' ? '0' : '120');
+const WORKERS = process.env.SWEEP_WORKERS || '8';
 
-if (process.argv.length < 4) {
-  console.error('用法: node scripts/_bt_sweep.mjs <baseEnv> "K1:V1,V2;K2:V1,V2"');
-  process.exit(2);
-}
+const PRESETS = {
+  // pump-short：单轴粗扫（全部为生产默认的邻域）
+  pump: [
+    { tag: 'p-base' },
+    { tag: 'p-pump35', overrides: { pumpAtrMin: 3.5 } },
+    { tag: 'p-pump45', overrides: { pumpAtrMin: 4.5 } },
+    { tag: 'p-tp45', overrides: { takeProfitR: 4.5 } },
+    { tag: 'p-tp60', overrides: { takeProfitR: 6 } },
+    { tag: 'p-pull08', overrides: { pullbackAtr: 0.8 } },
+    { tag: 'p-pull12', overrides: { pullbackAtr: 1.2 } },
+    { tag: 'p-hold48', overrides: { maxHoldBars: 48 } },
+    { tag: 'p-stop30', overrides: { stopBufferAtr: 3.0 } },
+  ],
+  // enhanced：单轴扫（基于 P13 基线）
+  enhanced: [
+    { tag: 'e-base' },
+    { tag: 'e-score78', overrides: { minTrendScore: 78 } },
+    { tag: 'e-score82', overrides: { minTrendScore: 82 } },
+    { tag: 'e-hold5', env: { NOFX_MIN_HOLD_BARS: '5' } },
+    { tag: 'e-hold10', env: { NOFX_MIN_HOLD_BARS: '10' } },
+    { tag: 'e-stop26', overrides: { stopAtr: 2.6 } },
+    { tag: 'e-pull17', overrides: { pullbackAtrShallow: 1.7, pullbackAtrDeep: 2.0 } },
+    { tag: 'e-tp4', overrides: { mainTpR: 4 } },
+    { tag: 'e-atr10', overrides: { maxAtrPct: 0.010 } },
+  ],
+};
 
-const parseEnv = s => Object.fromEntries(
-  s.split(/\s+/).filter(Boolean).map(kv => {
-    const i = kv.indexOf('='); return [kv.slice(0, i), kv.slice(i + 1)];
-  })
-);
-const baseEnv = parseEnv(process.argv[2]);
-const sweep = process.argv[3].split(';').filter(Boolean).map(spec => {
-  const [k, vs] = spec.split(':');
-  return { k, values: vs.split(',').map(v => v.trim()) };
-});
+const cells = arg('cells') ? JSON.parse(arg('cells')) : PRESETS[preset];
+if (!cells) { console.error('未知 preset 或缺 --cells'); process.exit(1); }
 
-// 笛卡尔积
-const cartesian = arrs => arrs.reduce((a, vs) => a.flatMap(x => vs.map(v => [...x, v])), [[]]);
-const grid = cartesian(sweep.map(s => s.values));
-const N = grid.length;
-const total = N * 50; // ~50s each
-
-console.log(`\n[扫描] 组合 ${N} 组 × 50 币 ≈ ${(N * 50 / 60).toFixed(0)} min`);
-console.log('基线 env:', JSON.stringify(baseEnv));
-console.log('扫描维度:', sweep.map(s => `${s.k}∈{${s.values.join(',')}}`).join('; '), '\n');
-
-const ts = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 16);
-const sweepFile = join(DIR, `sweep-${ts}.json`);
-const results = [];
-
-for (let i = 0; i < grid.length; i++) {
-  const combo = grid[i];
-  const envExtra = {};
-  const label = sweep.map((s, j) => `${s.k}=${combo[j]}`).join(' ');
-  for (let j = 0; j < sweep.length; j++) {
-    // 自动加 NOFX_ 前缀（用户写 MIN_TREND_SCORE → NOFX_MIN_TREND_SCORE）；
-    // 已带前缀或完全以 NOFX_ 开头的跳过。
-    const k = sweep[j].k.startsWith('NOFX_') ? sweep[j].k : `NOFX_${sweep[j].k}`;
-    envExtra[k] = combo[j];
-  }
-  const fullEnv = { ...baseEnv, ...envExtra, BT_OUT: `sweep-${i}.json` };
-
+console.log(`== 扫参 ${cells.length} cells · 语料 ${IV === '15m' ? (process.env.LIVE_DIR || 'data/backtest/bf90-15mrs') : 'data/backtest/bf90-1m'} · 采样 ${SAMPLE} · 并行 ${WORKERS} ==\n`);
+const rows = [];
+for (let i = 0; i < cells.length; i++) {
+  const cell = cells[i];
+  const env = {
+    ...process.env,
+    BT_STRATEGY: IV === '15m' ? 'pump-short' : 'enhanced',   // ⚠️ 必传：不传子进程默认 enhanced，pump 参数会被忽略
+    LIVE_TAG: cell.tag,
+    LIVE_WORKERS: WORKERS,
+    LIVE_SAMPLE: String(SAMPLE),
+    LIVE_TF_MS: IV === '15m' ? '900000' : '60000',
+    ...(IV === '15m' ? { LIVE_DIR: process.env.LIVE_DIR || 'data/backtest/bf90-15mrs' } : {}),
+    ...(cell.overrides ? { BT_PARAM_OVERRIDES: JSON.stringify(cell.overrides) } : {}),
+    ...(cell.env || {}),
+  };
   const t0 = Date.now();
-  const r = spawnSync(NODE, [SCRIPT], { env: { ...process.env, ...fullEnv }, encoding: 'utf8' });
-  const dt = (Date.now() - t0) / 1000;
-  if (r.status !== 0) {
-    console.log(`[${i + 1}/${N}] ✗ ${label} (exit ${r.status}) stderr=${(r.stderr || '').slice(-200)}`);
+  const r = spawnSync(process.execPath, ['scripts/_bt_live.mjs'], { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  const dur = ((Date.now() - t0) / 1000).toFixed(0);
+  const sumFile = `data/backtest/results/live-${cell.tag}-${IV}.summary.json`;
+  if (r.status !== 0 || !fs.existsSync(sumFile)) {
+    console.error(`[${i + 1}/${cells.length}] ${cell.tag} ✗ exit=${r.status}\n${(r.stderr || '').slice(-500)}`);
     continue;
   }
-  // 解析 _bt_run.mjs 末行：净盈亏 NNN.U USDT 胜率 NN% 笔数 NNN
-  const m = r.stdout.match(/净盈亏\s+(-?\d+\.\d+)\s+USDT\s+胜率\s+(\d+\.\d+)%\s+均单\s+(-?\d+\.\d+)U/);
-  const trades = (() => {
-    try {
-      const d = JSON.parse(readFileSync(join(DIR, fullEnv.BT_OUT), 'utf8'));
-      return d.trades.filter(x => !x.unfinished);
-    } catch { return []; }
-  })();
-  const placed = (() => { try { return JSON.parse(readFileSync(join(DIR, fullEnv.BT_OUT), 'utf8')).placed.length; } catch { return 0; } })();
-
-  const summary = {
-    i, label, env: envExtra,
-    net: m ? +m[1] : NaN, winRate: m ? +m[2] : NaN, avg: m ? +m[3] : NaN,
-    trades: trades.length, placed, seconds: +dt.toFixed(1)
-  };
-  results.push(summary);
-  console.log(`[${i + 1}/${N}] ${label.padEnd(60)} n=${summary.trades.toString().padStart(3)} 净${summary.net.toFixed(1).padStart(8)} 胜率${summary.winRate.toFixed(1).padStart(5)}%  均单${summary.avg.toFixed(3).padStart(7)}  ${dt.toFixed(0)}s`);
-  writeFileSync(sweepFile, JSON.stringify(results, null, 2));
+  const s = JSON.parse(fs.readFileSync(sumFile, 'utf8'));
+  rows.push({ tag: cell.tag, ...s });
+  console.log(`[${i + 1}/${cells.length}] ${cell.tag.padEnd(12)} 净${s.net.toFixed(0).padStart(7)}U  胜率${s.wr.toFixed(0).padStart(3)}%  PF${(s.pf === Infinity ? '∞' : s.pf.toFixed(2)).padStart(5)}  笔数${String(s.filled).padStart(5)}  剔T3${s.netExTop3.toFixed(0).padStart(7)}  h1/h2 ${s.h1.toFixed(0)}/${s.h2.toFixed(0)}  (${dur}s)`);
 }
 
-results.sort((a, b) => b.net - a.net);
-console.log('\n=== Top 5 ===');
-for (const r of results.slice(0, 5)) {
-  console.log(`净${r.net.toFixed(1).padStart(8)} 胜率${r.winRate.toFixed(1).padStart(5)}%  n=${r.trades.toString().padStart(3)}  ${r.label}`);
+rows.sort((a, b) => b.net - a.net);
+console.log('\n===== 排名（按净盈亏）=====');
+for (const [i, r] of rows.entries()) {
+  console.log(`${String(i + 1).padStart(2)}. ${r.tag.padEnd(12)} 净${r.net.toFixed(1).padStart(9)}U  PF${(r.pf === Infinity ? '∞' : r.pf.toFixed(2)).padStart(5)}  胜率${r.wr.toFixed(1).padStart(5)}%  笔${String(r.filled).padStart(5)}  MDD${r.mdd.toFixed(0).padStart(6)}  剔T3${r.netExTop3.toFixed(0).padStart(8)}  剔T10${r.netExTop10.toFixed(0).padStart(8)}  h1/h2 ${r.h1.toFixed(0)}/${r.h2.toFixed(0)}`);
 }
-console.log(`\n结果写入: ${sweepFile}`);
+fs.writeFileSync(`data/backtest/results/sweep-${preset || 'custom'}-${IV}.json`, JSON.stringify({ at: new Date().toISOString(), iv: IV, sample: SAMPLE, rows }, null, 1));
+console.log(`\n明细 data/backtest/results/sweep-${preset || 'custom'}-${IV}.json`);

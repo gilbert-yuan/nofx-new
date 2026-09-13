@@ -57,6 +57,10 @@ export function defineStrategy(def) {
     engine: String(def.engine || 'enhanced'),
     modelId: String(def.modelId || `${id}-rules-v1`),
     needsAux: Array.isArray(def.needsAux) ? [...def.needsAux] : [],
+    // 原生计划周期（可选）：策略信号在非主周期（如 15m）K 线上计算时声明，
+    // globalAutomation 会用该周期的行情建研究记录 —— 订单 interval 跟随此值，
+    // maxHoldBars / 止损止盈结算都按该周期根数口径（如 15m 的 96 根 = 24h）。
+    planInterval: typeof def.planInterval === 'string' && def.planInterval ? def.planInterval : null,
     paramSchema,
     priority: Number.isFinite(def.priority) ? def.priority : 100,
     builtin: def.builtin !== false,
