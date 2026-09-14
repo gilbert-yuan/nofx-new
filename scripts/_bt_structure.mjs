@@ -21,11 +21,27 @@ const WORKERS = Math.max(1, Number(process.env.STRUCT_WORKERS || 8));
 const SAMPLE = Number(process.env.STRUCT_SAMPLE || 0);
 const ENGINES = (process.env.STRUCT_ENGINES || 'structure-short,structure-long').split(',').map(s => s.trim()).filter(Boolean);
 const TAG = process.env.STRUCT_TAG || 'bf90';
-// 基座 env（铁律：shared/strategyGuards 模块加载时冻结 env；recommendedLeverage 读这两个值）
+// 基座 env（铁律：shared/strategyGuards 与 enhancedAnalysis 在**模块加载时**冻结 env，
+// 漏注会静默换成代码默认值 —— 与生产口径差很远）。
+// ⚠️ 2026-09-14 修正：原先只注入 5 个变量，漏掉了 NOFX_SMART_MA_ATR / NOFX_SMART_MIN_HOLD
+//    （默认 1.0 ATR / 0 根），于是「回调挂单入场」与「均线失守退出」几何重叠 → 成交后第 1 根
+//    就被 smart_exit_ma 打掉（实测 98% 出场为 smart_exit_ma、heldBars=1），正是生产 P8 注释里
+//    已修掉的「入场即出场」结构性冲突。生产用 2.0 ATR + 15 根最小持仓抑制该冲突。
+// 唯一来源：ecosystem.config.cjs（生产 P15）。生产改参数时必须同步改这里。
 const BASE_ENV = {
+  NOFX_LONG_ONLY: 'true',
+  NOFX_MIN_TREND_SCORE: '73',
+  NOFX_SMART_MA_ATR: '2.0',
+  NOFX_SMART_MIN_HOLD: '15',
+  NOFX_STOP_ATR: '2.0',
+  NOFX_SMART_EXIT: 'false',
   NOFX_MAX_LEVERAGE: '12',
   NOFX_RISK_BUDGET_PCT: '0.18',
-  NOFX_LONG_ONLY: 'true',
+  NOFX_MAX_ATR_PCT: '0.012',
+  NOFX_MIN_ATR_PCT: '0.007',
+  NOFX_PULLBACK_ATR_SHALLOW: '1.9',
+  NOFX_PULLBACK_ATR_DEEP: '2.2',
+  NOFX_PENDING_GRACE_MIN: '60',
   NOFX_SYMBOL_COOLDOWN_MIN: '30',
   NOFX_STOP_COOLDOWN_MIN: '60'
 };
@@ -61,7 +77,7 @@ for (const engine of ENGINES) {
           BT_SYMBOLS: list.join(','),
           BT_OUT: out
         },
-        cwd: process.cwd(), stdio: ['ignore', 'ignore', 'pipe']
+        cwd: process.cwd(), stdio: ['ignore', 'inherit', 'pipe']
       });
       let err = '';
       r.stderr.on('data', d => { err += d; });
@@ -108,6 +124,25 @@ for (const s of summaries) {
   console.log(`  ${s.engine}: 挂单 ${s.placed}  成交 ${s.filled}  净 ${s.net.toFixed(1)}U  胜率 ${s.wr.toFixed(1)}%  PF ${s.pf === Infinity ? '∞' : s.pf.toFixed(2)}  剔Top3币 ${s.netExTop3.toFixed(1)}U  剔最大5笔 ${s.netExTop5t.toFixed(1)}U  前后半 ${s.h1.toFixed(0)}/${s.h2.toFixed(0)}U`);
 }
 
+/**
+ * 持仓小时数。
+ * ⚠️ 2026-09-14：`held15m` 字段已不再由结果产出（TradingSimulator 只回传 heldBars=分钟），
+ * 旧代码直接用 x.held15m 会让所有成交落进同一个桶、中位持仓变成 NaN。改为优先 held15m、
+ * 回退 heldBars/60，两个字段都缺才返回 NaN。
+ */
+function holdHours(x) {
+  if (Number.isFinite(x.held15m)) return x.held15m;
+  if (Number.isFinite(x.heldBars)) return x.heldBars / 60;
+  return NaN;
+}
+
+/** 名义成交额（成本拆解的分母）。优先 notional，回退 quantity×entry。 */
+function notionalOf(x) {
+  if (Number.isFinite(x.notional) && x.notional > 0) return x.notional;
+  if (Number.isFinite(x.quantity) && Number.isFinite(x.entry) && x.quantity > 0) return x.quantity * x.entry;
+  return NaN;
+}
+
 function audit(merged, coinsTested, tag) {
   const T = merged.trades.filter(x => !x.unfinished && Number.isFinite(x.net));
   const net = T.reduce((a, x) => a + x.net, 0);
@@ -126,7 +161,7 @@ function audit(merged, coinsTested, tag) {
   const gross = T.reduce((a, x) => a + x.gross, 0);
   const fee = T.reduce((a, x) => a + x.fee, 0);
   const funding = T.reduce((a, x) => a + x.funding, 0);
-  const notionalSum = T.reduce((a, x) => a + x.notional, 0);
+  const notionalSum = T.reduce((a, x) => a + notionalOf(x), 0);
   const reasons = T.reduce((m, x) => (m[x.reason] = (m[x.reason] || 0) + 1, m), {});
   const evs = [];
   for (const x of T) { evs.push([Date.parse(x.entryAt), 1]); evs.push([Date.parse(x.exitAt) + 1, -1]); }
@@ -139,8 +174,8 @@ function audit(merged, coinsTested, tag) {
   const med = (a) => { const s = a.filter(Number.isFinite).sort((x, y) => x - y); return s.length ? s[Math.floor(s.length / 2)] : NaN; };
   const heldBuckets = {};
   for (const x of T) {
-    const h = x.held15m;
-    const k = h < 2 ? '<2h' : h < 8 ? '2-8h' : h < 16 ? '8-16h' : '16-24h';
+    const h = holdHours(x);
+    const k = !Number.isFinite(h) ? '未知' : h < 2 ? '<2h' : h < 8 ? '2-8h' : h < 16 ? '8-16h' : h < 24 ? '16-24h' : '≥24h';
     heldBuckets[k] = (heldBuckets[k] || { n: 0, net: 0 });
     heldBuckets[k].n++; heldBuckets[k].net += x.net;
   }
@@ -149,7 +184,7 @@ function audit(merged, coinsTested, tag) {
     filled: T.length, fillRate: merged.placed.length ? 100 * T.length / merged.placed.length : 0,
     net, wr: T.length ? 100 * wins.length / T.length : 0, pf: gl > 0 ? gp / gl : Infinity,
     mdd, avg: T.length ? net / T.length : NaN,
-    medHeld15m: med(T.map(x => x.held15m)), medRoi: med(T.map(x => x.roi)) * 100,
+    medHeld15m: med(T.map(holdHours)), medRoi: med(T.map(x => x.roi)) * 100,
     medScore: med(T.map(x => x.score)), medEntryQuality: med(T.map(x => x.entryQuality)),
     reasons, heldBuckets,
     gross, fee, funding, grossBps: notionalSum ? 10000 * gross / notionalSum : NaN,

@@ -77,12 +77,12 @@ const defaultState = {
   decisions: []
 };
 
-// 多策略体系：启用集 + 每个策略的参数覆盖。
-// enabled=null 表示「尚未初始化」，由 StrategyRuntime 按 config.analysis.engine 推导后落盘。
+// 多策略体系：每个策略的启用状态、完整有效参数和备注放在同一条记录中。
+// initialized=false 表示「尚未初始化」，由 StrategyRuntime 按 config.analysis.engine 推导后落盘。
 const defaultStrategies = {
-  version: 1,
-  enabled: null,
-  overrides: {},
+  version: 2,
+  initialized: false,
+  strategies: {},
   updatedAt: null
 };
 
@@ -165,7 +165,7 @@ export class Store {
     return this.writeJson(this.strategyPath, strategy);
   }
 
-  /** 多策略：启用集 + 参数覆盖（data/strategies.json） */
+  /** 多策略：按策略保存启用状态、完整参数和备注（data/strategies.json） */
   getStrategies() {
     return this.readJson(this.strategiesPath);
   }

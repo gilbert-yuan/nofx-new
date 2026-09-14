@@ -42,7 +42,7 @@ defineStrategy({
   priority: 10,
   paramSchema: ENHANCED_PARAM_SCHEMA,
   analyze: (market, ctx = {}) => enhancedAnalysis(market, ctx.params),
-  review: (order, market) => enhancedProtectionReview(order, market)
+  review: (order, market, ctx = {}) => enhancedProtectionReview(order, market, ctx)
 });
 
 /**
@@ -72,6 +72,8 @@ defineStrategy({
   paramSchema: [...STRUCTURE_SHORT_PARAM_SCHEMA, ...PUMP_SHORT_EXIT_PARAM_SCHEMA],
   analyze: (market, ctx = {}) => structureShortAnalysis(market, ctx),
   // 本地规则复核：R 口径移动止损阶梯（方向对称，空头取 min 侧）
+  // 移动止损规则已经在订单 plan.exitRules 中快照；第三参不是 ctx，而是旧版
+  // localProtectionReview 的 trailingRule 兼容参数，不能把整个 ctx 误传进去。
   review: (order, market) => localProtectionReview(order, market),
   // 引擎原生不带 exitRules，这里补一份「该策略的」出场规则（智能退出默认关闭）
   decoratePlan: (plan, ctx = {}) => ({
@@ -108,6 +110,7 @@ defineStrategy({
   paramSchema: [...STRUCTURE_LONG_PARAM_SCHEMA, ...PUMP_SHORT_EXIT_PARAM_SCHEMA],
   analyze: (market, ctx = {}) => structureLongAnalysis(market, ctx),
   // 本地规则复核：R 口径移动止损阶梯（方向对称，多头取 max 侧）
+  // 同上：复核必须按订单快照恢复规则，不能用运行时 ctx 覆盖订单归属。
   review: (order, market) => localProtectionReview(order, market),
   // 引擎原生不带 exitRules，这里补一份「该策略的」出场规则（智能退出默认关闭）
   decoratePlan: (plan, ctx = {}) => ({

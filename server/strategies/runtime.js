@@ -3,20 +3,27 @@
  *
  * 持久化文件：data/strategies.json
  *   {
- *     version: 1,
- *     enabled: ["enhanced-trend-v1"],      // null = 尚未初始化，按 config.analysis.engine 推导
- *     overrides: { "<id>": { "<paramKey>": value } },
- *     notes: { "<id>": "做多" },            // 人工备注（说明该策略当前用途/方向，不参与任何计算）
+ *     version: 2,
+ *     initialized: true,
+ *     strategies: {
+ *       "enhanced-trend-v1": {
+ *         enabled: true,
+ *         params: { minTrendScore: 66, ... },
+ *         notes: "做多"
+ *       }
+ *     },
  *     updatedAt: "..."
  *   }
  *
  * 改造要点：首次运行时把既有的 `config.analysis.engine` 平移成启用集，
  * 保证升级前后「自动化跑的策略」完全一致（enhanced → enhanced-trend-v1）。
+ * v1（enabled/overrides/notes）文件会在首次读取时自动迁移到 v2；v2 把一个策略
+ * 的启用状态、完整有效参数和备注放在同一条记录里，回测与线上运行共用这一份配置。
  */
 import { listStrategies, getStrategy, resolveParams, defaultParams } from './registry.js';
 import { ENGINE_DEFAULT_STRATEGY } from './builtins.js';
 
-const VERSION = 1;
+const VERSION = 2;
 
 /** 备注最大长度（超长截断，避免把说明文字当存储用） */
 export const MAX_NOTES_LENGTH = 200;
@@ -27,7 +34,9 @@ export function normalizeNotes(value) {
   return value.replace(/\s+/g, ' ').trim().slice(0, MAX_NOTES_LENGTH);
 }
 
-const emptyState = () => ({ version: VERSION, enabled: null, overrides: {}, notes: {}, updatedAt: null });
+const isPlainObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+
+const emptyState = () => ({ version: VERSION, initialized: false, strategies: {}, updatedAt: null });
 
 /** 备注只保留字符串值，脏数据（旧文件/手改）直接丢弃而不是抛错 */
 function sanitizeNotes(raw) {
@@ -39,6 +48,56 @@ function sanitizeNotes(raw) {
   }
   return out;
 }
+
+function normalizeEntry(raw) {
+  return {
+    enabled: raw?.enabled === true,
+    params: isPlainObject(raw?.params) ? { ...raw.params } : {},
+    notes: normalizeNotes(raw?.notes)
+  };
+}
+
+/** 将旧的 enabled/overrides/notes 结构转换成 v2 的按策略记录结构。 */
+function normalizeState(raw) {
+  if (isPlainObject(raw) && isPlainObject(raw.strategies)) {
+    const strategies = Object.fromEntries(
+      Object.entries(raw.strategies).map(([id, entry]) => [id, normalizeEntry(entry)])
+    );
+    return {
+      state: {
+        ...emptyState(),
+        version: VERSION,
+        initialized: typeof raw.initialized === 'boolean' ? raw.initialized : Object.keys(strategies).length > 0,
+        strategies,
+        updatedAt: typeof raw.updatedAt === 'string' ? raw.updatedAt : null
+      },
+      migrated: raw.version !== VERSION
+    };
+  }
+
+  const enabled = Array.isArray(raw?.enabled) ? new Set(raw.enabled) : null;
+  const overrides = isPlainObject(raw?.overrides) ? raw.overrides : {};
+  const notes = sanitizeNotes(raw?.notes);
+  const ids = new Set([
+    ...listStrategies().map(def => def.id),
+    ...Object.keys(overrides),
+    ...Object.keys(notes)
+  ]);
+  const strategies = {};
+  for (const id of ids) {
+    strategies[id] = normalizeEntry({
+      enabled: enabled ? enabled.has(id) : false,
+      params: overrides[id],
+      notes: notes[id]
+    });
+  }
+  return {
+    state: { ...emptyState(), initialized: enabled !== null, strategies },
+    migrated: true
+  };
+}
+
+const sameJson = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 
 export class StrategyRuntime {
   /**
@@ -53,20 +112,17 @@ export class StrategyRuntime {
     this.resolveEngine = typeof resolveEngine === 'function' ? resolveEngine : () => 'enhanced';
   }
 
-  async readState() {
-    if (typeof this.store?.getStrategies !== 'function') return emptyState();
+  async readStateMeta() {
+    if (typeof this.store?.getStrategies !== 'function') return { state: emptyState(), migrated: false };
     try {
-      const raw = await this.store.getStrategies();
-      if (!raw || typeof raw !== 'object') return emptyState();
-      return {
-        ...emptyState(),
-        ...raw,
-        overrides: (raw.overrides && typeof raw.overrides === 'object') ? raw.overrides : {},
-        notes: sanitizeNotes(raw.notes)
-      };
+      return normalizeState(await this.store.getStrategies());
     } catch {
-      return emptyState();
+      return { state: emptyState(), migrated: false };
     }
+  }
+
+  async readState() {
+    return (await this.readStateMeta()).state;
   }
 
   async writeState(state) {
@@ -86,49 +142,78 @@ export class StrategyRuntime {
   }
 
   /**
-   * 读取状态，必要时初始化并落盘。
-   *
-   * 顺带清理「已下线策略」残留在启用集里的 id：这类 id 取不到定义，
-   * 既不会出现在策略列表里、也不会被 enabled() 跑，只会让前端的
-   * 「启用 N / M」计数虚高（策略删除后最容易踩到的隐形残留）。
+   * 读取状态，必要时初始化、补齐新策略参数并落盘。
+   * 新版本策略增加参数时，只给已有配置补上缺失的默认键，不覆盖用户已经保存的值。
    */
   async ensureState(config) {
-    const state = await this.readState();
-    if (!Array.isArray(state.enabled)) {
-      state.enabled = this.defaultEnabled(config);
-      return this.writeState(state);
+    const { state: rawState, migrated } = await this.readStateMeta();
+    const state = { ...rawState, strategies: { ...(rawState.strategies || {}) } };
+    let changed = migrated;
+    const defs = listStrategies();
+
+    if (!state.initialized) {
+      const defaults = new Set(this.defaultEnabled(config));
+      for (const def of defs) {
+        const current = normalizeEntry(state.strategies[def.id]);
+        state.strategies[def.id] = { ...current, enabled: defaults.has(def.id) };
+      }
+      state.initialized = true;
+      changed = true;
     }
-    const known = new Set(listStrategies().map(s => s.id));
-    const alive = state.enabled.filter(id => known.has(id));
-    if (alive.length !== state.enabled.length) {
-      // 重排为注册表顺序，与 update() 的写入顺序保持一致
-      state.enabled = listStrategies().map(s => s.id).filter(id => alive.includes(id));
-      return this.writeState(state);
+
+    for (const def of defs) {
+      const current = normalizeEntry(state.strategies[def.id]);
+      const params = resolveParams(def.paramSchema, current.params).params;
+      const next = { ...current, params };
+      if (!sameJson(next, state.strategies[def.id])) changed = true;
+      state.strategies[def.id] = next;
     }
-    return state;
+
+    return changed ? this.writeState(state) : state;
   }
 
-  /** 某个策略的有效参数（默认值 + 已保存的覆盖） */
+  /** 某个策略的有效参数（默认值 + 配置文件中的完整参数） */
   effectiveParams(def, state) {
-    const overrides = state.overrides?.[def.id];
-    return resolveParams(def.paramSchema, overrides || {}).params;
+    return resolveParams(def.paramSchema, state.strategies?.[def.id]?.params || {}).params;
+  }
+
+  /** 将注册表定义和一份参数快照合成可执行策略对象。 */
+  materialize(def, params = {}) {
+    return { ...def, params: resolveParams(def.paramSchema, params).params };
   }
 
   /** 运行时就绪的策略列表（含 params）—— 自动化用它来跑分析 */
   async enabled(config) {
     const state = await this.ensureState(config);
-    return state.enabled
-      .map(id => getStrategy(id))
-      .filter(Boolean)
-      .map(def => ({ ...def, params: this.effectiveParams(def, state) }));
+    return listStrategies()
+      .filter(def => state.strategies?.[def.id]?.enabled === true)
+      .map(def => this.materialize(def, this.effectiveParams(def, state)));
+  }
+
+  /** 全量已注册策略（包括停用策略），供存量订单恢复原策略配置。 */
+  async all(config) {
+    const state = await this.ensureState(config);
+    return listStrategies().map(def => this.materialize(def, this.effectiveParams(def, state)));
+  }
+
+  /** 按策略 id 读取当前配置；snapshotParams 存在时优先恢复订单快照。 */
+  async configured(id, config = {}, snapshotParams = null) {
+    const def = getStrategy(id);
+    if (!def) return null;
+    if (isPlainObject(snapshotParams)) return this.materialize(def, snapshotParams);
+    const state = await this.ensureState(config);
+    return this.materialize(def, this.effectiveParams(def, state));
   }
 
   /** 给 API / 前端：全量策略 + 启用状态 + 有效参数 + 默认值 */
   async list(config) {
     const state = await this.ensureState(config);
-    const enabledSet = new Set(state.enabled);
+    const enabled = listStrategies()
+      .filter(def => state.strategies?.[def.id]?.enabled === true)
+      .map(def => def.id);
+    const enabledSet = new Set(enabled);
     return {
-      enabled: [...state.enabled],
+      enabled,
       updatedAt: state.updatedAt || null,
       strategies: listStrategies().map(def => ({
         id: def.id,
@@ -144,7 +229,7 @@ export class StrategyRuntime {
         planInterval: def.planInterval,
         builtin: def.builtin,
         enabled: enabledSet.has(def.id),
-        notes: state.notes?.[def.id] || '',
+        notes: state.strategies?.[def.id]?.notes || '',
         paramSchema: def.paramSchema,
         params: this.effectiveParams(def, state),
         defaults: defaultParams(def.paramSchema)
@@ -168,39 +253,33 @@ export class StrategyRuntime {
     if (!def) throw Object.assign(new Error(`未知策略：${id}`), { status: 404 });
     const state = await this.ensureState(config);
     const rejected = [];
+    const entry = normalizeEntry(state.strategies[def.id]);
 
-    if (typeof patch.enabled === 'boolean') {
-      const set = new Set(state.enabled);
-      if (patch.enabled) set.add(def.id); else set.delete(def.id);
-      state.enabled = listStrategies().map(s => s.id).filter(key => set.has(key));
-    }
+    if (typeof patch.enabled === 'boolean') entry.enabled = patch.enabled;
 
-    if (patch.params && typeof patch.params === 'object') {
-      const { params, rejected: bad } = resolveParams(def.paramSchema, patch.params);
+    if (isPlainObject(patch.params)) {
+      const { rejected: bad } = resolveParams(def.paramSchema, patch.params);
       rejected.push(...bad);
-      // 只落盘「本次显式提交且合法」的键：
-      //   · 与默认值相同也照样写入 —— 那是用户明确设过的意图，应当可见、可追溯；
-      //   · 未提交的键保持原样（调用方可以只提交改动项，文件不会被默认值塞满）；
-      //   · 校验失败的键既不改值也不落盘。
-      // 清空请用 reset()（恢复默认）。
       const badKeys = new Set(bad.map((item) => item.key));
-      const merged = { ...(state.overrides[def.id] || {}) };
+      const current = this.effectiveParams(def, state);
+      const merged = { ...current };
       for (const spec of def.paramSchema) {
         if (!Object.prototype.hasOwnProperty.call(patch.params, spec.key)) continue;
         if (badKeys.has(spec.key)) continue;
-        merged[spec.key] = params[spec.key];
+        merged[spec.key] = resolveParams(def.paramSchema, {
+          ...current,
+          [spec.key]: patch.params[spec.key]
+        }).params[spec.key];
       }
-      state.overrides = { ...state.overrides, [def.id]: merged };
+      entry.params = merged;
     }
 
     // 备注：纯展示用途，不参与任何分析计算；传空串即清除
     if (typeof patch.notes === 'string') {
-      const note = normalizeNotes(patch.notes);
-      const notes = { ...(state.notes || {}) };
-      if (note) notes[def.id] = note; else delete notes[def.id];
-      state.notes = notes;
+      entry.notes = normalizeNotes(patch.notes);
     }
 
+    state.strategies = { ...state.strategies, [def.id]: entry };
     await this.writeState(state);
     return { strategy: await this.describe(def.id, config), rejected };
   }
@@ -210,22 +289,50 @@ export class StrategyRuntime {
     const def = getStrategy(id);
     if (!def) throw Object.assign(new Error(`未知策略：${id}`), { status: 404 });
     const state = await this.ensureState(config);
-    const overrides = { ...state.overrides };
-    delete overrides[def.id];
-    state.overrides = overrides;
+    state.strategies = {
+      ...state.strategies,
+      [def.id]: {
+        ...normalizeEntry(state.strategies[def.id]),
+        params: defaultParams(def.paramSchema)
+      }
+    };
     await this.writeState(state);
     return { strategy: await this.describe(def.id, config) };
   }
 
-  /** 订单 → 该订单所属的策略（含参数）。订单未标记策略时回退到默认策略。 */
+  /**
+   * 订单 → 该订单所属的策略（含参数）。订单快照优先于当前配置，保证改配置/停策略
+   * 不会改变已在途订单；没有快照的旧订单才回退当前策略配置或默认值。
+   */
   resolveForOrder(order, strategies, config) {
+    const available = Array.isArray(strategies) ? strategies : [];
     const id = order?.analysisContext?.strategyId;
     if (id) {
-      const found = strategies.find(item => item.id === id);
-      if (found) return found;
+      const def = getStrategy(id);
+      if (def) {
+        const snapshot = order?.analysisContext?.strategyParams;
+        if (isPlainObject(snapshot)) return this.materialize(def, snapshot);
+        const found = available.find(item => item.id === id);
+        if (found) return found;
+        return this.materialize(def);
+      }
     }
     const fallbackId = this.defaultEnabled(config)[0];
-    return strategies.find(item => item.id === fallbackId) || strategies[0] || null;
+    return available.find(item => item.id === fallbackId) || available[0] || null;
+  }
+
+  /** 异步订单解析：没有快照时也能从配置文件恢复已停用策略的当前参数。 */
+  async strategyForOrder(order, config = {}, strategies = []) {
+    const id = order?.analysisContext?.strategyId;
+    if (id) {
+      const snapshot = order?.analysisContext?.strategyParams;
+      const configured = await this.configured(id, config, snapshot);
+      if (configured) return configured;
+    }
+    return strategies.find(item => item.id === this.defaultEnabled(config)[0])
+      || strategies[0]
+      || (await this.enabled(config))[0]
+      || null;
   }
 }
 

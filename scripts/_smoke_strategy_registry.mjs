@@ -67,7 +67,7 @@ console.log('paramSchema size =', before.paramSchema.length);
 const upd = await rt.update('enhanced-trend-v1', { enabled: true, params: { maxHoldBars: 60, minTrendScore: 9999 } });
 console.log('update -> maxHoldBars=', upd.strategy.params.maxHoldBars, 'minTrendScore(越界回退)=', upd.strategy.params.minTrendScore);
 console.log('rejected =', JSON.stringify(upd.rejected));
-console.log('persisted overrides =', JSON.stringify(store._s.overrides));
+console.log('persisted strategy.params =', JSON.stringify(store._s.strategies?.['enhanced-trend-v1']?.params));
 
 const r2 = await rt.reset('enhanced-trend-v1');
 console.log('after reset maxHoldBars =', r2.strategy.params.maxHoldBars, 'enabled still =', r2.strategy.enabled);

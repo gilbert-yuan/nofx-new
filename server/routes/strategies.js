@@ -3,7 +3,7 @@
  *
  *   GET    /api/strategies            全量策略：启用状态 + 有效参数 + 默认值 + 参数模式
  *   GET    /api/strategies/:id        单个策略快照
- *   PUT    /api/strategies/:id        勾选/取消启用（enabled）+ 覆盖参数（params）+ 备注（notes）
+ *   PUT    /api/strategies/:id        勾选/取消启用（enabled）+ 策略参数（params）+ 备注（notes）
  *   POST   /api/strategies/:id/reset  参数恢复默认（不影响启用状态与备注）
  *
  * 落盘在 data/strategies.json；运行时不缓存，改动下一轮自动化立即生效。

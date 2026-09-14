@@ -33,11 +33,13 @@
  *    并 shadow 验证 ≥2 周。做多方向与生产 enhanced-trend-v1 同向，同币种竞争由 priority
  *    仲裁（本策略 85，排在 enhanced 10 之后；同币种已有单时自动跳过）。
  *
- * 参数化约定与其它引擎一致：默认值只作未传参兜底，策略级覆盖走 data/strategies.json 的
- * overrides（前端「策略管理」页）。
+ * 参数化约定与注册表一致：默认值只作未传参兜底，策略完整参数由
+ * data/strategies.json 读取（前端「策略管理」页）。
  */
 import { PAPER_COSTS } from './research.js';
 import { marketStructure, summarize, isFiniteCandle, summarizeStructure, selectPivotTarget } from './shared/marketStructure.js';
+import { recommendedLeverage } from './localAnalysis.js';
+import { STRATEGY_RISK_DEFAULTS, STRATEGY_RISK_PARAM_SCHEMA } from './strategies/commonParams.js';
 
 /** 规则强度说明（写进信号的 risk 字段；⚠️ 尚无回测证据，默认关闭） */
 const RISK_NOTE = '结构做多（多周期）：4H 定方向、1H 定位置、15m 定确认，回踩进支撑区才开多，不追涨。'
@@ -58,7 +60,8 @@ export const STRUCTURE_LONG_DEFAULTS = Object.freeze({
   // 真实 pivot 目标最低 RR；找不到达标目标直接 HOLD
   minRealRR: 2.0,
   // 持仓约束（15m 根：96 根 = 24h；计划校验上限 120 根）
-  maxHoldBars: 96
+  maxHoldBars: 96,
+  ...STRATEGY_RISK_DEFAULTS
 });
 
 const numSpec = (key, label, group, min, max, step, description) =>
@@ -81,10 +84,11 @@ export const STRUCTURE_LONG_PARAM_SCHEMA = Object.freeze([
   numSpec('minStopPct', '最小止损（价格比例）', 'risk', 0, 0.05, 0.001,
     'R 的绝对下限，兜底成本约束（低于它时止损距离被抬高）。'),
   numSpec('maxHoldBars', '最长持仓（15m 根）', 'position', 10, 120, 1,
-    '超时未触发的订单按收盘价结算。96 根 = 24h（计划校验上限 120 根 = 30h）。')
+    '超时未触发的订单按收盘价结算。96 根 = 24h（计划校验上限 120 根 = 30h）。'),
+  ...STRATEGY_RISK_PARAM_SCHEMA
 ]);
 
-/** 解析策略参数：默认值为底，overrides 逐字段覆盖（越界回退默认并告警） */
+/** 解析策略参数：默认值为底，params 逐字段覆盖（越界回退默认并告警） */
 export function resolveStructureLongParams(overrides) {
   const params = { ...STRUCTURE_LONG_DEFAULTS };
   if (!overrides || typeof overrides !== 'object') return params;
@@ -200,7 +204,8 @@ export function structureLongAnalysis(market, ctx = {}, costs = PAPER_COSTS) {
   if (s15.chochBullish) entryQuality += 12;
   if (s15.bosBullish) entryQuality += 8;
   if (s15.failedBreakdown) entryQuality += 10;
-  if (distanceAtr > 2) entryQuality -= 35;
+  // 过度延伸惩罚跟随 extendedAtr 参数（与闸门 4 同源；此前硬编码 2，调参时两处会分裂）
+  if (distanceAtr > p.extendedAtr) entryQuality -= 35;
   if (i4.rsi != null && i4.rsi > 70) entryQuality -= 20;
   if (i4.atrPct > 0.9) entryQuality -= 15;
   entryQuality = Math.max(0, Math.min(100, entryQuality));
@@ -234,6 +239,8 @@ export function structureLongAnalysis(market, ctx = {}, costs = PAPER_COSTS) {
   }
 
   const confidence = Math.max(0, Math.min(0.95, score / 100));
+  const leverage = recommendedLeverage({ entryLimit, stopLoss }, 'OPEN_LONG', p);
+  const marginRiskPct = leverage * stopDistance / entryLimit;
   const reason = `结构做多（4H→1H→15m）：${reasons.join('；')}；`
     + `评分 ${score}/85、入场质量 ${entryQuality}/100、4H RSI ${i4.rsi == null ? 'NA' : i4.rsi.toFixed(1)}、`
     + `距 4H EMA20 ${distanceAtr.toFixed(2)}×ATR；`
@@ -266,7 +273,9 @@ export function structureLongAnalysis(market, ctx = {}, costs = PAPER_COSTS) {
       targetPivotTime: target.pivotTime,
       realRR: target.rr,
       riskUnit: stopDistance,
-      maxHoldBars: Math.round(p.maxHoldBars)
+      maxHoldBars: Math.round(p.maxHoldBars),
+      recommendedLeverage: leverage,
+      marginRiskPct
     }
   };
 }

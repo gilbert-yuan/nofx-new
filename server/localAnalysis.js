@@ -202,12 +202,18 @@ export function planRisk(plan, direction) {
  *   现在预算/上限都来自 strategyGuards 单一事实源，且入参口径与计划一致
  *   （优先 entryLimit = 实际成交锚点）。置 NOFX_MAX_LEVERAGE / NOFX_RISK_BUDGET_PCT 可调。
  */
-export function recommendedLeverage(plan, direction) {
+export function recommendedLeverage(plan, direction, limits = {}) {
   if (!plan) return 1;
   const entry = planRefEntry(plan, direction);
   const distance = Math.abs(entry - plan.stopLoss) / entry;
+  const maxLeverage = Number.isFinite(Number(limits.maxLeverage))
+    ? Number(limits.maxLeverage)
+    : RISK_RULE.maxLeverage;
+  const riskBudgetPct = Number.isFinite(Number(limits.riskBudgetPct))
+    ? Number(limits.riskBudgetPct)
+    : RISK_RULE.riskBudgetPct;
   return Number.isFinite(distance) && distance > 0
-    ? Math.max(1, Math.min(RISK_RULE.maxLeverage, Math.floor(RISK_RULE.riskBudgetPct / distance)))
+    ? Math.max(1, Math.min(maxLeverage, Math.floor(riskBudgetPct / distance)))
     : 1;
 }
 

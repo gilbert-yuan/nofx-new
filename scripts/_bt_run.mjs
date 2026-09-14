@@ -2,9 +2,9 @@
  * 随机 50 币 × 近 30 天 1m K 线 —— 当前线上策略全量回测
  *
  * 保真口径（全部复用生产代码，零重写策略逻辑）：
- *   信号生成   server/enhancedAnalysis.js  → enhancedAnalysis()      （engine=enhanced，与 data/config.json 一致）
+ *   信号生成   server/strategies 注册定义 → strategy.analyze()      （默认 enhanced-trend-v1）
  *   挂单复核   server/shared/pendingReview.js → applyPendingReview() （方向反转立即撤 / 软门槛 30 分钟宽限）
- *   持仓复核   server/enhancedAnalysis.js  → enhancedProtectionReview()（移动止损阶梯 + 智能退出 CLOSE）
+ *   持仓复核   server/strategies 注册定义 → strategy.review()       （移动止损阶梯 + 智能退出 CLOSE）
  *   保护写回   server/shared/protectionReview.js → applyPaperProtectionReview()
  *   逐根结算   server/tradingSimulator.js  → _simulate()/_settle()   （分批止盈 / 止损止盈 / 根级均线失守 / 超时）
  *
@@ -13,27 +13,34 @@
  *   · 信号在 bar[i] 收盘产生，入场最早从 bar[i+2] 开始（firstEntryAt 口径）
  *   · 同币种同时只允许 1 笔 pending/open
  *   · 平仓后冷却 30 分钟；止损平仓后冷却 60 分钟（SYMBOL_COOLDOWN_MIN / STOP_COOLDOWN_MIN）
- *   · 每单保证金 100 USDT，杠杆由 recommendedLeverage(plan) 决定（≤5x）
+ *   · 每单保证金 100 USDT，杠杆由正式策略计划决定（同时受全局风控硬上限约束）
  *
- * 运行前需设置（与 ecosystem.config.cjs 完全一致）：
- *   NOFX_LONG_ONLY=true  NOFX_MIN_TREND_SCORE=70
+ * 运行默认读取 data/strategies.json；BT_PARAM_OVERRIDES 仅用于显式回测实验，不回写正式配置。
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { enhancedAnalysis, enhancedProtectionReview } from '../server/enhancedAnalysis.js';
+import { loadConfiguredStrategy } from '../server/strategies/loader.js';
+import { resolveParams } from '../server/strategies/registry.js';
 import { applyPaperProtectionReview } from '../server/shared/protectionReview.js';
 import { applyPendingReview } from '../server/shared/pendingReview.js';
 import { TradingSimulator } from '../server/tradingSimulator.js';
 import { PAPER_COSTS } from '../server/research.js';
 import { recommendedLeverage } from '../server/localAnalysis.js';
-import { LONG_ONLY } from '../server/shared/strategyGuards.js';
+import { LONG_ONLY, RISK_RULE } from '../server/shared/strategyGuards.js';
 import { pumpFadeShortAnalysis } from '../server/pumpFadeShortAnalysis.js';
 import { localProtectionReview } from '../server/shared/protectionReview.js';
 
-// 策略开关（2026-09-13）：enhanced = 线上做多主策略 enhanced-trend-v1（默认，老行为零变化）；
-// pump-short = 冲高回落空 v1（15m，线上 engine='pump-short'），信号/复核全走生产函数。
+// 正式策略入口：enhanced / enhanced-trend-v1 都解析到注册表策略。
+// pump-short 是历史未注册引擎，保留兼容分支供旧实验复现；新策略应先注册再接入此入口。
 // pump-short 用法：BT_STRATEGY=pump-short BT_TF_MS=900000 BT_DIR=data/backtest/bf90-15mrs
-const STRATEGY = process.env.BT_STRATEGY || 'enhanced';
+const STRATEGY_REQUEST = process.env.BT_STRATEGY || 'enhanced';
+const STRATEGY = STRATEGY_REQUEST === 'enhanced' ? 'enhanced-trend-v1' : STRATEGY_REQUEST;
+const IS_FORMAL_STRATEGY = STRATEGY === 'enhanced-trend-v1';
+if (!IS_FORMAL_STRATEGY && STRATEGY !== 'pump-short') {
+  console.error('BT_STRATEGY 必须是 enhanced | enhanced-trend-v1 | pump-short，得到 ' + STRATEGY_REQUEST);
+  process.exit(1);
+}
+const STRATEGY_CONFIG_PATH = process.env.BT_STRATEGY_CONFIG || 'data/strategies.json';
 
 const DIR = path.resolve(process.env.BT_DIR || 'data/backtest');
 const KDIR = path.join(DIR, 'klines');
@@ -59,6 +66,35 @@ try {
   console.error('BT_PARAM_OVERRIDES 解析失败:', e.message);
   process.exit(1);
 }
+let STRATEGY_DEF = null;
+let STRATEGY_CONFIG = {};
+let STRATEGY_PARAMS = {};
+if (IS_FORMAL_STRATEGY) {
+  const loaded = await loadConfiguredStrategy(STRATEGY, {
+    strategyPath: STRATEGY_CONFIG_PATH,
+    configPath: process.env.BT_CONFIG || 'data/config.json'
+  });
+  STRATEGY_DEF = loaded.strategy;
+  STRATEGY_CONFIG = loaded.config;
+  // BT_PARAM_OVERRIDES 是回测专用实验覆盖；不回写正式策略配置，默认路径仍完全使用配置文件。
+  const overrideObject = PARAM_OVERRIDES && typeof PARAM_OVERRIDES === 'object' && !Array.isArray(PARAM_OVERRIDES)
+    ? PARAM_OVERRIDES
+    : {};
+  const resolvedOverrides = resolveParams(STRATEGY_DEF.paramSchema, overrideObject);
+  const rejectedKeys = new Set(resolvedOverrides.rejected.map(item => item.key));
+  STRATEGY_PARAMS = { ...STRATEGY_DEF.params };
+  for (const spec of STRATEGY_DEF.paramSchema) {
+    if (!Object.prototype.hasOwnProperty.call(overrideObject, spec.key)) continue;
+    const raw = overrideObject[spec.key];
+    if (raw === undefined || raw === null || raw === '' || rejectedKeys.has(spec.key)) continue;
+    STRATEGY_PARAMS[spec.key] = resolvedOverrides.params[spec.key];
+  }
+  if (resolvedOverrides.rejected.length) {
+    console.warn('BT_PARAM_OVERRIDES 含非法值，已保留正式配置：', JSON.stringify(resolvedOverrides.rejected));
+  }
+} else {
+  STRATEGY_PARAMS = { ...(PARAM_OVERRIDES || {}) };
+}
 // 实验开关（仅回测 harness，生产未用）：入场 N 根内浮亏 ≤ -cutoffR 时市价减半一次。
 const EARLY_CUT_R = Number(process.env.NOFX_BT_EARLY_CUT_R ?? 0);
 const EARLY_CUT_BARS = Number(process.env.NOFX_BT_EARLY_CUT_BARS ?? 5);
@@ -82,7 +118,10 @@ const files = allFiles.filter(f => {
 });
 
 console.log('== 回测配置 ==');
-console.log(`  禁空 LONG_ONLY=${LONG_ONLY.enabled}   评分门槛 NOFX_MIN_TREND_SCORE=${process.env.NOFX_MIN_TREND_SCORE ?? '(默认66)'}`);
+console.log('  策略 ' + STRATEGY + '（请求=' + STRATEGY_REQUEST + '）'
+  + (IS_FORMAL_STRATEGY ? '  正式配置 ' + STRATEGY_CONFIG_PATH : '  历史兼容引擎'));
+if (IS_FORMAL_STRATEGY) console.log('  参数 ' + JSON.stringify(STRATEGY_PARAMS));
+console.log('  禁空 LONG_ONLY=' + (IS_FORMAL_STRATEGY ? STRATEGY_PARAMS.longOnly === true : LONG_ONLY.enabled) + '   评分门槛 NOFX_MIN_TREND_SCORE=' + (process.env.NOFX_MIN_TREND_SCORE ?? '(默认66)'));
 console.log(`  周期 ${INTERVAL}  窗口 ${WINDOW} 根  保证金 ${MARGIN}U/单  冷却 平仓${SYMBOL_COOLDOWN}根(${Math.round(SYMBOL_COOLDOWN * TF_MIN)}分)/止损${STOP_COOLDOWN}根(${Math.round(STOP_COOLDOWN * TF_MIN)}分)`);
 console.log(`  成本 fee=${PAPER_COSTS.feeBps}bps slip=${PAPER_COSTS.slippageBps}bps funding=${PAPER_COSTS.fundingBpsPer8h}bps/8h`);
 console.log(`  币种数 ${files.length}\n`);
@@ -109,7 +148,7 @@ function loadBars(file) {
   return out;
 }
 
-function runSymbol(symbol, bars) {
+async function runSymbol(symbol, bars) {
   const sim = new TradingSimulator({ mode: 'account', maxPositions: Infinity, allowDuplicateSymbol: false });
   const trades = [], cancels = [], placed = [];
   let active = null, cooldownUntil = -1, signalCount = 0;
@@ -189,11 +228,32 @@ function runSymbol(symbol, bars) {
 
     const needSignal = !active || active.status === 'pending';
     let sig = null;
-    if (needSignal) {
-      sig = STRATEGY === 'pump-short'
-        ? pumpFadeShortAnalysis({ symbol, interval: INTERVAL, klines: bars.slice(i - WINDOW + 1, i + 1) },
-            PARAM_OVERRIDES ? { params: PARAM_OVERRIDES } : {})
-        : enhancedAnalysis({ symbol, interval: INTERVAL, klines: bars.slice(i - WINDOW + 1, i + 1) }, PARAM_OVERRIDES || undefined);
+    // 无持仓时，信号只在「已过冷却期且还来得及挂单」的 bar 上被使用（B 需 active、D 有
+    // i>=cooldownUntil 与 i+2<N 两道闸）——冷却期内与最后两根 bar 的分析结果必然被丢弃，
+    // 直接跳过（精确等价：被跳过的 sig 在该状态下无任何消费方）。币多时冷却 bar 占比可观。
+    if (needSignal && !(!active && (i < cooldownUntil || i + 2 >= N))) {
+      const market = { symbol, interval: INTERVAL, klines: bars.slice(i - WINDOW + 1, i + 1) };
+      if (IS_FORMAL_STRATEGY) {
+        sig = await STRATEGY_DEF.analyze(market, {
+          params: STRATEGY_PARAMS,
+          config: STRATEGY_CONFIG,
+          interval: INTERVAL,
+          planInterval: STRATEGY_DEF.planInterval || INTERVAL
+        });
+      } else {
+        sig = await pumpFadeShortAnalysis(market, PARAM_OVERRIDES ? { params: PARAM_OVERRIDES } : {});
+      }
+      if (IS_FORMAL_STRATEGY && sig?.plan && typeof STRATEGY_DEF.decoratePlan === 'function') {
+        sig = {
+          ...sig,
+          plan: await STRATEGY_DEF.decoratePlan(sig.plan, {
+            params: STRATEGY_PARAMS,
+            config: STRATEGY_CONFIG,
+            interval: INTERVAL,
+            planInterval: STRATEGY_DEF.planInterval || INTERVAL
+          })
+        };
+      }
     }
 
     // ── B. 挂单复核（方向反转立即撤 / 软门槛连续不合格 30 分钟宽限）
@@ -222,9 +282,14 @@ function runSymbol(symbol, bars) {
       const market = { symbol, interval: INTERVAL, klines: bars.slice(Math.max(0, i - WINDOW + 1), i + 1) };
       // pump-short 用生产同款 localProtectionReview（R 口径移动止损阶梯，方向对称），
       // 它只出 HOLD/REVISE，不出 CLOSE —— 该策略生产上 SMART_EXIT 也是关闭的，口径一致。
-      const proposal = STRATEGY === 'pump-short'
-        ? localProtectionReview(active, market)
-        : enhancedProtectionReview(active, market);
+      const proposal = IS_FORMAL_STRATEGY
+        ? await STRATEGY_DEF.review(active, market, {
+            params: STRATEGY_PARAMS,
+            config: STRATEGY_CONFIG,
+            interval: INTERVAL,
+            planInterval: STRATEGY_DEF.planInterval || INTERVAL
+          })
+        : await localProtectionReview(active, market);
       // 最小持仓保护（实验用）：入场后 MIN_HOLD 根内不允许「智能退出」直接平仓，
       // 移动止损 / 止损止盈 / 超时照常生效。用于验证「过早离场」的修复空间。
       const inMinHold = Number(active.heldBars || 0) < MIN_HOLD;
@@ -249,7 +314,7 @@ function runSymbol(symbol, bars) {
         cooldownUntil = i + SYMBOL_COOLDOWN;
         active = null;
       } else {
-        applyPaperProtectionReview(active, proposal, now, STRATEGY === 'pump-short' ? 'local' : 'enhanced');
+        applyPaperProtectionReview(active, proposal, now, IS_FORMAL_STRATEGY ? STRATEGY_DEF.engine : 'local');
       }
     }
 
@@ -257,7 +322,11 @@ function runSymbol(symbol, bars) {
     if (!active && sig && sig.action !== 'WAIT' && sig.plan && i >= cooldownUntil && i + 2 < N) {
       const dir = sig.action === 'BUY' ? 'OPEN_LONG' : 'OPEN_SHORT';
       const plan = { ...sig.plan };
-      const leverage = recommendedLeverage(plan, dir);
+      const strategyLeverage = Number(plan.recommendedLeverage ?? sig.recommendedLeverage);
+      const requestedLeverage = Number.isFinite(strategyLeverage) && strategyLeverage > 0
+        ? Math.floor(strategyLeverage)
+        : recommendedLeverage(plan, dir, STRATEGY_PARAMS);
+      const leverage = Math.max(1, Math.min(RISK_RULE.maxLeverage, requestedLeverage));
       const close = bars[i].close;
       signalCount++;
       // ⚠️ 不能带 eligible 字段：tradingSimulator._normalizeInput 用「eligible !== undefined && plan」
@@ -267,6 +336,7 @@ function runSymbol(symbol, bars) {
         nextTime: bars[i + 2].openTime,
         notional: MARGIN * leverage, leverage, margin: MARGIN,
         costs: { ...PAPER_COSTS }, protectionRevisions: [],
+        analysisContext: { strategyId: STRATEGY, strategyParams: STRATEGY_PARAMS },
         status: 'pending', error: '', ineligibleRounds: 0, ineligibleSince: null,
         createdAt: new Date(now).toISOString(), nextTimeIdx: i + 2,
         _score: plan.trendStrengthScore ?? null,
@@ -318,7 +388,7 @@ for (const f of files) {
   const symbol = f.replace(/\.ndjson$/, '');
   const bars = loadBars(f);
   const t = Date.now();
-  const r = runSymbol(symbol, bars);
+  const r = await runSymbol(symbol, bars);
   all.push(r);
   const closed = r.trades.filter(x => !x.unfinished);
   const net = closed.reduce((a, x) => a + x.net, 0);
@@ -329,15 +399,24 @@ const trades = all.flatMap(r => r.trades.filter(x => !x.unfinished));
 const placed = all.flatMap(r => r.placed);
 const cancels = all.flatMap(r => r.cancels);
 
-fs.writeFileSync(path.join(DIR, OUT_NAME), JSON.stringify({
+// BT_OUT：相对路径拼在语料目录 DIR 下（老行为不变）；绝对路径原样使用。
+// 输出目录不存在时自动创建（此前目录缺失会 ENOENT，回测白算不落盘）。
+const OUT_PATH = path.isAbsolute(OUT_NAME) ? OUT_NAME : path.join(DIR, OUT_NAME);
+fs.mkdirSync(path.dirname(OUT_PATH), { recursive: true });
+fs.writeFileSync(OUT_PATH, JSON.stringify({
   generatedAt: new Date().toISOString(),
   config: {
+    strategy: STRATEGY,
+    strategyRequest: STRATEGY_REQUEST,
+    strategyConfigPath: IS_FORMAL_STRATEGY ? STRATEGY_CONFIG_PATH : null,
+    strategyParams: STRATEGY_PARAMS,
     interval: INTERVAL, window: WINDOW, margin: MARGIN,
-    longOnly: LONG_ONLY.enabled,
+    longOnly: IS_FORMAL_STRATEGY ? STRATEGY_PARAMS.longOnly === true : LONG_ONLY.enabled,
     minTrendScore: process.env.NOFX_MIN_TREND_SCORE ?? null,
     days: meta.days, seed: meta.seed, minHoldBars: MIN_HOLD,
     earlyCutR: EARLY_CUT_R, earlyCutBars: EARLY_CUT_BARS,
     paramOverrides: PARAM_OVERRIDES,
+    systemMaxLeverage: RISK_RULE.maxLeverage,
     symbolCooldown: SYMBOL_COOLDOWN, stopCooldown: STOP_COOLDOWN
   },
   symbols: all.map(r => ({ symbol: r.symbol, bars: r.bars, placed: r.placed.length, cancelled: r.cancels.length, filled: r.trades.filter(x => !x.unfinished).length })),

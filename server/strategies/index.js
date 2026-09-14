@@ -10,6 +10,7 @@
  */
 export { defineStrategy, listStrategies, getStrategy, hasStrategy, resolveParams, defaultParams, sanitizePatch } from './registry.js';
 export { createStrategyRuntime, StrategyRuntime } from './runtime.js';
+export { loadConfiguredStrategy } from './loader.js';
 export { ENGINE_DEFAULT_STRATEGY } from './builtins.js';
 
 // 副作用：注册内置策略（enhanced-trend-v1 / structure-short-v1 / structure-long-v1；

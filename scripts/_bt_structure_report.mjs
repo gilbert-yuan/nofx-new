@@ -22,9 +22,11 @@ const load = (engine) => {
   return JSON.parse(fs.readFileSync(f, 'utf8'));
 };
 
-/** 同期市场基准：每币 15m 首末收盘价涨幅（决策可用窗口口径），取中位数/均值 + BTC/ETH */
+/** 同期市场基准：每币 15m 首末收盘价涨幅（决策可用窗口口径），取中位数/均值 + BTC/ETH
+ *  BTC/ETH 无条件纳入读取范围：它们可能全程未成交，若只遍历成交币会让基准行退化成 0.00%。 */
 function marketBenchmark(merged) {
-  const syms = [...new Set(merged.trades.filter(t => !t.unfinished).map(t => t.symbol))];
+  const traded = [...new Set(merged.trades.filter(t => !t.unfinished).map(t => t.symbol))];
+  const syms = [...new Set([...traded, 'BTCUSDT', 'ETHUSDT'])];
   const moves = [];
   let btc = null, eth = null;
   for (const s of syms) {
@@ -50,6 +52,15 @@ function marketBenchmark(merged) {
   };
 }
 
+/** 持仓小时数：优先 held15m，回退 heldBars/60（TradingSimulator 只回传 heldBars 分钟）。
+ *  ⚠️ 2026-09-14：结果里已无 held15m，直接用旧字段会让分桶全部塌进同一桶、中位持仓变 NaN。 */
+const holdHours = (x) => Number.isFinite(x.held15m) ? x.held15m
+  : (Number.isFinite(x.heldBars) ? x.heldBars / 60 : NaN);
+
+/** 名义成交额（成本拆解分母）：优先 notional，回退 quantity×entry。 */
+const notionalOf = (x) => (Number.isFinite(x.notional) && x.notional > 0) ? x.notional
+  : ((Number.isFinite(x.quantity) && Number.isFinite(x.entry) && x.quantity > 0) ? x.quantity * x.entry : NaN);
+
 function stats(merged) {
   const T = merged.trades.filter(x => !x.unfinished && Number.isFinite(x.net));
   const net = T.reduce((a, x) => a + x.net, 0);
@@ -68,13 +79,14 @@ function stats(merged) {
   const gross = T.reduce((a, x) => a + x.gross, 0);
   const fee = T.reduce((a, x) => a + x.fee, 0);
   const funding = T.reduce((a, x) => a + x.funding, 0);
-  const notionalSum = T.reduce((a, x) => a + x.notional, 0);
+  const notionalSum = T.reduce((a, x) => a + notionalOf(x), 0);
   const top3 = coins.slice(0, 3).reduce((a, [, v]) => a + v, 0);
   const top10 = coins.slice(0, 10).reduce((a, [, v]) => a + v, 0);
   const top5t = [...T].sort((a, b) => b.net - a.net).slice(0, 5).reduce((a, x) => a + x.net, 0);
   const buckets = [
-    ['<2h', x => x.held15m < 2], ['2-8h', x => x.held15m >= 2 && x.held15m < 8],
-    ['8-16h', x => x.held15m >= 8 && x.held15m < 16], ['16-24h', x => x.held15m >= 16]
+    ['<2h', x => holdHours(x) < 2], ['2-8h', x => holdHours(x) >= 2 && holdHours(x) < 8],
+    ['8-16h', x => holdHours(x) >= 8 && holdHours(x) < 16], ['16-24h', x => holdHours(x) >= 16 && holdHours(x) < 24],
+    ['≥24h', x => holdHours(x) >= 24], ['未知', x => !Number.isFinite(holdHours(x))]
   ].map(([k, fn]) => {
     const g = T.filter(fn);
     return { k, n: g.length, net: g.reduce((a, x) => a + x.net, 0), wr: g.length ? 100 * g.filter(x => x.net > 0).length / g.length : NaN };
@@ -87,7 +99,7 @@ function stats(merged) {
     n: T.length, placed: merged.placed.length, cancels: merged.cancels.length,
     net, wr: T.length ? 100 * wins.length / T.length : NaN, pf: gl > 0 ? gp / gl : Infinity,
     mdd, avg: T.length ? net / T.length : NaN,
-    medHeld15m: med(T.map(x => x.held15m).sort((a, b) => a - b)),
+    medHeld15m: med(T.map(holdHours).sort((a, b) => a - b)),
     medRoi: 100 * med(T.map(x => x.roi).sort((a, b) => a - b)),
     gross, fee, funding, grossBps: notionalSum ? 10000 * gross / notionalSum : NaN,
     h1, h2, coins, top3, top10, top5t,
@@ -103,9 +115,16 @@ const fmt = (v, d = 1) => Number.isFinite(v) ? v.toFixed(d) : '–';
 const signCls = v => v > 0 ? 'up' : v < 0 ? 'down' : '';
 const red = v => v >= 0 ? 'var(--up)' : 'var(--down)';
 
+// 标题与币数一律从结果文件现算，避免写死「528 币」误导子集回测（如 STRUCT_SAMPLE=50）。
+const MERGED = new Map(ENGINES.map(e => [e, load(e)]));
+const LOADED = ENGINES.map(e => MERGED.get(e)).filter(Boolean);
+const COINS_TESTED = LOADED.length ? Math.max(...LOADED.map(m => (m.symbols || []).length)) : 0;
+const DATASET = (LOADED[0]?.config?.dataset) || TAG;
+const TITLE = `结构策略 ${TAG} 回测报告`;
+
 let html = `<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
-<title>结构策略 bf90 回测报告</title>
+<title>${TITLE}</title>
 <style>
 :root{--bg:#f5f6f8;--card:#fff;--tx:#1a1f27;--tx2:#5a6472;--line:#e4e7ec;--up:#c8362b;--down:#1a9e5c;--accent:#2b5fd9;--warn:#b7791f;}
 *{box-sizing:border-box;margin:0;padding:0}
@@ -129,12 +148,12 @@ th{color:var(--tx2);font-weight:500;font-size:11.5px}
 .note{color:var(--tx2);font-size:12px;line-height:1.7;margin-top:10px}
 .badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;background:#eef2ff;color:var(--accent);margin-right:6px}
 </style></head><body><div class="wrap">
-<h1>结构策略 bf90 回测报告（structure-short-v1 / structure-long-v1）</h1>
-<div class="sub">语料 币安 USDT-M 合约 528 币 × 90 天 1m（bf90，同源派生 15m/1h/4h 决策序列）· 决策 15m 收盘（80 根窗口）· 执行 1m 限价触达 · 成本 fee 6bps + slip 5bps + funding 3bps/8h · 保证金 100U/单 · 杠杆 = 生产同款 recommendedLeverage（≤12x，风险预算 18%）· 生成于 ${new Date().toISOString()}</div>
+<h1>${TITLE}（structure-short-v1 / structure-long-v1 · ${COINS_TESTED} 只达标币）</h1>
+<div class="sub">语料 币安 USDT-M 合约 ${COINS_TESTED} 只 × 90 天 1m（${DATASET}，同源派生 15m/1h/4h 决策序列）· 决策 15m 收盘（80 根窗口）· 执行 1m 限价触达 · 成本 fee 6bps + slip 5bps + funding 3bps/8h · 保证金 100U/单 · 杠杆 = 生产同款 recommendedLeverage（≤12x，风险预算 18%）· 生成于 ${new Date().toISOString()}</div>
 `;
 
 for (const engine of ENGINES) {
-  const merged = load(engine);
+  const merged = MERGED.get(engine);
   if (!merged) { html += `<div class="card"><h2>${engine}</h2><p>结果文件缺失，跳过。</p></div>`; continue; }
   const S = stats(merged);
   const bench = marketBenchmark(merged);
@@ -188,19 +207,19 @@ ${S.buckets.map(b => `<tr><td>${b.k}</td><td>${b.n}</td><td style="color:${red(b
 
 <h2 style="margin-top:18px">同期市场基准与出场构成</h2>
 <table><tr><th>口径</th><th>区间涨跌幅</th></tr>
-<tr><td>成交币区间收益中位数（${bench.n} 币，90 天首末）</td><td style="color:${red(bench.median)}">${fmt(bench.median * 100, 2)}%</td></tr>
-<tr><td>BTCUSDT</td><td style="color:${red(bench.btc)}">${fmt(bench.btc * 100, 2)}%</td></tr>
-<tr><td>ETHUSDT</td><td style="color:${red(bench.eth)}">${fmt(bench.eth * 100, 2)}%</td></tr></table>
+<tr><td>样本币区间收益中位数（${bench.n} 币，90 天首末）</td><td style="color:${red(bench.median)}">${fmt(bench.median * 100, 2)}%</td></tr>
+<tr><td>BTCUSDT</td><td style="color:${red(bench.btc)}">${Number.isFinite(bench.btc) ? fmt(bench.btc * 100, 2) + '%' : '–'}</td></tr>
+<tr><td>ETHUSDT</td><td style="color:${red(bench.eth)}">${Number.isFinite(bench.eth) ? fmt(bench.eth * 100, 2) + '%' : '–'}</td></tr></table>
 <table style="margin-top:8px"><tr><th>出场</th><th>笔数</th></tr>
 ${Object.entries(S.reasons).map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('')}
 <tr><td>方向构成</td><td>${Object.entries(S.dirs).map(([k, v]) => `${k}×${v}`).join(' / ')}</td></tr></table>
 
-<div class="note">挂单失效 ${S.cancels} 笔（15m 收盘突破止损位或 24h 未成交）。口径说明：未实现 decoratePlan 的分批止盈与 R 阶梯移动止损（生产上两策略 smartExit 默认关闭；trailing 属增益项，不影响 alpha 定性）。信号总分门槛 70 / 入场质量门槛 70，与线上引擎完全同参。</div>
+<div class="note">挂单失效 ${S.cancels} 笔（15m 收盘突破止损位或 24h 未成交）。口径说明：回测 worker 直接调用正式策略的 analyze / decoratePlan / review，分批止盈与 R 阶梯保护按订单 exitRules 结算；smartExit 是否开启由策略配置决定。信号总分门槛与入场质量门槛以产物中的 strategyParams 为准。</div>
 </div>`;
 }
 
 html += `</div></body></html>`;
-const out = 'output/structure-bf90-report.html';
+const out = `output/structure-${TAG}-report.html`; // TAG=bf90 时与原路径一致
 fs.mkdirSync('output', { recursive: true });
 fs.writeFileSync(out, html);
 console.log(`报告已生成 ${out}（${(html.length / 1024).toFixed(0)} KB）`);

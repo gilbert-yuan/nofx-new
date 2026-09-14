@@ -1220,7 +1220,11 @@ export function enhancedProtectionReview(order, market) {
   }
 
   // 动态止损（R 口径渐进式移动止损阶梯，Task #1）
-  const fireTrail = shouldFireTrailing(order, close, long);
+  // 修复（2026-09-14）：触发判定必须用**该订单所属策略**的 trailRule（plan.exitRules 快照），
+  // 与下方 computeTrailStop 的 rule 同源。此前漏传第 4 参 → 回退全局 TRAILING_RULE，
+  // 一旦某策略通过「策略管理」覆盖 trailingTriggerR / profitTriggerPct，
+  // 会出现「触发用全局阈值、算止损用策略阶梯」的静默分裂（localProtectionReview 一直是正确传参的）。
+  const fireTrail = shouldFireTrailing(order, close, long, trailRule);
 
   if (!fireTrail.fire) {
     // 未达触发线：保持初始保护价，不做任何收紧。

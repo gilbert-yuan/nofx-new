@@ -14,6 +14,7 @@ import { applyPaperProtectionReview } from './shared/protectionReview.js';
 import { proxyHealth } from './core/proxyHealth.js';
 import { applyPendingReview, HELD_INELIGIBLE } from './shared/pendingReview.js';
 import { createStrategyRuntime } from './strategies/index.js';
+import { RISK_RULE } from './shared/strategyGuards.js';
 import { normalizeCloseReason, isStopReason } from '../shared/closeReasons.js';
 
 // ── 同币种冷却（2026-09-11 优化：由「仅止损后」扩展到「任意平仓后」）────────
@@ -57,7 +58,7 @@ export class GlobalAutomation {
     this.store = store;
     this.owner = randomUUID();
     this.superAnalysis = createSuperEnhancedAnalysis({ store });
-    // 多策略运行时：启用集与参数覆盖来自 data/strategies.json；
+    // 多策略运行时：启用状态、完整参数与备注来自 data/strategies.json；
     // 首次运行按 config.analysis.engine 推导默认启用集（enhanced → enhanced-trend-v1），保证升级平滑。
     this.strategies = createStrategyRuntime({ store, resolveEngine: selectAnalysisEngine });
 
@@ -195,7 +196,7 @@ export class GlobalAutomation {
    * 行情分析（多策略）：遍历「已启用策略」，每个策略用自己的参数独立扫描候选币种。
    *
    * 改造要点（2026-09-11 老板需求）：
-   *   · 启用哪些策略由 data/strategies.json 决定（前端「策略管理」页勾选）；
+   *   · 启用哪些策略及其参数由 data/strategies.json 决定（前端「策略管理」页配置）；
    *   · 每个策略用**自己的参数**跑分析，产出的信号带 strategyId，订单落库时一并固化；
    *   · 同一币种若被多个策略看中，只有优先级最高的那个能成交（沿用「同币种不重复开仓」风控）。
    *
@@ -356,7 +357,13 @@ export class GlobalAutomation {
 
           // 策略可给计划补上自己的出场规则（如本地引擎原生不带 exitRules）。
           if (typeof strategy.decoratePlan === 'function' && analysis.plan) {
-            analysis.plan = strategy.decoratePlan(analysis.plan, { params: strategy.params });
+            analysis.plan = await strategy.decoratePlan(analysis.plan, {
+              params: strategy.params,
+              config,
+              interval,
+              planInterval: strategy.planInterval || interval,
+              deps: this.strategyDeps()
+            });
           }
 
           // 原生计划周期策略（planInterval，如冲高回落空的 15m）：用该周期的辅助行情建
@@ -527,7 +534,12 @@ export class GlobalAutomation {
       // 自动提交模拟订单（带 strategyId，订单从此知道自己属于哪个策略）。
       // 模拟订单是否镜像到 Binance Demo 由 trader.syncPaperOrdersToDemo 控制，
       // 避免把本地回测/纸面订单误发到远端。
-      const leverage = recommendedLeverage(signal.plan, signal.action === 'BUY' ? 'OPEN_LONG' : 'OPEN_SHORT');
+      // 正式策略已经按自己的 params 计算并固化了推荐杠杆。
+      // 只有旧策略没有输出该字段时，才回退到全局风控默认值。
+      const strategyLeverage = Number(signal.recommendedLeverage ?? signal.plan?.recommendedLeverage);
+      const leverage = Number.isFinite(strategyLeverage) && strategyLeverage > 0
+        ? Math.max(1, Math.min(RISK_RULE.maxLeverage, Math.floor(strategyLeverage)))
+        : recommendedLeverage(signal.plan, signal.action === 'BUY' ? 'OPEN_LONG' : 'OPEN_SHORT');
       if (!shouldContinue()) return { symbol, success: true, action: 'ABORTED' };
       await this.simulation.submit({
         recordId,
@@ -572,11 +584,11 @@ export class GlobalAutomation {
     if (openOrders.length === 0) return;
 
     const config = await this.store.getConfig();
-    // 多策略：本轮把所有启用策略读一次，之后按「每个订单自己所属的策略」分派复核。
+    // 多策略：启用集只用于无 strategyId 的旧订单回退；有 strategyId 的存量订单
+    // 由 strategyForOrder 从订单快照/配置文件恢复，即使原策略已被停用也继续复核。
     const strategies = await this.strategies.enabled(config);
     if (!strategies.length) {
-      console.warn('[GlobalAutomation] ⚠️ 未启用任何策略，跳过本轮持仓复核。');
-      return;
+      console.warn('[GlobalAutomation] ⚠️ 当前未启用新策略，但仍继续复核已有订单的策略快照。');
     }
 
     // 轻量快照直接传给复核链路：此前 reviewPendingOrder → runAnalysis 拿不到 state 时
@@ -621,7 +633,7 @@ export class GlobalAutomation {
         const market = markets.get(key);
         if (!shouldContinue()) break;
         // 该订单所属策略（订单落库时固化的 strategyId；老订单回退默认策略）。
-        const orderStrategy = this.strategies.resolveForOrder(order, strategies, config);
+        const orderStrategy = await this.strategies.strategyForOrder(order, config, strategies);
         if (order.status === 'pending') {
           await this.reviewPendingOrder(order, market, shouldContinue, context, orderStrategy);
           this._reviewedCandle.set(snapshot.id, curCandle);
@@ -644,6 +656,7 @@ export class GlobalAutomation {
         if (orderStrategy.engine === 'ai') context.strategyPrompt ??= await this.store.getStrategy();
         const proposal = await orderStrategy.review(order, market, {
           config,
+          params: orderStrategy.params,
           strategyPrompt: context.strategyPrompt,
           interval: order.interval,
           deps: this.strategyDeps()
@@ -741,7 +754,8 @@ export class GlobalAutomation {
    */
   async reviewPendingOrder(order, market, shouldContinue = () => true, context = {}, strategy = null) {
     if (market.partial) return;
-    const orderStrategy = strategy || this.strategies.resolveForOrder(order, [], context.config || {});
+    const orderStrategy = strategy
+      || await this.strategies.strategyForOrder(order, context.config || {}, []);
     if (!orderStrategy) return;
     const signals = await this.runAnalysis({
       symbols: [order.symbol],

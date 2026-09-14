@@ -178,7 +178,10 @@ export class TradingSimulator {
     // 现按计划里固化的 smartExit 配置，在每根已收盘 K 线上判定；复核周期仅作兜底。
     // 只看**已收盘** K 线，不使用未来数据，回测/实盘口径一致。
     const smartExit = hasSmartExitSnapshot ? exitRules.smartExit : null;
-    const barLevelMaExit = !!smartExit && smartExit.barLevel !== false && Number.isFinite(smartExit.maBreakAtr);
+    // enabled 总开关必须管住根级均线失守：smartExitEnabled=false 时三条智能退出规则
+    // 全部停用（与复核层 enhancedProtectionReview 及 enhancedAnalysis 注释语义一致）。
+    // enabled !== false：兼容旧快照无该字段时默认开启，与 resolveSmartExitRule 同口径。
+    const barLevelMaExit = !!smartExit && smartExit.enabled !== false && smartExit.barLevel !== false && Number.isFinite(smartExit.maBreakAtr);
     // 根级最小持仓保护（P8，2026-09-11）：与复核层 enhancedProtectionReview 同口径 ——
     // 入场后 minHoldBars 根内禁止「均线失守」平仓（优先 plan 快照，旧订单回退全局
     // NOFX_SMART_MIN_HOLD）。止损/止盈/分批/超时不受影响。
