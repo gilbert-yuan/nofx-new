@@ -1,6 +1,7 @@
 import { BinanceClient } from './binanceClient.js';
 import { normalizeBinanceKline } from './marketDb.js';
 import { nextOpenTime, toBybitInterval } from './research.js';
+import { upsertSymbolLeverage, loadAllSymbolLeverage } from './symbolLeverageStore.js';
 
 /**
  * 币安 U 本位永续（USDT-M Futures）公开行情源 —— 生产唯一行情来源（合约口径）。
@@ -22,6 +23,8 @@ export class BinanceMarket {
     this.updatedAt = null;
     this.lastError = '';
     this.pending = null;
+    /** 币种 → 最大杠杆（来自 exchangeInfo 的 LEVERAGE_FILTER）；下单前用于截断超限杠杆。 */
+    this.leverageBySymbol = new Map();
   }
 
   /** 存储键：合约与现货同为 `BINANCE_` 命名空间（provider 不变），无需迁移历史 key。 */
@@ -32,9 +35,15 @@ export class BinanceMarket {
     if (!refresh && this.rows.length && Date.now() - Date.parse(this.updatedAt) < 3600000) return this.rows;
     if (this.pending) return this.pending;
     this.pending = this.client.exchangeInfo().then(info => {
-      this.rows = (info.symbols || [])
-        .filter(s => s.status === 'TRADING' && s.contractType === 'PERPETUAL' && s.quoteAsset === 'USDT' && s.marginAsset === 'USDT')
-        .map(s => ({ symbol: s.symbol, baseCoin: s.baseAsset, quoteCoin: s.quoteAsset, filters: s.filters, marketProvider: this.provider }))
+      const symbols = (info.symbols || [])
+        .filter(s => s.status === 'TRADING' && s.contractType === 'PERPETUAL' && s.quoteAsset === 'USDT' && s.marginAsset === 'USDT');
+      this.rows = symbols
+        .map(s => {
+          // 仅提取真实盘最大杠杆供行情展示；**下单截断用的权威来源是 Demo 端 applyDemoLeverage**
+          // （真实盘上限对 Demo 不可靠：如 ARKUSDT 真实盘支持高杠杆，但 Demo 上限更低才会被 400 拒）。
+          const maxLeverage = Number(s.filters?.find(f => f.filterType === 'LEVERAGE_FILTER')?.maxLeverage) || null;
+          return { symbol: s.symbol, baseCoin: s.baseAsset, quoteCoin: s.quoteAsset, filters: s.filters, maxLeverage, marketProvider: this.provider };
+        })
         .sort((a, b) => a.symbol.localeCompare(b.symbol));
       this.updatedAt = new Date().toISOString();
       this.lastError = '';
@@ -48,6 +57,37 @@ export class BinanceMarket {
   status() {
     return { provider: this.provider, marketType: this.marketType, count: this.rows.length,
       updatedAt: this.updatedAt, busy: Boolean(this.pending), lastError: this.lastError };
+  }
+
+  /** 读取某币种支持的最大杠杆（已落库 + 内存缓存）。找不到返回 null（调用方应降级到全局上限）。 */
+  getMaxLeverage(symbol) {
+    return this.leverageBySymbol.get(symbol) || null;
+  }
+
+  /** 启动预热：从 symbol_leverage 表把历史值载入内存，消除冷启动首单空窗。 */
+  async loadLeverageCache() {
+    try {
+      const rows = await loadAllSymbolLeverage();
+      for (const r of rows) this.leverageBySymbol.set(r.symbol, Number(r.maxLeverage));
+      return rows.length;
+    } catch (e) {
+      console.warn('[BinanceMarket] 加载币种杠杆缓存失败:', e.message);
+      return 0;
+    }
+  }
+
+  /**
+   * Demo（下单目标环境）批量写入币种最大杠杆：覆盖内存缓存 + 落库。
+   * 调用方为拿 Demo exchangeInfo 的代码（如下单镜像 paperLimitParams），它才是准确来源；
+   * 真实盘行情刷新不写此字段，避免用真实盘高上限覆盖 Demo 低上限导致仍被 400 拒单。
+   * @param rows [{ symbol, maxLeverage }]
+   */
+  applyDemoLeverage(rows) {
+    const valid = (rows || []).filter(r => r && typeof r.symbol === 'string' && r.symbol
+      && Number.isFinite(Number(r.maxLeverage)) && Number(r.maxLeverage) > 0);
+    for (const r of valid) this.leverageBySymbol.set(r.symbol, Number(r.maxLeverage));
+    if (valid.length) upsertSymbolLeverage(valid).catch(e => console.warn('[BinanceMarket] Demo 币种最大杠杆落库失败:', e.message));
+    return valid.length;
   }
 
   async klines({ symbol, interval = '15m', limit = 80, startTime, endTime }) {

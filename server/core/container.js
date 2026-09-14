@@ -38,6 +38,8 @@ export class Container {
     this.klineSync = new KlineSync({ store: this.store, marketDb: this.marketDb, positionMonitor: this.positionMonitor });
 
     this.marketData = marketData;
+    // 预热币种最大杠杆缓存（从 symbol_leverage 表），消除冷启动首单空窗；失败不阻塞启动。
+    await this.marketData.loadLeverageCache?.().catch(e => console.warn('[Container] 杠杆缓存预热失败:', e.message));
     this.ready = true;
   }
 

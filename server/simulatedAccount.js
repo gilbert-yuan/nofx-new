@@ -10,6 +10,7 @@ import { SimulatedAccountRepository } from './simulatedAccountRepository.js';
 import { getOrderReplayData, batchAnalyzeOrders } from './orderReplay.js';
 import { optimizeStrategyFromOrders } from './adaptiveStrategy.js';
 import { BinanceClient } from './binanceClient.js';
+import { binanceMarket } from './binanceMarket.js';
 
 const active = order => ['pending', 'open'].includes(order.status);
 export const PENDING_ORDER_TTL_MS = 24 * 60 * 60 * 1000;
@@ -65,6 +66,20 @@ async function paperLimitParams(order, client) {
     throw new Error('模拟订单缺少有效 entryLimit 或数量，无法同步 Binance Demo。');
   }
   const info = await client.exchangeInfo();
+  // 「获取币种时记录」最大杠杆：Demo（下单目标环境）的 leverageBracket 才是准确上限来源
+  // （新版币安已把 maxLeverage 从 exchangeInfo.filters 移到 leverageBracket 接口）。
+  // 仅当该币尚未缓存时才拉一次全量 leverageBracket 批量记录，避免每笔下单重复拉取。
+  if (!binanceMarket.getMaxLeverage(order.symbol)) {
+    try {
+      const brackets = await client.leverageBracket();
+      binanceMarket.applyDemoLeverage((brackets || []).map(b => ({
+        symbol: b.symbol,
+        maxLeverage: b.brackets?.[0]?.initialLeverage || null
+      })));
+    } catch (e) {
+      console.warn('[paper] Demo leverageBracket 获取失败，将靠试错探测上限:', e.message);
+    }
+  }
   const symbolInfo = (info.symbols || []).find(item => item.symbol === order.symbol);
   const priceFilter = symbolInfo?.filters?.find(item => item.filterType === 'PRICE_FILTER');
   const lotFilter = symbolInfo?.filters?.find(item => item.filterType === 'LOT_SIZE' || item.filterType === 'MARKET_LOT_SIZE');
@@ -81,6 +96,34 @@ async function paperLimitParams(order, client) {
   return { symbol: order.symbol, side, quantity, price };
 }
 export const initialPaperAccount = () => ({ initialBalance: 10000, orders: [] });
+
+/**
+ * 安全设置杠杆：先按已记录的「该币在 Demo 的最大杠杆」截断，再发给币安；
+ * 若仍被拒（杠杆超限，如 ARKUSDT 在 Demo 上限 < 全局 12），逐级降级重试（10→5→3→2→1）
+ * 并记忆探测到的上限，避免重复踩雷。非杠杆类错误（网络/鉴权）不重试直接抛出。
+ * @returns 实际设置成功的杠杆
+ */
+export async function safeSetLeverage(client, symbol, desired) {
+  const cached = binanceMarket.getMaxLeverage(symbol);
+  const start = (cached && cached > 0) ? Math.min(desired, cached) : desired;
+  const ladder = [start];
+  for (const L of [10, 5, 3, 2, 1]) if (L < start) ladder.push(L);
+  const tries = Array.from(new Set(ladder)).sort((a, b) => b - a);
+  let lastErr;
+  for (const L of tries) {
+    try {
+      await client.setLeverage({ symbol, leverage: L });
+      binanceMarket.applyDemoLeverage([{ symbol, maxLeverage: L }]); // 记忆该币已验证可设的杠杆上限
+      return L;
+    } catch (e) {
+      const msg = String(e?.message || '');
+      const isLeverageErr = /leverage/i.test(msg) && /(not valid|exceed|max|invalid)/i.test(msg);
+      if (!isLeverageErr) throw e;
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error(`币种 ${symbol} 无法设置杠杆 ${desired}`);
+}
 
 export function accountSummary(state) {
   const orders = state.orders;
@@ -117,12 +160,16 @@ export function submitPaperOrder(state, record, input, now = Date.now()) {
     margin = Math.floor(equity * Number(input.autoMarginPct) * 100) / 100;
   } else margin = 100;
   if (input.autoMarginPct != null && margin < 1) fail(`账户权益过低，按 ${(input.autoMarginPct * 100).toFixed(1)}% 自动仓位不足 1 USDT，跳过开仓。`);
-  const leverage = Number(input.leverage ?? signal.recommendedLeverage ?? recommendedLeverage(signal.plan, signal.positionRecommendation));
-  // 杠杆上限必须与全局配置 RISK_RULE.maxLeverage 一致（由 NOFX_MAX_LEVERAGE 驱动）。
-  // 此前此处硬编码 5，P12 把 NOFX_MAX_LEVERAGE 提到 12 后脱节，导致被推荐 ~10x 的
-  // 币种（如 IOSTUSDT）在模拟下单时被误拒。改读单一事实源，避免再次漂移。
-  const maxLev = RISK_RULE.maxLeverage;
-  if (!Number.isFinite(margin) || margin < 1 || margin > 100000 || !Number.isInteger(leverage) || leverage < 1 || leverage > maxLev) fail(`保证金须为 1～100000 USDT，杠杆须为 1～${maxLev} 的整数。`);
+  // 杠杆上限分两道：
+  // ① 全局风控硬上限 RISK_RULE.maxLeverage：超过配置上限的请求一律拒绝（策略/用户输入越界）；
+  // ② 币种上限（该币在 Demo 真实可设的最大杠杆）：在全局上限内再夹一道，规避币安 400
+  //    「Leverage N is not valid」（如 ARKUSDT 在 Demo 最大杠杆 < 全局 12）。
+  const requestedLeverage = Math.floor(Number(input.leverage ?? signal.recommendedLeverage ?? recommendedLeverage(signal.plan, signal.positionRecommendation)));
+  if (!Number.isFinite(margin) || margin < 1 || margin > 100000 || !Number.isInteger(requestedLeverage) || requestedLeverage < 1 || requestedLeverage > RISK_RULE.maxLeverage)
+    fail(`保证金须为 1～100000 USDT，杠杆须为 1～${RISK_RULE.maxLeverage} 的整数（${input.symbol} 在币安最大杠杆 ${binanceMarket.getMaxLeverage(input.symbol) || '未知'}）。`);
+  const perSymbolMax = binanceMarket.getMaxLeverage(input.symbol);
+  const effectiveMax = (perSymbolMax && perSymbolMax > 0) ? Math.min(RISK_RULE.maxLeverage, perSymbolMax) : RISK_RULE.maxLeverage;
+  const leverage = Math.max(1, Math.min(requestedLeverage, effectiveMax));
   if (!state.unlimitedCapital && state.orders.filter(active).length >= 20) fail('最多同时持有 20 个模拟挂单或持仓。');
   if (!state.unlimitedCapital && state.orders.some(o => active(o) && o.symbol === input.symbol)) fail('该币种已有模拟挂单或持仓。');
   const plan = { ...signal.plan, stopLoss: Number(input.stopLoss ?? signal.plan.stopLoss), takeProfit: Number(input.takeProfit ?? signal.plan.takeProfit) };
@@ -340,7 +387,8 @@ export class SimulatedAccount {
     const clientOrderId = order.exchange?.clientOrderId || paperClientOrderId(order);
     try {
       const params = await paperLimitParams(order, client);
-      if (typeof client.setLeverage === 'function') await client.setLeverage({ symbol: order.symbol, leverage: order.leverage });
+      // 安全设置杠杆：按币种 Demo 上限截断 + 杠杆超限时试错降级（根治 Binance 400「Leverage N is not valid」）。
+      if (typeof client.setLeverage === 'function') await safeSetLeverage(client, order.symbol, order.leverage);
       const result = await client.limitOrder({ ...params, timeInForce: 'GTC', clientOrderId });
       return this.mutateLight(state => {
         const current = state.orders.find(item => item.id === order.id);
