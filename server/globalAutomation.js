@@ -524,7 +524,9 @@ export class GlobalAutomation {
         return { symbol, success: true, action: 'SKIP_COOLDOWN' };
       }
 
-      // 自动提交模拟订单（带 strategyId，订单从此知道自己属于哪个策略）
+      // 自动提交模拟订单（带 strategyId，订单从此知道自己属于哪个策略）。
+      // 模拟订单是否镜像到 Binance Demo 由 trader.syncPaperOrdersToDemo 控制，
+      // 避免把本地回测/纸面订单误发到远端。
       const leverage = recommendedLeverage(signal.plan, signal.action === 'BUY' ? 'OPEN_LONG' : 'OPEN_SHORT');
       if (!shouldContinue()) return { symbol, success: true, action: 'ABORTED' };
       await this.simulation.submit({

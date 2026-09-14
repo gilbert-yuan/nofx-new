@@ -68,8 +68,8 @@ export function pivots(rows, left = 3, right = 3) {
       if (rows[j].high >= rows[i].high) isH = false;
       if (rows[j].low <= rows[i].low) isL = false;
     }
-    if (isH) highs.push({ index: i, price: rows[i].high });
-    if (isL) lows.push({ index: i, price: rows[i].low });
+    if (isH) highs.push({ index: i, price: rows[i].high, time: rows[i].openTime ?? null });
+    if (isL) lows.push({ index: i, price: rows[i].low, time: rows[i].openTime ?? null });
   }
   return { highs, lows };
 }
@@ -79,24 +79,51 @@ export function pivots(rows, left = 3, right = 3) {
  * BOS（跌破前一摆动低点 / 突破前一摆动高点）、CHOCH（BOS + 对应高低点形态）、
  * 假突破/假跌破、最近阻力/支撑。
  */
-export function marketStructure(rows, left = 3, right = 3) {
-  const p = pivots(rows, left, right);
-  const h = p.highs.slice(-2), l = p.lows.slice(-2);
+function trendFromPivots(highs, lows) {
+  const h = highs.slice(-2), l = lows.slice(-2);
   const highPattern = h.length < 2 ? 'NA' : h[1].price < h[0].price ? 'LH' : 'HH';
   const lowPattern = l.length < 2 ? 'NA' : l[1].price < l[0].price ? 'LL' : 'HL';
   const trend = highPattern === 'LH' && lowPattern === 'LL' ? 'BEARISH'
     : highPattern === 'HH' && lowPattern === 'HL' ? 'BULLISH' : 'NEUTRAL';
-  const lastClose = rows.at(-1).close;
+  return { trend, highPattern, lowPattern };
+}
+
+/**
+ * 市场结构：CHOCH 必须是「先形成完整反向结构，再由 BOS 确认」。
+ * 例如多转空要求：此前存在 BULLISH 结构，随后形成 LH+LL，最后收盘跌破
+ * 最新摆动低点；仅仅在上涨趋势里跌破一个低点不再被标记为 bearish CHOCH。
+ */
+export function marketStructure(rows, left = 3, right = 3) {
+  const p = pivots(rows, left, right);
+  const current = trendFromPivots(p.highs, p.lows);
+  const h = p.highs.slice(-2), l = p.lows.slice(-2);
+  // 当前结构由各方向最新两枚 pivot 构成；旧结构必须剔除各方向最新 pivot，
+  // 防止“新高已出现、旧低仍在”的混合窗口把趋势状态污染成 NEUTRAL。
+  const prior = trendFromPivots(p.highs.slice(0, -1), p.lows.slice(0, -1));
+  const lastClose = rows.at(-1)?.close;
   const bosBearish = l.at(-1) != null && lastClose < l.at(-1).price;
   const bosBullish = h.at(-1) != null && lastClose > h.at(-1).price;
+  const structureShiftBearish = prior.trend === 'BULLISH' && current.trend === 'BEARISH';
+  const structureShiftBullish = prior.trend === 'BEARISH' && current.trend === 'BULLISH';
   const failedBreakout = h.length >= 2 && rows.slice(-8).some(x => x.high > h[0].price && x.close < h[0].price);
   const failedBreakdown = l.length >= 2 && rows.slice(-8).some(x => x.low < l[0].price && x.close > l[0].price);
   return {
-    trend, highPattern, lowPattern,
-    bosBearish, chochBearish: bosBearish && highPattern === 'LH', failedBreakout,
-    bosBullish, chochBullish: bosBullish && lowPattern === 'HL', failedBreakdown,
+    ...current,
+    priorTrend: prior.trend,
+    structureShiftBearish,
+    structureShiftBullish,
+    bosBearish,
+    chochBearish: structureShiftBearish && bosBearish,
+    failedBreakout,
+    bosBullish,
+    chochBullish: structureShiftBullish && bosBullish,
+    failedBreakdown,
+    highs: p.highs,
+    lows: p.lows,
     resistance: h.at(-1)?.price ?? null,
-    support: l.at(-1)?.price ?? null
+    support: l.at(-1)?.price ?? null,
+    pivotHighs: p.highs.map(x => x.price),
+    pivotLows: p.lows.map(x => x.price)
   };
 }
 
@@ -123,12 +150,36 @@ export const isFiniteCandle = r => r && ['open', 'high', 'low', 'close'].every(k
 /** 结构摘要（写进信号，便于前端/研究记录追溯三周期判定） */
 export function summarizeStructure(s4, s1, s15) {
   return {
-    '4h': { trend: s4.trend, highPattern: s4.highPattern, lowPattern: s4.lowPattern },
-    '1h': { trend: s1.trend, resistance: s1.resistance, support: s1.support },
+      '4h': { trend: s4.trend, priorTrend: s4.priorTrend, highPattern: s4.highPattern, lowPattern: s4.lowPattern },
+      '1h': { trend: s1.trend, priorTrend: s1.priorTrend, resistance: s1.resistance, support: s1.support },
     '15m': {
       trend: s15.trend,
+      priorTrend: s15.priorTrend,
+      structureShiftBearish: s15.structureShiftBearish,
       chochBearish: s15.chochBearish, bosBearish: s15.bosBearish, failedBreakout: s15.failedBreakout,
+      structureShiftBullish: s15.structureShiftBullish,
       chochBullish: s15.chochBullish, bosBullish: s15.bosBullish, failedBreakdown: s15.failedBreakdown
     }
   };
+}
+
+/**
+ * 从 1H/4H 已确认 pivot 中选真实止盈位。只接受方向正确且达到最低真实 RR
+ * 的目标；找不到就返回 null，由策略直接 HOLD。
+ */
+export function selectPivotTarget({ long, entry, stopDistance, minRealRR, structures = [] }) {
+  const candidates = [];
+  for (const item of structures) {
+    for (const pivot of (long ? item.structure?.highs : item.structure?.lows) || []) {
+      const price = Number(pivot.price);
+      if (!Number.isFinite(price) || !(price > 0)) continue;
+      const favorable = long ? price > entry : price < entry;
+      if (!favorable) continue;
+      const rr = Math.abs(price - entry) / stopDistance;
+      candidates.push({ price, rr, source: item.interval, pivotIndex: pivot.index,
+      ...(pivot.time != null ? { pivotTime: pivot.time } : {}) });
+    }
+  }
+  candidates.sort((a, b) => Math.abs(a.price - entry) - Math.abs(b.price - entry));
+  return candidates.find(target => target.rr >= minRealRR) || null;
 }

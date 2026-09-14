@@ -34,6 +34,7 @@ const defaultConfig = {
     allowEntryOrders: false,
     allowCloseOrders: false,
     allowProtectionUpdates: true,
+    syncPaperOrdersToDemo: false,
     entrySymbolsText: '',
     maxNewEntriesPerCycle: 1,
     maxPositionsToReview: 10,

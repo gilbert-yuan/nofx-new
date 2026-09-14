@@ -37,6 +37,41 @@ test('validated plans start strictly after generation', () => {
   assert.equal(signal.expiresAt, undefined);
   assert.equal(signal.plan.validForBars, undefined);
 });
+
+test('structure diagnostics and strategy exit rules survive plan normalization', () => {
+  const structure = { '4h': { trend: 'BULLISH' }, '1h': { support: 98 }, '15m': { chochBullish: true, bosBullish: true } };
+  const exitRules = { trailing: { triggerR: 0.4 }, smartExit: { enabled: false }, partialTp: { enabled: true } };
+  const result = normalizePlan({ ...raw, score: 78, entryQuality: 84, structure,
+    trend: { bars: { '15m': 80, '1h': 80, '4h': 80 } },
+    plan: { ...raw.plan, riskUnit: 4, targetSource: '1h', targetPivotIndex: 17, realRR: 3.1, exitRules } }, market, now);
+  assert.equal(result.eligible, true);
+  assert.equal(result.score, 78);
+  assert.equal(result.entryQuality, 84);
+  assert.deepEqual(result.structure, structure);
+  assert.deepEqual(result.trend.bars, { '15m': 80, '1h': 80, '4h': 80 });
+  assert.equal(result.plan.targetSource, '1h');
+  assert.equal(result.plan.targetPivotIndex, 17);
+  assert.equal(result.plan.realRR, 3.1);
+  assert.deepEqual(result.plan.exitRules, exitRules);
+});
+
+test('research records retain structure diagnostics for audit', () => {
+  const structure = { '4h': { trend: 'BEARISH' }, '1h': { resistance: 105 }, '15m': { chochBearish: true, bosBearish: true } };
+  const record = createResearchRecord({
+    config: { model: { model: 'rules', baseUrl: 'local://rules' } },
+    strategy: { interval: '1h', rules: 'structure' },
+    market: [market],
+    result: { analyses: [{ ...raw, score: 73, entryQuality: 79, structure, trend: { bars: { '1h': 80 } },
+      plan: { ...raw.plan, targetSource: '4h', targetPivotIndex: 33, realRR: 2.4, exitRules: { smartExit: { enabled: false } } } }] },
+    type: 'single', scope: { limit: 20 }, now
+  });
+  assert.equal(record.analyses[0].eligible, true);
+  assert.equal(record.analyses[0].score, 73);
+  assert.deepEqual(record.analyses[0].structure, structure);
+  assert.equal(record.analyses[0].plan.targetSource, '4h');
+  assert.equal(record.analyses[0].plan.realRR, 2.4);
+  assert.equal(record.analyses[0].plan.exitRules.smartExit.enabled, false);
+});
 test('invalid scores, reversed exits, thin reward and noninteger horizons become WAIT', () => {
   const variants = [
     { ...raw, confidence: '0.8' }, { ...raw, confidence: 90 }, { ...raw, plan: null },

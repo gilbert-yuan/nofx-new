@@ -31,7 +31,7 @@ export async function freshMarkets({ symbols, interval, limit, client, marketDb 
 export async function registerResearchRoutes({ app, store, marketDb, loadContracts }) {
   const archive = new ResearchStore(marketDb.pool);
   await archive.init((await store.getState()).decisions);
-  const simulation = new SimulatedAccount({ pool: marketDb.pool, market: marketData, archive, marketDb });
+  const simulation = new SimulatedAccount({ pool: marketDb.pool, market: marketData, archive, marketDb, store });
   await simulation.init();
   registerSimulationRoutes(app, simulation);
   registerAdaptiveStrategyRoutes(app, simulation);

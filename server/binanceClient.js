@@ -103,8 +103,11 @@ export class BinanceClient {
     });
   }
 
-  async cancelOrder({ symbol, orderId }) {
-    return this.signedRequest('DELETE', '/fapi/v1/order', { symbol, orderId });
+  async cancelOrder({ symbol, orderId, clientOrderId }) {
+    return this.signedRequest('DELETE', '/fapi/v1/order', {
+      symbol,
+      ...(Number.isInteger(Number(orderId)) && Number(orderId) > 0 ? { orderId: Number(orderId) } : { origClientOrderId: clientOrderId })
+    });
   }
 
   async positionMode() { return this.signedRequest('GET', '/fapi/v1/positionSide/dual'); }

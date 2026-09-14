@@ -215,6 +215,10 @@ export class TradingSimulator {
 
     // 逐根K线推进
     while (nextOpenTime(time, order.interval) <= now) {
+      // 所有模拟挂单统一 24 小时 TTL；已过期订单不再被后续 K 线触发。
+      if (!entry && Number.isFinite(order.pendingExpiresAt) && time >= order.pendingExpiresAt) {
+        return { ...checkpoint(), status: 'expired', reason: 'pending_expired', expiresAt: new Date(order.pendingExpiresAt).toISOString() };
+      }
       // 获取当前K线
       const row = byTime.get(time);
       if (!this._validateKline(row, time, order.interval)) {
@@ -426,7 +430,8 @@ export class TradingSimulator {
         leverage: 1,
         margin: this.config.costs.notional ?? PAPER_COSTS.notional,
         costs: { ...this.config.costs },
-        protectionRevisions: []
+        protectionRevisions: [],
+        pendingExpiresAt: Number.isFinite(Date.parse(input.createdAt)) ? Date.parse(input.createdAt) + 24 * 60 * 60 * 1000 : null
       };
     }
 
@@ -444,6 +449,7 @@ export class TradingSimulator {
       margin: input.margin,
       costs: input.costs || { ...PAPER_COSTS },
       protectionRevisions: input.protectionRevisions || [],
+      pendingExpiresAt: Number.isFinite(Date.parse(input.createdAt)) ? Date.parse(input.createdAt) + 24 * 60 * 60 * 1000 : null,
       entry: input.entry,
       entryTime: input.entryAt ? Date.parse(input.entryAt) : null,
       heldBars: input.heldBars || 0,

@@ -27,7 +27,7 @@
  *   · funding/OI/BTC 环境自动化不提供 → 三项评分成分剔除（max 100→85）；
  *   · 库内无 takerBuyVolume → 量能成分 = 15m 放量收阳（volumeRatio>1.1 且 close>open）；
  *   · planInterval='15m'，订单止损止盈按 15m 根数结算（96 根 = 24h）；
- *   · RR 闸门 = 项目统一的「成本后净盈亏比 ≥ 1」，1:2 静态阈值由 takeProfitR 默认 2R 承接。
+ *   · RR 闸门 = 项目统一的「成本后净盈亏比 ≥ 1」，目标先满足真实 pivot 最低 2R，再做成本校验。
  *
  * ⚠️ 尚无回测证据：默认不启用，落地为可参数化对照实验；启用前需在 bf90 语料跑真实回测
  *    并 shadow 验证 ≥2 周。做多方向与生产 enhanced-trend-v1 同向，同币种竞争由 priority
@@ -37,7 +37,7 @@
  * overrides（前端「策略管理」页）。
  */
 import { PAPER_COSTS } from './research.js';
-import { marketStructure, summarize, isFiniteCandle, summarizeStructure } from './shared/marketStructure.js';
+import { marketStructure, summarize, isFiniteCandle, summarizeStructure, selectPivotTarget } from './shared/marketStructure.js';
 
 /** 规则强度说明（写进信号的 risk 字段；⚠️ 尚无回测证据，默认关闭） */
 const RISK_NOTE = '结构做多（多周期）：4H 定方向、1H 定位置、15m 定确认，回踩进支撑区才开多，不追涨。'
@@ -55,8 +55,8 @@ export const STRUCTURE_LONG_DEFAULTS = Object.freeze({
   // 止损：1H 支撑 − N×ATR4h（skill 0.35 ATR）；R 绝对下限兜底成本
   stopBufferAtr: 0.35,
   minStopPct: 0.008,
-  // 止盈：入场 + N×R（skill 的 tp2 = 2R，RR 阈值 1:2 由默认值承接）
-  takeProfitR: 2.0,
+  // 真实 pivot 目标最低 RR；找不到达标目标直接 HOLD
+  minRealRR: 2.0,
   // 持仓约束（15m 根：96 根 = 24h；计划校验上限 120 根）
   maxHoldBars: 96
 });
@@ -74,8 +74,8 @@ export const STRUCTURE_LONG_PARAM_SCHEMA = Object.freeze([
     '价格高于 4H EMA20 超过 N×ATR 视为涨过头，禁止追涨（skill：2 ATR → WAIT_FOR_PULLBACK）。'),
   numSpec('entryBufAtr', '入场位缓冲（ATR）', 'entry', 0, 2, 0.05,
     '限价 = 1H 支撑 + N×ATR4h。0.25 = skill 原值（回踩进入支撑区上沿即挂多）。'),
-  numSpec('takeProfitR', '止盈（R）', 'protection', 1, 10, 0.1,
-    '止盈 = 入场 + N×R。skill 的 tp2 口径 = 2R（对应 1:2 盈亏比要求）。'),
+  numSpec('minRealRR', '真实目标最低 RR', 'protection', 1, 10, 0.1,
+    '使用 1H/4H 已确认摆动高点作为止盈，目标距离不足该 RR 时直接 HOLD。默认 2R。'),
   numSpec('stopBufferAtr', '止损缓冲（ATR）', 'risk', 0, 3, 0.05,
     '止损 = 1H 支撑 − N×ATR4h。0.35 = skill 原值（支撑被有效跌破即逻辑失效）。'),
   numSpec('minStopPct', '最小止损（价格比例）', 'risk', 0, 0.05, 0.001,
@@ -122,7 +122,7 @@ export function structureLongAnalysis(market, ctx = {}, costs = PAPER_COSTS) {
     dataAsOf: source15?.dataAsOf || null
   };
   const wait = (reason, extra = {}) => ({
-    symbol: market?.symbol, action: 'WAIT', confidence: 0, reason, risk: RISK_NOTE, plan: null,
+    symbol: market?.symbol, action: 'WAIT', decision: 'HOLD', state: 'HOLD', confidence: 0, reason, risk: RISK_NOTE, plan: null,
     trend: windowInfo, ...extra
   });
 
@@ -159,14 +159,20 @@ export function structureLongAnalysis(market, ctx = {}, costs = PAPER_COSTS) {
   // 量能（适配：库内无 takerBuyVolume → 15m 放量收阳）
   const volBullish = last15.close > last15.open && i15.volumeRatio > 1.1;
 
-  // 计划（先算再打分：RR 加分进总分，与 skill 顺序一致）
+  // 计划：入场/止损先定，再从 1H/4H 真实已确认 pivot 选择止盈。
   const support = s1.support ?? s4.support ?? last15.close - 0.8 * i4.atr;
   const entryLimit = Math.min(last15.close, support + p.entryBufAtr * i4.atr);
   let stopDistance = entryLimit - (support - p.stopBufferAtr * i4.atr);
   stopDistance = Math.max(stopDistance, p.minStopPct * entryLimit);
   const stopLoss = entryLimit - stopDistance;
-  const takeProfit = entryLimit + p.takeProfitR * stopDistance;
-  const grossRR = p.takeProfitR;
+  const target = selectPivotTarget({ long: true, entry: entryLimit, stopDistance, minRealRR: p.minRealRR,
+    structures: [{ interval: '1h', structure: s1 }, { interval: '4h', structure: s4 }] });
+  if (!target) {
+    return wait(`1H/4H 真实摆动高点不足最低 ${p.minRealRR.toFixed(2)}R，直接 HOLD，不使用虚构固定止盈。`,
+      { structure: summarizeStructure(s4, s1, s15), entryLimit, stopLoss, minRealRR: p.minRealRR });
+  }
+  const takeProfit = target.price;
+  const grossRR = target.rr;
 
   // 成本后盈亏比（与 research.normalizePlan 判定同源；成本 = 2×(费+滑) + 资金费）
   const hours = p.maxHoldBars * 15 / 60;
@@ -217,9 +223,9 @@ export function structureLongAnalysis(market, ctx = {}, costs = PAPER_COSTS) {
   // 闸门 6：成本后净盈亏比
   if (!(netRewardRisk >= 1)) {
     const minTpR = stopDistance > 0 ? 1 + 2 * costAbs / stopDistance : Infinity;
-    return wait(`成本后盈亏比 ${netRewardRisk.toFixed(2)} 低于 1（止盈 ${p.takeProfitR}R 太近，`
+    return wait(`成本后盈亏比 ${netRewardRisk.toFixed(2)} 低于 1（真实目标 ${grossRR.toFixed(2)}R 太近，`
       + `当前止损距离 ${(stopDistance / entryLimit * 100).toFixed(3)}% 下需 ≥ ${minTpR.toFixed(2)}R），不出手。`,
-      { structure: summarizeStructure(s4, s1, s15), score, entryQuality });
+      { structure: summarizeStructure(s4, s1, s15), score, entryQuality, targetSource: target.source, targetPivotIndex: target.pivotIndex, realRR: grossRR });
   }
   // 闸门 7：15m 确认（rules.md 最后一关：多头 CHOCH + BOS）
   if (!(s15.chochBullish && s15.bosBullish)) {
@@ -233,13 +239,15 @@ export function structureLongAnalysis(market, ctx = {}, costs = PAPER_COSTS) {
     + `距 4H EMA20 ${distanceAtr.toFixed(2)}×ATR；`
     + `在 1H 支撑 ${support.toPrecision(6)} 上方 ${p.entryBufAtr}ATR 挂限价多 ${entryLimit.toPrecision(6)} 等回踩，`
     + `止损 ${stopLoss.toPrecision(6)}（−${p.stopBufferAtr}ATR / R=${(stopDistance / entryLimit * 100).toFixed(3)}%），`
-    + `止盈 ${takeProfit.toPrecision(6)}（${p.takeProfitR}R，成本后净盈亏比 ${netRewardRisk.toFixed(2)}），`
+    + `止盈 ${takeProfit.toPrecision(6)}（真实 ${grossRR.toFixed(2)}R，来源 ${target.source}#${target.pivotIndex}，成本后净盈亏比 ${netRewardRisk.toFixed(2)}），`
     + `15m 持仓上限 ${p.maxHoldBars} 根 = ${(p.maxHoldBars * 15 / 60).toFixed(0)}h。`
     + `失效条件：15m 收盘有效跌破 ${stopLoss.toPrecision(6)}。`;
 
   return {
     symbol: market.symbol,
     action: 'BUY',
+    decision: 'LONG_ALLOWED',
+    state: 'ALLOWED',
     confidence,
     reason,
     risk: RISK_NOTE,
@@ -253,6 +261,10 @@ export function structureLongAnalysis(market, ctx = {}, costs = PAPER_COSTS) {
       entryLimit,
       stopLoss,
       takeProfit,
+      targetSource: target.source,
+      targetPivotIndex: target.pivotIndex,
+      targetPivotTime: target.pivotTime,
+      realRR: target.rr,
       riskUnit: stopDistance,
       maxHoldBars: Math.round(p.maxHoldBars)
     }

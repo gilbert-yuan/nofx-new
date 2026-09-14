@@ -96,6 +96,15 @@ export function normalizePlan(raw, market, now, costs = PAPER_COSTS) {
   const requestedAction = String(raw?.positionRecommendation || raw?.action || 'WAIT').toUpperCase();
   let action = ({ BUY: 'OPEN_LONG', SELL: 'OPEN_SHORT', HOLD: 'WAIT' })[requestedAction] || requestedAction;
   const confidence = typeof raw?.confidence === 'number' && Number.isFinite(raw.confidence) && raw.confidence >= 0 && raw.confidence <= 1 ? raw.confidence : null;
+  const optNum = v => (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
+  const optInt = v => (Number.isInteger(v) ? v : undefined);
+  const optString = v => (typeof v === 'string' && v.length > 0 ? v : undefined);
+  const score = optNum(raw?.score);
+  const entryQuality = optNum(raw?.entryQuality);
+  const decision = optString(raw?.decision);
+  const state = optString(raw?.state);
+  const structure = raw?.structure && typeof raw.structure === 'object' ? raw.structure : undefined;
+  const trend = raw?.trend && typeof raw.trend === 'object' ? raw.trend : undefined;
   if (confidence === null) issues.push('模型自评分必须为 0～1 的数值');
   if (['CLOSE_LONG', 'CLOSE_SHORT'].includes(action)) issues.push('未接入持仓，平仓建议仅供已有对应持仓者参考');
   else if (!['OPEN_LONG', 'OPEN_SHORT', 'WAIT'].includes(action)) issues.push('未知交易方向');
@@ -131,19 +140,30 @@ export function normalizePlan(raw, market, now, costs = PAPER_COSTS) {
         //   enhancedAnalysis 新增的 riskUnit / smartExit（根级智能退出配置）/ takeProfit1-3
         //   会被**静默丢弃**，导致下游 tradingSimulator 拿不到 R 基准与根级退出开关。
         //   现把可选字段一并透传（仅在有限数时才带上，避免用 undefined 覆盖默认行为）。
-        const optNum = v => (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
         const riskUnit = optNum(plan.riskUnit);
         const takeProfit1 = optNum(plan.takeProfit1);
         const takeProfit2 = optNum(plan.takeProfit2);
         const takeProfit3 = optNum(plan.takeProfit3);
+        const targetPivotIndex = optInt(plan.targetPivotIndex);
+        const targetPivotTime = optNum(plan.targetPivotTime);
+        const targetSource = optString(plan.targetSource);
+        const realRR = optNum(plan.realRR);
+        const marginRiskPct = optNum(plan.marginRiskPct);
+        // 结构策略的真实 pivot 目标和策略级出场规则必须随订单快照保存。
+        // 只挑已知字段透传，避免把分析对象里的临时字段带入持久化计划。
         normalized = { entryMin, entryMax, entryLimit, stopLoss, takeProfit, maxHoldBars, netRewardRisk,
           entryRule: entryLimit != null ? 'limit_pullback' : 'next_candle_open_in_range',
           ...(riskUnit !== undefined ? { riskUnit } : {}),
           ...(takeProfit1 !== undefined ? { takeProfit1 } : {}),
           ...(takeProfit2 !== undefined ? { takeProfit2 } : {}),
           ...(takeProfit3 !== undefined ? { takeProfit3 } : {}),
-          ...(plan.smartExit ? { smartExit: plan.smartExit } : {}),
-          ...(optNum(plan.marginRiskPct) !== undefined ? { marginRiskPct: optNum(plan.marginRiskPct) } : {}) };
+          ...(targetSource !== undefined ? { targetSource } : {}),
+          ...(targetPivotIndex !== undefined ? { targetPivotIndex } : {}),
+          ...(targetPivotTime !== undefined ? { targetPivotTime } : {}),
+          ...(realRR !== undefined ? { realRR } : {}),
+          ...(plan.exitRules && typeof plan.exitRules === 'object' ? { exitRules: plan.exitRules } : {}),
+          ...(plan.smartExit && typeof plan.smartExit === 'object' ? { smartExit: plan.smartExit } : {}),
+          ...(marginRiskPct !== undefined ? { marginRiskPct } : {}) };
       }
     }
   }
@@ -158,6 +178,12 @@ export function normalizePlan(raw, market, now, costs = PAPER_COSTS) {
     generatedAt: new Date(now).toISOString(), firstEntryAt: new Date(firstEntryAt).toISOString(),
     positionRecommendation: action, action: action === 'OPEN_LONG' ? 'BUY' : action === 'OPEN_SHORT' ? 'SELL' : 'HOLD',
     confidence, confidenceType: 'model_self_assessment', reason: String(raw?.reason || ''), risk: String(raw?.risk || ''), suggestion: String(raw?.suggestion || ''),
+    ...(score !== undefined ? { score } : {}),
+    ...(entryQuality !== undefined ? { entryQuality } : {}),
+    ...(decision !== undefined ? { decision } : {}),
+    ...(state !== undefined ? { state } : {}),
+    ...(structure !== undefined ? { structure } : {}),
+    ...(trend !== undefined ? { trend } : {}),
     recommendedLeverage: leverage,
     marginRiskPct,
     validationIssues: issues, eligible: !issues.length && !!normalized, plan: issues.length ? null : normalized

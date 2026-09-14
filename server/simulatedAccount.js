@@ -9,9 +9,77 @@ import { analyzeClosedOrders, generateStrategyAdjustments } from './strategyOpti
 import { SimulatedAccountRepository } from './simulatedAccountRepository.js';
 import { getOrderReplayData, batchAnalyzeOrders } from './orderReplay.js';
 import { optimizeStrategyFromOrders } from './adaptiveStrategy.js';
+import { BinanceClient } from './binanceClient.js';
 
 const active = order => ['pending', 'open'].includes(order.status);
+export const PENDING_ORDER_TTL_MS = 24 * 60 * 60 * 1000;
 const fail = message => { throw Object.assign(new Error(message), { status: 422 }); };
+
+function pendingExpiry(order) {
+  const created = Date.parse(order.createdAt);
+  return Number.isFinite(created) ? created + PENDING_ORDER_TTL_MS : null;
+}
+
+export function expirePendingOrder(order, now = Date.now()) {
+  if (order?.status !== 'pending') return false;
+  const expiresAt = pendingExpiry(order);
+  if (!Number.isFinite(expiresAt) || now < expiresAt) return false;
+  Object.assign(order, {
+    status: 'expired',
+    expiresAt: new Date(expiresAt).toISOString(),
+    expiredAt: new Date(now).toISOString(),
+    reason: 'pending_expired',
+    error: ''
+  });
+  return true;
+}
+
+function demoSyncEnabled(config) {
+  return demoTradingEnabled(config) && config?.trader?.syncPaperOrdersToDemo === true;
+}
+
+function demoTradingEnabled(config) {
+  return config?.binance?.demo === true && config?.trader?.enabled === true && config?.trader?.dryRun === false;
+}
+
+function paperExchangeClient(config, clientFactory) {
+  return clientFactory(config.binance);
+}
+
+function paperClientOrderId(order) {
+  return `nofxpaper${order.id.replaceAll('-', '').slice(0, 20)}`.slice(0, 36);
+}
+
+function floorStep(value, step) {
+  return Number((Math.floor((value + step * 1e-9) / step) * step).toFixed(12));
+}
+
+function ceilStep(value, step) {
+  return Number((Math.ceil((value - step * 1e-9) / step) * step).toFixed(12));
+}
+
+async function paperLimitParams(order, client) {
+  const rawPrice = Number(order.plan?.entryLimit);
+  const rawQuantity = Number(order.notional) / rawPrice;
+  if (!Number.isFinite(rawPrice) || rawPrice <= 0 || !Number.isFinite(rawQuantity) || rawQuantity <= 0) {
+    throw new Error('模拟订单缺少有效 entryLimit 或数量，无法同步 Binance Demo。');
+  }
+  const info = await client.exchangeInfo();
+  const symbolInfo = (info.symbols || []).find(item => item.symbol === order.symbol);
+  const priceFilter = symbolInfo?.filters?.find(item => item.filterType === 'PRICE_FILTER');
+  const lotFilter = symbolInfo?.filters?.find(item => item.filterType === 'LOT_SIZE' || item.filterType === 'MARKET_LOT_SIZE');
+  const minNotional = Number(symbolInfo?.filters?.find(item => item.filterType === 'MIN_NOTIONAL')?.notional || 0);
+  const side = order.direction === 'OPEN_LONG' ? 'BUY' : 'SELL';
+  const priceStep = Number(priceFilter?.tickSize);
+  const quantityStep = Number(lotFilter?.stepSize);
+  if (!(priceStep > 0) || !(quantityStep > 0)) throw new Error(`Binance Demo 未返回 ${order.symbol} 的价格/数量过滤器。`);
+  const price = side === 'BUY' ? floorStep(rawPrice, priceStep) : ceilStep(rawPrice, priceStep);
+  const quantity = floorStep(rawQuantity, quantityStep);
+  if (!(price > 0) || !(quantity > 0) || quantity < Number(lotFilter.minQty || 0) || (minNotional > 0 && quantity * price < minNotional)) {
+    throw new Error(`模拟订单 ${order.symbol} 对齐 Binance 过滤器后低于最小下单要求。`);
+  }
+  return { symbol: order.symbol, side, quantity, price };
+}
 export const initialPaperAccount = () => ({ initialBalance: 10000, orders: [] });
 
 export function accountSummary(state) {
@@ -85,11 +153,14 @@ export function submitPaperOrder(state, record, input, now = Date.now()) {
     dataAsOf: signal.dataAsOf // 行情时间戳
   };
 
+  const createdAt = new Date(now).toISOString();
+  const expiresAt = new Date(now + PENDING_ORDER_TTL_MS).toISOString();
   const order = { id: randomUUID(), recordId: record.id, symbol: signal.symbol, interval: signal.interval, marketProvider,
     direction: signal.positionRecommendation, status: 'pending', margin, leverage, notional, plan, initialPlan: { ...plan }, costs: { ...PAPER_COSTS },
     automatic: input.automatic === true, protectionRevisions: [], reviewHistory: [],
     analysisContext, // 新增：完整分析上下文
-    createdAt: new Date(now).toISOString(), nextTime: first, heldBars: 0, error: '' };
+    exchange: { provider: 'binance-demo', status: 'not_submitted', clientOrderId: null, orderId: null, submittedAt: null, lastError: '' },
+    createdAt, expiresAt, nextTime: first, heldBars: 0, error: '' };
   state.orders.unshift(order);
   return order;
 }
@@ -138,6 +209,7 @@ export function settlePaperOrder(order, price, reason, time, ambiguousBar = fals
 
 export function advancePaperOrder(order, rows, now = Date.now()) {
   if (!active(order)) return order;
+  if (expirePendingOrder(order, now)) return order;
 
   // 使用统一的账户模拟器
   const simulator = createAccountSimulator({
@@ -171,6 +243,11 @@ export function advancePaperOrder(order, rows, now = Date.now()) {
     return order;
   }
 
+  if (result.status === 'expired') {
+    Object.assign(order, { status: 'expired', reason: result.reason, expiresAt: result.expiresAt, error: '' });
+    return order;
+  }
+
   if (result.status === 'closed') {
     // 平仓
     Object.assign(order, {
@@ -197,8 +274,8 @@ export function advancePaperOrder(order, rows, now = Date.now()) {
 }
 
 export class SimulatedAccount {
-  constructor({ pool, market, archive, marketDb }) {
-    Object.assign(this, { pool, market, archive, marketDb, busy: false, lastError: '', lastRunAt: null });
+  constructor({ pool, market, archive, marketDb, store = null, clientFactory = config => new BinanceClient(config) }) {
+    Object.assign(this, { pool, market, archive, marketDb, store, clientFactory, busy: false, lastError: '', lastRunAt: null });
     this.repository = new SimulatedAccountRepository(pool);
   }
   async init() {
@@ -251,7 +328,59 @@ export class SimulatedAccount {
       const label = this.market.provider === 'binance' ? 'Binance' : 'OKX';
       fail('请使用当前 ' + label + ' 行情重新分析后模拟下单。');
     }
-    return this.mutateLight(state => submitPaperOrder(state, record, input));
+    const order = await this.mutateLight(state => submitPaperOrder(state, record, input));
+    return this.syncNewPaperOrderToDemo(order);
+  }
+
+  async syncNewPaperOrderToDemo(order) {
+    const config = await this.store?.getConfig?.() || {};
+    if (!demoSyncEnabled(config) || order.marketProvider !== 'binance' || order.status !== 'pending') return order;
+    if (order.exchange?.status === 'submitted' || order.exchange?.status === 'new') return order;
+    const client = paperExchangeClient(config, this.clientFactory || (cfg => new BinanceClient(cfg)));
+    const clientOrderId = order.exchange?.clientOrderId || paperClientOrderId(order);
+    try {
+      const params = await paperLimitParams(order, client);
+      if (typeof client.setLeverage === 'function') await client.setLeverage({ symbol: order.symbol, leverage: order.leverage });
+      const result = await client.limitOrder({ ...params, timeInForce: 'GTC', clientOrderId });
+      return this.mutateLight(state => {
+        const current = state.orders.find(item => item.id === order.id);
+        if (!current) return order;
+        current.exchange = { provider: 'binance-demo', status: String(result.status || 'NEW').toLowerCase(), clientOrderId,
+          orderId: result.orderId ?? null, submittedAt: current.exchange?.submittedAt || new Date().toISOString(), lastError: '' };
+        return current;
+      });
+    } catch (error) {
+      await this.mutateLight(state => {
+        const current = state.orders.find(item => item.id === order.id);
+        if (!current) return;
+        current.exchange = { provider: 'binance-demo', status: 'submit_error', clientOrderId, orderId: null, submittedAt: null, lastError: error.message };
+        current.error = `Demo 挂单同步失败：${error.message}`;
+      });
+      throw error;
+    }
+  }
+
+  async cancelDemoOrder(order) {
+    const config = await this.store?.getConfig?.() || {};
+    if (!demoTradingEnabled(config) || order?.exchange?.provider !== 'binance-demo') return order;
+    const exchange = order.exchange;
+    const exchangeStatus = String(exchange.status || '').toLowerCase();
+    if (!['new', 'partially_filled', 'submitted', 'cancel_requested'].includes(exchangeStatus)) return order;
+    const client = paperExchangeClient(config, this.clientFactory || (cfg => new BinanceClient(cfg)));
+    try {
+      const result = await client.cancelOrder({ symbol: order.symbol, orderId: exchange.orderId, clientOrderId: exchange.clientOrderId });
+      return this.mutateLight(state => {
+        const current = state.orders.find(item => item.id === order.id);
+        if (current) current.exchange = { ...exchange, ...current.exchange, status: String(result.status || 'CANCELED').toLowerCase(), cancelledAt: new Date().toISOString(), lastError: '' };
+        return current || order;
+      });
+    } catch (error) {
+      await this.mutateLight(state => {
+        const current = state.orders.find(item => item.id === order.id);
+        if (current) { current.exchange = { ...current.exchange, status: 'cancel_error', lastError: error.message }; current.error = `Demo 撤单同步失败：${error.message}`; }
+      });
+      throw error;
+    }
   }
   async refresh(options = {}) {
     while (this.refreshPromise) await this.refreshPromise.catch(() => {});
@@ -299,15 +428,26 @@ export class SimulatedAccount {
             } });
         } catch (error) { failure = error.message; }
         if (!shouldContinue()) break;
+        const cancelCandidates = [];
         await this.mutateLight(current => {
           if (!shouldContinue()) return;
           for (const snapshot of orders) {
             const order = current.orders.find(o => o.id === snapshot.id);
             if (!order || !active(order) || order.nextTime !== snapshot.nextTime) continue;
+            const wasPending = order.status === 'pending';
+            const previousExchange = order.exchange ? { ...order.exchange } : null;
             advancePaperOrder(order, rows, now);
             if (failure && active(order)) order.error = failure;
+            if (wasPending && ['expired', 'cancelled'].includes(order.status) && ['submitted', 'new', 'partially_filled'].includes(previousExchange?.status)) {
+              order.exchange = { ...previousExchange, status: 'cancel_requested', cancelRequestedAt: new Date().toISOString() };
+              cancelCandidates.push({ ...order, exchange: { ...order.exchange } });
+            }
           }
         });
+        for (const candidate of cancelCandidates) {
+          try { await this.cancelDemoOrder(candidate); }
+          catch (error) { this.lastError = error.message; }
+        }
         await new Promise(resolve => setImmediate(resolve));
       }
       this.lastRunAt = new Date().toISOString(); this.lastError = '';
@@ -320,20 +460,31 @@ export class SimulatedAccount {
     if (refresh) await this.refresh();
     const closeReason = normalizeCloseReason(reason);
     // 只操作单个目标订单，不需要历史订单明细
-    return this.mutateLight(state => {
-      const order = state.orders.find(o => o.id === id);
-      if (!order) fail('模拟订单不存在。');
+    let cancelRemote = false;
+    const order = await this.mutateLight(state => {
+      const current = state.orders.find(o => o.id === id);
+      if (!current) fail('模拟订单不存在。');
       // 挂单未成交 → 撤销（此前不写 reason，统计里表现为「无理由消失」）
-      if (order.status === 'pending') {
-        order.status = 'cancelled';
-        order.reason = 'strategy_cancelled';
-        return order;
+      if (current.status === 'pending') {
+        current.status = 'cancelled';
+        current.reason = 'strategy_cancelled';
+        const remote = ['submitted', 'new', 'partially_filled'].includes(current.exchange?.status);
+        if (remote) {
+          current.exchange = { ...current.exchange, status: 'cancel_requested', cancelRequestedAt: new Date().toISOString() };
+          cancelRemote = true;
+        }
+        return current;
       }
-      if (order.status !== 'open') return order;
-      if (order.error || Date.parse(order.markAt) !== candleOpenAt(Date.now(), order.interval)) fail('行情未更新，不能用过期价格模拟平仓，请先刷新。');
-      settlePaperOrder(order, order.markPrice, closeReason, Date.now());
-      return order;
+      if (current.status !== 'open') return current;
+      if (current.error || Date.parse(current.markAt) !== candleOpenAt(Date.now(), current.interval)) fail('行情未更新，不能用过期价格模拟平仓，请先刷新。');
+      settlePaperOrder(current, current.markPrice, closeReason, Date.now());
+      return current;
     });
+    if (cancelRemote) {
+      try { return await this.cancelDemoOrder(order); }
+      catch { return order; }
+    }
+    return order;
   }
 }
 

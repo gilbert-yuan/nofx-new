@@ -29,6 +29,13 @@ function pending() {
   { symbol: 'BTCUSDT', margin: 100, leverage: 3 }, 10 * bar);
 }
 
+test('all pending orders expire after 24 hours even without a new candle', () => {
+  const order = pending();
+  advancePaperOrder(order, [], 10 * bar + 24 * 60 * 60 * 1000 + 1);
+  assert.equal(order.status, 'expired');
+  assert.equal(order.reason, 'pending_expired');
+});
+
 test('unfinished and out-of-order rows never advance the checkpoint or mark price', () => {
   const order = pending();
   advancePaperOrder(order, [candle(11, { close: 101 }), candle(12, { close: 110, high: 111 })], 12 * bar + 1);

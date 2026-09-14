@@ -11,8 +11,8 @@ const fields = (text = '', number = '', boolean = '', timestamp = '') => [
   ...timestamp.split(' ').filter(Boolean).map(key => [key, 'TIMESTAMPTZ'])
 ];
 const snake = name => name.replace(/[A-Z]/g, c => `_${c.toLowerCase()}`);
-// Legacy expiry columns/status are retained only to round-trip historical records.
-// New plans and orders do not generate or enforce entry deadlines.
+// Legacy expiry columns/status are retained for historical records; all newly created
+// simulated pending orders receive and enforce the shared 24-hour expiry.
 const planFields = fields('entryRule', 'entryMin entryMax stopLoss takeProfit validForBars maxHoldBars netRewardRisk');
 const jobFields = fields('owner runId engine', 'index total held failed updated eligible submitted startedAt finishedAt leaseUntil nextAt', 'running');
 const orderFields = fields('id recordId symbol interval direction status marketProvider error reason lastReviewRunId',

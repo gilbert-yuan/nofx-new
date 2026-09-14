@@ -24,6 +24,9 @@ import { structureShortAnalysis } from '../server/structureShortAnalysis.js';
 import { structureLongAnalysis } from '../server/structureLongAnalysis.js';
 import { PAPER_COSTS } from '../server/research.js';
 import { recommendedLeverage } from '../server/localAnalysis.js';
+import { createAccountSimulator } from '../server/tradingSimulator.js';
+import { buildExitRules, ENHANCED_DEFAULTS } from '../server/enhancedAnalysis.js';
+import { localProtectionReview, applyPaperProtectionReview } from '../server/shared/protectionReview.js';
 import { LONG_ONLY } from '../server/shared/strategyGuards.js';
 
 const STRATEGY = process.env.BT_STRATEGY || 'structure-short';
@@ -40,8 +43,7 @@ const D4H = path.resolve(process.env.BT_DIR_4H || 'data/backtest/bf90-4h');
 const TF1M = 60000, TF15 = 900000, TF1H = 3600000, TF4H = 14400000;
 const WINDOW = 80;                    // 与生产 getFreshMarket 的 80 根窗口一致
 const MARGIN = 100;
-const MAX_HOLD_1M = 96 * 15;          // plan.maxHoldBars(15m 根) × 15 = 1440 根 1m
-const PENDING_TTL_1M = 96 * 15;       // 挂单 24h 未成交 → 撤
+const PENDING_TTL_1M = 24 * 60;       // 生产统一挂单 TTL：24h
 const COOLDOWN_1M = 30;               // 平仓后 30 分钟（1m 根）
 const STOP_COOLDOWN_1M = 60;          // 止损后 60 分钟
 const OUT = path.join(D1M, process.env.BT_OUT || 'structure-result.json');
@@ -94,9 +96,15 @@ function runSymbol(symbol) {
   const N = bars1m.length;
   const trades = [], placed = [], cancels = [];
   let signalCount = 0;
+  const simulator = createAccountSimulator({
+    enableLiquidation: true,
+    enableIsolatedMargin: true,
+    enableDynamicProtection: true,
+    initialBalance: 100000000
+  });
 
   const hi15 = { i: 0 }, hi1h = { i: 0 }, hi4h = { i: 0 };
-  let order = null;          // { plan, dir, status:'pending'|'open', ... }
+  let order = null;          // 生产模拟器输入订单
   let cooldownUntilTs = -1;  // 决策时刻戳（15m 收盘时刻）口径的冷却
   let mIdx = 0;              // 1m 推进指针
 
@@ -111,11 +119,12 @@ function runSymbol(symbol) {
 
     // ── 1. 挂单失效判定（15m 收盘有效突破止损 = 引擎声明的失效条件）──
     if (order && order.status === 'pending') {
-      const invalid = order.dir === 1 ? bars15[j].close <= order.plan.stopLoss : bars15[j].close >= order.plan.stopLoss;
+      const long = order.direction === 'OPEN_LONG';
+      const invalid = long ? bars15[j].close <= order.plan.stopLoss : bars15[j].close >= order.plan.stopLoss;
       const expired = decisionTime - Date.parse(order.createdAt) > PENDING_TTL_1M * 60000;
       if (invalid || expired) {
         cancels.push({
-          symbol, direction: order.dir === 1 ? 'OPEN_LONG' : 'OPEN_SHORT', at: decisionTime,
+          symbol, direction: order.direction, at: decisionTime,
           reason: invalid ? 'invalidated' : 'pending_expired',
           waitMin: (decisionTime - Date.parse(order.createdAt)) / 60000
         });
@@ -142,101 +151,65 @@ function runSymbol(symbol) {
           signalCount++;
           const dir = sig.action === 'BUY' ? 1 : -1;
           const leverage = recommendedLeverage(sig.plan, dir === 1 ? 'OPEN_LONG' : 'OPEN_SHORT');
+          const plan = {
+            ...sig.plan,
+            exitRules: buildExitRules({ ...ENHANCED_DEFAULTS, smartExitEnabled: false })
+          };
+          const createdAt = new Date(decisionTime).toISOString();
           order = {
-            symbol, dir, plan: sig.plan, status: 'pending',
+            id: `${symbol}-${decisionTime}`,
+            symbol, direction: dir === 1 ? 'OPEN_LONG' : 'OPEN_SHORT', interval: '1m',
+            plan: { ...plan, maxHoldBars: Math.round((sig.plan.maxHoldBars || 96) * 15) },
+            initialPlan: { ...plan, maxHoldBars: Math.round((sig.plan.maxHoldBars || 96) * 15) }, status: 'pending',
             notional: MARGIN * leverage, leverage, margin: MARGIN,
+            costs: { ...PAPER_COSTS }, createdAt,
+            nextTime: firstBarAtOrAfter(decisionTime) < N ? bars1m[firstBarAtOrAfter(decisionTime)].openTime : decisionTime,
             score: sig.score ?? null, entryQuality: sig.entryQuality ?? null,
-            createdAt: new Date(decisionTime).toISOString(),
-            mStart: firstBarAtOrAfter(decisionTime)   // 决策后第一根 1m 才可能成交（无前视）
+            protectionRevisions: [], reviewHistory: []
           };
           placed.push({ symbol, direction: dir === 1 ? 'OPEN_LONG' : 'OPEN_SHORT', at: bars15[j].openTime, score: order.score, entryQuality: order.entryQuality });
         }
       }
     }
 
-    // ── 3. 推进 1m 执行（把 mIdx 推到下一个 15m 决策点为止）──
+    // ── 3. 推进 1m 执行：每根 K 线直接调用生产 TradingSimulator ──
     const nextDecision = j + 1 < bars15.length ? bars15[j + 1].openTime + TF15 : Infinity;
     while (order && mIdx < N && bars1m[mIdx].openTime < nextDecision) {
-      if (mIdx < order.mStart) { mIdx++; continue; }
       const row = bars1m[mIdx];
-      const long = order.dir === 1;
-      const plan = order.plan;
       const nowMs = row.openTime + TF1M;
-
-      if (order.status === 'pending') {
-        // 限价触达（_tryEntry.limit 语义）：多头 low≤entryLimit / 空头 high≥entryLimit
-        const reached = long ? row.low <= plan.entryLimit : row.high >= plan.entryLimit;
-        if (reached) {
-          const slipped = plan.entryLimit * (1 + order.dir * PAPER_COSTS.slippageBps / 10000);
-          const valid = long ? (slipped > plan.stopLoss && slipped < plan.takeProfit)
-            : (slipped < plan.stopLoss && slipped > plan.takeProfit);
-          if (valid) {
-            order.status = 'open';
-            order.entry = slipped;
-            order.entryAt = new Date(row.openTime).toISOString();
-            order.entryMs = row.openTime;
-            order.entryFee = order.notional * PAPER_COSTS.feeBps / 10000;
-            order.quantity = order.notional / slipped;
-            order.held = 0;
-            order.initialStop = plan.stopLoss;
-            // 成交当根保守口径：触止损即按止损结算（_checkExit 的 ctx.entryBar 分支）
-            const hitStop = long ? row.low <= plan.stopLoss : row.high >= plan.stopLoss;
-            if (hitStop) { settle(order, plan.stopLoss, row.openTime + TF1M, 1, 'stop_loss', true); order = null; mIdx++; continue; }
-          }
-        }
-        // 24h 未成交撤单（在 1m 粒度上兜底，防 15m 判定的边界漏网）
-        if (order && order.status === 'pending' && row.openTime - Date.parse(order.createdAt) > PENDING_TTL_1M * 60000) {
-          cancels.push({ symbol, direction: long ? 'OPEN_LONG' : 'OPEN_SHORT', at: nowMs, reason: 'pending_expired', waitMin: (row.openTime - Date.parse(order.createdAt)) / 60000 });
-          order = null;
-        }
-      } else if (order.status === 'open') {
-        order.held += 1;
-        const hitStop = long ? row.low <= plan.stopLoss : row.high >= plan.stopLoss;
-        const hitTarget = long ? row.high >= plan.takeProfit : row.low <= plan.takeProfit;
-        if (hitStop && hitTarget) {
-          // 同根双触发：开盘已越过止盈 → 按更优价止盈；否则保守按止损
-          const openedBeyondTarget = long ? row.open >= plan.takeProfit : row.open <= plan.takeProfit;
-          if (openedBeyondTarget) settle(order, long ? Math.max(row.open, plan.takeProfit) : Math.min(row.open, plan.takeProfit), nowMs, order.held, 'take_profit', true);
-          else settle(order, long ? Math.min(row.open, plan.stopLoss) : Math.max(row.open, plan.stopLoss), nowMs, order.held, 'stop_loss', true);
-          order = null;
-        } else if (hitStop) {
-          settle(order, long ? Math.min(row.open, plan.stopLoss) : Math.max(row.open, plan.stopLoss), nowMs, order.held, 'stop_loss', false);
-          order = null;
-        } else if (hitTarget) {
-          settle(order, plan.takeProfit, nowMs, order.held, 'take_profit', false);
-          order = null;
-        } else if (order.held >= MAX_HOLD_1M) {
-          settle(order, row.close, nowMs, order.held, 'timeout', false);
-          order = null;
-        }
+      const result = simulator.evaluate(order, bars1m, nowMs);
+      for (const key of ['nextTime', 'entry', 'entryAt', 'heldBars', 'quantity', 'entryFee',
+        'liquidationPrice', 'markPrice', 'markAt', 'unrealized', 'tpStage', 'tpStopFloor',
+        'realizedGross', 'realizedFee', 'realizedFunding', 'realizedNet', 'realizedQty']) {
+        if (result[key] !== undefined && result[key] !== null) order[key] = result[key];
       }
-      if (!order) {
-        cooldownUntilTs = Date.parse(trades.at(-1)?.exitAt || '') + (trades.at(-1)?.reason === 'stop_loss' ? STOP_COOLDOWN_1M : COOLDOWN_1M) * 60000;
+      if (result.status === 'open' && order.entry) {
+        const market = { symbol, interval: '1m', klines: bars1m.slice(Math.max(0, mIdx - 80), mIdx + 1) };
+        const proposal = localProtectionReview(order, market);
+        applyPaperProtectionReview(order, proposal, nowMs, 'local');
       }
-      mIdx++;
+      if (result.status === 'closed') {
+        const trade = { symbol, direction: order.direction, ...result,
+          waitBars: result.entryAt ? (Date.parse(result.entryAt) - Date.parse(order.createdAt)) / 60000 : null,
+          score: order.score, entryQuality: order.entryQuality, unfinished: false };
+        trades.push(trade);
+        const cooldown = result.reason === 'stop_loss' || result.reason === 'trailing_stop' || result.reason === 'break_even_stop'
+          ? STOP_COOLDOWN_1M : COOLDOWN_1M;
+        cooldownUntilTs = Date.parse(result.exitAt) + cooldown * 60000;
+        order = null;
+      } else if (result.status === 'expired') {
+        cancels.push({ symbol, direction: order.direction, at: nowMs, reason: result.reason,
+          waitMin: (nowMs - Date.parse(order.createdAt)) / 60000 });
+        order = null;
+      } else {
+        order = { ...order, status: result.status };
+        const next = Number(result.nextTime);
+        const advanced = Number.isFinite(next) ? firstBarAtOrAfter(next) : mIdx + 1;
+        mIdx = Math.max(mIdx + 1, advanced);
+      }
     }
   }
   if (order) trades.push({ symbol, status: order.status, unfinished: true });
-
-  function settle(o, exitRaw, exitMs, held, reason, ambiguous) {
-    const long = o.dir === 1;
-    const exit = exitRaw * (1 - o.dir * PAPER_COSTS.slippageBps / 10000);
-    const qty = o.quantity;
-    const gross = o.dir * (exit - o.entry) * qty;
-    const exitFee = exit * qty * PAPER_COSTS.feeBps / 10000;
-    const funding = o.notional * PAPER_COSTS.fundingBpsPer8h / 10000 * (exitMs - o.entryMs) / 28800000;
-    const net = gross - o.entryFee - exitFee - funding;
-    trades.push({
-      symbol, direction: long ? 'OPEN_LONG' : 'OPEN_SHORT',
-      entry: o.entry, exit, entryAt: o.entryAt, exitAt: new Date(exitMs).toISOString(),
-      heldBars: held, held15m: held / 15,
-      reason, ambiguous,
-      net, gross, fee: o.entryFee + exitFee, funding,
-      roi: net / o.margin, leverage: o.leverage, margin: o.margin, notional: o.notional,
-      waitBars: (o.entryMs - Date.parse(o.createdAt)) / 60000,
-      score: o.score, entryQuality: o.entryQuality
-    });
-  }
 
   return { symbol, bars: N, signalCount, placed, trades, cancels };
 }
@@ -258,7 +231,7 @@ const trades = all.flatMap(r => r.trades.filter(x => !x.unfinished));
 fs.writeFileSync(OUT, JSON.stringify({
   generatedAt: new Date().toISOString(),
   config: { strategy: STRATEGY, window: WINDOW, margin: MARGIN, decisionTf: '15m', execTf: '1m',
-    maxHold1m: MAX_HOLD_1M, pendingTtlMin: PENDING_TTL_1M,
+    maxHold1m: 'plan.maxHoldBars × 15 (生产模拟器)', pendingTtlMin: PENDING_TTL_1M,
     longOnly: LONG_ONLY.enabled,
     maxLeverage: Number(process.env.NOFX_MAX_LEVERAGE ?? 5),
     riskBudgetPct: Number(process.env.NOFX_RISK_BUDGET_PCT ?? 0.1) },

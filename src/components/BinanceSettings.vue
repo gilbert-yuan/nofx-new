@@ -24,6 +24,7 @@ const smoke = reactive({ symbol: 'BTCUSDT', quantity: 0.002 });
           <label><input v-model="trader.allowEntryOrders" type="checkbox" /><span><b>自动开仓</b><small>只分析下方指定的候选币种</small></span></label>
           <label><input v-model="trader.allowProtectionUpdates" type="checkbox" /><span><b>止盈止损管理</b><small>复核并更新本系统的保护单</small></span></label>
           <label><input v-model="trader.allowCloseOrders" type="checkbox" /><span><b>自动平仓</b><small>策略退出时提交只减仓订单</small></span></label>
+          <label><input v-model="trader.syncPaperOrdersToDemo" type="checkbox" :disabled="binance.demo !== true" /><span><b>模拟挂单同步到 Demo</b><small>创建模拟限价挂单时同步同价 Demo GTC 单</small></span></label>
         </div>
       </fieldset>
       <fieldset class="settings-group"><legend>开仓与风控</legend>
@@ -36,7 +37,7 @@ const smoke = reactive({ symbol: 'BTCUSDT', quantity: 0.002 });
           <label>总仓名义价值 / 权益<input v-model.number="trader.maxTotalNotionalPct" type="number" min="0.01" max="1" step="0.01" /></label>
           <label>保护价最小调整幅度（基点）<input v-model.number="trader.minProtectionMoveBps" type="number" min="0" step="5" /></label>
         </div>
-        <p class="muted">比例 0.2 表示账户权益的 20%；置信度是模型自评，不代表实际胜率。实盘发单需要关闭“仅生成模拟指令”。</p>
+        <p class="muted">比例 0.2 表示账户权益的 20%；置信度是模型自评，不代表实际胜率。Demo 同步只接受限价计划，不会补发历史模拟挂单。</p>
       </fieldset>
       <div class="button-row"><button class="primary" @click="$emit('save')" :disabled="loading">保存币安配置</button><button class="ghost" @click="$emit('test')" :disabled="loading">测试已保存的连接</button></div>
       <fieldset class="settings-group"><legend>测试网冒烟验证</legend>

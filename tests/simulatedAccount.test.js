@@ -36,11 +36,45 @@ test('paper reservation is funded, idempotent and refuses invalid plans without 
   const late = submitPaperOrder(initialPaperAccount(), record(), { symbol: 'BTCUSDT' }, 14 * bar);
   assert.equal(late.status, 'pending');
   assert.equal(late.nextTime, 15 * bar);
-  assert.equal(late.expiresAt, undefined);
+  assert.equal(late.expiresAt, new Date(14 * bar + 24 * 60 * 60 * 1000).toISOString());
   const noDeadline = record(); delete noDeadline.analyses[0].expiresAt;
   assert.equal(submitPaperOrder(initialPaperAccount(), noDeadline, { symbol: 'BTCUSDT' }, now).status, 'pending');
   const invalid = record(); invalid.analyses[0].eligible = false;
   assert.throws(() => submitPaperOrder(initialPaperAccount(), invalid, { symbol: 'BTCUSDT' }, now), /观望/);
+});
+
+test('new paper pending orders mirror to Binance Demo as idempotent limit orders', async () => {
+  const state = initialPaperAccount();
+  const calls = [];
+  const config = { binance: { apiKey: 'demo-key', secretKey: 'demo-secret', demo: true, testnet: false },
+    trader: { enabled: true, dryRun: false, syncPaperOrdersToDemo: true } };
+  const client = {
+    exchangeInfo: async () => ({ symbols: [{ symbol: 'BTCUSDT', filters: [
+      { filterType: 'PRICE_FILTER', tickSize: '0.1' },
+      { filterType: 'LOT_SIZE', minQty: '0.001', stepSize: '0.001' },
+      { filterType: 'MIN_NOTIONAL', notional: '5' }
+    ] }] }),
+    setLeverage: async input => { calls.push({ leverage: true, ...input }); },
+    limitOrder: async input => { calls.push(input); return { orderId: 321, status: 'NEW' }; },
+    cancelOrder: async input => { calls.push({ cancel: true, ...input }); return { status: 'CANCELED', orderId: 321 }; }
+  };
+  const simulation = new SimulatedAccount({
+    pool: {}, archive: { get: async () => { const r = record(); r.analyses[0].plan.entryLimit = 100; return r; } }, market: { provider: 'binance' },
+    store: { getConfig: async () => config }, clientFactory: () => client
+  });
+  simulation.mutateLight = async fn => fn(state);
+  const created = await simulation.submit({ recordId: 'long', symbol: 'BTCUSDT', margin: 100, leverage: 3 });
+  assert.equal(created.status, 'pending');
+  assert.equal(created.exchange.status, 'new');
+  assert.equal(created.exchange.orderId, 321);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[0], { leverage: true, symbol: 'BTCUSDT', leverage: 3 });
+  assert.deepEqual(calls[1], { symbol: 'BTCUSDT', side: 'BUY', quantity: 3, price: 100, timeInForce: 'GTC', clientOrderId: created.exchange.clientOrderId });
+  await simulation.close(created.id, { refresh: false });
+  assert.equal(calls.length, 3);
+  assert.equal(calls[2].cancel, true);
+  assert.equal(calls[2].clientOrderId, created.exchange.clientOrderId);
+  assert.equal(created.exchange.status, 'canceled');
 });
 
 test('old-provider orders are isolated instead of replayed with Binance candles', async () => {
@@ -58,19 +92,16 @@ test('old-provider orders are isolated instead of replayed with Binance candles'
   assert.match(o.error, /旧订单不会使用不同交易所的 K 线推进/);
   assert.equal(o.status, 'pending');
 });
-test('pending orders retain reserves and can fill after a legacy entry deadline', () => {
+test('all pending orders expire after the unified 24-hour TTL', () => {
   const { state, o } = order();
-  o.expiresAt = new Date(14 * bar).toISOString();
-  o.plan.validForBars = 3;
-  advancePaperOrder(o, [candle(10 * bar), candle(11 * bar)], 11 * bar + 1);
+  assert.equal(o.expiresAt, new Date(now + 24 * 60 * 60 * 1000).toISOString());
+  advancePaperOrder(o, [candle(11 * bar)], 11 * bar + 1);
   assert.equal(o.status, 'pending');
-  advancePaperOrder(o, [11, 12, 13].map(t => candle(t * bar, { open: 105, high: 106, low: 104, close: 105 })), 14 * bar);
-  assert.equal(o.status, 'pending');
-  assert.equal(o.nextTime, 14 * bar);
-  almost(accountSummary(state).available, 10000 - 100 - 0.18);
-  advancePaperOrder(o, [candle(14 * bar)], 15 * bar);
-  assert.equal(o.status, 'open');
-  assert.equal(o.entryAt, new Date(14 * bar).toISOString());
+  advancePaperOrder(o, [], now + 24 * 60 * 60 * 1000 + 1);
+  assert.equal(o.status, 'expired');
+  assert.equal(o.reason, 'pending_expired');
+  assert.equal(o.expiresAt, new Date(now + 24 * 60 * 60 * 1000).toISOString());
+  almost(accountSummary(state).available, 10000);
 });
 
 test('3x changes position size once; long TP books exact gross, fees, funding and margin ROI', () => {

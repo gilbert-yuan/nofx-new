@@ -62,7 +62,7 @@ test('limit order and cancel target testnet fapi with correct signed parameters'
   const calls = [];
   client.request = async (url, options) => { calls.push({ url: new URL(url), options }); return { ok: true, text: async () => '{"orderId":1}' }; };
   await client.limitOrder({ symbol: 'BTCUSDT', side: 'BUY', quantity: 0.002, price: 25000.5 });
-  await client.cancelOrder({ symbol: 'BTCUSDT', orderId: 42 });
+  await client.cancelOrder({ symbol: 'BTCUSDT', orderId: 42, clientOrderId: 'nofxpaper123' });
   assert.match(calls[0].url.hostname, /binancefuture/);
   assert.equal(calls[0].url.pathname, '/fapi/v1/order');
   assert.equal(calls[0].url.searchParams.get('type'), 'LIMIT');
@@ -72,6 +72,9 @@ test('limit order and cancel target testnet fapi with correct signed parameters'
   assert.equal(calls[1].url.pathname, '/fapi/v1/order');
   assert.equal(calls[1].options.method, 'DELETE');
   assert.equal(calls[1].url.searchParams.get('orderId'), '42');
+  assert.equal(calls[1].url.searchParams.has('origClientOrderId'), false);
+  await client.cancelOrder({ symbol: 'BTCUSDT', clientOrderId: 'nofxpaper123' });
+  assert.equal(calls[2].url.searchParams.get('origClientOrderId'), 'nofxpaper123');
 });
 
 test('testnet smoke walks place→query→cancel→recheck and rolls back on failure', async () => {

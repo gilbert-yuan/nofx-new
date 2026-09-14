@@ -27,6 +27,14 @@ const isOppositeDirection = (recommendation, direction) =>
 // Apply only to orders that have already replayed through the latest closed bar.
 export function applyPendingReview(order, signal, now = Date.now()) {
   if (order.status !== 'pending') return { action: 'held' };
+  const createdAt = Date.parse(order.createdAt);
+  if (Number.isFinite(createdAt) && now >= createdAt + 24 * 60 * 60 * 1000) {
+    order.status = 'expired';
+    order.reason = 'pending_expired';
+    order.expiresAt = new Date(createdAt + 24 * 60 * 60 * 1000).toISOString();
+    order.expiredAt = new Date(now).toISOString();
+    return { action: 'expired', reason: '挂单已超过统一 24 小时有效期，自动过期。' };
+  }
   const report = { at: new Date(now).toISOString(), action: 'held', reason: signal?.reason || '保留原挂单。' };
   const record = () => {
     order.reviewHistory = [...(order.reviewHistory || []), report].slice(-50);

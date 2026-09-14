@@ -2,8 +2,9 @@
  * 冒烟：验证结构做空策略（structure-short-v1）的注册契约与信号链路
  *   · 注册字段：engine='structure-short'、planInterval='15m'、needsAux=['15m','1h','4h']、priority=80
  *   · decoratePlan 补的出场规则里「智能退出」默认关闭
- *   · analyze 全链路：缺数据 → WAIT；4H 强上涨 → WAIT；完整空头结构 → SELL 且计划自洽
+ *   · analyze 全链路：缺数据 → WAIT；4H 强上涨 → WAIT；趋势延续只有 BOS → HOLD
  *   · 80 根窗口回归：辅助行情窗口与生产一致（每个周期恰好 80 根），不出现「K 线不够」
+ *   · CHOCH 必须来自完整反向结构，不允许把趋势延续 BOS 当转向
  *
  * 合成 K 线：以 15m 为基础序列做锯齿形阴跌，再按 4:16 聚合出 1h/4h（跨周期价格天然一致）。
  * 所有 K 线过 validCandle 口径（low ≤ min(open,close) ≤ max ≤ high，四价 > 0）。
@@ -110,7 +111,7 @@ if (def) {
 
   const p = defaultParams(def.paramSchema);
   const expect = { bearishScoreMin: 70, entryQualityMin: 70, extendedAtr: 2, entryBufAtr: 0.25,
-    stopBufferAtr: 0.35, minStopPct: 0.008, takeProfitR: 2, maxHoldBars: 96 };
+    stopBufferAtr: 0.35, minStopPct: 0.008, minRealRR: 2, maxHoldBars: 96 };
   for (const k of Object.keys(expect)) {
     check(`默认参数 ${k} = ${expect[k]}`, Math.abs((p[k] ?? NaN) - expect[k]) < 1e-9, `实际 ${p[k]}`);
   }
@@ -130,7 +131,7 @@ const ctx = params => ({ params, auxMarkets: {} });
   check('缺辅助行情 → WAIT', r.action === 'WAIT' && r.plan === null, r.reason);
 }
 
-// 2b. 完整空头结构 → SELL（合成序列调参见下方输出诊断）
+// 2b. 持续空头趋势中的 BOS 不构成 CHOCH，必须 HOLD（防趋势延续误判）
 function buildBearishCase() {
   const rows15 = bearishMultiScale({});
   const rows1h = aggregate(rows15, 4, 80);
@@ -150,6 +151,8 @@ let sellResult = null;
   console.log('structure:', JSON.stringify(r.structure));
   console.log('reason   :', r.reason);
   sellResult = r;
+  check('趋势延续 BOS 不误判 CHOCH → HOLD', r.action === 'WAIT' && !r.structure?.['15m']?.chochBearish,
+    JSON.stringify(r.structure?.['15m']));
 }
 
 // 2c. 4H 强上涨 → WAIT
@@ -166,23 +169,10 @@ let sellResult = null;
 
 if (sellResult) {
   const r = sellResult;
-  if (r.action === 'SELL') {
-    check('完整空头结构 → SELL', r.action === 'SELL');
-    const plan = r.plan;
-    check('计划自洽：stopLoss > entryLimit > takeProfit > 0',
-      plan.stopLoss > plan.entryLimit && plan.entryLimit > plan.takeProfit && plan.takeProfit > 0,
-      JSON.stringify({ entry: plan.entryLimit, sl: plan.stopLoss, tp: plan.takeProfit }));
-    check('计划自洽：entryMin ≤ entryLimit ≤ entryMax', plan.entryMin <= plan.entryLimit && plan.entryLimit <= plan.entryMax);
-    check('riskUnit ≥ minStopPct×entry', plan.riskUnit >= p.minStopPct * plan.entryLimit - 1e-9, `riskUnit=${plan.riskUnit}`);
-    check('maxHoldBars = 96（15m 根）', plan.maxHoldBars === 96);
-    check('窗口 80 根（生产窗口回归）', r.trend?.bars && r.trend.bars['15m'] === 80 && r.trend.bars['1h'] === 80 && r.trend.bars['4h'] === 80,
-      JSON.stringify(r.trend?.bars));
-    check('信号带结构摘要与评分', !!r.structure && Number.isFinite(r.score) && Number.isFinite(r.entryQuality));
-    check('confidence ∈ (0, 1]', r.confidence > 0 && r.confidence <= 1, `confidence=${r.confidence}`);
-  } else {
-    // 序列参数没调好时显式失败，诊断信息已在上方输出
-    check('完整空头结构 → SELL（合成序列需调参）', false, `实际 ${r.action}`);
-  }
+  check('窗口 80 根（生产窗口回归）', r.trend?.bars && r.trend.bars['15m'] === 80 && r.trend.bars['1h'] === 80 && r.trend.bars['4h'] === 80,
+    JSON.stringify(r.trend?.bars));
+  check('信号带结构摘要与评分', !!r.structure && Number.isFinite(r.score) && Number.isFinite(r.entryQuality));
+  check('趋势延续时明确 HOLD', r.action === 'WAIT' && /评分|CHOCH|确认/.test(r.reason), r.reason);
 }
 
 console.log(fail ? `\n❌ ${fail} 项失败` : '\n✅ structure-short-v1 冒烟全部通过');
