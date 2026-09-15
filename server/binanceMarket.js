@@ -97,6 +97,36 @@ export class BinanceMarket {
     const rows = await this.client.klines({ symbol, interval, limit: count, startTime, endTime });
     return rows.map(row => ({ ...normalizeBinanceKline(row), confirmed: nextOpenTime(Number(row[0]), interval) <= Date.now() }));
   }
+
+  /**
+   * Load the public derivatives context required by the supplied crypto SKILLs.
+   * Individual endpoints are allowed to fail so the strategy can fail closed
+   * with an explicit data-quality reason instead of silently inventing values.
+   */
+  async skillContext(symbol) {
+    const calls = {
+      premium: () => this.client.premiumIndex(symbol),
+      funding: () => this.client.fundingRate({ symbol, limit: 200 }),
+      oi: () => this.client.openInterestHist({ symbol, period: '15m', limit: 200 }),
+      globalRatio: () => this.client.globalLongShortAccountRatio({ symbol, period: '15m', limit: 30 }),
+      topRatio: () => this.client.topLongShortPositionRatio({ symbol, period: '15m', limit: 30 }),
+      takerRatio: () => this.client.takerLongShortRatio({ symbol, period: '15m', limit: 30 })
+    };
+    const results = await Promise.all(Object.entries(calls).map(async ([key, fn]) => {
+      try { return [key, await fn(), null]; }
+      catch (error) { return [key, null, error.message]; }
+    }));
+    return {
+      symbol,
+      premium: results.find(([key]) => key === 'premium')?.[1] || null,
+      funding: results.find(([key]) => key === 'funding')?.[1] || [],
+      oi: results.find(([key]) => key === 'oi')?.[1] || [],
+      globalRatio: results.find(([key]) => key === 'globalRatio')?.[1] || [],
+      topRatio: results.find(([key]) => key === 'topRatio')?.[1] || [],
+      takerRatio: results.find(([key]) => key === 'takerRatio')?.[1] || [],
+      errors: Object.fromEntries(results.filter(([, , error]) => error).map(([key, , error]) => [key, error]))
+    };
+  }
 }
 
 export const binanceMarket = new BinanceMarket();

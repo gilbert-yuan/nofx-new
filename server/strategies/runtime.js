@@ -225,6 +225,9 @@ export class StrategyRuntime {
         // 此前漏传导致所有卡片的标签都是空的（引擎标签正常，容易看不出来）。
         priority: def.priority,
         needsAux: def.needsAux,
+        marketWindow: def.marketWindow,
+        marketWindows: def.marketWindows,
+        marketContext: def.marketContext,
         // 原生计划周期（15m/4h 策略的订单周期口径）也要暴露给前端，漏传会显示为空
         planInterval: def.planInterval,
         builtin: def.builtin,

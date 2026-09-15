@@ -66,7 +66,10 @@ defineStrategy({
   modelId: 'structure-short-v1',
   priority: 80,
   // 信号需要三个周期：15m（确认 + 计划周期）、1h（结构/阻力）、4h（趋势/指标）
-  needsAux: ['15m', '1h', '4h'],
+  needsAux: ['5m', '15m', '1h', '4h'],
+  marketWindow: 500,
+  marketWindows: { '5m': 300, '15m': 500, '1h': 500, '4h': 500 },
+  marketContext: { btc: '4h', derivatives: true, requireFiveMinute: false },
   // 订单落在 15m 周期：maxHoldBars=96 根 = 24h
   planInterval: '15m',
   paramSchema: [...STRUCTURE_SHORT_PARAM_SCHEMA, ...PUMP_SHORT_EXIT_PARAM_SCHEMA],
@@ -104,7 +107,10 @@ defineStrategy({
   modelId: 'structure-long-v1',
   priority: 85,
   // 信号需要三个周期：15m（确认 + 计划周期）、1h（结构/支撑）、4h（趋势/指标）
-  needsAux: ['15m', '1h', '4h'],
+  needsAux: ['5m', '15m', '1h', '4h'],
+  marketWindow: 500,
+  marketWindows: { '5m': 300, '15m': 500, '1h': 500, '4h': 500 },
+  marketContext: { btc: '4h', derivatives: true, requireFiveMinute: false },
   // 订单落在 15m 周期：maxHoldBars=96 根 = 24h
   planInterval: '15m',
   paramSchema: [...STRUCTURE_LONG_PARAM_SCHEMA, ...PUMP_SHORT_EXIT_PARAM_SCHEMA],

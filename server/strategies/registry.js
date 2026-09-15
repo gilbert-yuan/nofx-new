@@ -57,6 +57,14 @@ export function defineStrategy(def) {
     engine: String(def.engine || 'enhanced'),
     modelId: String(def.modelId || `${id}-rules-v1`),
     needsAux: Array.isArray(def.needsAux) ? [...def.needsAux] : [],
+    // Optional deterministic context/data requirements for extensible strategies.
+    marketWindow: Number.isInteger(def.marketWindow) ? Math.max(20, Math.min(1000, def.marketWindow)) : 80,
+    marketWindows: def.marketWindows && typeof def.marketWindows === 'object'
+      ? Object.freeze(Object.fromEntries(Object.entries(def.marketWindows)
+        .filter(([, value]) => Number.isInteger(value))
+        .map(([key, value]) => [key, Math.max(20, Math.min(1000, value))]))) : Object.freeze({}),
+    marketContext: def.marketContext && typeof def.marketContext === 'object'
+      ? Object.freeze({ ...def.marketContext }) : Object.freeze({}),
     // 原生计划周期（可选）：策略信号在非主周期（如 15m）K 线上计算时声明，
     // globalAutomation 会用该周期的行情建研究记录 —— 订单 interval 跟随此值，
     // maxHoldBars / 止损止盈结算都按该周期根数口径（如 15m 的 96 根 = 24h）。

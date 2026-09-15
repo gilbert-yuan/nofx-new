@@ -40,6 +40,62 @@ export function rsi(values, period = 14) {
   return out;
 }
 
+/** 与 crypto-*-skill-node/src/indicators/core.js 同口径的基础序列。 */
+export function trueRanges(rows) {
+  return rows.map((row, index) => index
+    ? Math.max(row.high - row.low, Math.abs(row.high - rows[index - 1].close), Math.abs(row.low - rows[index - 1].close))
+    : row.high - row.low);
+}
+
+/** SKILL 的 ATR 使用 EMA(TR, 14)，与项目原有保护层 ATR 保持独立。 */
+export function skillAtrSeries(rows, period = 14) {
+  return ema(trueRanges(rows), period);
+}
+
+export function zScore(values) {
+  const valid = values.filter(Number.isFinite);
+  if (valid.length < 2) return 0;
+  const mean = valid.reduce((sum, value) => sum + value, 0) / valid.length;
+  const variance = valid.reduce((sum, value) => sum + (value - mean) ** 2, 0) / valid.length;
+  const deviation = Math.sqrt(variance);
+  return deviation > 0 ? (valid.at(-1) - mean) / deviation : 0;
+}
+
+export function skillMacd(values, fast = 12, slow = 26, signal = 9) {
+  const fastEma = ema(values, fast), slowEma = ema(values, slow);
+  const line = values.map((_, index) => fastEma[index] == null || slowEma[index] == null
+    ? null : fastEma[index] - slowEma[index]);
+  const valid = line.filter(value => value != null);
+  const signalValid = ema(valid, signal);
+  let cursor = 0;
+  const signalLine = line.map(value => value == null ? null : signalValid[cursor++]);
+  return {
+    line,
+    signal: signalLine,
+    histogram: line.map((value, index) => value == null || signalLine[index] == null
+      ? null : value - signalLine[index])
+  };
+}
+
+export function skillAdx(rows, period = 14) {
+  const tr = trueRanges(rows), plus = [0], minus = [0];
+  for (let index = 1; index < rows.length; index += 1) {
+    const up = rows[index].high - rows[index - 1].high;
+    const down = rows[index - 1].low - rows[index].low;
+    plus.push(up > down && up > 0 ? up : 0);
+    minus.push(down > up && down > 0 ? down : 0);
+  }
+  const atr = ema(tr, period), plusEma = ema(plus, period), minusEma = ema(minus, period);
+  const plusDi = rows.map((_, index) => atr[index] ? 100 * plusEma[index] / atr[index] : null);
+  const minusDi = rows.map((_, index) => atr[index] ? 100 * minusEma[index] / atr[index] : null);
+  const dx = rows.map((_, index) => plusDi[index] == null
+    ? null : 100 * Math.abs(plusDi[index] - minusDi[index]) / (plusDi[index] + minusDi[index] || 1));
+  const valid = dx.filter(value => value != null), average = ema(valid, period);
+  let cursor = 0;
+  const adx = dx.map(value => value == null ? null : average[cursor++]);
+  return { adx, plusDI: plusDi, minusDI: minusDi };
+}
+
 /** 滚动 ATR 序列（口径 = shared/protectionReview.averageTrueRange，与 pump-short 一致） */
 export function atrSeries(rows, period = 14) {
   const out = new Array(rows.length).fill(NaN);
@@ -127,6 +183,36 @@ export function marketStructure(rows, left = 3, right = 3) {
   };
 }
 
+/**
+ * 原始 SKILL 结构判定。
+ *
+ * marketStructure() 是 NOFX 其它策略使用的更严格版本（CHOCH 要求前置趋势切换）。
+ * 两个 crypto skill 必须保留自己的判定口径，避免移植后悄悄改变信号集合。
+ */
+export function skillStructure(rows, left = 3, right = 3) {
+  const p = pivots(rows, left, right);
+  const highs = p.highs.slice(-2), lows = p.lows.slice(-2);
+  const highPattern = highs.length < 2 ? 'NA' : highs[1].price < highs[0].price ? 'LH' : 'HH';
+  const lowPattern = lows.length < 2 ? 'NA' : lows[1].price < lows[0].price ? 'LL' : 'HL';
+  const trend = highPattern === 'LH' && lowPattern === 'LL' ? 'BEARISH'
+    : highPattern === 'HH' && lowPattern === 'HL' ? 'BULLISH' : 'NEUTRAL';
+  const lastClose = rows.at(-1)?.close;
+  const priorLow = lows.at(-1)?.price, priorHigh = highs.at(-1)?.price;
+  const bosBearish = priorLow != null && lastClose < priorLow;
+  const bosBullish = priorHigh != null && lastClose > priorHigh;
+  const failedBreakout = highs.length >= 2 && rows.slice(-8).some(row => row.high > highs[0].price && row.close < highs[0].price);
+  const failedBreakdown = lows.length >= 2 && rows.slice(-8).some(row => row.low < lows[0].price && row.close > lows[0].price);
+  return {
+    trend, highPattern, lowPattern, bosBearish, bosBullish,
+    chochBearish: bosBearish && highPattern === 'LH',
+    chochBullish: bosBullish && lowPattern === 'HL',
+    failedBreakout, failedBreakdown,
+    resistance: highs.at(-1)?.price ?? null,
+    support: lows.at(-1)?.price ?? null,
+    highs: p.highs, lows: p.lows, pivots: p
+  };
+}
+
 /** 单周期指标摘要（skill summarizeIndicators 的本地化子集） */
 export function summarize(rows) {
   const close = rows.map(x => x.close), volume = rows.map(x => x.volume);
@@ -141,6 +227,38 @@ export function summarize(rows) {
     atrPct: atrPercentile(a.filter(Number.isFinite)),
     rsi: rs.at(-1),
     volumeRatio: volume.at(-1) / (volMean || 1)
+  };
+}
+
+/** 单周期指标摘要，逐字段对齐 crypto-*-skill-node 的 summarizeIndicators。 */
+export function summarizeSkill(rows) {
+  const close = rows.map(row => row.close);
+  const volume = rows.map(row => row.volume);
+  const e20 = ema(close, 20), e50 = ema(close, 50), e200 = ema(close, 200);
+  const atr = skillAtrSeries(rows, 14);
+  const rsiValues = rsi(close, 14);
+  const macd = skillMacd(close);
+  const adx = skillAdx(rows);
+  const validAtr = atr.filter(Number.isFinite).slice(-200);
+  const currentAtr = atr.at(-1);
+  const volumeWindow = volume.slice(-20).filter(Number.isFinite);
+  const volumeMean = volumeWindow.length ? volumeWindow.reduce((sum, value) => sum + value, 0) / volumeWindow.length : NaN;
+  const last = rows.at(-1) || {};
+  const takerBuyVolume = Number(last.takerBuyVolume);
+  return {
+    price: close.at(-1),
+    ema20: e20.at(-1), ema50: e50.at(-1), ema200: e200.at(-1),
+    ema20Slope: e20.at(-1) - e20.at(-6), ema50Slope: e50.at(-1) - e50.at(-6),
+    atr: currentAtr,
+    atrPercentile: validAtr.length ? validAtr.filter(value => value <= currentAtr).length / validAtr.length : 0,
+    atrPct: validAtr.length ? validAtr.filter(value => value <= currentAtr).length / validAtr.length : 0,
+    rsi: rsiValues.at(-1),
+    macd: macd.line.at(-1), macdSignal: macd.signal.at(-1), macdHistogram: macd.histogram.at(-1),
+    adx: adx.adx.at(-1), plusDI: adx.plusDI.at(-1), minusDI: adx.minusDI.at(-1),
+    volumeRatio: Number.isFinite(volumeMean) && volumeMean !== 0 ? volume.at(-1) / volumeMean : NaN,
+    volumeZ: zScore(volume.slice(-100)),
+    takerSellRatio: Number.isFinite(takerBuyVolume) && Number(volume.at(-1)) > 0
+      ? 1 - takerBuyVolume / volume.at(-1) : NaN
   };
 }
 

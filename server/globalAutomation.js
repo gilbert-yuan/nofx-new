@@ -16,6 +16,7 @@ import { applyPendingReview, HELD_INELIGIBLE } from './shared/pendingReview.js';
 import { createStrategyRuntime } from './strategies/index.js';
 import { RISK_RULE } from './shared/strategyGuards.js';
 import { normalizeCloseReason, isStopReason } from '../shared/closeReasons.js';
+import { accountSummary } from './simulatedAccount.js';
 
 // ── 同币种冷却（2026-09-11 优化：由「仅止损后」扩展到「任意平仓后」）────────
 // 依据：2711 笔真实成交 + 真实 1m K 线回放，统一出场（2ATR 止损/3R 止盈/1R 后移动 1.5ATR/120 根）。
@@ -82,11 +83,32 @@ export class GlobalAutomation {
       totalReviews: 0,
       errors: []
     };
+    this.skillContextCache = new Map();
   }
 
   /** 策略分析/复核共用的依赖注入（策略定义里通过 ctx.deps 取用） */
   strategyDeps() {
-    return { superAnalysis: this.superAnalysis, store: this.store };
+    return { superAnalysis: this.superAnalysis, store: this.store, market: this.market, marketDb: this.marketDb };
+  }
+
+  async getSkillDerivatives(symbol) {
+    const bucket = Math.floor(Date.now() / 900000);
+    const key = `derivatives:${symbol}:${bucket}`;
+    if (this.skillContextCache.has(key)) return this.skillContextCache.get(key);
+    const promise = typeof this.market.skillContext === 'function'
+      ? this.market.skillContext(symbol)
+      : { symbol, errors: { market: '行情客户端未提供 skillContext()' } };
+    this.skillContextCache.set(key, promise);
+    return promise;
+  }
+
+  async getSkillBtcMarket(interval = '4h', limit = 500) {
+    const bucket = Math.floor(Date.now() / 900000);
+    const key = `btc:${interval}:${limit}:${bucket}`;
+    if (this.skillContextCache.has(key)) return this.skillContextCache.get(key);
+    const promise = this.getFreshMarket('BTCUSDT', interval, false, limit);
+    this.skillContextCache.set(key, promise);
+    return promise;
   }
 
   /**
@@ -444,16 +466,19 @@ export class GlobalAutomation {
       strategyPrompt,
       interval,
       state,
-      deps: this.strategyDeps()
+      deps: this.strategyDeps(),
+      account: state ? accountSummary(state) : null
     };
 
     if (strategy.needsAux?.length) {
       const auxMarkets = {};
       let incomplete = false;
+      const requiredWindow = strategy.marketWindow || 80;
       for (const auxInterval of strategy.needsAux) {
-        if (auxInterval === market.interval) continue;
         try {
-          const aux = await this.getFreshMarket(symbol, auxInterval);
+          const intervalWindow = strategy.marketWindows?.[auxInterval] || requiredWindow;
+          const canReuseConfiguredMain = auxInterval === market.interval && market.klines?.length >= intervalWindow;
+          const aux = canReuseConfiguredMain ? market : await this.getFreshMarket(symbol, auxInterval, false, intervalWindow);
           if (!aux || aux.partial) incomplete = true;
           if (aux) auxMarkets[auxInterval] = aux;
         } catch (error) {
@@ -465,6 +490,16 @@ export class GlobalAutomation {
       if (!submit && incomplete) throw new Error('Auxiliary market data incomplete; retaining pending order');
       ctx.auxMarkets = auxMarkets;
     }
+
+    if (strategy.marketContext?.derivatives) ctx.derivatives = await this.getSkillDerivatives(symbol);
+    if (strategy.marketContext?.btc) {
+      ctx.btcMarket = await this.getSkillBtcMarket(strategy.marketContext.btc, strategy.marketWindow || 500);
+    }
+    ctx.skillContext = {
+      derivatives: ctx.derivatives || null,
+      btcMarket: ctx.btcMarket || null,
+      requireFiveMinute: Boolean(strategy.marketContext?.requireFiveMinute)
+    };
 
     if (strategy.engine === 'local') {
       const defaults = {
@@ -540,15 +575,44 @@ export class GlobalAutomation {
       const leverage = Number.isFinite(strategyLeverage) && strategyLeverage > 0
         ? Math.max(1, Math.min(RISK_RULE.maxLeverage, Math.floor(strategyLeverage)))
         : recommendedLeverage(signal.plan, signal.action === 'BUY' ? 'OPEN_LONG' : 'OPEN_SHORT');
+      let explicitMargin = null;
+      const skillRisk = Number(signal.plan?.riskPerTrade);
+      const skillDailyLoss = Number(signal.plan?.maxDailyLoss);
+      if (signal.strategyId?.startsWith('structure-') && Number.isFinite(skillRisk) && skillRisk > 0) {
+        const summary = accountSummary(simState);
+        const equity = Number(summary.equity ?? summary.initialBalance);
+        const dayStart = Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), new Date().getUTCDate());
+        const dailyNet = (simState.orders || [])
+          .filter(order => order.status === 'closed' && Date.parse(order.exitAt || '') >= dayStart)
+          .reduce((sum, order) => sum + Number(order.net || 0), 0);
+        if (Number.isFinite(skillDailyLoss) && skillDailyLoss > 0 && Number.isFinite(equity)
+          && dailyNet <= -equity * skillDailyLoss) {
+          console.log(`[GlobalAutomation][${signal.strategyId}] ${symbol} 已达到每日亏损上限 ${skillDailyLoss * 100}% ，跳过开仓`);
+          return { symbol, success: true, action: 'SKIP_DAILY_LOSS' };
+        }
+        const entry = Number(signal.plan.entryLimit ?? ((signal.plan.entryMin + signal.plan.entryMax) / 2));
+        const stop = Number(signal.plan.stopLoss);
+        const stopPct = entry > 0 ? Math.abs(entry - stop) / entry : 0;
+        if (Number.isFinite(equity) && equity > 0 && stopPct > 0) {
+          const notional = equity * skillRisk / stopPct;
+          explicitMargin = Math.floor((notional / leverage) * 100) / 100;
+          if (explicitMargin < 1) {
+            console.log(`[GlobalAutomation][${signal.strategyId}] ${symbol} 按 ${skillRisk * 100}% 止损风险计算的保证金不足 1 USDT，跳过开仓`);
+            return { symbol, success: true, action: 'SKIP_RISK_SIZE' };
+          }
+        }
+      }
       if (!shouldContinue()) return { symbol, success: true, action: 'ABORTED' };
-      await this.simulation.submit({
+      const submitInput = {
         recordId,
         symbol,
-        autoMarginPct: AUTO_MARGIN_PCT,
         leverage,
         automatic: true,
         strategyId: signal.strategyId
-      });
+      };
+      if (explicitMargin != null) submitInput.margin = explicitMargin;
+      else submitInput.autoMarginPct = AUTO_MARGIN_PCT;
+      await this.simulation.submit(submitInput);
 
       console.log(`[GlobalAutomation][${signal.strategyId || 'strategy'}] ${symbol} 已提交 ${signal.action} 订单，杠杆 ${leverage}x`);
       if (signal.plan?.trendStrengthScore) {
@@ -781,15 +845,16 @@ export class GlobalAutomation {
     });
   }
 
-  async getFreshMarket(symbol, interval = MAIN_INTERVAL, forceFetch = false) {
+  async getFreshMarket(symbol, interval = MAIN_INTERVAL, forceFetch = false, limit = 80) {
     const key = this.market.storageSymbol(symbol);
     const now = Date.now();
+    const windowLimit = Math.min(1000, Math.max(20, Number(limit) || 80));
 
     // 用交易所返回的原始数据构造"尽力而为"的已收盘K线集合
     const buildPartial = rows => {
       const closed = (Array.isArray(rows) ? rows : [])
         .filter(row => row.confirmed !== false && nextOpenTime(row.openTime, interval) <= now)
-        .sort((a, b) => a.openTime - b.openTime).slice(-80)
+        .sort((a, b) => a.openTime - b.openTime).slice(-windowLimit)
         .map(row => ({ ...row, closeTime: nextOpenTime(row.openTime, interval) - 1 }));
       return {
         symbol,
@@ -803,24 +868,25 @@ export class GlobalAutomation {
     };
 
     const fetchPrepared = async limit => {
-      const raw = await this.market.klines({ symbol, interval, limit });
+      const fetchLimit = Math.min(1000, Math.max(windowLimit + 2, Number(limit) || windowLimit + 2));
+      const raw = await this.market.klines({ symbol, interval, limit: fetchLimit });
       await this.marketDb.saveKlines({ symbol: key, interval, rows: raw });
-      const prepared = prepareMarket({ symbol, interval, rows: raw, limit: 80, marketProvider: this.market.provider, throwOnInsufficient: false });
+      const prepared = prepareMarket({ symbol, interval, rows: raw, limit: windowLimit, marketProvider: this.market.provider, throwOnInsufficient: false });
       return prepared.insufficient ? buildPartial(raw) : prepared;
     };
 
-    if (forceFetch) return fetchPrepared(100);
+    if (forceFetch) return fetchPrepared(windowLimit + 2);
 
     try {
       // 先尝试从数据库获取
-      const rows = await this.marketDb.listKlines({ symbol: key, interval, limit: 80 });
+      const rows = await this.marketDb.listKlines({ symbol: key, interval, limit: windowLimit });
 
       // 尝试准备市场数据，检查是否足够
-      let prepared = prepareMarket({ symbol, interval, rows, limit: 80, marketProvider: this.market.provider, throwOnInsufficient: false });
+      let prepared = prepareMarket({ symbol, interval, rows, limit: windowLimit, marketProvider: this.market.provider, throwOnInsufficient: false });
 
       // 如果数据不足，从交易所获取更多（交易所也不够时降级为部分数据，不报错）
       if (prepared.insufficient) {
-        prepared = await fetchPrepared(Math.max(82, prepared.required + 2));
+        prepared = await fetchPrepared(Math.max(windowLimit + 2, prepared.required + 2));
       }
 
       if (!prepared.partial) {
@@ -835,7 +901,7 @@ export class GlobalAutomation {
       }
 
       // 从交易所获取（数据仍不足时降级为部分数据，不报错）
-      const prepared = await fetchPrepared(82);
+      const prepared = await fetchPrepared(windowLimit + 2);
 
       if (!prepared.partial) {
         await this.marketDb.saveKlines({ symbol: key, interval, rows: prepared.klines }).catch(() => {});

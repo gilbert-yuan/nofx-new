@@ -149,6 +149,12 @@ export function normalizePlan(raw, market, now, costs = PAPER_COSTS) {
         const targetSource = optString(plan.targetSource);
         const realRR = optNum(plan.realRR);
         const marginRiskPct = optNum(plan.marginRiskPct);
+        const riskPerTrade = optNum(plan.riskPerTrade);
+        const maxDailyLoss = optNum(plan.maxDailyLoss);
+        const adjustedRisk = optNum(plan.adjustedRisk);
+        const position = plan.position && typeof plan.position === 'object' ? plan.position : undefined;
+        const liquidationSafety = plan.liquidationSafety && typeof plan.liquidationSafety === 'object'
+          ? plan.liquidationSafety : undefined;
         // 结构策略的真实 pivot 目标和策略级出场规则必须随订单快照保存。
         // 只挑已知字段透传，避免把分析对象里的临时字段带入持久化计划。
         normalized = { entryMin, entryMax, entryLimit, stopLoss, takeProfit, maxHoldBars, netRewardRisk,
@@ -161,6 +167,11 @@ export function normalizePlan(raw, market, now, costs = PAPER_COSTS) {
           ...(targetPivotIndex !== undefined ? { targetPivotIndex } : {}),
           ...(targetPivotTime !== undefined ? { targetPivotTime } : {}),
           ...(realRR !== undefined ? { realRR } : {}),
+          ...(riskPerTrade !== undefined ? { riskPerTrade } : {}),
+          ...(maxDailyLoss !== undefined ? { maxDailyLoss } : {}),
+          ...(adjustedRisk !== undefined ? { adjustedRisk } : {}),
+          ...(position !== undefined ? { position } : {}),
+          ...(liquidationSafety !== undefined ? { liquidationSafety } : {}),
           ...(plan.exitRules && typeof plan.exitRules === 'object' ? { exitRules: plan.exitRules } : {}),
           ...(plan.smartExit && typeof plan.smartExit === 'object' ? { smartExit: plan.smartExit } : {}),
           ...(marginRiskPct !== undefined ? { marginRiskPct } : {}) };

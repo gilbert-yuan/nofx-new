@@ -61,6 +61,23 @@ export class BinanceClient {
     return this.publicRequest('/fapi/v1/klines', { symbol, interval, limit, startTime, endTime });
   }
 
+  // Binance USD-M public derivatives context used by the deterministic SKILL engines.
+  async premiumIndex(symbol) { return this.publicRequest('/fapi/v1/premiumIndex', { symbol }); }
+  async fundingRate({ symbol, limit = 200 } = {}) { return this.publicRequest('/fapi/v1/fundingRate', { symbol, limit }); }
+  async openInterest({ symbol } = {}) { return this.publicRequest('/fapi/v1/openInterest', { symbol }); }
+  async openInterestHist({ symbol, period = '15m', limit = 200 } = {}) {
+    return this.publicRequest('/futures/data/openInterestHist', { symbol, period, limit });
+  }
+  async globalLongShortAccountRatio({ symbol, period = '15m', limit = 30 } = {}) {
+    return this.publicRequest('/futures/data/globalLongShortAccountRatio', { symbol, period, limit });
+  }
+  async topLongShortPositionRatio({ symbol, period = '15m', limit = 30 } = {}) {
+    return this.publicRequest('/futures/data/topLongShortPositionRatio', { symbol, period, limit });
+  }
+  async takerLongShortRatio({ symbol, period = '15m', limit = 30 } = {}) {
+    return this.publicRequest('/futures/data/takerlongshortRatio', { symbol, period, limit });
+  }
+
   async account() {
     return this.signedRequest('GET', '/fapi/v2/account');
   }

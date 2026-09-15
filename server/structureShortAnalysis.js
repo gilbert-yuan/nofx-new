@@ -23,19 +23,13 @@
  * 入场质量（50 基础）：近阻力 +15 / CHOCH +12 / BOS +8 / 假突破 +10 /
  *   过度延伸 −35 / RSI<30 超卖 −20 / ATR 分位 >0.9 高波动 −15
  *
- * ⚠️ 适配点（与原 skill 的差异，均为运行时约束所致，已写入信号披露）：
- *   1. 实时行情窗口固定 80 根（globalAutomation.getFreshMarket → prepareMarket limit:80）：
- *      4H EMA200 不可用 → 趋势/排列判定降为 price<EMA20<EMA50；强上涨阻挡 =
- *      4H 结构 BULLISH 且 EMA20>EMA50。
- *   2. 衍生品数据（funding/OI/多空比/BTC 环境）自动化不提供 → 原评分中
- *      funding 5 / OI 5 / BTC 5 三项剔除，BTC BULLISH 的 −15 惩罚同样不生效
- *      （max 100 → 85；阈值默认 70 保持 skill 原值）。
- *   3. 库内 K 线无 takerBuyVolume → 量能成分 = 15m 最新收盘 K 线「放量收阴」
- *      （volumeRatio > 1.1 且 close < open）。
- *   4. 计划周期 = 15m（planInterval），订单止损止盈按 15m 根数口径结算；
- *      信号用 needsAux=['15m','1h','4h'] 拉取的多周期辅助行情。
- *   5. RR 闸门换成项目统一的「成本后净盈亏比 ≥ 1」（含手续费/滑点/资金费），
- *      真实 pivot 目标先满足最低 2R，再经过成本后净盈亏比校验。
+ * 当前正式入口已与 SKILL 规则保持确定性一致：
+ *   1. 决策窗口为 4H/1H/15m=500 根、5m=300 根，EMA200 与多周期结构完整可用。
+ *   2. funding/OI/多空比/taker/BTC 环境通过 marketContext 注入，严格模式缺失时闭合为 WAIT。
+ *   3. 评分、挤压风险、延伸过滤、RR≥2 及 15m CHOCH+BOS 按 rules.md 的顺序执行。
+ *   4. 计划几何、风险金额、波动降风险、仓位与预估爆仓安全检查统一由
+ *      shared/skillStrategy.js 生成。
+ *   5. 导出的正式函数调用 shared/skillStructureAnalysis.js，文件内旧实现仅保留作历史兼容参考。
  *
  * ⚠️ 尚无回测证据：按项目纪律（先证伪再落地），本策略**默认不启用**，落地为可参数化的
  *    对照实验；启用前请在 bf90 语料上跑真实回测（1m 执行 + 派生 15m/1h/4h 决策序列），
@@ -49,6 +43,7 @@ import { PAPER_COSTS } from './research.js';
 import { marketStructure, summarize, isFiniteCandle, summarizeStructure, selectPivotTarget } from './shared/marketStructure.js';
 import { recommendedLeverage } from './localAnalysis.js';
 import { STRATEGY_RISK_DEFAULTS, STRATEGY_RISK_PARAM_SCHEMA } from './strategies/commonParams.js';
+import { analyzeSkillStructure } from './shared/skillStructureAnalysis.js';
 
 /** 规则强度说明（写进信号的 risk 字段；⚠️ 尚无回测证据，默认关闭） */
 const RISK_NOTE = '结构做空（多周期）：4H 定方向、1H 定位置、15m 定确认，反弹进阻力区才开空，不追空。'
@@ -68,13 +63,27 @@ export const STRUCTURE_SHORT_DEFAULTS = Object.freeze({
   minStopPct: 0.008,
   // 真实 pivot 目标最低 RR；找不到达标目标直接 HOLD
   minRealRR: 2.0,
+  riskPerTrade: 0.01,
+  maxDailyLoss: 0.03,
+  extremeAtr: 3,
+  defaultLeverage: 5,
+  strictSkillData: true,
+  requireFiveMinute: false,
   // 持仓约束（15m 根：96 根 = 24h；计划校验上限 120 根）
   maxHoldBars: 96,
-  ...STRATEGY_RISK_DEFAULTS
+  ...STRATEGY_RISK_DEFAULTS,
+  // SKILL defaults are independent from legacy global environment overrides.
+  maxLeverage: 5,
+  riskBudgetPct: 0.1
 });
 
 const numSpec = (key, label, group, min, max, step, description) =>
   ({ key, label, group, type: 'number', default: STRUCTURE_SHORT_DEFAULTS[key], min, max, step, description });
+const boolSpec = (key, label, group, description) =>
+  ({ key, label, group, type: 'boolean', default: STRUCTURE_SHORT_DEFAULTS[key], description });
+const STRUCTURE_RISK_PARAM_SCHEMA = STRATEGY_RISK_PARAM_SCHEMA.map(spec => ({
+  ...spec, default: spec.key === 'maxLeverage' ? 5 : 0.1
+}));
 
 /** 参数模式（不含出场规则 —— 出场规则在 builtins.js 展开 EXIT_PARAM_SCHEMA） */
 export const STRUCTURE_SHORT_PARAM_SCHEMA = Object.freeze([
@@ -94,7 +103,19 @@ export const STRUCTURE_SHORT_PARAM_SCHEMA = Object.freeze([
     'R 的绝对下限，兜底成本约束（低于它时止损距离被抬高）。'),
   numSpec('maxHoldBars', '最长持仓（15m 根）', 'position', 10, 120, 1,
     '超时未触发的订单按收盘价结算。96 根 = 24h（计划校验上限 120 根 = 30h）。'),
-  ...STRATEGY_RISK_PARAM_SCHEMA
+  numSpec('riskPerTrade', '单笔风险比例', 'risk', 0.001, 0.02, 0.001,
+    '按账户权益 × 风险比例计算止损允许亏损，SKILL 默认 1%。'),
+  numSpec('maxDailyLoss', '每日亏损上限', 'risk', 0.005, 0.2, 0.005,
+    '达到账户权益该比例的当日已实现亏损后停止新开仓，SKILL 默认 3%。'),
+  numSpec('extremeAtr', '极端波动 ATR 门槛', 'filter', 1, 6, 0.1,
+    '为后续策略扩展保留的极端波动门槛，SKILL 默认 3 ATR。'),
+  numSpec('defaultLeverage', '默认杠杆', 'risk', 1, 20, 1,
+    'SKILL 风险计划的默认杠杆；下单仍受系统全局硬上限约束。'),
+  boolSpec('strictSkillData', '严格数据完整性', 'filter',
+    '缺少 BTC、衍生品或 taker 数据时 HOLD，避免用降级数据伪造 SKILL 信号。'),
+  boolSpec('requireFiveMinute', '强制 5m 数据', 'filter',
+    '启用后额外要求 5m 历史；原始 SKILL 会加载但默认不消费 5m。'),
+  ...STRUCTURE_RISK_PARAM_SCHEMA
 ]);
 
 /** 解析策略参数：默认值为底，params 逐字段覆盖（越界回退默认并告警） */
@@ -104,6 +125,13 @@ export function resolveStructureShortParams(overrides) {
   for (const spec of STRUCTURE_SHORT_PARAM_SCHEMA) {
     const raw = overrides[spec.key];
     if (raw === undefined || raw === null || raw === '') continue;
+    if (spec.type === 'boolean') {
+      if (typeof raw === 'boolean') params[spec.key] = raw;
+      else if (/^(true|1|yes)$/i.test(String(raw).trim())) params[spec.key] = true;
+      else if (/^(false|0|no)$/i.test(String(raw).trim())) params[spec.key] = false;
+      else console.warn(`[structureShortAnalysis] 策略参数 ${spec.key}=${raw} 非法，回退默认值 ${spec.default}`);
+      continue;
+    }
     const value = Number(raw);
     if (Number.isFinite(value) && value >= spec.min && value <= spec.max) params[spec.key] = value;
     else console.warn(`[structureShortAnalysis] 策略参数 ${spec.key}=${raw} 非法（需在 ${spec.min}~${spec.max}），回退默认值 ${spec.default}`);
@@ -126,7 +154,7 @@ export function resolveStructureShortParams(overrides) {
  * @param {object} [ctx]  策略上下文：多周期行情取 ctx.auxMarkets['15m'|'1h'|'4h']
  * @param {{feeBps?:number, slippageBps?:number, fundingBpsPer8h?:number}} [costs]
  */
-export function structureShortAnalysis(market, ctx = {}, costs = PAPER_COSTS) {
+function legacyStructureShortAnalysis(market, ctx = {}, costs = PAPER_COSTS) {
   // 计划周期固定 15m（builtins 声明 planInterval='15m'）：订单与止损止盈按 15m 根数结算。
   const PLAN_TF = '15m';
   const source15 = market?.interval === PLAN_TF ? market : ctx?.auxMarkets?.[PLAN_TF];
@@ -295,4 +323,12 @@ export function structureShortAnalysis(market, ctx = {}, costs = PAPER_COSTS) {
       marginRiskPct
     }
   };
+}
+
+/** 正式入口：使用与 crypto-short-skill-node 同口径的公共确定性引擎。 */
+export function structureShortAnalysis(market, ctx = {}) {
+  return analyzeSkillStructure(market, ctx, {
+    long: false,
+    params: resolveStructureShortParams(ctx?.params)
+  });
 }
