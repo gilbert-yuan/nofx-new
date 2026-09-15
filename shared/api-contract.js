@@ -22,6 +22,8 @@ export const API = {
     status: '/api/binance/status',
     test: '/api/binance/test',
     review: '/api/binance/review',
+    trades: '/api/binance/trades',
+    spotDemoOrders: '/api/binance/spot-demo/orders',
     order: '/api/binance/order',
     openOrders: '/api/binance/openOrders',
     positions: '/api/binance/positions',

@@ -9,6 +9,7 @@ import SymbolSidebar from './components/SymbolSidebar.vue';
 import WorkbenchView from './components/WorkbenchView.vue';
 import TradingView from './components/TradingView.vue';
 import BinanceSettings from './components/BinanceSettings.vue';
+import BinanceOrdersView from './components/BinanceOrdersView.vue';
 import DailyTrendView from './components/DailyTrendView.vue';
 import StrategiesView from './components/StrategiesView.vue';
 import StrategyStatsView from './components/StrategyStatsView.vue';
@@ -24,7 +25,7 @@ const loadStatus = () => { if (typeof document !== 'undefined' && document.hidde
 
 // 前端已下线的视图：「历史分析」「模型设置」（导航入口已移除）。
 // 老书签 / 历史 URL 落到这些视图时回落到工作台，避免白屏。
-const AVAILABLE_VIEWS = ['workbench', 'trading', 'trading-simulation', 'strategies', 'strategy-stats', 'automation', 'daily-trend'];
+const AVAILABLE_VIEWS = ['workbench', 'trading', 'binance-orders', 'trading-simulation', 'strategies', 'strategy-stats', 'automation', 'daily-trend'];
 const normalizeView = view => (AVAILABLE_VIEWS.includes(view) ? view : 'workbench');
 
 const activeView = ref('workbench');
@@ -183,6 +184,7 @@ let statusTimer;
           router.updateParams({ date: date || undefined });
         }" :active-symbol="activeSymbol" :interval="scope.interval" :rows="state.rows" :chart="chart" :market-loading="isMarketLoading" :kline-sync-loading="isKlineSyncLoading" :scope="scope" @refresh="selectSymbol(activeSymbol)" @fetch-latest="fetchLatestKlines" />
         <TradingView v-else-if="activeView === 'trading-simulation'" />
+        <BinanceOrdersView v-else-if="activeView === 'binance-orders'" />
         <StrategiesView v-else-if="activeView === 'strategies'" />
         <StrategyStatsView v-else-if="activeView === 'strategy-stats'" />
         <AutomationView v-else-if="activeView === 'automation'" />

@@ -15,6 +15,8 @@ import { binanceMarket } from './binanceMarket.js';
 const active = order => ['pending', 'open'].includes(order.status);
 export const PENDING_ORDER_TTL_MS = 24 * 60 * 60 * 1000;
 const fail = message => { throw Object.assign(new Error(message), { status: 422 }); };
+const TRANSIENT_ORDER_ERROR_RE = /ECONNRESET|ECONNABORTED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|fetch failed|Unable to reach|Client network socket|TLS connection|DNS|proxy|network|timeout/i;
+export const isTransientOrderError = error => TRANSIENT_ORDER_ERROR_RE.test(String(error || ''));
 
 function pendingExpiry(order) {
   const created = Date.parse(order.createdAt);
@@ -66,9 +68,12 @@ async function paperLimitParams(order, client) {
     throw new Error('模拟订单缺少有效 entryLimit 或数量，无法同步 Binance Demo。');
   }
   const info = await client.exchangeInfo();
-  // 「获取币种时记录」最大杠杆：Demo（下单目标环境）的 leverageBracket 才是准确上限来源
-  // （新版币安已把 maxLeverage 从 exchangeInfo.filters 移到 leverageBracket 接口）。
-  // 仅当该币尚未缓存时才拉一次全量 leverageBracket 批量记录，避免每笔下单重复拉取。
+  const symbolInfo = (info.symbols || []).find(item => item.symbol === order.symbol);
+  if (!symbolInfo || symbolInfo.status !== 'TRADING' || symbolInfo.contractType !== 'PERPETUAL' || symbolInfo.quoteAsset !== 'USDT') {
+    throw new Error('Binance Demo 不支持合约 ' + order.symbol + '，已跳过下单；请从 Demo exchangeInfo 的 TRADING USDT 永续列表中选择币种。');
+  }
+  // 优先使用 Demo 的签名 leverageBracket；若 API Key 无效或接口不可用，回退到同一 Demo
+  // exchangeInfo 返回的 LEVERAGE_FILTER，禁止再用下单失败来试探上限。
   if (!binanceMarket.getMaxLeverage(order.symbol)) {
     try {
       const brackets = await client.leverageBracket();
@@ -77,10 +82,14 @@ async function paperLimitParams(order, client) {
         maxLeverage: b.brackets?.[0]?.initialLeverage || null
       })));
     } catch (e) {
-      console.warn('[paper] Demo leverageBracket 获取失败，将靠试错探测上限:', e.message);
+      const fallback = (info.symbols || []).map(item => ({
+        symbol: item.symbol,
+        maxLeverage: item.filters?.find(filter => filter.filterType === 'LEVERAGE_FILTER')?.maxLeverage || null
+      }));
+      binanceMarket.applyDemoLeverage(fallback);
+      console.warn('[paper] Demo leverageBracket 获取失败，改用 Demo exchangeInfo 杠杆上限:', e.message);
     }
   }
-  const symbolInfo = (info.symbols || []).find(item => item.symbol === order.symbol);
   const priceFilter = symbolInfo?.filters?.find(item => item.filterType === 'PRICE_FILTER');
   const lotFilter = symbolInfo?.filters?.find(item => item.filterType === 'LOT_SIZE' || item.filterType === 'MARKET_LOT_SIZE');
   const minNotional = Number(symbolInfo?.filters?.find(item => item.filterType === 'MIN_NOTIONAL')?.notional || 0);
@@ -486,6 +495,7 @@ export class SimulatedAccount {
             const previousExchange = order.exchange ? { ...order.exchange } : null;
             advancePaperOrder(order, rows, now);
             if (failure && active(order)) order.error = failure;
+            else if (active(order) && order.error && isTransientOrderError(order.error)) order.error = '';
             if (wasPending && ['expired', 'cancelled'].includes(order.status) && ['submitted', 'new', 'partially_filled'].includes(previousExchange?.status)) {
               order.exchange = { ...previousExchange, status: 'cancel_requested', cancelRequestedAt: new Date().toISOString() };
               cancelCandidates.push({ ...order, exchange: { ...order.exchange } });

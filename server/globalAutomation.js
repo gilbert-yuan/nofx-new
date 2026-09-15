@@ -16,7 +16,7 @@ import { applyPendingReview, HELD_INELIGIBLE } from './shared/pendingReview.js';
 import { createStrategyRuntime } from './strategies/index.js';
 import { RISK_RULE } from './shared/strategyGuards.js';
 import { normalizeCloseReason, isStopReason } from '../shared/closeReasons.js';
-import { accountSummary } from './simulatedAccount.js';
+import { accountSummary, isTransientOrderError } from './simulatedAccount.js';
 
 // ── 同币种冷却（2026-09-11 优化：由「仅止损后」扩展到「任意平仓后」）────────
 // 依据：2711 笔真实成交 + 真实 1m K 线回放，统一出场（2ATR 止损/3R 止盈/1R 后移动 1.5ATR/120 根）。
@@ -629,23 +629,59 @@ export class GlobalAutomation {
    * 任务2: 更新挂单和持仓行情、复核订单并计算盈亏
    */
   async reviewPositions(shouldContinue = () => true) {
-
+    const task = this.tasks.positionReview;
+    const startedAt = Date.now();
     const state = this.simulation.readLight ? await this.simulation.readLight() : await this.simulation.read();
     const openOrders = state.orders.filter(o => ['pending', 'open'].includes(o.status));
-    this.tasks.positionReview.progress = { total: openOrders.length, completed: 0, failed: 0, symbol: null };
+    const progress = task.progress = { total: openOrders.length, completed: 0, failed: 0, symbol: null, stage: null };
+    const summary = {
+      reviewed: 0,
+      updated: 0,
+      held: 0,
+      closed: 0,
+      refreshed: 0,
+      skippedSameCandle: 0,
+      skippedInactive: 0,
+      skippedError: 0,
+      skippedNoStrategy: 0,
+      skippedPartial: 0
+    };
 
-    // 复核日志只在「持仓数变化」时打（此任务每秒一轮，逐轮打日志 = 每天上万行噪音）。
-    // 已复核到哪根 K 线的记忆（订单 id → 已复核的 1m 开盘时间），同一根内不重复复核 ——
-    // 1m K 线 60 秒才变一次，逐秒重算是 60 倍超采样（交易所请求 ×60、指标计算 ×60）。
+    const finishLog = force => {
+      progress.symbol = null;
+      progress.stage = null;
+      const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
+      const line = `[GlobalAutomation][positionReview 轮] 活跃 ${openOrders.length} · 进度 ${progress.completed}/${progress.total}`
+        + ` · 实复核 ${summary.reviewed} · 刷新 ${summary.refreshed}`
+        + ` · 跳过 同K线${summary.skippedSameCandle}/已结束${summary.skippedInactive}/错误订单${summary.skippedError}`
+        + `/无策略${summary.skippedNoStrategy}/数据不足${summary.skippedPartial}`
+        + ` · 更新 ${summary.updated} · 保持 ${summary.held} · 智能退出 ${summary.closed}`
+        + ` · 失败 ${progress.failed} · 耗时 ${elapsed}s`;
+      task.lastSummary = line;
+      task.lastSummaryAt = new Date().toISOString();
+
+      const due = Date.now() - (this._positionReviewLastSummaryAt || 0) >= 60000;
+      if (force || due) {
+        this._positionReviewLastSummaryAt = Date.now();
+        console.log(line);
+      }
+    };
+
+    // 复核日志不能每秒刷屏，但需要有心跳摘要，避免任务正常跳过时看起来“没输出”。
+    // 已复核到哪根 K 线的记忆（订单 id → 已复核的开盘时间），同一根内不重复复核。
     this._reviewedCandle ??= new Map();
-    const reviewKey = `${openOrders.length}`;
-    if (this._reviewLogKey !== reviewKey) {
+    const reviewKey = openOrders.map(o => `${o.id}:${o.status}:${o.error ? 'E' : ''}`).join('|') || '0';
+    const changed = this._reviewLogKey !== reviewKey;
+    if (changed) {
       this._reviewLogKey = reviewKey;
       console.log(openOrders.length
-        ? `[GlobalAutomation] 开始复核 ${openOrders.length} 个持仓...`
-        : '[GlobalAutomation] 无持仓需要复核');
+        ? `[GlobalAutomation] 开始复核 ${openOrders.length} 个持仓/挂单...`
+        : '[GlobalAutomation] 无持仓/挂单需要复核');
     }
-    if (openOrders.length === 0) return;
+    if (openOrders.length === 0) {
+      finishLog(changed);
+      return;
+    }
 
     const config = await this.store.getConfig();
     // 多策略：启用集只用于无 strategyId 的旧订单回退；有 strategyId 的存量订单
@@ -662,62 +698,68 @@ export class GlobalAutomation {
     const activeIds = new Set(openOrders.map(o => o.id));
     for (const id of this._reviewedCandle.keys()) if (!activeIds.has(id)) this._reviewedCandle.delete(id);
 
-    let reviewed = 0;
-    let updated = 0;
-    let held = 0;
-    let closed = 0;
-
     const refreshed = new Set();
     const markets = new Map();
-    const progress = this.tasks.positionReview.progress = { total: openOrders.length, completed: 0, failed: 0, symbol: null };
     for (const snapshot of openOrders) {
       if (!shouldContinue()) break;
-      // 同一根 K 线内只复核一次：新 K 线出现（或进程刚启动）才会真正干活
-      const curCandle = candleOpenAt(Date.now(), snapshot.interval);
-      if (this._reviewedCandle.get(snapshot.id) === curCandle) continue;
       progress.symbol = snapshot.symbol;
+      const curCandle = candleOpenAt(Date.now(), snapshot.interval);
+      if (this._reviewedCandle.get(snapshot.id) === curCandle) {
+        summary.skippedSameCandle++;
+        progress.completed++;
+        continue;
+      }
       try {
-        // 刷新行情：该订单已推进到当前根（markAt == 当根开盘）就无需再拉交易所 ——
-        // K 线没变，推进结果不会变；拉了也只是空跑一次 HTTPS + 事务。
-        // 带 error 的订单（如标的不存在）复核时本来就会被跳过，不再反复空刷。
         const symbolKey = `${snapshot.symbol}:${snapshot.interval}`;
+        const retryError = isTransientOrderError(snapshot.error);
         if (!refreshed.has(symbolKey)
-          && !snapshot.error
-          && Date.parse(snapshot.markAt) !== curCandle) {
+          && (!snapshot.error || retryError)
+          && (retryError || Date.parse(snapshot.markAt) !== curCandle)) {
+          progress.stage = 'refresh';
           await this.simulation.refresh({ symbols: [snapshot.symbol], shouldContinue });
+          summary.refreshed++;
         }
         refreshed.add(symbolKey);
         if (!shouldContinue()) break;
+        progress.stage = 'read-order';
         const order = this.simulation.getOrder ? await this.simulation.getOrder(snapshot.id)
           : (await this.simulation.read()).orders.find(o => o.id === snapshot.id);
-        if (!order || !['pending', 'open'].includes(order.status) || order.error) continue;
-        // 获取最新行情
-        const key = `${order.symbol}:${order.interval}`;
-        if (!markets.has(key)) markets.set(key, await this.getFreshMarket(order.symbol, order.interval));
-        const market = markets.get(key);
-        if (!shouldContinue()) break;
-        // 该订单所属策略（订单落库时固化的 strategyId；老订单回退默认策略）。
-        const orderStrategy = await this.strategies.strategyForOrder(order, config, strategies);
-        if (order.status === 'pending') {
-          await this.reviewPendingOrder(order, market, shouldContinue, context, orderStrategy);
-          this._reviewedCandle.set(snapshot.id, curCandle);
-          reviewed++;
+        if (!order || !['pending', 'open'].includes(order.status)) {
+          summary.skippedInactive++;
+          continue;
+        }
+        if (order.error) {
+          summary.skippedError++;
           continue;
         }
 
-        // 数据不足（如新上币种）时跳过复核，等K线积累够了再处理
+        const key = `${order.symbol}:${order.interval}`;
+        progress.stage = 'market';
+        if (!markets.has(key)) markets.set(key, await this.getFreshMarket(order.symbol, order.interval));
+        const market = markets.get(key);
+        if (!shouldContinue()) break;
+        const orderStrategy = await this.strategies.strategyForOrder(order, config, strategies);
+        if (order.status === 'pending') {
+          progress.stage = 'pending-review';
+          await this.reviewPendingOrder(order, market, shouldContinue, context, orderStrategy);
+          this._reviewedCandle.set(snapshot.id, curCandle);
+          summary.reviewed++;
+          continue;
+        }
+
         if (market.partial && market.klines.length < 15) {
+          summary.skippedPartial++;
           console.log(`[GlobalAutomation] ${order.symbol} ${order.interval} 已收盘K线不足 ${market.klines.length} 根，本次跳过复核`);
           continue;
         }
 
-        // 生成复核建议 —— 调用**该订单所属策略**的复核实现，保证出场语义与下单时一致。
-        // 智能退出 / 移动止损 / 分批止盈的阈值都从 order.plan.exitRules 读（策略级快照）。
         if (!orderStrategy) {
+          summary.skippedNoStrategy++;
           console.warn(`[GlobalAutomation] ${order.symbol} 找不到所属策略，跳过复核。`);
           continue;
         }
         if (orderStrategy.engine === 'ai') context.strategyPrompt ??= await this.store.getStrategy();
+        progress.stage = 'strategy-review';
         const proposal = await orderStrategy.review(order, market, {
           config,
           params: orderStrategy.params,
@@ -726,16 +768,8 @@ export class GlobalAutomation {
           deps: this.strategyDeps()
         });
 
-        // ── 智能退出：真正执行平仓 ──────────────────────────────────────────
-        // 此前 `proposal.action === 'CLOSE'` 只往 reviewHistory 记一条 close_suggested 就 return，
-        // 从不平仓 —— 等于 enhanced/super 引擎里「趋势反转 / RSI 极值 / MACD 背离」三条退出规则
-        // 全是死代码（其中「均线失守且未盈利5%」极易命中）。
-        // ⚠️ 行为变更：CLOSE 建议一旦命中，立即按最新标记价市价平仓，不再等待人工确认。
         if (!shouldContinue()) break;
         if (proposal.action === 'CLOSE') {
-          // 平仓理由：优先用复核层给的机器码（smart_exit_ma / rsi / macd）。
-          // 此前这里一律记 `manual`，26 笔智能退出在统计里全成了「手动平仓」，
-          // 完全看不出「趋势证伪 / 力竭了结」各占多少。
           const closeReason = proposal.closeReason || normalizeCloseReason(proposal.reason);
           await this.simulation.mutateLight(state => {
             if (!shouldContinue()) return;
@@ -753,17 +787,17 @@ export class GlobalAutomation {
             }].slice(-50);
           });
 
-          // 真正的平仓动作：刷新行情后按 markPrice 以该理由结算（与 /api/paper/orders/:id/close 同一原语）
           if (!shouldContinue()) break;
+          progress.stage = 'close';
           await this.simulation.close(order.id, { refresh: false, reason: closeReason });
-          closed++;
+          summary.closed++;
           this._reviewedCandle.set(snapshot.id, curCandle);
           console.log(`[GlobalAutomation][${orderStrategy.id}] ${order.symbol} 智能退出平仓：${closeReason} — ${proposal.reason}`);
-          reviewed++;
+          summary.reviewed++;
           continue;
         }
 
-        // 应用复核建议（只改当前这个活跃订单，走轻量写入）
+        progress.stage = 'write-review';
         await this.simulation.mutateLight(state => {
           if (!shouldContinue()) return;
           const current = state.orders.find(o => o.id === order.id);
@@ -771,10 +805,9 @@ export class GlobalAutomation {
 
           const report = applyPaperProtectionReview(current, proposal, Date.now(), orderStrategy.engine);
           if (report.action === 'updated') {
-            updated++;
+            summary.updated++;
             console.log(`[GlobalAutomation][${orderStrategy.id}] ${order.symbol} 止盈止损已更新`);
 
-            // 如果是增强版或超级增强版，显示额外信息
             if ((orderStrategy.engine === 'enhanced' || orderStrategy.engine === 'super') && proposal.profitPercent !== undefined) {
               console.log(`[GlobalAutomation] ${order.symbol} 当前盈亏：${proposal.profitPercent.toFixed(2)}%`);
             }
@@ -782,30 +815,25 @@ export class GlobalAutomation {
               console.log(`[GlobalAutomation] ${order.symbol} 市场情绪：${proposal.sentiment.classification}`);
             }
           } else {
-            held++;
+            summary.held++;
           }
         });
 
-        reviewed++;
+        summary.reviewed++;
         this._reviewedCandle.set(snapshot.id, curCandle);
       } catch (error) {
         progress.failed++;
         this.tasks.positionReview.error = `${snapshot.symbol}: ${error.message}`;
         console.error(`[GlobalAutomation] Review ${snapshot.symbol} failed:`, error.message);
       } finally {
+        progress.stage = null;
         progress.completed++;
       }
     }
-    progress.symbol = null;
 
-    this.stats.totalReviews += reviewed;
-
-    // 有实际复核动作才打日志（空轮每秒一次会刷屏）
-    if (reviewed > 0) {
-      console.log(`[GlobalAutomation] 复核完成: 已复核 ${reviewed}, 已更新 ${updated}, 保持 ${held}, 智能退出 ${closed}`);
-    }
+    this.stats.totalReviews += summary.reviewed;
+    finishLog(changed || summary.reviewed > 0 || progress.failed > 0);
   }
-
   /**
    * 获取最新行情数据
    * 数据不足时：先查数据库，不够再直接从交易所获取；

@@ -34,10 +34,10 @@ export class BinanceClient {
     return this.publicRequest('/fapi/v1/exchangeInfo');
   }
 
-  /** 杠杆阶梯（含每个 symbol 的最大杠杆 = brackets[0].initialLeverage）。公开接口，无需签名。
+  /** 杠杆阶梯（含每个 symbol 的最大杠杆 = brackets[0].initialLeverage）。Binance USER_DATA 接口，必须使用 API Key + HMAC 签名。
    *  注意：新版币安已把 maxLeverage 从 exchangeInfo.filters(LEVERAGE_FILTER) 移到此接口。 */
   async leverageBracket({ symbol } = {}) {
-    return this.publicRequest('/fapi/v1/leverageBracket', symbol ? { symbol } : {});
+    return this.signedRequest('GET', '/fapi/v1/leverageBracket', symbol ? { symbol } : {});
   }
 
   async perpetualUsdtSymbols() {

@@ -39,6 +39,7 @@ function toggleThemeMenu() {
     <nav class="top-nav">
       <button :class="{ active: activeView === 'workbench' }" @click="$emit('change-view', 'workbench')">行情工作台</button>
       <button :class="{ active: activeView === 'trading' }" @click="$emit('change-view', 'trading')">币安交易</button>
+      <button :class="{ active: activeView === 'binance-orders' }" @click="$emit('change-view', 'binance-orders')">币安订单</button>
       <button :class="{ active: activeView === 'trading-simulation' }" @click="$emit('change-view', 'trading-simulation')">交易模拟</button>
       <button :class="{ active: activeView === 'strategies' }" @click="$emit('change-view', 'strategies')">策略管理</button>
       <button :class="{ active: activeView === 'strategy-stats' }" @click="$emit('change-view', 'strategy-stats')">策略统计</button>

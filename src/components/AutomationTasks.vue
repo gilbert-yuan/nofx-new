@@ -41,7 +41,10 @@ onBeforeUnmount(() => { disposed = true; clearInterval(timer); });
         <p>每轮完成后等待 {{ task.interval / 1000 }} 秒</p>
         <p>进度 {{ task.progress?.completed || 0 }} / {{ task.progress?.total || 0 }} · 失败 {{ task.progress?.failed || 0 }}</p>
         <p v-if="task.progress?.symbol">当前币种：{{ task.progress.symbol }}</p>
+        <p v-if="task.progress?.stage">当前阶段：{{ task.progress.stage }}</p>
+        <p v-if="task.lastSummary" class="task-summary">{{ task.lastSummary }}</p>
         <small>最近完成：{{ time(task.lastRun) }}</small>
+        <small v-if="task.lastSummaryAt">摘要时间：{{ time(task.lastSummaryAt) }}</small>
         <small>下一轮：{{ state.active && task.enabled ? time(task.nextRunAt) : '—' }}</small>
         <p v-if="key === 'positionReview'">本次启动以来：撤单 {{ task.cancelled || 0 }} · 宽限保留 {{ task.graced || 0 }} · 改价 {{ task.repriced || 0 }}</p>
         <p v-if="task.error" class="signal-warning">{{ task.error }}</p>
@@ -59,6 +62,7 @@ onBeforeUnmount(() => { disposed = true; clearInterval(timer); });
 .task-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
 .task-grid article { border: 1px solid var(--border-primary); border-radius: 8px; padding: 16px; }
 .task-grid small { display: block; margin: 6px 0; }
+.task-summary { font-size: 12px; line-height: 1.45; color: var(--text-secondary); word-break: break-word; }
 .task-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
 @media (max-width: 700px) { .task-grid { grid-template-columns: 1fr; } }
 </style>
