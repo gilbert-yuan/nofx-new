@@ -33,6 +33,9 @@ export async function registerResearchRoutes({ app, store, marketDb, loadContrac
   await archive.init((await store.getState()).decisions);
   const simulation = new SimulatedAccount({ pool: marketDb.pool, market: marketData, archive, marketDb, store });
   await simulation.init();
+  // The worker only polls when an environment toggle and both credentials are
+  // configured. It is deliberately detached from paper-order request latency.
+  simulation.startExchangeSync();
   registerSimulationRoutes(app, simulation);
   registerAdaptiveStrategyRoutes(app, simulation);
   // Legacy independent automation has been merged into the two global tasks.

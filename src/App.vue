@@ -19,6 +19,13 @@ import AutomationView from './components/AutomationView.vue';
 const configStore = useConfigStore();
 const { config, strategy } = configStore;
 const { tradingStatus, symbolStatus, syncStatus, savedMode, statusError } = storeToRefs(configStore);
+const binanceControl = reactive({
+  account: null,
+  openOrders: [],
+  positions: [],
+  positionMode: 'one-way',
+  updatedAt: null
+});
 // 后台标签页暂停轮询（与 AutomationTasks.vue 同款守卫）：不可见时浏览器已限流 timer，
 // 但请求仍会发出，白耗带宽。回到前台的下一次 tick 自动恢复。
 const loadStatus = () => { if (typeof document !== 'undefined' && document.hidden) return; configStore.loadStatus(); };
@@ -153,7 +160,54 @@ async function fetchLatestKlines(interval = scope.interval) {
 }
 async function loadConfig() { await run(async () => { await configStore.load(); scope.interval = strategy.interval || scope.interval; scope.limit = strategy.klineLimit || scope.limit; }, 'settings'); }
 async function saveBinanceSettings() { await run(async () => { await configStore.saveBinance(); message.value = '币安交易配置已保存'; }, 'settings'); }
-async function testBinance() { const result = await run(() => configStore.test(), 'settings'); if (result) message.value = `${result.testnet ? '测试网' : '实盘'}只读连接成功 · ${result.activePositions} 个持仓 · ${result.positionMode === 'hedge' ? '双向持仓（自动交易需切换为单向）' : '单向持仓'}`; }
+async function testBinance() {
+  const result = await run(() => configStore.test(), 'settings');
+  if (result) {
+    binanceControl.account = result;
+    binanceControl.positionMode = result.positionMode || 'one-way';
+    binanceControl.updatedAt = Date.now();
+    message.value = (result.demo ?? result.testnet ? 'Demo 模拟盘' : '实盘')
+      + '只读连接成功 · ' + result.activePositions + ' 个持仓 · '
+      + (result.positionMode === 'hedge' ? '双向持仓（自动交易需切换为单向）' : '单向持仓');
+  }
+  return result;
+}
+async function refreshBinanceOrders(symbol) {
+  const result = await run(() => configStore.openOrders(symbol || undefined), 'settings');
+  if (result) {
+    binanceControl.openOrders = result.orders || [];
+    binanceControl.updatedAt = Date.now();
+    message.value = '已刷新币安挂单 · ' + binanceControl.openOrders.length + ' 条';
+  }
+  return result;
+}
+async function refreshBinancePositions(symbol) {
+  const result = await run(() => configStore.positions(symbol || undefined), 'settings');
+  if (result) {
+    binanceControl.positions = result.positions || [];
+    binanceControl.positionMode = result.positionMode || 'one-way';
+    binanceControl.updatedAt = Date.now();
+    message.value = '已刷新币安持仓 · ' + binanceControl.positions.length + ' 个';
+  }
+  return result;
+}
+async function placeBinanceOrder(payload) {
+  const result = await run(() => configStore.order(payload), 'settings');
+  if (result) {
+    message.value = '币安订单已提交 · ' + payload.symbol + ' ' + payload.side + ' ' + payload.type + ' · #' + (result.order?.orderId || '待确认');
+    await refreshBinanceOrders(payload.symbol);
+    if (payload.reduceOnly) await refreshBinancePositions(payload.symbol);
+  }
+  return result;
+}
+async function cancelBinanceOrder(payload) {
+  const result = await run(() => configStore.cancelOrder(payload), 'settings');
+  if (result) {
+    message.value = '币安订单已撤销 · ' + payload.symbol + ' · #' + payload.orderId;
+    await refreshBinanceOrders(payload.symbol);
+  }
+  return result;
+}
 async function reviewBinance() { const result = await run(() => configStore.review(), 'settings'); if (result) { await loadStatus(); message.value = result.reason || `已复核 ${result.reviewed || 0} 个持仓，请查看执行记录`; } }
 const binanceSmokeResult = ref(null);
 async function smokeBinance(payload) {
@@ -189,7 +243,7 @@ let statusTimer;
         <StrategyStatsView v-else-if="activeView === 'strategy-stats'" />
         <AutomationView v-else-if="activeView === 'automation'" />
         <DailyTrendView v-else-if="activeView === 'daily-trend'" />
-        <BinanceSettings v-else-if="activeView === 'trading'" :binance="config.binance" :trader="config.trader" :status="tradingStatus" :saved-mode="savedMode" :loading="Boolean(loadingAreas.settings)" :smoke-result="binanceSmokeResult" @save="saveBinanceSettings" @test="testBinance" @review="reviewBinance" @smoke="smokeBinance" />
+        <BinanceSettings v-else-if="activeView === 'trading'" :binance="config.binance" :trader="config.trader" :status="tradingStatus" :saved-mode="savedMode" :loading="Boolean(loadingAreas.settings)" :smoke-result="binanceSmokeResult" :control="binanceControl" @save="saveBinanceSettings" @test="testBinance" @review="reviewBinance" @smoke="smokeBinance" @refresh-account="testBinance" @refresh-orders="refreshBinanceOrders" @refresh-positions="refreshBinancePositions" @place-order="placeBinanceOrder" @cancel-order="cancelBinanceOrder" @close-position="placeBinanceOrder" />
       </main></div>
   </div>
 </template>

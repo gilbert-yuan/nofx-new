@@ -274,10 +274,14 @@ export class PaperAutomation {
           }
           if (record.error) return { symbol, error: record.error };
           if (!record.analyses[0]?.eligible) return { symbol, held: true };
+          let submittedOrder;
           await this.editJob('scan', (j, state) => {
             if (!state.automation.enabled) throw new Error('自动流程已暂停。');
-            submitPaperOrder(state, record, { symbol, margin: 100, leverage: record.analyses[0].recommendedLeverage, automatic: true });
+            submittedOrder = submitPaperOrder(state, record, { symbol, margin: 100, leverage: record.analyses[0].recommendedLeverage, automatic: true });
           });
+          // Legacy automation still writes through the shared paper ledger. Keep
+          // its remote mirror non-blocking when the current simulator provides it.
+          if (submittedOrder?.id) this.simulation.enqueueExchangeSync?.(submittedOrder.id, { type: 'submit' });
           return { symbol, submitted: true, eligible: true };
         } catch (error) { return { symbol, error: error.message }; }
       }));

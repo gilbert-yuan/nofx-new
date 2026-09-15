@@ -2,6 +2,7 @@ import express from 'express';
 import { asyncHandler, ApiError } from '../core/errors.js';
 import { BinanceClient } from '../binanceClient.js';
 import { BinanceSpotClient } from '../binanceSpotClient.js';
+import { binanceEnvironmentConfig } from '../binancePaperSync.js';
 
 /** 币安账户连接状态 / 连通性测试 / K线复盘 / 测试网交易通道 */
 export function createBinanceRouter(container) {
@@ -14,14 +15,18 @@ export function createBinanceRouter(container) {
 
   router.post('/api/binance/test', asyncHandler(async (req, res) => {
     const config = await store.getConfig();
-    const client = new BinanceClient(config.binance);
+    const demo = isBinanceDemo(config.binance);
+    const environment = demo ? 'demo' : 'live';
+    const client = new BinanceClient(binanceEnvironmentConfig(config, environment));
     if (!client.hasCredentials()) {
       throw new ApiError('请填写币安 API Key 和 Secret Key。', 422);
     }
     const [balance, positions, mode] = await Promise.all([client.account(), client.positions(), client.positionMode()]);
     res.json({
       ok: true,
-      testnet: Boolean(config.binance?.testnet),
+      demo,
+      testnet: demo,
+      environment: demo ? 'demo' : 'live',
       totalEquity: Number(balance.totalWalletBalance || 0),
       activePositions: positions.filter((p) => Math.abs(Number(p.positionAmt)) > 0).length,
       positionMode: mode.dualSidePosition ? 'hedge' : 'one-way'
@@ -107,11 +112,12 @@ export function createBinanceRouter(container) {
   // ── 测试网交易通道（限价/市价下单、撤单、挂单、持仓）──
   const tradeClient = async () => {
     const config = await store.getConfig();
-    const client = clientFactory(config.binance);
+    const environment = isBinanceDemo(config.binance) ? 'demo' : 'live';
+    const client = clientFactory(binanceEnvironmentConfig(config, environment));
     if (!client.hasCredentials()) {
-      throw new ApiError('请先在「币安交易配置」里保存 API Key / Secret Key（测试网 key 请在 testnet.binancefuture.com 注册获取）。', 422);
+      throw new ApiError('请先在「币安交易配置」里保存 API Key / Secret Key（Demo key 请在 demo.binance.com 创建）。', 422);
     }
-    return { config, client };
+    return { config, client, environment };
   };
 
   const normalizeSymbol = (value) => {
@@ -134,7 +140,12 @@ export function createBinanceRouter(container) {
   router.get('/api/binance/positions', asyncHandler(async (req, res) => {
     const { client } = await tradeClient();
     const positions = await client.positions(req.query.symbol ? normalizeSymbol(req.query.symbol) : undefined);
-    res.json({ ok: true, positions: positions.filter(p => Math.abs(Number(p.positionAmt)) > 0) });
+    const mode = typeof client.positionMode === 'function' ? await client.positionMode() : null;
+    res.json({
+      ok: true,
+      positions: positions.filter(p => Math.abs(Number(p.positionAmt)) > 0),
+      positionMode: mode?.dualSidePosition ? 'hedge' : 'one-way'
+    });
   }));
 
   router.post('/api/binance/order', asyncHandler(async (req, res) => {
@@ -145,10 +156,13 @@ export function createBinanceRouter(container) {
     const type = String(body.type || 'LIMIT').toUpperCase();
     if (!['LIMIT', 'MARKET'].includes(type)) throw new ApiError('type 只能是 LIMIT / MARKET', 422);
     const quantity = positiveNumber(body.quantity, 'quantity');
+    const reduceOnly = body.reduceOnly === true || body.reduceOnly === 'true';
+    const clientOrderId = body.clientOrderId ? String(body.clientOrderId) : undefined;
     const { client } = await tradeClient();
+    const orderArgs = { symbol, side, quantity, reduceOnly, ...(clientOrderId ? { clientOrderId } : {}) };
     const order = type === 'LIMIT'
-      ? await client.limitOrder({ symbol, side, quantity, price: positiveNumber(body.price, 'price') })
-      : await client.marketOrder({ symbol, side, quantity });
+      ? await client.limitOrder({ ...orderArgs, price: positiveNumber(body.price, 'price') })
+      : await client.marketOrder(orderArgs);
     res.json({ ok: true, order });
   }));
 
@@ -168,6 +182,9 @@ export function createBinanceRouter(container) {
   router.post('/api/binance/smoke', asyncHandler(async (req, res) => {
     const symbol = normalizeSymbol(req.body?.symbol || 'BTCUSDT');
     const { config, client } = await tradeClient();
+    if (!isBinanceDemo(config.binance)) {
+      throw new ApiError('冒烟测试仅允许 Binance Demo Trading，当前配置是实盘。', 422);
+    }
     const steps = [];
     const step = (name, fn) => Promise.resolve()
       .then(fn)
@@ -200,15 +217,20 @@ export function createBinanceRouter(container) {
         return { remaining: open.length };
       });
 
-      res.json({ ok: true, testnet: Boolean(config.binance?.testnet), symbol, orderId, steps });
+      const demo = isBinanceDemo(config.binance);
+      res.json({ ok: true, demo, testnet: demo, environment: demo ? 'demo' : 'live', symbol, orderId, steps });
     } catch (error) {
       // 冒烟中断时兜底撤单，避免残留挂单
       if (orderId) { try { await client.cancelOrder({ symbol, orderId }); } catch { /* 尽力而为 */ } }
       res.status(error.status && error.status >= 400 && error.status < 500 ? error.status : 502)
-        .json({ ok: false, testnet: Boolean(config.binance?.testnet), symbol, steps, error: error.message });
+        .json({ ok: false, demo: true, testnet: true, environment: 'demo', symbol, steps, error: error.message });
     }
   }));
 
+
+function isBinanceDemo(config = {}) {
+  return config.demo !== undefined ? config.demo === true : config.testnet !== false;
+}
 
 const SPOT_DAY_MS = 24 * 60 * 60 * 1000;
 const SPOT_AUTO_SYMBOL_LIMIT = 120;

@@ -95,7 +95,9 @@ export function timeoutFor(path) {
 
 /** @typedef {Object} BinanceTestResponse
  *  @property {boolean} ok
+ *  @property {boolean} demo 是否使用 Binance Demo Trading
  *  @property {boolean} testnet
+ *  @property {'demo'|'live'} environment
  *  @property {number} totalEquity
  *  @property {number} activePositions
  *  @property {'hedge'|'one-way'} positionMode

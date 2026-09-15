@@ -4,6 +4,8 @@ import { BinanceMarket } from '../server/binanceMarket.js';
 import { BinanceClient } from '../server/binanceClient.js';
 import { BinancePositionMonitor, normalizeQuantity, protectionLevels } from '../server/binancePositionMonitor.js';
 import { candleOpenAt } from '../server/research.js';
+import { mergeConfig } from '../server/store.js';
+import { binanceEnvironmentConfig } from '../server/binancePaperSync.js';
 
 const instrument = { symbol: 'BTCUSDT', filters: [
   { filterType: 'MARKET_LOT_SIZE', minQty: '0.001', maxQty: '100', stepSize: '0.001' },
@@ -16,6 +18,17 @@ function store(initial = config) {
   let state = { decisions: [] };
   return { getConfig: async () => initial, getState: async () => state, mutateState: async f => { state = f(state); }, addDecision: async d => { state.decisions.push(d); } };
 }
+
+test('legacy Binance testnet patches still control the normalized demo environment', () => {
+  const current = { binance: { demo: true, testnet: true } };
+  const live = mergeConfig(current, { binance: { testnet: false } });
+  assert.equal(live.binance.demo, false);
+  assert.equal(live.binance.testnet, false);
+
+  const demo = mergeConfig(live, { binance: { demo: true } });
+  assert.equal(demo.binance.demo, true);
+  assert.equal(demo.binance.testnet, true);
+});
 
 test('symbols use exchangeInfo only; cache coalesces refreshes and candles do not depend on symbol API', async () => {
   let calls = 0, candleCalls = 0;
@@ -46,7 +59,7 @@ test('Binance request signing uses the selected environment and correct algo/clo
   client.request = async (url, options) => { calls.push({ url: new URL(url), options }); return { ok: true, text: async () => '{"algoId":1}' }; };
   await client.protectionOrder({ symbol: 'BTCUSDT', side: 'SELL', type: 'STOP_MARKET', triggerPrice: 90, clientAlgoId: 'nofx123' });
   await client.marketOrder({ symbol: 'BTCUSDT', side: 'BUY', quantity: 0.001, reduceOnly: true });
-  assert.match(calls[0].url.hostname, /binancefuture/);
+  assert.equal(calls[0].url.hostname, 'demo-fapi.binance.com');
   assert.equal(calls[0].url.pathname, '/fapi/v1/algoOrder');
   assert.equal(calls[0].url.searchParams.get('closePosition'), 'true');
   assert.equal(calls[0].url.searchParams.has('quantity'), false);
@@ -56,14 +69,14 @@ test('Binance request signing uses the selected environment and correct algo/clo
   assert.equal(calls[1].url.searchParams.get('reduceOnly'), 'true');
 });
 
-test('limit order and cancel target testnet fapi with correct signed parameters', async () => {
+test('limit order and cancel target Binance Demo with correct signed parameters', async () => {
   const client = new BinanceClient({ apiKey: 'fake', secretKey: 'fake', testnet: true });
   client.timeOffset = 0; // 跳过时间同步
   const calls = [];
   client.request = async (url, options) => { calls.push({ url: new URL(url), options }); return { ok: true, text: async () => '{"orderId":1}' }; };
   await client.limitOrder({ symbol: 'BTCUSDT', side: 'BUY', quantity: 0.002, price: 25000.5 });
   await client.cancelOrder({ symbol: 'BTCUSDT', orderId: 42, clientOrderId: 'nofxpaper123' });
-  assert.match(calls[0].url.hostname, /binancefuture/);
+  assert.equal(calls[0].url.hostname, 'demo-fapi.binance.com');
   assert.equal(calls[0].url.pathname, '/fapi/v1/order');
   assert.equal(calls[0].url.searchParams.get('type'), 'LIMIT');
   assert.equal(calls[0].url.searchParams.get('timeInForce'), 'GTC');
@@ -75,6 +88,23 @@ test('limit order and cancel target testnet fapi with correct signed parameters'
   assert.equal(calls[1].url.searchParams.has('origClientOrderId'), false);
   await client.cancelOrder({ symbol: 'BTCUSDT', clientOrderId: 'nofxpaper123' });
   assert.equal(calls[2].url.searchParams.get('origClientOrderId'), 'nofxpaper123');
+  await client.order({ symbol: 'BTCUSDT', clientOrderId: 'nofxpaper123' });
+  assert.equal(calls[3].options.method, 'GET');
+  assert.equal(calls[3].url.searchParams.get('origClientOrderId'), 'nofxpaper123');
+});
+
+test('Demo and live paper-sync credentials resolve independently', () => {
+  const config = { binance: {
+    demo: true, demoApiKey: 'demo-key', demoSecretKey: 'demo-secret', liveApiKey: 'live-key', liveSecretKey: 'live-secret'
+  } };
+  assert.deepEqual(
+    [binanceEnvironmentConfig(config, 'demo').apiKey, binanceEnvironmentConfig(config, 'demo').secretKey],
+    ['demo-key', 'demo-secret']
+  );
+  assert.deepEqual(
+    [binanceEnvironmentConfig(config, 'live').apiKey, binanceEnvironmentConfig(config, 'live').secretKey],
+    ['live-key', 'live-secret']
+  );
 });
 
 test('testnet smoke walks place→query→cancel→recheck and rolls back on failure', async () => {
@@ -124,6 +154,31 @@ test('testnet smoke walks place→query→cancel→recheck and rolls back on fai
   assert.equal(res2.status, 502);
   assert.equal(res2.json.steps.filter(s => !s.ok).length, 1); // 只在查单一步断掉
   assert.deepEqual(calls, [['rollback', 8]]); // 兜底撤单已执行
+});
+
+test('manual order route forwards reduceOnly and positions expose the account mode', async () => {
+  const { createBinanceRouter } = await import('../server/routes/binance.js');
+  const storeStub = { getConfig: async () => ({ binance: { apiKey: 'k', secretKey: 's', demo: true } }) };
+  let submitted;
+  const clientStub = {
+    hasCredentials: () => true,
+    marketOrder: async args => { submitted = args; return { orderId: 21, status: 'FILLED' }; },
+    positions: async () => [{ symbol: 'BTCUSDT', positionAmt: '0.001' }],
+    positionMode: async () => ({ dualSidePosition: false })
+  };
+  const router = createBinanceRouter({ store: storeStub, positionMonitor: {}, clientFactory: () => clientStub });
+  const invoke = (path, req) => new Promise((resolve, reject) => {
+    const handler = router.stack.find(layer => layer.route?.path === path).route.stack[0].handle;
+    const response = { statusCode: 200, body: null, json(body) { this.body = body; resolve(this); return body; }, status(code) { this.statusCode = code; return this; } };
+    handler(req, response, reject);
+  });
+
+  const orderResponse = await invoke('/api/binance/order', { body: { symbol: 'BTCUSDT', side: 'SELL', type: 'MARKET', quantity: 0.001, reduceOnly: true } });
+  assert.equal(orderResponse.body.order.orderId, 21);
+  assert.equal(submitted.reduceOnly, true);
+  const positionsResponse = await invoke('/api/binance/positions', { query: { symbol: 'BTCUSDT' } });
+  assert.equal(positionsResponse.body.positionMode, 'one-way');
+  assert.equal(positionsResponse.body.positions.length, 1);
 });
 
 test('smoke rejects before trading when credentials are missing', async () => {

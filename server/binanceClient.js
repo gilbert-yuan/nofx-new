@@ -3,22 +3,23 @@ import { fetch, ProxyAgent } from 'undici';
 
 // ⚠️ 合约基址不用 fapi.binance.com：该域名对**受限地区**直接返回 451（本机代理出口即受限地区，实测）。
 // 币安官网前端的 /fapi/v1/* 边缘路由（www.binance.com）提供**同一套合约接口**且不被地区封锁
-// （实测 exchangeInfo/klines/ping 均 200），故公开行情与合约交易统一走 www.binance.com。
+// （实测 exchangeInfo/klines/ping 均 200），故公开行情与正式盘交易统一走 www.binance.com。
 // 如需回官方域可用 BINANCE_FUTURES_BASE 覆盖。
 const FUTURES_BASE_URL = process.env.BINANCE_FUTURES_BASE || 'https://www.binance.com';
-const FUTURES_TESTNET_BASE_URL = 'https://testnet.binancefuture.com';
-// ⭐ Demo Trading（demo.binance.com，统一模拟盘，已取代 Spot/Futures Testnet）的合约 REST 基址。
+// Binance 当前 USDⓈ-M Futures 文档给出的 Testnet / Demo REST 基址。
 // Demo key 在 demo.binance.com 的 API 管理页创建，同时适配现货(demo-api)与合约(demo-fapi)。
-const FUTURES_DEMO_BASE_URL = 'https://demo-fapi.binance.com';
+const FUTURES_TESTNET_BASE_URL = 'https://demo-fapi.binance.com';
 
 export class BinanceClient {
-  constructor({ apiKey = '', secretKey = '', testnet = true, demo = false, proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY } = {}) {
+  constructor({ apiKey = '', secretKey = '', testnet = true, demo, proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY } = {}) {
     this.apiKey = apiKey;
     this.secretKey = secretKey;
-    // demo 优先于 testnet（testnet 为遗留环境）
-    this.baseUrl = demo ? FUTURES_DEMO_BASE_URL : (testnet ? FUTURES_TESTNET_BASE_URL : FUTURES_BASE_URL);
-    this.testnet = testnet;
-    this.demo = demo;
+    // demo 是新字段；没有它时兼容旧配置中的 testnet。当前官方 Testnet
+    // 文档使用 Demo Trading 基址，不再回退到已过时的 testnet.binancefuture.com。
+    this.demo = demo === undefined ? testnet !== false : Boolean(demo);
+    this.baseUrl = this.demo ? FUTURES_TESTNET_BASE_URL : FUTURES_BASE_URL;
+    // testnet 保留为旧响应字段，语义与 demo 对齐，避免前端旧版本误显示为实盘。
+    this.testnet = this.demo;
     this.dispatcher = proxyUrl ? new ProxyAgent(proxyUrl) : undefined;
   }
 
@@ -130,6 +131,15 @@ export class BinanceClient {
     return this.signedRequest('DELETE', '/fapi/v1/order', {
       symbol,
       ...(Number.isInteger(Number(orderId)) && Number(orderId) > 0 ? { orderId: Number(orderId) } : { origClientOrderId: clientOrderId })
+    });
+  }
+
+  async order({ symbol, orderId, clientOrderId }) {
+    return this.signedRequest('GET', '/fapi/v1/order', {
+      symbol,
+      ...(Number.isInteger(Number(orderId)) && Number(orderId) > 0
+        ? { orderId: Number(orderId) }
+        : { origClientOrderId: clientOrderId })
     });
   }
 

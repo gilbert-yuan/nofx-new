@@ -76,6 +76,9 @@ CREATE INDEX IF NOT EXISTS simulated_orders_symbol_idx ON simulated_orders(accou
 CREATE INDEX IF NOT EXISTS simulated_orders_record_idx ON simulated_orders(account_id, record_id, symbol);
 CREATE INDEX IF NOT EXISTS simulated_orders_closed_idx ON simulated_orders(account_id, exit_at DESC) WHERE status = 'closed';
 CREATE INDEX IF NOT EXISTS simulated_order_analysis_strategy_idx ON simulated_order_analysis(strategy_version, analysis_engine);
+CREATE INDEX IF NOT EXISTS simulated_order_exchange_sync_idx
+  ON simulated_order_extensions(account_id, (path[1]))
+  WHERE path[1] IN ('exchangeSync', 'exchange');
 CREATE TABLE IF NOT EXISTS simulated_account_migrations (
   version INTEGER PRIMARY KEY, migrated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   source_order_count INTEGER NOT NULL, source_digest TEXT NOT NULL
@@ -267,6 +270,11 @@ export class SimulatedAccountRepository {
       await this.pool.query('INSERT INTO simulated_accounts(account_id,initial_balance) VALUES(1,10000) ON CONFLICT DO NOTHING');
     }
     if (!(await this.pool.query('SELECT 1 FROM simulated_accounts WHERE account_id=1')).rowCount) throw new Error('Normalized simulated account is not initialized');
+    await this.pool.query(`
+      CREATE INDEX IF NOT EXISTS simulated_order_exchange_sync_idx
+      ON simulated_order_extensions(account_id, (path[1]))
+      WHERE path[1] IN ('exchangeSync', 'exchange')
+    `);
   }
   /**
    * @param {object} options
@@ -283,7 +291,7 @@ export class SimulatedAccountRepository {
    *   历史行既不在 previous 也不在 next，因此不会被误删，也不会被重新插入。
    *   代价是 mutate 回调内读不到历史订单的明细，故仅限确认不需要历史数据的写路径使用。
    */
-  async readFrom(client, { summary = false, orderId, light = false } = {}) {
+  async readFrom(client, { summary = false, orderId, light = false, exchangeSync = false } = {}) {
     const tables = {};
     const summaryTables = new Set(['simulated_accounts', 'simulated_orders', 'simulated_order_costs', 'simulated_order_plans', 'simulated_automation_settings', 'simulated_automation_jobs', 'simulated_account_extensions']);
     let activeOrderIds = null;
@@ -304,8 +312,12 @@ export class SimulatedAccountRepository {
         sql += ' AND order_id=$1';
         params.push(orderId);
       } else if (light && childTable) {
-        sql += ' AND order_id = ANY($1::text[])';
-        params.push(activeOrderIds);
+        if (exchangeSync && def.name === 'simulated_order_extensions') {
+          sql += " AND path[1] IN ('exchangeSync', 'exchange')";
+        } else {
+          sql += ' AND order_id = ANY($1::text[])';
+          params.push(activeOrderIds);
+        }
       }
       if (summary && def.name === 'simulated_order_plans') sql += " AND plan_kind='current'";
       tables[def.name] = (await client.query(sql, params)).rows;
@@ -319,6 +331,31 @@ export class SimulatedAccountRepository {
       const state = await this.readFrom(client, options);
       await client.query('COMMIT');
       return state;
+    } catch (error) { await client.query('ROLLBACK'); throw error; } finally { client.release(); }
+  }
+  /**
+   * Read only orders carrying exchange synchronization metadata. This keeps the
+   * background Binance worker independent from the large historical extension set.
+   */
+  async readExchangeSync() {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
+      const orders = (await client.query(`
+        SELECT * FROM simulated_orders
+        WHERE account_id=1 AND EXISTS (
+          SELECT 1 FROM simulated_order_extensions e
+          WHERE e.account_id=1
+            AND e.order_id=simulated_orders.order_id
+            AND e.path[1] IN ('exchangeSync', 'exchange')
+        )
+      `)).rows;
+      const extensions = (await client.query(`
+        SELECT * FROM simulated_order_extensions
+        WHERE account_id=1 AND path[1] IN ('exchangeSync', 'exchange')
+      `)).rows;
+      await client.query('COMMIT');
+      return hydrateAccount({ simulated_orders: orders, simulated_order_extensions: extensions });
     } catch (error) { await client.query('ROLLBACK'); throw error; } finally { client.release(); }
   }
   async writeChanges(client, before, after) {

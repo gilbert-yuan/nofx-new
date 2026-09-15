@@ -51,6 +51,10 @@ export const binanceApi = {
   review: () => api(API.binance.review, { method: 'POST' }),
   trades: (params = {}) => api(API.binance.trades + qs(params)),
   spotDemoOrders: (params = {}) => api(API.binance.spotDemoOrders + qs(params)),
+  openOrders: (symbol) => api(API.binance.openOrders + qs({ symbol })),
+  positions: (symbol) => api(API.binance.positions + qs({ symbol })),
+  order: (body) => api(API.binance.order, { method: 'POST', body }),
+  cancelOrder: (body) => api(API.binance.order, { method: 'DELETE', body }),
   /** 一键冒烟：远价限价单 → 查单 → 撤单，全链路验证（零成交风险） */
   smoke: (body) => api(API.binance.smoke, { method: 'POST', body })
 };

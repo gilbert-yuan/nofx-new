@@ -14,7 +14,7 @@ info:
       * 长耗时接口（`/api/market/analyze*`、`/api/research/performance/refresh`、
         `/api/history/fetch`）单次运行可达数分钟，前端应按长轮询/进度条轮询处理。
       * 写操作的请求体采用「合并语义」：未传入的字段不会清空既有配置（参见 `store.js#mergeConfig`）。
-      * 配置中的密钥字段（`binance.apiKey/secretKey`、`okx.apiKey/secretKey/passphrase`、
+      * 配置中的密钥字段（`binance.apiKey/secretKey/demoApiKey/demoSecretKey/liveApiKey/liveSecretKey`、`okx.apiKey/secretKey/passphrase`、
         `model.apiKey`）始终以 `xxxx...xxxx` 形式回显，原值在 `maskConfig` 中屏蔽。
 
 servers:
@@ -95,7 +95,7 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/ConfigPatch' }
             example:
-              binance: { apiKey: 'newKey', secretKey: 'newSecret', testnet: true }
+              binance: { apiKey: 'newKey', secretKey: 'newSecret', demo: true, testnet: true }
               trader: { enabled: true, dryRun: true, maxLeverage: 3 }
       responses:
         '200':
@@ -175,10 +175,12 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [ok, testnet, totalEquity, activePositions, positionMode]
+                required: [ok, demo, testnet, environment, totalEquity, activePositions, positionMode]
                 properties:
                   ok: { type: boolean, example: true }
-                  testnet: { type: boolean, description: 是否使用 testnet.fapi 域名 }
+                  demo: { type: boolean, description: 是否使用 Binance Demo Trading }
+                  testnet: { type: boolean, description: demo 的兼容别名 }
+                  environment: { type: string, enum: [demo, live] }
                   totalEquity: { type: number, description: '钱包余额 (USDT)', example: 1024.5 }
                   activePositions: { type: integer, description: 非零持仓数, example: 2 }
                   positionMode:
@@ -192,6 +194,114 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
               example: { error: '请填写币安 API Key 和 Secret Key。' }
         '500': { $ref: '#/components/responses/ServerError' }
+  /api/binance/openOrders:
+    get:
+      tags: [Binance]
+      summary: 查询当前 USDⓈ-M 未成交订单
+      parameters:
+        - in: query
+          name: symbol
+          schema: { type: string, example: BTCUSDT }
+          description: 可选；不传时返回全部交易对挂单
+      responses:
+        '200':
+          description: 当前挂单
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, orders]
+                properties:
+                  ok: { type: boolean, example: true }
+                  orders: { type: array, items: { $ref: '#/components/schemas/JsonObject' } }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+  /api/binance/positions:
+    get:
+      tags: [Binance]
+      summary: 查询当前 USDⓈ-M 非零持仓
+      parameters:
+        - in: query
+          name: symbol
+          schema: { type: string, example: BTCUSDT }
+      responses:
+        '200':
+          description: 当前持仓与持仓模式
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, positions, positionMode]
+                properties:
+                  ok: { type: boolean, example: true }
+                  positionMode: { type: string, enum: [hedge, one-way] }
+                  positions: { type: array, items: { $ref: '#/components/schemas/JsonObject' } }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+  /api/binance/order:
+    post:
+      tags: [Binance]
+      summary: 提交 USDⓈ-M 市价或限价订单
+      description: 由服务端签名调用 Binance POST /fapi/v1/order；reduceOnly=true 用于只减仓。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [symbol, side, type, quantity]
+              properties:
+                symbol: { type: string, example: BTCUSDT }
+                side: { type: string, enum: [BUY, SELL] }
+                type: { type: string, enum: [LIMIT, MARKET] }
+                quantity: { type: number, exclusiveMinimum: 0, example: 0.001 }
+                price: { type: number, exclusiveMinimum: 0, description: LIMIT 必填 }
+                reduceOnly: { type: boolean, default: false }
+      responses:
+        '200':
+          description: Binance 订单回执
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JsonObject' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+    delete:
+      tags: [Binance]
+      summary: 撤销单个 USDⓈ-M 订单
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [symbol, orderId]
+              properties:
+                symbol: { type: string, example: BTCUSDT }
+                orderId: { type: integer, format: int64, example: 12345 }
+      responses:
+        '200':
+          description: Binance 撤单回执
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JsonObject' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+  /api/binance/smoke:
+    post:
+      tags: [Binance]
+      summary: Demo 环境订单全链路冒烟测试
+      description: 仅允许 Demo Trading；远价限价单 → 查询挂单 → 撤单 → 再查询。
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                symbol: { type: string, default: BTCUSDT }
+                quantity: { type: number, default: 0.002, exclusiveMinimum: 0 }
+      responses:
+        '200':
+          description: 五步冒烟结果
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JsonObject' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
   /api/binance/review:
     post:
       tags: [Binance]
@@ -1130,6 +1240,11 @@ components:
           properties:
             apiKey: { type: string, example: 'abcd...wxyz', description: '脱敏：仅首尾 4 位' }
             secretKey: { type: string, example: 'abcd...wxyz' }
+            demoApiKey: { type: string, example: 'abcd...wxyz', description: 'Demo Trading 专用 Key，脱敏回显' }
+            demoSecretKey: { type: string, example: 'abcd...wxyz', description: 'Demo Trading 专用 Secret，脱敏回显' }
+            liveApiKey: { type: string, example: 'abcd...wxyz', description: 'USDⓈ-M 实盘专用 Key，脱敏回显' }
+            liveSecretKey: { type: string, example: 'abcd...wxyz', description: 'USDⓈ-M 实盘专用 Secret，脱敏回显' }
+            demo: { type: boolean, description: 是否使用 Binance Demo Trading }
             testnet: { type: boolean }
         okx:
           type: object
@@ -1162,6 +1277,8 @@ components:
             allowEntryOrders: { type: boolean }
             allowCloseOrders: { type: boolean }
             allowProtectionUpdates: { type: boolean }
+            syncPaperOrdersToDemo: { type: boolean, description: 是否异步把模拟订单镜像到 Demo Trading }
+            syncPaperOrdersToLive: { type: boolean, description: 是否异步把模拟订单镜像到 USDⓈ-M 实盘 }
             entrySymbolsText: { type: string }
             maxNewEntriesPerCycle: { type: integer, example: 1 }
             maxPositionsToReview: { type: integer, example: 10 }
@@ -1193,8 +1310,8 @@ components:
         部分更新字段；后端逐层 merge，未出现字段保留旧值。密钥字段传脱敏值不会覆盖。
       additionalProperties: true
       example:
-        binance: { apiKey: 'newKey', secretKey: 'newSecret', testnet: true }
-        trader: { enabled: true, maxLeverage: 3 }
+        binance: { demoApiKey: 'newDemoKey', demoSecretKey: 'newDemoSecret', liveApiKey: 'newLiveKey', liveSecretKey: 'newLiveSecret', demo: true, testnet: true }
+        trader: { syncPaperOrdersToDemo: true, syncPaperOrdersToLive: false, maxLeverage: 3 }
 
     # ───── Strategy ─────
     Strategy:
@@ -1419,6 +1536,48 @@ components:
         heldBars: { type: integer }
         ambiguousBar: { type: boolean, description: '同根 K 线同时触及止盈止损' }
         analysisContext: { $ref: '#/components/schemas/JsonObject' }
+        exchange:
+          $ref: '#/components/schemas/ExchangeSyncTarget'
+          description: 'Demo 同步兼容别名；完整双环境状态见 exchangeSync'
+        exchangeSync:
+          type: object
+          properties:
+            demo: { $ref: '#/components/schemas/ExchangeSyncTarget' }
+            live: { $ref: '#/components/schemas/ExchangeSyncTarget' }
+    ExchangeSyncTarget:
+      type: object
+      description: 'Binance 某一环境的异步入口/平仓同步状态'
+      properties:
+        environment: { type: string, enum: [demo, live] }
+        provider: { type: string, example: binance-demo }
+        status: { type: string, example: filled }
+        clientOrderId: { type: string, nullable: true }
+        orderId: { type: integer, nullable: true }
+        origQty: { type: number, nullable: true }
+        executedQty: { type: number }
+        avgPrice: { type: number, nullable: true }
+        submittedAt: { type: string, format: date-time, nullable: true }
+        lastSyncedAt: { type: string, format: date-time, nullable: true }
+        lastError: { type: string }
+        retryAt: { type: string, format: date-time, nullable: true }
+        closeOrders:
+          type: array
+          items: { $ref: '#/components/schemas/ExchangeCloseOrder' }
+    ExchangeCloseOrder:
+      type: object
+      properties:
+        id: { type: string }
+        reason: { type: string }
+        status: { type: string, example: filled }
+        clientOrderId: { type: string, nullable: true }
+        orderId: { type: integer, nullable: true }
+        paperQuantity: { type: number }
+        remoteQuantity: { type: number, nullable: true }
+        executedQty: { type: number }
+        avgPrice: { type: number, nullable: true }
+        lastSyncedAt: { type: string, format: date-time, nullable: true }
+        lastError: { type: string }
+        retryAt: { type: string, format: date-time, nullable: true }
     OrderSubmit:
       type: object
       required: [symbol, direction, interval]

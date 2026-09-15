@@ -10,12 +10,16 @@ import { configApi, strategyApi, binanceApi, marketApi, historyApi } from '../ap
 export const useConfigStore = defineStore('config', () => {
   const config = reactive({
     model: { enabled: false, apiKey: '', baseUrl: '', model: '', maxConcurrentRequests: 5 },
-    binance: { apiKey: '', secretKey: '', testnet: true },
+    binance: {
+      apiKey: '', secretKey: '', demoApiKey: '', demoSecretKey: '', liveApiKey: '', liveSecretKey: '',
+      demo: true, testnet: true
+    },
     trader: {
       exchange: 'binance', enabled: false, dryRun: true, allowEntryOrders: false,
       allowCloseOrders: false, allowProtectionUpdates: true, entrySymbolsText: '',
       maxNewEntriesPerCycle: 1, minConfidence: 0.65, maxLeverage: 3, maxPositionNotionalPct: 0.2,
-      maxTotalNotionalPct: 0.3, minProtectionMoveBps: 25
+      maxTotalNotionalPct: 0.3, minProtectionMoveBps: 25,
+      syncPaperOrdersToDemo: false, syncPaperOrdersToLive: false
     }
   });
   const strategy = reactive({ name: '', interval: '1m', klineLimit: 80, systemPrompt: '', rules: '' });
@@ -26,20 +30,31 @@ export const useConfigStore = defineStore('config', () => {
   const savedMode = ref('读取配置中');
   const statusError = ref('');
 
+  const isBinanceDemo = value => value?.demo !== undefined
+    ? value.demo === true
+    : value?.testnet !== false;
+
   function updateSavedMode(value) {
     savedMode.value = !value.trader?.enabled
       ? '币安自动交易关闭'
       : value.trader.dryRun !== false
         ? '仅模拟指令'
-        : value.binance?.testnet
-          ? '测试网交易'
+        : isBinanceDemo(value.binance)
+          ? 'Demo Trading'
           : '实盘交易';
   }
 
   async function load() {
     const [savedConfig, savedStrategy] = await Promise.all([configApi.get(), strategyApi.get()]);
     Object.assign(config.model, savedConfig.model || {});
-    Object.assign(config.binance, savedConfig.binance || {});
+    const savedBinance = { ...savedConfig.binance };
+    savedBinance.demo = isBinanceDemo(savedBinance);
+    savedBinance.testnet = savedBinance.demo;
+    if (!Object.hasOwn(savedBinance, 'demoApiKey')) savedBinance.demoApiKey = savedBinance.demo ? savedBinance.apiKey || '' : '';
+    if (!Object.hasOwn(savedBinance, 'demoSecretKey')) savedBinance.demoSecretKey = savedBinance.demo ? savedBinance.secretKey || '' : '';
+    if (!Object.hasOwn(savedBinance, 'liveApiKey')) savedBinance.liveApiKey = savedBinance.demo ? '' : savedBinance.apiKey || '';
+    if (!Object.hasOwn(savedBinance, 'liveSecretKey')) savedBinance.liveSecretKey = savedBinance.demo ? '' : savedBinance.secretKey || '';
+    Object.assign(config.binance, savedBinance);
     Object.assign(config.trader, savedConfig.trader || {});
     updateSavedMode(savedConfig);
     Object.assign(strategy, savedStrategy || {});
@@ -54,7 +69,13 @@ export const useConfigStore = defineStore('config', () => {
   }
 
   async function saveBinance() {
-    const saved = await configApi.put({ binance: { ...config.binance }, trader: { ...config.trader, exchange: 'binance' } });
+    const demo = isBinanceDemo(config.binance);
+    const apiKey = demo ? config.binance.demoApiKey : config.binance.liveApiKey;
+    const secretKey = demo ? config.binance.demoSecretKey : config.binance.liveSecretKey;
+    const saved = await configApi.put({
+      binance: { ...config.binance, apiKey, secretKey, demo, testnet: demo },
+      trader: { ...config.trader, exchange: 'binance' }
+    });
     Object.assign(config.binance, saved.binance || {});
     Object.assign(config.trader, saved.trader || {});
     updateSavedMode(saved);
@@ -73,6 +94,22 @@ export const useConfigStore = defineStore('config', () => {
     return binanceApi.smoke(payload);
   }
 
+  async function openOrders(symbol) {
+    return binanceApi.openOrders(symbol);
+  }
+
+  async function positions(symbol) {
+    return binanceApi.positions(symbol);
+  }
+
+  async function order(payload) {
+    return binanceApi.order(payload);
+  }
+
+  async function cancelOrder(payload) {
+    return binanceApi.cancelOrder(payload);
+  }
+
   let pendingStatus;
   function loadStatus() {
     if (pendingStatus) return pendingStatus;
@@ -86,6 +123,6 @@ export const useConfigStore = defineStore('config', () => {
 
   return {
     config, strategy, tradingStatus, symbolStatus, syncStatus, savedMode, statusError,
-    load, saveAi, saveBinance, test, review, smoke, loadStatus
+    load, saveAi, saveBinance, test, review, smoke, openOrders, positions, order, cancelOrder, loadStatus
   };
 });

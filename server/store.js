@@ -5,6 +5,11 @@ const defaultConfig = {
   binance: {
     apiKey: '',
     secretKey: '',
+    demoApiKey: '',
+    demoSecretKey: '',
+    liveApiKey: '',
+    liveSecretKey: '',
+    demo: true,
     testnet: true
   },
   okx: {
@@ -35,6 +40,7 @@ const defaultConfig = {
     allowCloseOrders: false,
     allowProtectionUpdates: true,
     syncPaperOrdersToDemo: false,
+    syncPaperOrdersToLive: false,
     entrySymbolsText: '',
     maxNewEntriesPerCycle: 1,
     maxPositionsToReview: 10,
@@ -212,8 +218,12 @@ export function maskConfig(config) {
     ...config,
     binance: {
       ...config.binance,
-      apiKey: maskSecret(config.binance.apiKey),
-      secretKey: maskSecret(config.binance.secretKey)
+      apiKey: maskSecret(config.binance?.apiKey),
+      secretKey: maskSecret(config.binance?.secretKey),
+      demoApiKey: maskSecret(config.binance?.demoApiKey),
+      demoSecretKey: maskSecret(config.binance?.demoSecretKey),
+      liveApiKey: maskSecret(config.binance?.liveApiKey),
+      liveSecretKey: maskSecret(config.binance?.liveSecretKey)
     },
     okx: {
       ...config.okx,
@@ -229,9 +239,22 @@ export function maskConfig(config) {
 }
 
 export function mergeConfig(current, patch) {
+  const patchBinance = patch.binance || {};
+  const binance = { ...current.binance, ...patchBinance };
+  // 新客户端以 demo 为准；旧客户端显式提交 testnet 时仍应能切换环境。
+  const demo = patchBinance.demo !== undefined
+    ? patchBinance.demo === true
+    : patchBinance.testnet !== undefined
+      ? patchBinance.testnet !== false
+      : binance.demo !== undefined
+        ? binance.demo === true
+        : binance.testnet !== false;
+  binance.demo = demo;
+  // testnet is retained as a compatibility alias for older config files/API clients.
+  binance.testnet = demo;
   const model = { ...current.model, ...(patch.model || {}) };
   return {
-    binance: { ...current.binance, ...(patch.binance || {}) },
+    binance,
     okx: { ...current.okx, ...(patch.okx || {}) },
     model: {
       ...model,

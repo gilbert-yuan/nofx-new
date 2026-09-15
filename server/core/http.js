@@ -12,8 +12,9 @@ export function isMasked(value) {
 /** 合并配置时保留被掩码（未改动）的密钥 */
 export function stripMaskedSecrets(current, patch) {
   const next = structuredClone(patch);
-  if (isMasked(next.binance?.apiKey)) next.binance.apiKey = current.binance.apiKey;
-  if (isMasked(next.binance?.secretKey)) next.binance.secretKey = current.binance.secretKey;
+  for (const key of ['apiKey', 'secretKey', 'demoApiKey', 'demoSecretKey', 'liveApiKey', 'liveSecretKey']) {
+    if (isMasked(next.binance?.[key])) next.binance[key] = current.binance?.[key] || '';
+  }
   if (isMasked(next.model?.apiKey)) next.model.apiKey = current.model.apiKey;
   if (isMasked(next.okx?.apiKey)) next.okx.apiKey = current.okx?.apiKey || '';
   if (isMasked(next.okx?.secretKey)) next.okx.secretKey = current.okx?.secretKey || '';

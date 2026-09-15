@@ -49,7 +49,7 @@ test('new paper pending orders mirror to Binance Demo as idempotent limit orders
   const config = { binance: { apiKey: 'demo-key', secretKey: 'demo-secret', demo: true, testnet: false },
     trader: { enabled: true, dryRun: false, syncPaperOrdersToDemo: true } };
   const client = {
-    exchangeInfo: async () => ({ symbols: [{ symbol: 'BTCUSDT', filters: [
+      exchangeInfo: async () => ({ symbols: [{ symbol: 'BTCUSDT', status: 'TRADING', contractType: 'PERPETUAL', quoteAsset: 'USDT', filters: [
       { filterType: 'PRICE_FILTER', tickSize: '0.1' },
       { filterType: 'LOT_SIZE', minQty: '0.001', stepSize: '0.001' },
       { filterType: 'MIN_NOTIONAL', notional: '5' }
@@ -63,18 +63,78 @@ test('new paper pending orders mirror to Binance Demo as idempotent limit orders
     store: { getConfig: async () => config }, clientFactory: () => client
   });
   simulation.mutateLight = async fn => fn(state);
+  simulation.getOrder = async id => state.orders.find(item => item.id === id);
   const created = await simulation.submit({ recordId: 'long', symbol: 'BTCUSDT', margin: 100, leverage: 3 });
   assert.equal(created.status, 'pending');
+  assert.equal(calls.length, 0, '模拟下单接口不应等待 Binance 网络请求');
+  await simulation.exchangeSync.flush();
   assert.equal(created.exchange.status, 'new');
   assert.equal(created.exchange.orderId, 321);
   assert.equal(calls.length, 2);
   assert.deepEqual(calls[0], { leverage: true, symbol: 'BTCUSDT', leverage: 3 });
   assert.deepEqual(calls[1], { symbol: 'BTCUSDT', side: 'BUY', quantity: 3, price: 100, timeInForce: 'GTC', clientOrderId: created.exchange.clientOrderId });
   await simulation.close(created.id, { refresh: false });
+  await simulation.exchangeSync.flush();
   assert.equal(calls.length, 3);
   assert.equal(calls[2].cancel, true);
   assert.equal(calls[2].clientOrderId, created.exchange.clientOrderId);
   assert.equal(created.exchange.status, 'canceled');
+});
+
+test('paper entry and reduce-only close sync independently to Demo and live queues', async () => {
+  const state = initialPaperAccount();
+  const calls = [];
+  const symbolInfo = { symbol: 'BTCUSDT', status: 'TRADING', contractType: 'PERPETUAL', quoteAsset: 'USDT', filters: [
+    { filterType: 'PRICE_FILTER', tickSize: '0.1' },
+    { filterType: 'LOT_SIZE', minQty: '0.001', stepSize: '0.001' },
+    { filterType: 'MIN_NOTIONAL', notional: '5' }
+  ] };
+  const clients = Object.fromEntries(['demo', 'live'].map(environment => [environment, {
+    exchangeInfo: async () => ({ symbols: [symbolInfo] }),
+    setLeverage: async input => calls.push({ environment, type: 'leverage', ...input }),
+    limitOrder: async input => {
+      calls.push({ environment, type: 'entry', ...input });
+      return { orderId: environment === 'demo' ? 401 : 402, clientOrderId: input.clientOrderId, status: 'FILLED', origQty: '3', executedQty: '3', avgPrice: '100' };
+    },
+    marketOrder: async input => {
+      calls.push({ environment, type: 'close', ...input });
+      return { orderId: environment === 'demo' ? 501 : 502, clientOrderId: input.clientOrderId, status: 'FILLED', origQty: String(input.quantity), executedQty: String(input.quantity), avgPrice: '100' };
+    },
+    order: async () => { throw new Error('not expected after FILLED response'); },
+    cancelOrder: async input => { calls.push({ environment, type: 'cancel', ...input }); return { status: 'CANCELED' }; }
+  }]));
+  const config = { binance: {
+    demo: true, testnet: true, demoApiKey: 'demo-key', demoSecretKey: 'demo-secret', liveApiKey: 'live-key', liveSecretKey: 'live-secret'
+  }, trader: { syncPaperOrdersToDemo: true, syncPaperOrdersToLive: true } };
+  const simulation = new SimulatedAccount({
+    pool: {}, archive: { get: async () => { const r = record(); r.analyses[0].plan.entryLimit = 100; return r; } }, market: { provider: 'binance' },
+    store: { getConfig: async () => config }, clientFactory: target => clients[target.environment]
+  });
+  simulation.mutateLight = async fn => fn(state);
+  simulation.getOrder = async id => state.orders.find(item => item.id === id);
+
+  const created = await simulation.submit({ recordId: 'long', symbol: 'BTCUSDT', margin: 100, leverage: 3 });
+  assert.equal(calls.length, 0, '提交模拟单不应等待两个远端环境');
+  await simulation.exchangeSync.flush();
+  assert.deepEqual(calls.filter(item => item.type === 'entry').map(item => item.environment).sort(), ['demo', 'live']);
+  assert.equal(created.exchangeSync.demo.status, 'filled');
+  assert.equal(created.exchangeSync.live.status, 'filled');
+  assert.notEqual(created.exchangeSync.demo.clientOrderId, created.exchangeSync.live.clientOrderId);
+
+  created.status = 'open';
+  created.entry = 100;
+  created.entryAt = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+  created.markAt = new Date(Math.floor(Date.now() / (15 * 60 * 1000)) * (15 * 60 * 1000)).toISOString();
+  created.markPrice = 100;
+  created.quantity = 3;
+  created.entryFee = 0;
+  await simulation.close(created.id, { refresh: false, reason: 'manual' });
+  assert.equal(calls.filter(item => item.type === 'close').length, 0, '平仓接口也应先返回');
+  await simulation.exchangeSync.flush();
+  assert.deepEqual(calls.filter(item => item.type === 'close').map(item => item.environment).sort(), ['demo', 'live']);
+  assert.ok(calls.filter(item => item.type === 'close').every(item => item.reduceOnly === true));
+  assert.equal(created.exchangeSync.demo.closeOrders[0].status, 'filled');
+  assert.equal(created.exchangeSync.live.closeOrders[0].status, 'filled');
 });
 
 test('old-provider orders are isolated instead of replayed with Binance candles', async () => {
