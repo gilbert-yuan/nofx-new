@@ -178,10 +178,11 @@ export class TradingSimulator {
     // 现按计划里固化的 smartExit 配置，在每根已收盘 K 线上判定；复核周期仅作兜底。
     // 只看**已收盘** K 线，不使用未来数据，回测/实盘口径一致。
     const smartExit = hasSmartExitSnapshot ? exitRules.smartExit : null;
-    // enabled 总开关必须管住根级均线失守：smartExitEnabled=false 时三条智能退出规则
-    // 全部停用（与复核层 enhancedProtectionReview 及 enhancedAnalysis 注释语义一致）。
-    // enabled !== false：兼容旧快照无该字段时默认开启，与 resolveSmartExitRule 同口径。
-    const barLevelMaExit = !!smartExit && smartExit.enabled !== false && smartExit.barLevel !== false && Number.isFinite(smartExit.maBreakAtr);
+    // 根级均线失守由独立开关 barLevelEnabled 控制（方案A）：它与复核层 CLOSE 的
+    // enabled 总开关解耦 —— 可单独「根级开、CLOSE 关」（p19 实证盈利形态）。
+    // 兼容口径：resolveSmartExitRule 已把旧快照（无该字段）回退为跟随 enabled，
+    // 因此所有既有快照/配置在本改动下行为与之前完全一致（零变化）。
+    const barLevelMaExit = !!smartExit && smartExit.barLevelEnabled !== false && smartExit.barLevel !== false && Number.isFinite(smartExit.maBreakAtr);
     // 根级最小持仓保护（P8，2026-09-11）：与复核层 enhancedProtectionReview 同口径 ——
     // 入场后 minHoldBars 根内禁止「均线失守」平仓（优先 plan 快照，旧订单回退全局
     // NOFX_SMART_MIN_HOLD）。止损/止盈/分批/超时不受影响。
@@ -282,13 +283,21 @@ export class TradingSimulator {
         //   · 止损/爆仓 → 交给下面的 _checkExit 立即出场（保护优先），不巧立分批；
         //   · TP1/TP2   → 在价格路径上必然先于主止盈被触及，故先按各档价位分批，
         //                 剩余「奔跑仓」再交给 _checkExit 的主止盈判定。
+        //   · 限价成交当根没有成交后的 tick 顺序；保护优先，分批止盈也必须留到下一根。
+        //   · 任意持仓根同时触发保护价时，同样不能先记一批 TP 再按止损结算；
+        //                 否则会凭空把「止损优先」改成部分止盈 + 止损。
+        const entryBarProtection = entryViaLimit && held === 1;
+        const protectionTriggered = long ? row.low <= workingStop : row.high >= workingStop;
+        const liquidationTriggered = this.config.enableLiquidation
+          && Number.isFinite(order.liquidationPrice)
+          && (long ? row.low <= order.liquidationPrice : row.high >= order.liquidationPrice);
         if (tpLevels === null) {
           const riskUnit = Number(order.plan?.riskUnit) > 0
             ? Number(order.plan.riskUnit)
             : Math.abs(entry - Number(order.initialPlan?.stopLoss ?? protection.stopLoss));
           tpLevels = partialTpLevels({ long, entry, riskUnit, mainTakeProfit: protection.takeProfit, rule: exitRules.partialTp });
         }
-        while (tpStage < tpLevels.length) {
+        if (!entryBarProtection && !protectionTriggered && !liquidationTriggered) while (tpStage < tpLevels.length) {
           const level = tpLevels[tpStage];
           const hit = long ? row.high >= level.price : row.low <= level.price;
           if (!hit) break;
@@ -346,7 +355,7 @@ export class TradingSimulator {
             entry,
             long,
             // 成交当根且由限价单成交 → 启用「保护优先」的保守判定（见 _checkExit）
-            entryBar: entryViaLimit && held === 1,
+            entryBar: entryBarProtection,
             breakEvenDist: exitRules.partialTp.moveStopToBreakEven
               ? entry * netBreakEvenBps(order.costs, exitRules.trailing) / 10000
               : 0

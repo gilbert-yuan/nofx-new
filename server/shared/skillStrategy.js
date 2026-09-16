@@ -2,137 +2,103 @@
  * Shared deterministic primitives ported from crypto-long/short-skill-node.
  *
  * This module deliberately contains no model calls. It is the single source
- * of truth for the two SKILL-derived strategies' derivatives context, data
- * quality, regime and risk/plan geometry.
+ * of truth for the two SKILL-derived strategies' candle-data quality, regime
+ * and risk/plan geometry.
  */
-import { skillStructure } from './marketStructure.js';
-
-const finite = value => value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value));
-const number = value => finite(value) ? Number(value) : null;
-const pct = (a, b) => finite(a) && finite(b) && Number(b) !== 0 ? (Number(a) - Number(b)) / Number(b) : 0;
-const mean = values => values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
-const stdev = values => {
-  if (values.length < 2) return 0;
-  const average = mean(values);
-  return Math.sqrt(mean(values.map(value => (value - average) ** 2)));
-};
-
-export function summarizeSkillDerivatives(raw = {}) {
-  const funding = Array.isArray(raw.funding) ? raw.funding.map(row => Number(row.fundingRate)).filter(Number.isFinite) : [];
-  const oi = Array.isArray(raw.oi)
-    ? raw.oi.map(row => Number(row.sumOpenInterestValue ?? row.sumOpenInterest)).filter(Number.isFinite) : [];
-  const global = raw.globalRatio?.at(-1);
-  const top = raw.topRatio?.at(-1);
-  const taker = raw.takerRatio?.at(-1);
-  const premium = raw.premium || {};
-  const fundingMean = mean(funding);
-  const fundingDeviation = stdev(funding);
-  return {
-    markPrice: number(premium.markPrice),
-    indexPrice: number(premium.indexPrice),
-    basisPercent: pct(premium.markPrice, premium.indexPrice) * 100,
-    fundingRate: number(premium.lastFundingRate),
-    nextFundingTime: number(premium.nextFundingTime),
-    fundingZ: fundingDeviation > 0 ? (funding.at(-1) - fundingMean) / fundingDeviation : 0,
-    oiChange15m: oi.length > 1 ? pct(oi.at(-1), oi.at(-2)) : 0,
-    oiChange4h: oi.length > 16 ? pct(oi.at(-1), oi.at(-17)) : null,
-    globalLongShortRatio: number(global?.longShortRatio),
-    topTraderLongShortRatio: number(top?.longShortRatio),
-    takerBuySellRatio: number(taker?.buySellRatio)
-  };
-}
-
-export function skillRegime(indicators, structure) {
-  if (indicators?.atrPercentile > 0.9) return 'HIGH_VOLATILITY';
+export function skillRegime(indicators, structure, options = {}) {
+  const highVolatilityPercentile = Number.isFinite(Number(options.highVolatilityPercentile))
+    ? Number(options.highVolatilityPercentile) : 0.9;
+  const lowVolatilityPercentile = Number.isFinite(Number(options.lowVolatilityPercentile))
+    ? Number(options.lowVolatilityPercentile) : 0.2;
+  if (indicators?.atrPercentile > highVolatilityPercentile) return 'HIGH_VOLATILITY';
   if (structure?.trend === 'BULLISH'
     && indicators?.ema20 > indicators?.ema50
     && indicators?.ema50 > indicators?.ema200) return 'TREND_UP';
   if (structure?.trend === 'BEARISH'
     && indicators?.ema20 < indicators?.ema50
     && indicators?.ema50 < indicators?.ema200) return 'TREND_DOWN';
-  if (indicators?.atrPercentile < 0.2) return 'LOW_VOLATILITY';
+  if (indicators?.atrPercentile < lowVolatilityPercentile) return 'LOW_VOLATILITY';
   return 'RANGE';
 }
 
-/**
- * The SKILL docs require a HOLD when required market evidence is absent.
- * `requireFiveMinute` is opt-in because the shipped SKILL engine computes but
- * does not actually consume its 5m series; the formal strategies expose it
- * when available without inventing a 5m signal.
- */
-export function skillDataQuality({ rows4h, rows1h, rows15, rows5, btcMarket, rawDerivatives, requireFiveMinute = false } = {}) {
+/** Validate only candle evidence used by the strategy. Derivatives and BTC
+ * environment data are intentionally not a strategy prerequisite. */
+export function skillDataQuality({ rows4h, rows1h, rows15, rows5, requireFiveMinute = false } = {}) {
   const missing = [];
   if (!Array.isArray(rows4h) || rows4h.length < 200) missing.push('4h>=200');
   if (!Array.isArray(rows1h) || rows1h.length < 50) missing.push('1h>=50');
   if (!Array.isArray(rows15) || rows15.length < 30) missing.push('15m>=30');
   if (requireFiveMinute && (!Array.isArray(rows5) || rows5.length < 30)) missing.push('5m>=30');
-  if (!Array.isArray(btcMarket?.klines) || btcMarket.klines.length < 200) missing.push('BTC 4h>=200');
-  const premium = rawDerivatives?.premium || {};
-  if (!finite(premium.markPrice) || !finite(premium.indexPrice) || !finite(premium.lastFundingRate)) missing.push('premium');
-  if (!Array.isArray(rawDerivatives?.funding) || rawDerivatives.funding.length < 2) missing.push('funding');
-  if (!Array.isArray(rawDerivatives?.oi) || rawDerivatives.oi.length < 2) missing.push('openInterest');
-  if (!Array.isArray(rawDerivatives?.globalRatio) || !rawDerivatives.globalRatio.length) missing.push('globalLongShort');
-  if (!Array.isArray(rawDerivatives?.topRatio) || !rawDerivatives.topRatio.length) missing.push('topLongShort');
-  if (!Array.isArray(rawDerivatives?.takerRatio) || !rawDerivatives.takerRatio.length) missing.push('takerRatio');
-  const latest15 = rows15?.at(-1);
-  if (!finite(latest15?.takerBuyVolume)) missing.push('15m.takerBuyVolume');
   return { good: missing.length === 0, missing };
-}
-
-export function btcEnvironment(btcMarket) {
-  const rows = btcMarket?.klines;
-  return Array.isArray(rows) && rows.length ? skillStructure(rows).trend : 'UNKNOWN';
 }
 
 /** Exact risk/plan geometry from src/risk/plan.js in the supplied SKILLs. */
 export function makeSkillTradePlan({ long, price, atr, resistance, support, balance = 10000, risk = 0.01,
-  volatility = 0.5, leverage = 5 } = {}) {
+  volatility = 0.5, leverage = 5, maxLeverage = 20, riskBudgetPct = null,
+  entryBufAtr = 0.25, stopBufferAtr = 0.35, minStopPct = 0, targetR = 2,
+  highVolatilityPercentile = 0.9, mediumVolatilityPercentile = 0.8 } = {}) {
   const current = Number(price), range = Number(atr);
   if (!(current > 0) || !(range > 0)) return null;
+  const entryBuffer = Math.max(0, Number(entryBufAtr) || 0);
+  const stopBuffer = Math.max(0, Number(stopBufferAtr) || 0);
+  const minimumStopPct = Math.max(0, Number(minStopPct) || 0);
+  const targetMultiple = Math.max(1, Number(targetR) || 2);
   if (long) {
     support = support && support < current ? support : current - range * 0.8;
     resistance = resistance && resistance > current ? resistance : current + range * 2;
-    const entryLow = support - range * 0.15;
-    const entryHigh = Math.min(current, support + range * 0.25);
+    const entryLow = support - range * entryBuffer * 0.6;
+    const entryHigh = Math.min(current, support + range * entryBuffer);
     const entry = (entryLow + entryHigh) / 2;
-    const stopLoss = support - range * 0.35;
+    const stopCandidate = support - range * stopBuffer;
+    const stopLoss = Math.min(stopCandidate, entry - entry * minimumStopPct);
     const riskDistance = entry - stopLoss;
     const tp1 = Math.max(resistance, entry + riskDistance);
-    const tp2 = entry + riskDistance * 2;
-    const tp3 = entry + riskDistance * 3;
+    const tp2 = entry + riskDistance * targetMultiple;
+    const tp3 = entry + riskDistance * Math.max(3, targetMultiple + 1);
     return {
       ...finishSkillPlan({ long, entryLow, entryHigh, entry, stopLoss, tp1, tp2, tp3,
-        riskDistance, balance, risk, volatility, leverage }),
+        riskDistance, balance, risk, volatility, leverage, maxLeverage, riskBudgetPct,
+        highVolatilityPercentile, mediumVolatilityPercentile }),
       secondaryZone: [support - range, support - range * 0.5]
     };
   }
   resistance = resistance && resistance > current ? resistance : current + range * 0.8;
   support = support && support < current ? support : current - range * 2;
-  const entryLow = Math.max(current, resistance - range * 0.25);
-  const entryHigh = resistance + range * 0.15;
+  const entryLow = Math.max(current, resistance - range * entryBuffer);
+  const entryHigh = resistance + range * entryBuffer * 0.6;
   const entry = (entryLow + entryHigh) / 2;
-  const stopLoss = resistance + range * 0.35;
+  const stopCandidate = resistance + range * stopBuffer;
+  const stopLoss = Math.max(stopCandidate, entry + entry * minimumStopPct);
   const riskDistance = stopLoss - entry;
   const tp1 = Math.min(support, entry - riskDistance);
-  const tp2 = entry - riskDistance * 2;
-  const tp3 = entry - riskDistance * 3;
+  const tp2 = entry - riskDistance * targetMultiple;
+  const tp3 = entry - riskDistance * Math.max(3, targetMultiple + 1);
   return {
     ...finishSkillPlan({ long, entryLow, entryHigh, entry, stopLoss, tp1, tp2, tp3,
-      riskDistance, balance, risk, volatility, leverage }),
+      riskDistance, balance, risk, volatility, leverage, maxLeverage, riskBudgetPct,
+      highVolatilityPercentile, mediumVolatilityPercentile }),
     secondaryZone: [resistance + range * 0.5, resistance + range]
   };
 }
 
 function finishSkillPlan({ long, entryLow, entryHigh, entry, stopLoss, tp1, tp2, tp3,
-  riskDistance, balance, risk, volatility, leverage }) {
+  riskDistance, balance, risk, volatility, leverage, maxLeverage = 20, riskBudgetPct = null,
+  highVolatilityPercentile = 0.9, mediumVolatilityPercentile = 0.8 }) {
   if (!(entry > 0) || !(riskDistance > 0)) return null;
   const riskReward = Math.abs(tp2 - entry) / riskDistance;
-  const volFactor = volatility > 0.9 ? 0.5 : volatility > 0.8 ? 0.7 : 1;
+  const volFactor = volatility > highVolatilityPercentile ? 0.5
+    : volatility > mediumVolatilityPercentile ? 0.7 : 1;
   const adjustedRisk = Math.min(0.02, Math.max(0, Number(risk) * volFactor));
   const riskAmount = Number(balance) * adjustedRisk;
   const stopPercent = riskDistance / entry;
   const notional = stopPercent > 0 ? riskAmount / stopPercent : 0;
-  const effectiveLeverage = Math.min(20, Math.max(1, Number(leverage) || 5));
+  const leverageCap = Math.max(1, Number(maxLeverage) || 20);
+  const defaultLeverage = Math.max(1, Number(leverage) || 5);
+  const budgetLeverage = Number(riskBudgetPct) > 0 && stopPercent > 0
+    ? Number(riskBudgetPct) / stopPercent : null;
+  const requestedLeverage = Number.isFinite(budgetLeverage) && budgetLeverage > 0
+    ? Math.min(defaultLeverage, budgetLeverage) : defaultLeverage;
+  const effectiveLeverage = Math.min(leverageCap, Math.max(1, requestedLeverage || 5));
   const maintenanceMarginRateEstimate = 0.005;
   const estimatedLiquidationPrice = long
     ? entry * (1 - 1 / effectiveLeverage + maintenanceMarginRateEstimate)

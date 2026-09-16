@@ -83,7 +83,9 @@ export class GlobalAutomation {
       totalReviews: 0,
       errors: []
     };
-    this.skillContextCache = new Map();
+    // 4h 结构策略不使用衍生品/BTC 环境上下文。
+    // 相关拉取链路保留在下方注释中，避免旧配置或默认值重新启用。
+    // this.skillContextCache = new Map();
   }
 
   /** 策略分析/复核共用的依赖注入（策略定义里通过 ctx.deps 取用） */
@@ -91,6 +93,10 @@ export class GlobalAutomation {
     return { superAnalysis: this.superAnalysis, store: this.store, market: this.market, marketDb: this.marketDb };
   }
 
+  /*
+   * [已停用] 4h 结构策略不再拉取或消费衍生品/BTC 环境数据。
+   * 旧实现保留在注释中，便于审计历史变更，但不能被运行时调用。
+   *
   async getSkillDerivatives(symbol) {
     const bucket = Math.floor(Date.now() / 900000);
     const key = `derivatives:${symbol}:${bucket}`;
@@ -110,6 +116,7 @@ export class GlobalAutomation {
     this.skillContextCache.set(key, promise);
     return promise;
   }
+  */
 
   /**
    * 启动全局自动化系统
@@ -491,13 +498,15 @@ export class GlobalAutomation {
       ctx.auxMarkets = auxMarkets;
     }
 
-    if (strategy.marketContext?.derivatives) ctx.derivatives = await this.getSkillDerivatives(symbol);
-    if (strategy.marketContext?.btc) {
-      ctx.btcMarket = await this.getSkillBtcMarket(strategy.marketContext.btc, strategy.marketWindow || 500);
-    }
+    // 衍生品/BTC 环境判断已关闭。即使旧策略配置残留 derivatives/btc，也不拉取、不传递，
+    // 4h 策略只使用多周期 K 线和本地风险几何。
+    // if (strategy.marketContext?.derivatives) ctx.derivatives = await this.getSkillDerivatives(symbol);
+    // if (strategy.marketContext?.btc) {
+    //   ctx.btcMarket = await this.getSkillBtcMarket(strategy.marketContext.btc, strategy.marketWindow || 500);
+    // }
     ctx.skillContext = {
-      derivatives: ctx.derivatives || null,
-      btcMarket: ctx.btcMarket || null,
+      // derivatives: null, // 已关闭，不再向分析器注入
+      // btcMarket: null,   // 已关闭，不再向分析器注入
       requireFiveMinute: Boolean(strategy.marketContext?.requireFiveMinute)
     };
 

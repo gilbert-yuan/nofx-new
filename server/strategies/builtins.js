@@ -69,7 +69,8 @@ defineStrategy({
   needsAux: ['5m', '15m', '1h', '4h'],
   marketWindow: 500,
   marketWindows: { '5m': 300, '15m': 500, '1h': 500, '4h': 500 },
-  marketContext: { btc: '4h', derivatives: true, requireFiveMinute: false },
+  // 仅保留 K 线数据要求；不配置 derivatives / btc，避免衍生品环境判断链路。
+  marketContext: { requireFiveMinute: false },
   // 订单落在 15m 周期：maxHoldBars=96 根 = 24h
   planInterval: '15m',
   paramSchema: [...STRUCTURE_SHORT_PARAM_SCHEMA, ...PUMP_SHORT_EXIT_PARAM_SCHEMA],
@@ -110,7 +111,8 @@ defineStrategy({
   needsAux: ['5m', '15m', '1h', '4h'],
   marketWindow: 500,
   marketWindows: { '5m': 300, '15m': 500, '1h': 500, '4h': 500 },
-  marketContext: { btc: '4h', derivatives: true, requireFiveMinute: false },
+  // 仅保留 K 线数据要求；不配置 derivatives / btc，避免衍生品环境判断链路。
+  marketContext: { requireFiveMinute: false },
   // 订单落在 15m 周期：maxHoldBars=96 根 = 24h
   planInterval: '15m',
   paramSchema: [...STRUCTURE_LONG_PARAM_SCHEMA, ...PUMP_SHORT_EXIT_PARAM_SCHEMA],

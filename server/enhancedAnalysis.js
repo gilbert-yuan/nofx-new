@@ -287,6 +287,9 @@ const ENHANCED_DEFAULTS_RAW = {
   trailingL2LockR: TRAILING_RULE.ladder[2].lockR,
   // 智能退出
   smartExitEnabled: SMART_EXIT.enabled,
+  // 根级均线失守独立开关（方案A）：默认跟随总开关，确保既有配置零变化；
+  // 可单独设为 true（配合 smartExitEnabled=false）只开根级均线失守、关复核层 CLOSE。
+  smartExitBarLevelEnabled: SMART_EXIT.enabled,
   smartExitBarLevel: SMART_EXIT.barLevelMaExit,
   smartExitMaAtr: SMART_EXIT.maBreakAtr,
   smartExitMaExitMaxR: SMART_EXIT.maExitMaxProfitR,
@@ -360,6 +363,7 @@ export const ENHANCED_PARAM_SCHEMA = Object.freeze([
   numSpec('trailingBreakEvenFloorAtr', '保本落点（ATR）', 'exit', 0, 3, 0.05, '仅在启用保本落点时生效。'),
   numSpec('trailingBreakEvenCostBufferBps', '保本线成本缓冲（bps）', 'exit', 0, 200, 1, '净保本线的额外缓冲。'),
   boolSpec('smartExitEnabled', '启用智能退出', 'exit', '均线失守 / RSI 极值 / MACD 背离三条主动离场规则的总开关。'),
+  boolSpec('smartExitBarLevelEnabled', '根级均线失守（独立开关）', 'exit', '把均线失守下沉到每根已收盘 K 线判定；独立于总开关，未设置时跟随「启用智能退出」。'),
   boolSpec('smartExitBarLevel', '逐根判定均线失守', 'exit', '把均线失守下沉到每根已收盘 K 线，降低离场延迟。'),
   numSpec('smartExitMaAtr', '均线失守偏离（ATR）', 'exit', 0.2, 5, 0.1, '均线失守需要偏离 MA20 超过该 ATR 倍数才生效。'),
   numSpec('smartExitMaExitMaxR', '均线失守仅限浮盈（R）', 'exit', 0, 20, 0.1, '浮盈低于该值时均线失守才算趋势证伪；越过则交给移动止损。'),
@@ -427,6 +431,10 @@ export function buildExitRules(params) {
     },
     smartExit: {
       enabled: p.smartExitEnabled,
+      // 根级均线失守独立开关：策略未显式设置时跟随总开关（零变化兼容）。
+      barLevelEnabled: p.smartExitBarLevelEnabled !== undefined
+        ? p.smartExitBarLevelEnabled
+        : p.smartExitEnabled,
       barLevel: p.smartExitBarLevel,
       maPeriod: 20,
       maBreakAtr: p.smartExitMaAtr,

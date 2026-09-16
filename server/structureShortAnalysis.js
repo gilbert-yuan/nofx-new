@@ -25,8 +25,8 @@
  *
  * 当前正式入口已与 SKILL 规则保持确定性一致：
  *   1. 决策窗口为 4H/1H/15m=500 根、5m=300 根，EMA200 与多周期结构完整可用。
- *   2. funding/OI/多空比/taker/BTC 环境通过 marketContext 注入，严格模式缺失时闭合为 WAIT。
- *   3. 评分、挤压风险、延伸过滤、RR≥2 及 15m CHOCH+BOS 按 rules.md 的顺序执行。
+ *   2. 只使用 K 线结构、均线、ATR、RSI、量能和多周期确认，不依赖衍生环境或 BTC 外部环境。
+ *   3. 评分、延伸过滤、RR≥2 及 15m CHOCH+BOS 按 rules.md 的顺序执行。
  *   4. 计划几何、风险金额、波动降风险、仓位与预估爆仓安全检查统一由
  *      shared/skillStrategy.js 生成。
  *   5. 导出的正式函数调用 shared/skillStructureAnalysis.js，文件内旧实现仅保留作历史兼容参考。
@@ -56,6 +56,11 @@ export const STRUCTURE_SHORT_DEFAULTS = Object.freeze({
   entryQualityMin: 70,
   // 过度延伸：价格低于 4H EMA20 超过 N×ATR 禁追空（skill：2 ATR → WAIT_FOR_PULLBACK）
   extendedAtr: 2,
+  // 位置/量能/超卖阈值：从共享引擎中的固定值提取为可回测参数
+  nearLevelAtr: 1.2,
+  volumeRatioMin: 1.1,
+  rsiExtreme: 70,
+  highVolatilityPercentile: 0.9,
   // 入场：限价 = 1H 阻力 − N×ATR4h（skill entryZone 下沿 0.25 ATR）
   entryBufAtr: 0.25,
   // 止损：1H 阻力 + N×ATR4h（skill 0.35 ATR）；R 绝对下限兜底成本
@@ -67,7 +72,7 @@ export const STRUCTURE_SHORT_DEFAULTS = Object.freeze({
   maxDailyLoss: 0.03,
   extremeAtr: 3,
   defaultLeverage: 5,
-  strictSkillData: true,
+  strictSkillData: false,
   requireFiveMinute: false,
   // 持仓约束（15m 根：96 根 = 24h；计划校验上限 120 根）
   maxHoldBars: 96,
@@ -93,6 +98,14 @@ export const STRUCTURE_SHORT_PARAM_SCHEMA = Object.freeze([
     '低于门槛视为位置不好（离阻力太远/过度延伸/超卖），宁可等反弹。skill 原值 70。'),
   numSpec('extendedAtr', '过度延伸门槛（ATR）', 'filter', 0.5, 5, 0.1,
     '价格低于 4H EMA20 超过 N×ATR 视为跌过头，禁止追空（skill：2 ATR → WAIT_FOR_PULLBACK）。'),
+  numSpec('nearLevelAtr', '支撑/阻力距离（ATR）', 'filter', 0, 5, 0.1,
+    '4H 价格距离 1H 支撑/阻力不超过 N×ATR 时计入位置共振。'),
+  numSpec('volumeRatioMin', '最低量比', 'filter', 0, 5, 0.05,
+    '4H 最近量能相对基准量能达到该倍数才计入放量确认。'),
+  numSpec('rsiExtreme', 'RSI 极值门槛', 'filter', 50, 100, 1,
+    '多头高于该值、空头低于其对称值时扣减入场质量。'),
+  numSpec('highVolatilityPercentile', '高波动分位阈值', 'filter', 0.5, 1, 0.01,
+    'ATR 分位超过该值时进入高波动状态并扣减入场质量。'),
   numSpec('entryBufAtr', '入场位缓冲（ATR）', 'entry', 0, 2, 0.05,
     '限价 = 1H 阻力 − N×ATR4h。0.25 = skill 原值（反弹进入阻力区下沿即挂空）。'),
   numSpec('minRealRR', '真实目标最低 RR', 'protection', 1, 10, 0.1,
@@ -112,7 +125,7 @@ export const STRUCTURE_SHORT_PARAM_SCHEMA = Object.freeze([
   numSpec('defaultLeverage', '默认杠杆', 'risk', 1, 20, 1,
     'SKILL 风险计划的默认杠杆；下单仍受系统全局硬上限约束。'),
   boolSpec('strictSkillData', '严格数据完整性', 'filter',
-    '缺少 BTC、衍生品或 taker 数据时 HOLD，避免用降级数据伪造 SKILL 信号。'),
+    '启用后要求更长的多周期 K 线；不再检查 BTC、衍生品或 taker 环境数据。'),
   boolSpec('requireFiveMinute', '强制 5m 数据', 'filter',
     '启用后额外要求 5m 历史；原始 SKILL 会加载但默认不消费 5m。'),
   ...STRUCTURE_RISK_PARAM_SCHEMA
@@ -175,11 +188,11 @@ function legacyStructureShortAnalysis(market, ctx = {}, costs = PAPER_COSTS) {
     trend: windowInfo, ...extra
   });
 
-  // 闸门 1：数据不足（4H 至少 55 根才够 EMA50 + 摆动结构；1H/15m 至少 30 根）
+  // 闸门 1：紧凑 4H 模式最低 10 根；EMA50/EMA200 仅在较长窗口时参与评分。
   if (!source4h || !source1h) {
     return wait('未获取到 1h/4h 辅助行情（needsAux=["15m","1h","4h"] 未就绪），本轮观望。');
   }
-  const MIN = { '15m': 30, '1h': 30, '4h': 55 };
+  const MIN = { '15m': 30, '1h': 30, '4h': 10 };
   for (const [tf, rows] of [['15m', rows15], ['1h', rows1h], ['4h', rows4h]]) {
     if (rows.length < MIN[tf]) {
       return wait(`结构做空需要至少 ${MIN[tf]} 根已收盘 ${tf} K 线（实时窗口固定 80 根），实际 ${rows.length} 根。`);
@@ -205,7 +218,7 @@ function legacyStructureShortAnalysis(market, ctx = {}, costs = PAPER_COSTS) {
 
   // 近阻力（skill：1H 阻力在 1.2×ATR4h 内）与假突破
   const nearResistance = s1.resistance != null && Math.abs(i4.price - s1.resistance) <= 1.2 * i4.atr;
-  // 量能（适配：库内无 takerBuyVolume → 15m 放量收阴）
+  // 纯 K 线量能：15m 放量收阴
   const volBearish = last15.close < last15.open && i15.volumeRatio > 1.1;
 
   // 计划：入场/止损先定，再从 1H/4H 真实已确认 pivot 选择止盈。

@@ -243,8 +243,6 @@ export function summarizeSkill(rows) {
   const currentAtr = atr.at(-1);
   const volumeWindow = volume.slice(-20).filter(Number.isFinite);
   const volumeMean = volumeWindow.length ? volumeWindow.reduce((sum, value) => sum + value, 0) / volumeWindow.length : NaN;
-  const last = rows.at(-1) || {};
-  const takerBuyVolume = Number(last.takerBuyVolume);
   return {
     price: close.at(-1),
     ema20: e20.at(-1), ema50: e50.at(-1), ema200: e200.at(-1),
@@ -256,9 +254,7 @@ export function summarizeSkill(rows) {
     macd: macd.line.at(-1), macdSignal: macd.signal.at(-1), macdHistogram: macd.histogram.at(-1),
     adx: adx.adx.at(-1), plusDI: adx.plusDI.at(-1), minusDI: adx.minusDI.at(-1),
     volumeRatio: Number.isFinite(volumeMean) && volumeMean !== 0 ? volume.at(-1) / volumeMean : NaN,
-    volumeZ: zScore(volume.slice(-100)),
-    takerSellRatio: Number.isFinite(takerBuyVolume) && Number(volume.at(-1)) > 0
-      ? 1 - takerBuyVolume / volume.at(-1) : NaN
+    volumeZ: zScore(volume.slice(-100))
   };
 }
 

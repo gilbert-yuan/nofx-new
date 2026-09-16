@@ -6,10 +6,9 @@
  * the long and short strategy entries cannot drift apart over time.
  */
 import { summarizeSkill, skillStructure, isFiniteCandle } from './marketStructure.js';
-import { btcEnvironment, makeSkillTradePlan, skillDataQuality, skillRegime, summarizeSkillDerivatives } from './skillStrategy.js';
+import { makeSkillTradePlan, skillDataQuality, skillRegime } from './skillStrategy.js';
 
 const finite = value => value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value));
-const pct = (a, b) => finite(a) && finite(b) && Number(b) !== 0 ? (Number(a) - Number(b)) / Number(b) : 0;
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const round = (value, digits = 4) => finite(value) ? Number(Number(value).toFixed(digits)) : null;
 
@@ -72,10 +71,8 @@ export function analyzeSkillStructure(market, ctx = {}, { long, params = {}, cos
   const wait = (reason, extra = {}, quality) => waitSignal({ market, windowInfo, reason, extra, riskNote, quality });
 
   const strict = params.strictSkillData !== false;
-  const rawDerivatives = ctx.derivatives || ctx.skillContext?.derivatives || {};
-  const btcMarket = ctx.btcMarket || ctx.skillContext?.btcMarket || null;
   const quality = skillDataQuality({
-    rows4h, rows1h, rows15, rows5, btcMarket, rawDerivatives,
+    rows4h, rows1h, rows15, rows5,
     requireFiveMinute: Boolean(params.requireFiveMinute || ctx.skillContext?.requireFiveMinute)
   });
   if (strict && !quality.good) {
@@ -85,7 +82,10 @@ export function analyzeSkillStructure(market, ctx = {}, { long, params = {}, cos
 
   // Non-strict mode is an explicit diagnostic/backtest fallback only.  It
   // still refuses malformed or obviously undersized candles.
-  const minimum = { '15m': 30, '1h': 30, '4h': 55 };
+  // Compact 4h mode has a nominal floor of 10 candles for diagnostics. The
+  // engine still waits until EMA20 is actually available; longer EMA50/EMA200
+  // confluence is optional and simply scores zero when history is unavailable.
+  const minimum = { '15m': 30, '1h': 30, '4h': 10 };
   for (const [tf, rows] of Object.entries({ '15m': rows15, '1h': rows1h, '4h': rows4h })) {
     if (rows.length < minimum[tf]) return wait(`结构策略需要至少 ${minimum[tf]} 根 ${tf} K 线，实际 ${rows.length} 根。`, {}, quality);
   }
@@ -99,34 +99,30 @@ export function analyzeSkillStructure(market, ctx = {}, { long, params = {}, cos
   const i4 = summarizeSkill(rows4h);
   const i1 = summarizeSkill(rows1h);
   const i15 = summarizeSkill(rows15);
-  const d = summarizeSkillDerivatives(rawDerivatives);
-  const btc = btcEnvironment(btcMarket);
   if (!(i4.atr > 0) || !finite(i4.price) || !finite(i4.ema20)) {
     return wait('4H SKILL 指标未就绪（ATR/EMA20 无效），本轮 HOLD。', { structure: structureView(s4, s1, s15) }, quality);
   }
 
-  const marketRegime = skillRegime(i4, s4);
+  const numParam = (key, fallback) => Number.isFinite(Number(params[key])) ? Number(params[key]) : fallback;
+  const nearLevelAtr = Math.max(0, numParam('nearLevelAtr', 1.2));
+  const volumeRatioMin = Math.max(0, numParam('volumeRatioMin', 1.1));
+  const rsiExtreme = Math.max(50, Math.min(100, numParam('rsiExtreme', 70)));
+  const highVolatilityPercentile = Math.max(0.5, Math.min(1, numParam('highVolatilityPercentile', 0.9)));
+  const mediumVolatilityPercentile = Math.max(0.4, highVolatilityPercentile - 0.1);
+  const extendedAtr = Math.max(0.1, numParam('extendedAtr', 2));
+  const extremeAtr = Math.max(0.1, numParam('extremeAtr', 3));
+  const minRealRR = Math.max(1, numParam('minRealRR', 2));
+  const marketRegime = skillRegime(i4, s4, { highVolatilityPercentile });
   const distanceAtr = (i4.price - i4.ema20) / i4.atr;
-  const recentChange = pct(i4.price, rows4h.at(-5)?.close);
-  const dPriceChange = pct(i4.price, rows4h.at(-2)?.close);
-  const liquidationRisk = long
-    ? ((d.fundingZ > 2 && d.oiChange15m > 0 && recentChange <= 0)
-      || (s4.trend === 'BEARISH' && i4.volumeRatio > 1.5 && d.oiChange15m > 0)
-      ? 'HIGH' : d.fundingZ > 1 ? 'MEDIUM' : 'LOW')
-    : ((d.fundingZ < -2 && d.oiChange15m > 0 && recentChange >= 0)
-      || (s4.trend === 'BULLISH' && i4.volumeRatio > 1.5 && d.oiChange15m > 0)
-      ? 'HIGH' : d.fundingZ < -1 ? 'MEDIUM' : 'LOW');
 
-  const nearSupport = s1.support != null && Math.abs(i4.price - s1.support) <= 1.2 * i4.atr;
-  const nearResistance = s1.resistance != null && Math.abs(i4.price - s1.resistance) <= 1.2 * i4.atr;
+  const nearSupport = s1.support != null && Math.abs(i4.price - s1.support) <= nearLevelAtr * i4.atr;
+  const nearResistance = s1.resistance != null && Math.abs(i4.price - s1.resistance) <= nearLevelAtr * i4.atr;
   const confirmed = long ? s15.chochBullish && s15.bosBullish : s15.chochBearish && s15.bosBearish;
   const confluence = long ? nearSupport || s15.failedBreakdown : nearResistance || s15.failedBreakout;
   const emaAligned = long
     ? i4.price > i4.ema20 && i4.ema20 > i4.ema50 && i4.ema50 > i4.ema200
     : i4.price < i4.ema20 && i4.ema20 < i4.ema50 && i4.ema50 < i4.ema200;
-  const volumeAligned = long
-    ? i4.volumeRatio > 1.1 && i4.takerSellRatio < 0.5
-    : i4.volumeRatio > 1.1 && i4.takerSellRatio > 0.5;
+  const volumeAligned = i4.volumeRatio > volumeRatioMin;
   const trendAligned = long ? s4.trend === 'BULLISH' : s4.trend === 'BEARISH';
   const locationAligned = long ? s1.trend === 'BULLISH' : s1.trend === 'BEARISH';
   const reasons = [];
@@ -136,11 +132,7 @@ export function analyzeSkillStructure(market, ctx = {}, { long, params = {}, cos
   if (confirmed) { score += 10; reasons.push('15m CHOCH+BOS确认'); }
   if (confluence) { score += 10; reasons.push(long ? '价格接近支撑或出现假跌破' : '价格接近阻力或出现假突破'); }
   if (emaAligned) { score += 10; reasons.push(long ? 'EMA多头排列' : 'EMA空头排列'); }
-  if (volumeAligned) { score += 10; reasons.push(long ? '放量买盘确认' : '放量卖盘确认'); }
-  if (long ? d.fundingZ < 0 : d.fundingZ > 1) { score += 5; reasons.push('资金费率支持方向'); }
-  if (d.oiChange15m > 0 && (long ? dPriceChange > 0 : dPriceChange < 0)) { score += 5; reasons.push('OI与价格同向'); }
-  if (long ? btc === 'BULLISH' : btc === 'BEARISH') { score += 5; reasons.push('BTC 4H支持方向'); }
-  else if (long ? btc === 'BEARISH' : btc === 'BULLISH') { score -= 15; reasons.push('BTC 4H与方向相反'); }
+  if (volumeAligned) { score += 10; reasons.push('放量确认'); }
   score = clamp(score, 0, 90);
 
   const support = long ? s1.support : s4.support;
@@ -152,7 +144,15 @@ export function analyzeSkillStructure(market, ctx = {}, { long, params = {}, cos
     balance,
     risk: params.riskPerTrade ?? 0.01,
     volatility: i4.atrPercentile,
-    leverage: params.defaultLeverage ?? 5
+    leverage: params.defaultLeverage ?? 5,
+    maxLeverage: params.maxLeverage ?? 20,
+    riskBudgetPct: params.riskBudgetPct,
+    entryBufAtr: params.entryBufAtr ?? 0.25,
+    stopBufferAtr: params.stopBufferAtr ?? 0.35,
+    minStopPct: params.minStopPct ?? 0,
+    targetR: minRealRR,
+    highVolatilityPercentile,
+    mediumVolatilityPercentile
   });
   if (!plan) return wait('SKILL 无法建立有效入场/止损计划，本轮 HOLD。', { structure: structureView(s4, s1, s15), score }, quality);
   if (plan.riskReward >= 3) score += 10;
@@ -164,13 +164,14 @@ export function analyzeSkillStructure(market, ctx = {}, { long, params = {}, cos
   if (long ? s15.chochBullish : s15.chochBearish) entryQuality += 12;
   if (long ? s15.bosBullish : s15.bosBearish) entryQuality += 8;
   if (long ? s15.failedBreakdown : s15.failedBreakout) entryQuality += 10;
-  if (long ? distanceAtr > 2 : distanceAtr < -2) entryQuality -= 35;
-  if (long ? i4.rsi > 70 : i4.rsi < 30) entryQuality -= 20;
-  if (i4.atrPercentile > 0.9) entryQuality -= 15;
+  if (long ? distanceAtr > extendedAtr : distanceAtr < -extendedAtr) entryQuality -= 35;
+  if (long ? distanceAtr > extremeAtr : distanceAtr < -extremeAtr) entryQuality -= 20;
+  if (long ? i4.rsi > rsiExtreme : i4.rsi < 100 - rsiExtreme) entryQuality -= 20;
+  if (i4.atrPercentile > highVolatilityPercentile) entryQuality -= 15;
   entryQuality = clamp(entryQuality, 0, 100);
 
   const oppositeRegime = long ? marketRegime === 'TREND_DOWN' : marketRegime === 'TREND_UP';
-  const extended = long ? distanceAtr >= 2 : distanceAtr <= -2;
+  const extended = long ? distanceAtr >= extendedAtr : distanceAtr <= -extendedAtr;
   const minScore = params[long ? 'bullishScoreMin' : 'bearishScoreMin'] ?? 70;
   const minQuality = params.entryQualityMin ?? 70;
   let decision = long ? 'LONG_ALLOWED' : 'SHORT_ALLOWED';
@@ -178,23 +179,19 @@ export function analyzeSkillStructure(market, ctx = {}, { long, params = {}, cos
   const blockers = [];
   if (oppositeRegime) {
     decision = 'HOLD'; state = 'NO_SETUP'; blockers.push(long ? '4H强下跌趋势' : '4H强上涨趋势');
-  } else if (liquidationRisk === 'HIGH') {
-    decision = 'HOLD'; state = 'RISK_OFF'; blockers.push(long ? '多头爆仓风险高' : '挤空风险高');
   } else if (score < minScore) {
     decision = 'HOLD'; state = 'NO_SETUP'; blockers.push(`${long ? '多头' : '空头'}评分不足${minScore}`);
   } else if (extended || entryQuality < minQuality) {
     decision = 'WAIT_FOR_PULLBACK'; state = 'WAITING_PULLBACK'; blockers.push(long ? '当前位置不适合追涨' : '当前位置不适合追空');
-  } else if (plan.riskReward < 2) {
-    decision = 'HOLD'; state = 'NO_SETUP'; blockers.push('预期盈亏比低于1:2');
+  } else if (plan.riskReward < minRealRR) {
+    decision = 'HOLD'; state = 'NO_SETUP'; blockers.push('预期盈亏比低于1:' + minRealRR);
   } else if (!confirmed) {
     decision = 'WAIT_FOR_CONFIRMATION'; state = 'WAITING_CONFIRMATION'; blockers.push('等待15m CHOCH+BOS');
   }
 
   const risks = [];
-  if (i4.atrPercentile > 0.8) risks.push('波动率偏高，应降低仓位');
-  if (long ? btc === 'BEARISH' : btc === 'BULLISH') risks.push(`BTC 4H ${long ? '偏空' : '偏多'}`);
-  if (long ? i4.rsi > 70 : i4.rsi < 30) risks.push(long ? 'RSI超买，存在回调风险' : 'RSI超卖，存在反弹风险');
-  if (d.oiChange15m < 0) risks.push(long ? 'OI下降，上涨可能以空头平仓为主' : 'OI下降，下跌可能以多头平仓为主');
+  if (i4.atrPercentile > Math.max(0.8, highVolatilityPercentile - 0.1)) risks.push('波动率偏高，应降低仓位');
+  if (long ? i4.rsi > rsiExtreme : i4.rsi < 100 - rsiExtreme) risks.push(long ? 'RSI超买，存在回调风险' : 'RSI超卖，存在反弹风险');
   const planWithMetadata = {
     ...plan,
     maxHoldBars: Math.round(params.maxHoldBars ?? 96),
@@ -216,18 +213,22 @@ export function analyzeSkillStructure(market, ctx = {}, { long, params = {}, cos
     decision,
     state,
     confidence: allowed ? confidence : 0,
+    // Keep the numeric diagnostics alongside the human-readable reason. The
+    // portfolio backtester and production arbitration use these fields to
+    // rank simultaneous candidates; omitting them silently made every
+    // structure signal look like score=0 / entryQuality=0 downstream.
+    score,
+    entryQuality,
     dataQuality: quality.good ? 'GOOD' : 'DEGRADED',
     quality: { ...quality },
     reason,
     risk: risks.length ? `${riskNote} ${risks.join('；')}` : riskNote,
     marketRegime,
     currentPrice: round(i4.price),
-    markPrice: round(d.markPrice),
-    indexPrice: round(d.indexPrice),
-    ...(long ? { bullishProbability: score, longLiquidationRisk: liquidationRisk,
-      doNotChaseAbove: round(i4.ema20 + 2 * i4.atr), primaryLongZone: [plan.entryMin, plan.entryMax] }
-      : { bearishProbability: score, squeezeRisk: liquidationRisk,
-        doNotChaseBelow: round(i4.ema20 - 2 * i4.atr), primaryShortZone: [plan.entryMin, plan.entryMax] }),
+    ...(long ? { bullishProbability: score,
+      doNotChaseAbove: round(i4.ema20 + extendedAtr * i4.atr), primaryLongZone: [plan.entryMin, plan.entryMax] }
+      : { bearishProbability: score,
+        doNotChaseBelow: round(i4.ema20 - extendedAtr * i4.atr), primaryShortZone: [plan.entryMin, plan.entryMax] }),
     secondaryZone: plan.secondaryZone,
     confirmationRequired: '15m CHOCH + BOS + Retest',
     stopLoss: plan.stopLoss,
@@ -240,8 +241,6 @@ export function analyzeSkillStructure(market, ctx = {}, { long, params = {}, cos
     liquidationSafety: plan.liquidationSafety,
     invalidation: `${long ? '1H/4H收盘有效跌破' : '1H/4H收盘有效突破'} ${round(plan.stopLoss)}`,
     indicators: { '4h': i4, '1h': i1, '15m': i15 },
-    derivatives: d,
-    btcEnvironment: btc,
     structure: structureView(s4, s1, s15),
     mainReasons: reasons,
     blockers,

@@ -293,6 +293,11 @@ export function resolveSmartExitRule(smartExit) {
   const pick = (v, fallback) => (Number.isFinite(v) ? v : fallback);
   return {
     enabled: smartExit.enabled !== false,
+    // 根级均线失守独立开关（方案A）：旧快照无该字段时回退跟随总开关 enabled，
+    // 保证所有既有快照/配置行为与引入前完全一致（零变化）。
+    barLevelEnabled: smartExit.barLevelEnabled !== undefined
+      ? smartExit.barLevelEnabled !== false
+      : smartExit.enabled !== false,
     barLevel: smartExit.barLevel !== false,
     maPeriod: Number.isInteger(smartExit.maPeriod) && smartExit.maPeriod > 1 ? smartExit.maPeriod : 20,
     maBreakAtr: pick(smartExit.maBreakAtr, SMART_EXIT.maBreakAtr),
