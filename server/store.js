@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { mergeBinanceDemo } from '../shared/binanceEnvironment.js';
 
 const defaultConfig = {
   binance: {
@@ -242,13 +243,9 @@ export function mergeConfig(current, patch) {
   const patchBinance = patch.binance || {};
   const binance = { ...current.binance, ...patchBinance };
   // 新客户端以 demo 为准；旧客户端显式提交 testnet 时仍应能切换环境。
-  const demo = patchBinance.demo !== undefined
-    ? patchBinance.demo === true
-    : patchBinance.testnet !== undefined
-      ? patchBinance.testnet !== false
-      : binance.demo !== undefined
-        ? binance.demo === true
-        : binance.testnet !== false;
+  // 判定唯一实现在 shared/binanceEnvironment.js（此前为内联四层三元，与
+  // binancePaperSync/routes/binance/前端各写一份，口径易漂移）。
+  const demo = mergeBinanceDemo(patchBinance, binance);
   binance.demo = demo;
   // testnet is retained as a compatibility alias for older config files/API clients.
   binance.testnet = demo;

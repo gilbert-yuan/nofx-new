@@ -24,6 +24,7 @@ import { resolveParams } from '../server/strategies/registry.js';
 import { applyPaperProtectionReview } from '../server/shared/protectionReview.js';
 import { applyPendingReview } from '../server/shared/pendingReview.js';
 import { TradingSimulator } from '../server/tradingSimulator.js';
+import { buildExitRules } from '../server/enhancedAnalysis.js';
 import { PAPER_COSTS } from '../server/research.js';
 import { recommendedLeverage } from '../server/localAnalysis.js';
 import { LONG_ONLY, RISK_RULE } from '../server/shared/strategyGuards.js';
@@ -98,6 +99,14 @@ if (IS_FORMAL_STRATEGY) {
 // 实验开关（仅回测 harness，生产未用）：入场 N 根内浮亏 ≤ -cutoffR 时市价减半一次。
 const EARLY_CUT_R = Number(process.env.NOFX_BT_EARLY_CUT_R ?? 0);
 const EARLY_CUT_BARS = Number(process.env.NOFX_BT_EARLY_CUT_BARS ?? 5);
+// 方案A（仅回测 harness）：enhanced-trend-v1 引擎原生不写 exitRules 快照（无 decoratePlan），
+// 其订单在模拟器里根级均线失守恒关、复核层回退全局 SMART_EXIT —— 因此 smartExit*
+// 参数覆盖（含新独立开关 smartExitBarLevelEnabled）到不了逐根结算。
+// 当实验显式覆盖任一 smartExit* 参数时，把该策略解析后的出场参数快照进 plan.exitRules，
+// 让覆盖值真正生效（p19 形态：根级均线失守开 + 复核层 CLOSE 关）。
+// 不带 smartExit* 覆盖的运行不走此分支，与历史基线逐位一致。线上不经过本文件。
+const NEED_EXIT_SNAPSHOT = !!(PARAM_OVERRIDES
+  && Object.keys(PARAM_OVERRIDES).some(k => String(k).startsWith('smartExit')));
 const meta = JSON.parse(fs.readFileSync(path.join(DIR, 'meta.json'), 'utf8'));
 // 只回测数据完整的币种（补齐替换后，原数据不足的币仍留在磁盘上）
 // 派生语料（bf90-15mrs 等）meta 没有 barsTarget —— 用样本最大根数兜底。
@@ -158,8 +167,11 @@ async function runSymbol(symbol, bars) {
     const now = bars[i].openTime + TF;
 
     // ── A. 推进活跃单一根（simulator 内部：入场/分批止盈/止损止盈/根级均线失守/超时）
+    // 窗口化喂入：根级均线失守需要 MA20/ATR 历史（≥20 根）才能计算 —— 线上复核
+    // 本来就带 80 根窗口，这里补齐同一口径。模拟器从 active.nextTime 起只推进 1 根，
+    // 额外历史仅用于均线序列构建；barLevelMaExit=false（现行配置）时不建序列，零变化。
     if (active && active.nextTime === bars[i].openTime) {
-      const ev = sim.evaluate(active, [bars[i]], now);
+      const ev = sim.evaluate(active, bars.slice(Math.max(0, i - 250), i + 1), now);
       if (ev.status === 'closed') {
         const t = finalizeTrade(active, ev, 'sim');
         if (t) trades.push(t);
@@ -252,6 +264,13 @@ async function runSymbol(symbol, bars) {
             interval: INTERVAL,
             planInterval: STRATEGY_DEF.planInterval || INTERVAL
           })
+        };
+      } else if (IS_FORMAL_STRATEGY && sig?.plan && NEED_EXIT_SNAPSHOT) {
+        // 方案A 实验通道：仅当 smartExit* 覆盖存在时，给 enhanced 订单补该策略的
+        // 出场规则快照（模拟器逐根结算与复核层都从这里读，覆盖值才生效）。
+        sig = {
+          ...sig,
+          plan: { ...sig.plan, exitRules: buildExitRules(STRATEGY_PARAMS) }
         };
       }
     }

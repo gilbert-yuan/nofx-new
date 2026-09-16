@@ -25,6 +25,7 @@ export const API = {
     trades: '/api/binance/trades',
     spotDemoOrders: '/api/binance/spot-demo/orders',
     order: '/api/binance/order',
+    orderDetail: '/api/binance/orderDetail',
     openOrders: '/api/binance/openOrders',
     positions: '/api/binance/positions',
     smoke: '/api/binance/smoke'

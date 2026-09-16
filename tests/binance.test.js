@@ -202,6 +202,44 @@ test('smoke rejects before trading when credentials are missing', async () => {
   assert.equal(traded, false);
 });
 
+test('order detail route resolves environment credentials and returns the normalized remote order', async () => {
+  const { createBinanceRouter } = await import('../server/routes/binance.js');
+  const storeStub = { getConfig: async () => ({ binance: { demoApiKey: 'd', demoSecretKey: 'ds', liveApiKey: 'l', liveSecretKey: 'ls', demo: true } }) };
+  const seen = {};
+  const clientStub = {
+    hasCredentials: () => true,
+    order: async params => {
+      seen.orderParams = params;
+      return { orderId: 42, clientOrderId: 'nofxpaperX', symbol: 'BTCUSDT', side: 'BUY', type: 'LIMIT', status: 'NEW', price: '100', avgPrice: '0', origQty: '0.002', executedQty: '0', time: 1, updateTime: 2 };
+    }
+  };
+  const router = createBinanceRouter({
+    store: storeStub, positionMonitor: {},
+    clientFactory: config => { seen.clientConfig = config; return clientStub; }
+  });
+  const invoke = query => new Promise((resolve, reject) => {
+    const handler = router.stack.find(layer => layer.route?.path === '/api/binance/orderDetail').route.stack[0].handle;
+    const response = { statusCode: 200, body: null, json(body) { this.body = body; resolve(this); return body; }, status(code) { this.statusCode = code; return this; } };
+    handler({ query: Object.fromEntries(new URLSearchParams(query)) }, response, reject);
+  });
+
+  const result = await invoke('environment=demo&symbol=BTCUSDT&orderId=42');
+  assert.equal(seen.clientConfig.apiKey, 'd');          // demo 环境凭证解析
+  assert.equal(seen.orderParams.orderId, 42);
+  assert.equal(result.body.environment, 'demo');
+  assert.equal(result.body.order.orderId, 42);
+  assert.equal(result.body.order.status, 'NEW');
+  assert.equal(result.body.order.origQty, 0.002);
+
+  await invoke('environment=live&symbol=BTCUSDT&clientOrderId=nofxliveX');
+  assert.equal(seen.clientConfig.apiKey, 'l');          // live 环境凭证解析
+  // 真实 client.order({ symbol, clientOrderId }) 内部转 origClientOrderId；stub 透传，验证路由契约传的是 clientOrderId
+  assert.equal(seen.orderParams.clientOrderId, 'nofxliveX');
+
+  await assert.rejects(invoke('environment=spot&symbol=BTCUSDT&orderId=42')); // 非法环境
+  await assert.rejects(invoke('environment=demo&symbol=BTCUSDT'));            // 缺少订单标识
+});
+
 test('clock skew (-1021) resyncs server time and retries the signed request once', async () => {
   const client = new BinanceClient({ apiKey: 'fake', secretKey: 'fake', testnet: true });
   client.timeOffset = 0;

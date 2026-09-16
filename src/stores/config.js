@@ -6,6 +6,8 @@
 import { defineStore } from 'pinia';
 import { reactive, ref } from 'vue';
 import { configApi, strategyApi, binanceApi, marketApi, historyApi } from '../api/client.js';
+// demo/testnet 环境判定与后端共用同一实现（shared/），避免前后端口径漂移
+import { isBinanceDemo } from '../../shared/binanceEnvironment.js';
 
 export const useConfigStore = defineStore('config', () => {
   const config = reactive({
@@ -29,10 +31,6 @@ export const useConfigStore = defineStore('config', () => {
   const syncStatus = ref(null);
   const savedMode = ref('读取配置中');
   const statusError = ref('');
-
-  const isBinanceDemo = value => value?.demo !== undefined
-    ? value.demo === true
-    : value?.testnet !== false;
 
   function updateSavedMode(value) {
     savedMode.value = !value.trader?.enabled

@@ -64,6 +64,50 @@ test('GlobalAutomation - 初始化', () => {
   assert.ok(automation.tasks.positionReview, '持仓复核任务已配置');
 });
 
+test('GlobalAutomation - 4h 结构路径忽略残留衍生品/BTC 配置', async () => {
+  let capturedContext;
+  let derivativeCalls = 0;
+  const automation = new GlobalAutomation({
+    simulation: {},
+    market: {
+      skillContext: async () => {
+        derivativeCalls++;
+        throw new Error('衍生品上下文不应被调用');
+      }
+    },
+    marketDb: {},
+    archive: {},
+    store: {}
+  });
+
+  const result = await automation.runStrategyAnalysis({
+    strategy: {
+      engine: 'super',
+      marketContext: { derivatives: true, btc: '4h', requireFiveMinute: false },
+      analyze: async (_market, ctx) => {
+        capturedContext = ctx;
+        return { action: 'WAIT' };
+      }
+    },
+    symbol: 'BTCUSDT',
+    market: { symbol: 'BTCUSDT', interval: '15m', klines: [] },
+    submit: true,
+    interval: '15m',
+    config: {},
+    strategyPrompt: '',
+    state: { orders: [] },
+    adaptiveConfig: {},
+    adaptiveOverrides: {},
+    localHistory: []
+  });
+
+  assert.equal(result.analysis.action, 'WAIT');
+  assert.equal(derivativeCalls, 0);
+  assert.equal(capturedContext.derivatives, undefined);
+  assert.equal(capturedContext.btcMarket, undefined);
+  assert.deepEqual(capturedContext.skillContext, { requireFiveMinute: false });
+});
+
 test('GlobalAutomation - 任务配置', () => {
   const mockSimulation = {
     read: async () => ({ orders: [] })

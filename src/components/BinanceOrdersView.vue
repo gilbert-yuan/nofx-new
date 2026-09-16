@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue';
 import { binanceApi } from '../api/client.js';
+import { fmt, orderStatusLabel, moneyClass } from '../utils/binance.js';
 
 const mode = ref('simulation');
 const data = ref(null);
@@ -10,10 +11,8 @@ const orderView = ref('fills');
 const symbols = ref('');
 const from = ref('');
 const to = ref('');
-const fmt = value => Number.isFinite(Number(value)) ? Number(value).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 }) : '—';
-const moneyClass = value => Number(value) > 0 ? 'profit' : Number(value) < 0 ? 'loss' : '';
+const orderStatus = orderStatusLabel;
 const displaySymbols = computed(() => data.value?.symbols?.join(', ') || '未发现可同步交易对');
-const orderStatus = value => ({ FILLED: '已成交', NEW: '未成交', PARTIALLY_FILLED: '部分成交', CANCELED: '已撤单', EXPIRED: '已过期', REJECTED: '已拒绝' }[value] || value || '—');
 const scopeText = computed(() => {
   const discovery = data.value?.discovery;
   if (!discovery) return '';

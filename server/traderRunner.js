@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { BinanceClient } from './binanceClient.js';
+import { isBinanceDemo, binanceEnvironmentConfig } from '../shared/binanceEnvironment.js';
 import { analyzeMarkets, makeDecision } from './ai.js';
 import { normalizeDecision, validateOrder } from './risk.js';
 
@@ -52,7 +53,8 @@ export class TraderRunner {
           'Automatic order execution does not support ALL symbols. Use the all-contract research analysis endpoint instead.'
         );
       }
-      const client = new BinanceClient(config.binance);
+      // 与其他币安模块同一套环境凭证解析（demoApiKey/liveApiKey → 主 key 回落）
+      const client = new BinanceClient(binanceEnvironmentConfig(config, isBinanceDemo(config.binance) ? 'demo' : 'live'));
       const account = client.hasCredentials() ? await client.account() : null;
       const positions = client.hasCredentials() ? await client.positions() : [];
       const market = await loadMarket(client, strategy);

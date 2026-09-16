@@ -55,6 +55,8 @@ export const binanceApi = {
   positions: (symbol) => api(API.binance.positions + qs({ symbol })),
   order: (body) => api(API.binance.order, { method: 'POST', body }),
   cancelOrder: (body) => api(API.binance.order, { method: 'DELETE', body }),
+  /** 按绑定关系查币安订单详情：{ environment, symbol, orderId | clientOrderId } */
+  orderDetail: (params) => api(API.binance.orderDetail + qs(params)),
   /** 一键冒烟：远价限价单 → 查单 → 撤单，全链路验证（零成交风险） */
   smoke: (body) => api(API.binance.smoke, { method: 'POST', body })
 };

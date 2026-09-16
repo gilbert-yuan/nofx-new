@@ -1,5 +1,8 @@
 import { BinanceClient } from './binanceClient.js';
 import { binanceMarket } from './binanceMarket.js';
+// 环境判定/凭证解析的唯一实现在 shared/binanceEnvironment.js；这里 re-export 保持旧引用（含测试）兼容。
+import { isBinanceDemo, binanceEnvironmentConfig } from '../shared/binanceEnvironment.js';
+export { binanceEnvironmentConfig };
 
 export const BINANCE_SYNC_ENVIRONMENTS = ['demo', 'live'];
 const CLOSE_ACTIVE = new Set(['submitting', 'submitted', 'new', 'partially_filled', 'unknown']);
@@ -12,17 +15,6 @@ const environmentToggle = environment => environment === 'demo'
   : 'syncPaperOrdersToLive';
 const environmentPrefix = environment => environment === 'demo' ? 'demo' : 'live';
 const environmentLabel = environment => environment === 'demo' ? 'Demo' : '实盘';
-const selectedDemo = binance => binance?.demo !== undefined ? binance.demo === true : binance?.testnet !== false;
-
-export function binanceEnvironmentConfig(config = {}, environment = 'demo') {
-  const binance = config.binance || {};
-  const demo = environment === 'demo';
-  const prefix = environmentPrefix(environment);
-  const selected = selectedDemo(binance) === demo;
-  const apiKey = String(binance[prefix + 'ApiKey'] || (selected ? binance.apiKey : '') || '').trim();
-  const secretKey = String(binance[prefix + 'SecretKey'] || (selected ? binance.secretKey : '') || '').trim();
-  return { ...binance, apiKey, secretKey, demo, testnet: demo, environment };
-}
 
 export function binanceSyncEnabled(config = {}, environment = 'demo') {
   return config?.trader?.[environmentToggle(environment)] === true;
@@ -127,6 +119,14 @@ function isRetryDue(target) {
 function isUnknownExecution(error) {
   return Number(error?.status) === 503
     || /unknown error|execution status is unknown|timed out/i.test(String(error?.message || ''));
+}
+
+// 确定性失败：目标环境（Demo/实盘）的 exchangeInfo 里没有该合约。
+// 典型场景：实盘已上线、Demo 未同步的合约（含中文 ticker 的 meme 永续，
+// 如 龙虾USDT / 牛来USDT / 我踏马来了USDT —— 币安合法 symbol，非脏数据）。
+// 这类错误重试永远不会成功，必须与瞬时错误区分开。
+function isUnsupportedSymbolError(error) {
+  return /不支持合约|Invalid symbol/i.test(String(error?.message || error || ''));
 }
 
 function shortError(error) {
@@ -370,7 +370,8 @@ export class BinancePaperSync {
             && (link.closeOrders || []).some(action => !CLOSE_TERMINAL.has(action.status) && isRetryDue(action))) {
             this.enqueue(order.id, { type: 'submit' });
           }
-          if (['cancelled', 'expired'].includes(order.status) && linkHasRemoteOrder(link) && !['canceled', 'cancelled', 'expired'].includes(link.status)) {
+          if (['cancelled', 'expired'].includes(order.status) && linkHasRemoteOrder(link) && !['canceled', 'cancelled', 'expired', 'cancel_error'].includes(link.status)) {
+            // cancel_error：撤单已失败，按「失败不重试」策略不再重新入队，保留状态与错误信息供人工排查。
             this.enqueue(order.id, { type: 'cancel' });
           }
           if (order.status === 'closed' && (link.status === 'filled' || Number(link.executedQty) > 0) && !(link.closeOrders || []).length) {
@@ -454,6 +455,27 @@ export class BinancePaperSync {
       }
       await this.pullCloseOrders(order, environment, client);
     }
+
+    // 环境错配自愈：所有「已启用同步且已配置凭证」的环境都判定不支持该合约时，
+    // 这笔挂单永远不可能镜像到任何交易所，立即取消终态化 ——
+    // 否则会以 pending 滞留在复核循环里（历史上曾出现 7 笔滞留一天以上的死单）。
+    if (order && order.status === 'pending') {
+      const links = ensureExchangeSync(order);
+      const enabledEnvs = BINANCE_SYNC_ENVIRONMENTS.filter(env =>
+        binanceSyncEnabled(config, env) && binanceEnvironmentHasCredentials(config, env));
+      if (enabledEnvs.length > 0 && enabledEnvs.every(env => links[env]?.status === 'unsupported_symbol')) {
+        const cancelledAt = new Date().toISOString();
+        await this.simulation.mutateLight(state => {
+          const target = state.orders.find(item => item.id === orderId);
+          if (!target || target.status !== 'pending') return;
+          target.status = 'cancelled';
+          target.reason = 'exchange_unsupported';
+          target.error = links[enabledEnvs[0]]?.lastError || '目标交易环境不支持该合约。';
+          target.cancelledAt = cancelledAt;
+        });
+        console.warn(`[paper-sync] ${order.symbol} 所有启用环境均不支持该合约，挂单已自动取消（exchange_unsupported）。`);
+      }
+    }
   }
 
   async registerCloseActions(orderId, events) {
@@ -502,6 +524,13 @@ export class BinancePaperSync {
         return;
       }
       await this.updateLink(order.id, environment, current => {
+        if (isUnsupportedSymbolError(error)) {
+          // 环境无此合约：确定性失败，置终态不再重试（否则每轮 backoff 重试、订单永久滞留 pending）。
+          current.status = 'unsupported_symbol';
+          current.lastError = shortError(error);
+          current.retryAt = null;
+          return;
+        }
         current.status = isUnknownExecution(error) ? 'unknown' : 'submit_error';
         current.lastError = shortError(error);
         current.retryAt = new Date(errorRetryAt(current)).toISOString();
@@ -531,7 +560,8 @@ export class BinancePaperSync {
 
   async cancelEntry(order, environment, client) {
     const link = ensureExchangeSync(order)[environment];
-    if (!linkHasRemoteOrder(link) || ['filled', 'canceled', 'cancelled', 'expired'].includes(link.status)) return;
+    // cancel_error 属终态（失败不重试）：避免历史残留单（远端订单已不存在）每轮轮询无限重发撤单请求。
+    if (!linkHasRemoteOrder(link) || ['filled', 'canceled', 'cancelled', 'expired', 'cancel_error'].includes(link.status)) return;
     await this.updateLink(order.id, environment, current => {
       current.status = 'cancel_requested';
       current.lastError = '';

@@ -76,6 +76,40 @@ test('same-bar entry and exit retain ledger fields and invested margin', () => {
   assert.equal(summary.balance, 10000 + order.net);
 });
 
+test('limit entry defers partial TP on the fill candle and keeps protection first', () => {
+  const account = initialPaperAccount();
+  const limitPlan = {
+    entryMin: 99.5, entryMax: 101, entryLimit: 100,
+    stopLoss: 99, takeProfit: 110, riskUnit: 1, maxHoldBars: 10,
+    exitRules: {
+      smartExit: { enabled: false },
+      partialTp: { enabled: true, tp1R: 1, tp2R: 2, tp1ClosePct: 0.4, tp2ClosePct: 0.4, moveStopToBreakEven: false }
+    }
+  };
+  const record = {
+    id: 'limit-entry-partial-tp',
+    analyses: [{
+      symbol: 'BTCUSDT', marketProvider: 'okx', interval: '1m', eligible: true,
+      positionRecommendation: 'OPEN_LONG', firstEntryAt: new Date(11 * bar).toISOString(),
+      expiresAt: new Date(14 * bar).toISOString(), plan: limitPlan
+    }]
+  };
+  const order = submitPaperOrder(account, record, { symbol: 'BTCUSDT', margin: 100, leverage: 1 }, 10 * bar);
+
+  // The fill candle reaches TP1 after the limit fill, but its post-fill path is unknown.
+  advancePaperOrder(order, [candle(11, { low: 99.5, high: 101.5, close: 100.5 })], 12 * bar);
+  assert.equal(order.status, 'open');
+  assert.equal(order.tpStage, 0, 'TP1 is not manufactured on the limit fill candle');
+  assert.ok(order.entry > 100 && order.entry < 101, 'the limit order filled with modeled slippage');
+
+  // A later candle that touches both a partial target and the stop remains protection-first.
+  advancePaperOrder(order, [candle(12, { low: 98.5, high: 101.5, close: 99 })], 13 * bar);
+  assert.equal(order.status, 'closed');
+  assert.equal(order.reason, 'stop_loss');
+  assert.equal(order.tpStage, 0, 'a stop candle cannot book a partial TP first');
+  assert.equal(order.partialFills || 0, 0);
+});
+
 test('a candle cached before its close is a gap, even after wall time passes', () => {
   const order = pending();
   advancePaperOrder(order, [candle(11, { refreshedAt: new Date(11 * bar + 1000).toISOString() })], 12 * bar);

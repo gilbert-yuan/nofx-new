@@ -1,12 +1,79 @@
 <script setup>
 import { computed, onMounted, ref, watch } from 'vue';
 import { api } from '../api.js';
+import { binanceApi } from '../api/client.js';
 import { fmt, pct, statusLabel as status, reasonLabel as reason, reasonGroup } from '../utils/format.js';
+import { isoDateTime } from '../utils/binance.js';
 
 // 数据状态
 const accountData = ref(null);
 const busy = ref(false);
 const error = ref('');
+
+// 币安绑定订单（exchangeSync.demo / exchangeSync.live）
+const remoteDetail = ref({});   // env -> 远端订单详情（点击「详情」时自动实时拉取）
+const remoteLoading = ref({});  // env -> 是否正在向币安实时查询
+const remoteError = ref('');
+const BINANCE_ENVS = ['demo', 'live'];
+const SYNC_STATUS_LABEL = {
+  not_submitted: '未提交', submitting: '提交中', submitted: '已提交', new: '已挂单',
+  partially_filled: '部分成交', filled: '已成交', canceled: '已撤销', cancelled: '已撤销',
+  expired: '已过期', rejected: '已拒绝', submit_error: '提交失败', cancel_requested: '撤销中',
+  cancel_error: '撤销失败', unknown: '状态未知', skipped_no_fill: '未成交跳过', not_configured: '未配置',
+  unsupported_symbol: '环境不支持该合约'
+};
+const syncStatusLabel = value => SYNC_STATUS_LABEL[value] || value || '—';
+/** 归一化绑定信息：新结构 exchangeSync.{demo,live}，旧订单回落单环境 exchange（Demo） */
+function bindingOf(order, env) {
+  const link = order?.exchangeSync?.[env] || (env === 'demo' ? order?.exchange : null) || null;
+  const bound = Boolean(link && (link.orderId || link.clientOrderId) && !['not_submitted', 'not_configured', 'skipped_closed'].includes(link.status));
+  return { link, bound };
+}
+/** 清空币安侧状态：切换订单 / 重新打开详情时调用，避免展示上一单的残留数据 */
+function resetRemoteOrder() {
+  remoteDetail.value = {};
+  remoteLoading.value = {};
+  remoteError.value = '';
+}
+/**
+ * 向币安实时查询单个环境的订单详情。
+ * 默认复用本次已加载的结果；force=true 强制重新查询（刷新 / 失败重试）。
+ * 订单切换后回来的过期响应会被丢弃，不会污染当前弹窗。
+ */
+async function loadRemoteOrder(order, env, { force = false } = {}) {
+  if (!order) return;
+  const { link, bound } = bindingOf(order, env);
+  if (!bound) return;
+  if (!force && remoteDetail.value[env]) return;
+  remoteLoading.value = { ...remoteLoading.value, [env]: true };
+  remoteError.value = '';
+  try {
+    const result = await binanceApi.orderDetail({
+      environment: env, symbol: order.symbol,
+      orderId: link.orderId || undefined, clientOrderId: link.orderId ? undefined : link.clientOrderId
+    });
+    if (selectedOrder.value?.id !== order.id) return;
+    remoteDetail.value = { ...remoteDetail.value, [env]: result.order };
+  } catch (err) {
+    if (selectedOrder.value?.id !== order.id) return;
+    remoteError.value = env + '：' + err.message;
+  } finally {
+    remoteLoading.value = { ...remoteLoading.value, [env]: false };
+  }
+}
+/** 该订单所有已绑定环境的币安详情并行拉取（点击「详情」时自动触发，无需二次点击） */
+function loadBoundRemoteOrders(order) {
+  return Promise.all(
+    BINANCE_ENVS.filter(env => bindingOf(order, env).bound).map(env => loadRemoteOrder(order, env))
+  );
+}
+/** 绑定区按钮文案：获取中 / 刷新 / 重试（按钮只做刷新与重试，展示不再依赖它） */
+function remoteActionLabel(env) {
+  if (remoteLoading.value[env]) return '获取中…';
+  return remoteDetail.value[env] ? '刷新' : '重试';
+}
+// 切换查看的订单时清空上一单的远端详情（安全网：其他入口改动 selectedOrder 也会重置）
+watch(() => selectedOrder.value?.id, () => resetRemoteOrder());
 
 // 模拟交易相关
 const orderInput = ref({ recordId: '', symbol: '', margin: 100, leverage: 2 });
@@ -198,12 +265,18 @@ async function cancelOrder(orderId) {
   }
 }
 
-// 查看订单详情
+// 查看订单详情：点击即加载完整明细，并自动实时拉取该订单已绑定的币安订单详情
 async function viewOrderDetail(order) {
-  selectedOrder.value = order;
+  if (!order) return;
+  const orderId = order.id;
+  selectedOrder.value = order;   // 先渲染列表行已有字段，避免点击后空白等待
+  resetRemoteOrder();
   try {
-    const detail = await api(`/paper/orders/${encodeURIComponent(order.id)}`);
-    if (selectedOrder.value?.id === order.id) selectedOrder.value = detail;
+    const detail = await api(`/paper/orders/${encodeURIComponent(orderId)}`);
+    if (selectedOrder.value?.id !== orderId) return;   // 已切到别的订单，丢弃本次结果
+    selectedOrder.value = detail;
+    // 绑定关系只在完整明细里（accountSummary 不含 exchangeSync），拿到明细后立即并行拉币安详情
+    await loadBoundRemoteOrders(detail);
   } catch (err) { error.value = err.message; }
 }
 
@@ -541,6 +614,37 @@ onMounted(() => {
           </div>
         </div>
 
+        <div class="detail-section exchange-binding">
+          <h3>币安绑定订单</h3>
+          <div v-for="env in ['demo', 'live']" :key="env" class="binding-row">
+            <div class="binding-head">
+              <b :class="env === 'demo' ? 'binding-demo' : 'binding-live'">{{ env === 'demo' ? 'Demo 测试盘' : '实盘' }}</b>
+              <template v-if="bindingOf(selectedOrder, env).bound">
+                <code>#{{ bindingOf(selectedOrder, env).link.orderId || bindingOf(selectedOrder, env).link.clientOrderId }}</code>
+                <span class="binding-status" :data-status="bindingOf(selectedOrder, env).link.status">{{ syncStatusLabel(bindingOf(selectedOrder, env).link.status) }}</span>
+                <button class="btn-small" :disabled="remoteLoading[env]" @click="loadRemoteOrder(selectedOrder, env, { force: true })">
+                  {{ remoteActionLabel(env) }}
+                </button>
+              </template>
+              <span v-else class="muted">{{ bindingOf(selectedOrder, env).link?.status ? '未绑定（' + syncStatusLabel(bindingOf(selectedOrder, env).link.status) + '）' : '未绑定' }}</span>
+            </div>
+            <small v-if="bindingOf(selectedOrder, env).bound && !remoteLoading[env]" class="binding-meta">
+              {{ bindingOf(selectedOrder, env).link.lastSyncedAt ? '最近同步 ' + isoDateTime(bindingOf(selectedOrder, env).link.lastSyncedAt) : '尚未同步' }}<template v-if="bindingOf(selectedOrder, env).link.lastError"> · {{ bindingOf(selectedOrder, env).link.lastError }}</template>
+            </small>
+            <small v-else-if="remoteLoading[env]" class="binding-meta">正在向币安实时查询该订单详情…</small>
+            <dl v-if="remoteDetail[env]" class="binding-detail">
+              <dt>币安状态</dt><dd><span class="binding-status" :data-status="remoteDetail[env].status">{{ syncStatusLabel(String(remoteDetail[env].status).toLowerCase()) }}</span></dd>
+              <dt>订单类型</dt><dd>{{ remoteDetail[env].type || '—' }} · {{ remoteDetail[env].side || '—' }}</dd>
+              <dt>委托价</dt><dd>{{ remoteDetail[env].price ? fmt(remoteDetail[env].price) : '—' }}</dd>
+              <dt>成交均价</dt><dd>{{ remoteDetail[env].avgPrice ? fmt(remoteDetail[env].avgPrice) : '—' }}</dd>
+              <dt>委托 / 成交量</dt><dd>{{ fmt(remoteDetail[env].origQty) }} / {{ fmt(remoteDetail[env].executedQty) }}</dd>
+              <dt>最近更新</dt><dd>{{ remoteDetail[env].updateTime ? new Date(remoteDetail[env].updateTime).toLocaleString() : '—' }}</dd>
+            </dl>
+          </div>
+          <p v-if="remoteError" class="failed-text" role="alert">{{ remoteError }}</p>
+          <p class="muted binding-note">绑定关系在下单时建立：系统提交挂单到对应环境后记录币安订单 ID；平仓、分批止盈与撤销按同步开关分别执行到 Demo / 实盘。</p>
+        </div>
+
         <div v-if="selectedOrder.analysisContext" class="detail-section">
           <h3>分析上下文</h3>
           <dl>
@@ -784,6 +888,24 @@ onMounted(() => {
   font-family: monospace;
   font-size: 12px;
 }
+
+/* 币安绑定订单区块 */
+.exchange-binding { grid-column: 1 / -1; }
+.binding-row { padding: 10px 0; border-top: 1px solid var(--border-primary); }
+.binding-row:first-of-type { border-top: 0; padding-top: 0; }
+.binding-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.binding-head b { font-size: 13px; }
+.binding-demo { color: var(--long); }
+.binding-live { color: var(--short); }
+.binding-status { padding: 2px 7px; border-radius: 999px; background: var(--bg-elevated); color: var(--text-secondary); font-size: 11px; }
+.binding-status[data-status='filled'], .binding-status[data-status='new'] { color: var(--long); }
+.binding-status[data-status='submit_error'], .binding-status[data-status='cancel_error'], .binding-status[data-status='rejected'] { color: var(--short); }
+.binding-meta { display: block; margin-top: 6px; color: var(--text-tertiary); font-size: 11px; overflow-wrap: anywhere; }
+.binding-detail { margin-top: 10px; display: grid; grid-template-columns: 110px 1fr; gap: 6px; font-size: 12px; }
+.binding-detail dt { color: var(--text-tertiary); }
+.binding-detail dd { margin: 0; color: var(--text-primary); }
+.binding-note { margin: 12px 0 0; font-size: 11px; }
+.failed-text { color: var(--short); font-size: 12px; }
 
 .profit {
   color: var(--profit);

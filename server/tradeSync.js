@@ -1,4 +1,5 @@
 import { BinanceClient } from './binanceClient.js';
+import { isBinanceDemo, binanceEnvironmentConfig } from '../shared/binanceEnvironment.js';
 import { normalizeBinanceUserTrade } from './marketDb.js';
 
 export class TradeSync {
@@ -71,7 +72,9 @@ export class TradeSync {
 
     try {
       const config = await this.store.getConfig();
-      const client = new BinanceClient(config.binance);
+      // 与 routes/binance、模拟单同步同一套环境凭证解析：环境专属 key（demoApiKey/liveApiKey）
+      // 未配置时回落主 apiKey，避免各模块口径不一致。
+      const client = new BinanceClient(binanceEnvironmentConfig(config, isBinanceDemo(config.binance) ? 'demo' : 'live'));
       const datasets = [];
       let fetched = 0;
       let saved = 0;

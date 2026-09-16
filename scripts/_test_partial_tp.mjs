@@ -124,7 +124,7 @@ if (process.env.NOFX_TP_BREAKEVEN === 'true') {
 
   const costDist = ENTRY * netBreakEvenBps({ feeBps: 6, slippageBps: 5 }) / 10000;
   const beStop = ENTRY + costDist;
-  ok(r.status === 'closed' && r.reason === 'stop_loss', '保本线被回撤击穿，以止损收场', `status=${r.status} reason=${r.reason}`);
+  ok(r.status === 'closed' && r.reason === 'break_even_stop', '保本线被回撤击穿，以保本止损收场', `status=${r.status} reason=${r.reason}`);
   ok(near(r.exit, beStop * (1 - SLIP), 1e-9), '出场价 = 净保本线（而非初始止损 99.2）',
     `exit=${r.exit} 保本=${beStop}`);
   ok(r.partialFills === 1, '只成交了 TP1 一批', `got ${r.partialFills}`);
@@ -175,7 +175,7 @@ let oneShot = null;
   const r = createAccountSimulator().evaluate(rec, rows, rows.at(-1).openTime + 60000);
   oneShot = { rec, rows, r, now };
 
-  ok(r.status === 'closed' && r.reason === 'take_profit', '最终在主止盈收尾', `status=${r.status} reason=${r.reason}`);
+  ok(r.status === 'closed' && r.reason === 'partial_take_profit', '最终在主止盈收尾（保留分批止盈机器码）', `status=${r.status} reason=${r.reason}`);
   ok(r.partialFills === 2, 'partialFills=2（TP1 + TP2 各一批）', `got ${r.partialFills}`);
 
   // 手算期望：三批分别按各自档位价成交，各批入场费按份额分摊
@@ -226,7 +226,7 @@ console.log('\n[3] 跨轮续跑：分批进度不得丢失 / 不得重复平同�
   };
   const r2 = createAccountSimulator().evaluate(order2, rows, rows.at(-1).openTime + 60000);
 
-  ok(r2.status === 'closed' && r2.reason === 'take_profit', '第二轮收尾于主止盈', `status=${r2.status} reason=${r2.reason}`);
+  ok(r2.status === 'closed' && r2.reason === 'partial_take_profit', '第二轮收尾于主止盈（保留分批止盈机器码）', `status=${r2.status} reason=${r2.reason}`);
   ok(r2.partialFills === 2, '第二轮后 partialFills=2（未重复平 TP1）', `got ${r2.partialFills}`);
   ok(near(r2.net, oneShot.r.net, 1e-9),
     '两轮跑完与一轮跑完的净盈亏一致（分批状态可安全跨轮）', `two-phase=${r2.net} one-shot=${oneShot.r.net}`);

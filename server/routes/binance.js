@@ -1,13 +1,18 @@
 import express from 'express';
 import { asyncHandler, ApiError } from '../core/errors.js';
 import { BinanceClient } from '../binanceClient.js';
-import { BinanceSpotClient } from '../binanceSpotClient.js';
-import { binanceEnvironmentConfig } from '../binancePaperSync.js';
+import { binanceEnvironmentConfig, isBinanceDemo } from '../../shared/binanceEnvironment.js';
+import { createBinanceSpotDemoRouter } from './binanceSpotDemo.js';
 
-/** 币安账户连接状态 / 连通性测试 / K线复盘 / 测试网交易通道 */
+/**
+ * 币安路由（装配层）：
+ * - USDⓈ-M 合约：连接测试 / 持仓复核 / 成交流水 / 手动下单撤单 / Demo 冒烟
+ * - Spot Demo 订单同步：独立子路由（server/routes/binanceSpotDemo.js）
+ */
 export function createBinanceRouter(container) {
   const router = express.Router();
   const { store, positionMonitor, clientFactory = config => new BinanceClient(config) } = container;
+  router.use(createBinanceSpotDemoRouter({ store }));
 
   router.get('/api/binance/status', asyncHandler(async (req, res) => {
     res.json(await positionMonitor.status());
@@ -15,18 +20,18 @@ export function createBinanceRouter(container) {
 
   router.post('/api/binance/test', asyncHandler(async (req, res) => {
     const config = await store.getConfig();
-    const demo = isBinanceDemo(config.binance);
-    const environment = demo ? 'demo' : 'live';
+    const environment = isBinanceDemo(config.binance) ? 'demo' : 'live';
     const client = new BinanceClient(binanceEnvironmentConfig(config, environment));
     if (!client.hasCredentials()) {
       throw new ApiError('请填写币安 API Key 和 Secret Key。', 422);
     }
     const [balance, positions, mode] = await Promise.all([client.account(), client.positions(), client.positionMode()]);
+    const demo = environment === 'demo';
     res.json({
       ok: true,
       demo,
       testnet: demo,
-      environment: demo ? 'demo' : 'live',
+      environment,
       totalEquity: Number(balance.totalWalletBalance || 0),
       activePositions: positions.filter((p) => Math.abs(Number(p.positionAmt)) > 0).length,
       positionMode: mode.dualSidePosition ? 'hedge' : 'one-way'
@@ -35,61 +40,6 @@ export function createBinanceRouter(container) {
 
   router.post('/api/binance/review', asyncHandler(async (req, res) => {
     res.json(await positionMonitor.reviewAfterKlines({ interval: '15m' }));
-  }));
-
-  router.get('/api/binance/spot-demo/orders', asyncHandler(async (req, res) => {
-    const config = await store.getConfig();
-    const spotConfig = {
-      apiKey: config.binance?.spotApiKey || config.binance?.apiKey,
-      secretKey: config.binance?.spotSecretKey || config.binance?.secretKey,
-      demo: true,
-      proxyUrl: config.binance?.proxyUrl
-    };
-    const client = new BinanceSpotClient(spotConfig);
-    if (!client.hasCredentials()) throw new ApiError('请填写 Binance Spot Demo API Key 和 Secret Key。', 422);
-
-    const from = parseSpotDate(req.query.from, '开始日期');
-    const to = parseSpotDate(req.query.to, '结束日期', true);
-    if (from && to && from > to) throw new ApiError('开始日期不能晚于结束日期。', 422);
-    const limit = Math.min(1000, Math.max(1, Number(req.query.limit) || 1000));
-    const requested = parseSpotSymbols(req.query.symbols);
-    const automatic = requested.length === 0 || requested.includes('ALL');
-    const discovery = automatic ? await discoverSpotDemoSymbols(client) : { mode: 'manual', symbols: requested, candidateCount: requested.length, sources: [] };
-    const symbolCandidates = automatic ? [...discovery.symbols, ...requested.filter(symbol => symbol !== 'ALL')] : requested;
-    const symbols = [...new Set(symbolCandidates.map(normalizeSymbol))];
-    const windows = spotTimeWindows(from, to);
-
-    const datasets = await mapWithConcurrency(symbols, 3, async symbol => {
-      const results = await mapWithConcurrency(windows, 1, async window => {
-        const range = { symbol, limit, ...window };
-        const [trades, orders] = await Promise.all([client.myTrades(range), client.allOrders(range)]);
-        return { trades, orders };
-      });
-      return {
-        symbol,
-        trades: uniqueBy(results.flatMap(result => result.trades), row => `${row.id}:${row.orderId}`),
-        orders: uniqueBy(results.flatMap(result => result.orders), row => `${row.orderId}`)
-      };
-    });
-    const trades = datasets.flatMap(({ symbol, trades: rows }) => rows.map(row => normalizeSpotTrade(symbol, row)))
-      .sort((a, b) => a.time - b.time);
-    const historyOrders = datasets.flatMap(({ symbol, orders: rows }) => rows.map(row => normalizeSpotOrder(symbol, row)))
-      .sort((a, b) => b.time - a.time);
-    const report = summarizeSpotTrades(trades);
-    const reachedPerWindowLimit = datasets.some(dataset => dataset.trades.length >= limit || dataset.orders.length >= limit);
-    res.json({
-      ok: true,
-      product: 'spot',
-      demo: true,
-      baseUrl: 'https://demo-api.binance.com/api',
-      symbols,
-      syncedAt: new Date().toISOString(),
-      trades,
-      orders: report.orders,
-      historyOrders,
-      discovery: { ...discovery, mode: automatic ? 'auto-account' : 'manual', windows: windows.length, reachedPerWindowLimit },
-      summary: { ...report.summary, historyOrders: historyOrders.length }
-    });
   }));
 
   router.get('/api/binance/trades', asyncHandler(async (req, res) => {
@@ -107,9 +57,12 @@ export function createBinanceRouter(container) {
       .filter(row => (!from || row.time >= from) && (!to || row.time <= to))
       .sort((a, b) => a.time - b.time);
     const orders = summarizeTrades(trades);
-    res.json({ ok: true, demo: Boolean(config.binance?.demo), testnet: Boolean(config.binance?.testnet), symbols, syncedAt: new Date().toISOString(), trades, orders, summary: summarizeTotals(orders) });
+    const demo = isBinanceDemo(config.binance);
+    res.json({ ok: true, demo, testnet: demo, symbols, syncedAt: new Date().toISOString(), trades, orders, summary: summarizeTotals(orders) });
   }));
+
   // ── 测试网交易通道（限价/市价下单、撤单、挂单、持仓）──
+  // 统一入口：按当前选中环境解析凭证（demoApiKey/liveApiKey → 主 apiKey 回落）。
   const tradeClient = async () => {
     const config = await store.getConfig();
     const environment = isBinanceDemo(config.binance) ? 'demo' : 'live';
@@ -145,6 +98,47 @@ export function createBinanceRouter(container) {
       ok: true,
       positions: positions.filter(p => Math.abs(Number(p.positionAmt)) > 0),
       positionMode: mode?.dualSidePosition ? 'hedge' : 'one-way'
+    });
+  }));
+
+  /**
+   * 按绑定关系查询币安订单详情（模拟单 exchangeSync.demo/live.orderId ↔ 币安 orderId）。
+   * Query: environment=demo|live（必填）、symbol（必填）、orderId 或 clientOrderId（二选一）。
+   * 环境 demo/实盘走同一套凭证解析（binanceEnvironmentConfig）。
+   */
+  router.get('/api/binance/orderDetail', asyncHandler(async (req, res) => {
+    const environment = String(req.query.environment || '').toLowerCase();
+    if (!['demo', 'live'].includes(environment)) throw new ApiError('environment 必须是 demo 或 live。', 422);
+    const symbol = normalizeSymbol(req.query.symbol);
+    const orderId = Number(req.query.orderId);
+    const clientOrderId = req.query.clientOrderId ? String(req.query.clientOrderId) : undefined;
+    if (!(Number.isInteger(orderId) && orderId > 0) && !clientOrderId) {
+      throw new ApiError('必须提供 orderId 或 clientOrderId。', 422);
+    }
+    const config = await store.getConfig();
+    const client = clientFactory(binanceEnvironmentConfig(config, environment));
+    if (!client.hasCredentials()) throw new ApiError(`未配置 Binance ${environment === 'demo' ? 'Demo' : '实盘'} API Key / Secret Key。`, 422);
+    const remote = Number.isInteger(orderId) && orderId > 0
+      ? await client.order({ symbol, orderId })
+      : await client.order({ symbol, clientOrderId });
+    res.json({
+      ok: true,
+      environment,
+      order: {
+        orderId: remote.orderId ?? null,
+        clientOrderId: remote.clientOrderId || '',
+        symbol: remote.symbol || symbol,
+        side: remote.side || '',
+        type: remote.type || '',
+        status: remote.status || '',
+        price: Number(remote.price || 0),
+        avgPrice: Number(remote.avgPrice || 0),
+        origQty: Number(remote.origQty || remote.origQuantity || 0),
+        executedQty: Number(remote.executedQty || 0),
+        reduceOnly: remote.reduceOnly === true,
+        time: Number(remote.time || 0),
+        updateTime: Number(remote.updateTime || 0)
+      }
     });
   }));
 
@@ -202,7 +196,7 @@ export function createBinanceRouter(container) {
       const placed = await step('2/5 挂远价限价单', () => client.limitOrder({ symbol, side: 'BUY', quantity, price: farPrice }));
       orderId = Number(placed.orderId);
 
-      const found = await step('3/5 查挂单', async () => {
+      await step('3/5 查挂单', async () => {
         const open = await client.openOrders(symbol);
         const hit = open.find(o => Number(o.orderId) === orderId);
         if (!hit) throw new ApiError(`挂单 ${orderId} 未出现在 openOrders`, 502);
@@ -227,156 +221,22 @@ export function createBinanceRouter(container) {
     }
   }));
 
-
-function isBinanceDemo(config = {}) {
-  return config.demo !== undefined ? config.demo === true : config.testnet !== false;
-}
-
-const SPOT_DAY_MS = 24 * 60 * 60 * 1000;
-const SPOT_AUTO_SYMBOL_LIMIT = 120;
-const SPOT_PREFERRED_QUOTES = new Set(['USDT', 'USDC', 'FDUSD', 'BUSD', 'BTC', 'ETH', 'BNB']);
-
-function parseSpotSymbols(value) {
-  return [...new Set(String(value || '').split(',')
-    .map(item => String(item).trim().toUpperCase()).filter(Boolean))];
-}
-
-function parseSpotDate(value, label, endOfDay = false) {
-  if (value === undefined || value === null || String(value).trim() === '') return null;
-  const timestamp = Date.parse(String(value));
-  if (!Number.isFinite(timestamp)) throw new ApiError(`${label}格式无效。`, 422);
-  return endOfDay ? timestamp + SPOT_DAY_MS - 1 : timestamp;
-}
-
-function spotTimeWindows(from, to) {
-  if (!from && !to) return [{}];
-  const start = from || Math.max(0, to - SPOT_DAY_MS + 1);
-  const end = to || Date.now();
-  const windows = [];
-  for (let cursor = start; cursor <= end; cursor += SPOT_DAY_MS) {
-    windows.push({ startTime: cursor, endTime: Math.min(end, cursor + SPOT_DAY_MS - 1) });
+  function normalizeTrade(symbol, row) {
+    return { symbol, tradeId: Number(row.id), orderId: Number(row.orderId), time: Number(row.time), side: String(row.side || '').toUpperCase(), price: Number(row.price), quantity: Number(row.qty), quoteQuantity: Number(row.quoteQty || Number(row.price) * Number(row.qty)), realizedPnl: Number(row.realizedPnl || 0), commission: Number(row.commission || 0), commissionAsset: row.commissionAsset || 'USDT', positionSide: row.positionSide || 'BOTH', maker: Boolean(row.maker) };
   }
-  return windows;
-}
-
-async function discoverSpotDemoSymbols(client) {
-  const [account, exchangeInfo, openOrders, orderLists] = await Promise.all([
-    client.account({ omitZeroBalances: true }),
-    client.exchangeInfo(),
-    client.openOrders().catch(() => []),
-    client.allOrderLists().catch(() => [])
-  ]);
-  const activeAssets = new Set((account.balances || [])
-    .filter(balance => Number(balance.free || 0) > 0 || Number(balance.locked || 0) > 0)
-    .map(balance => String(balance.asset || '').toUpperCase()).filter(Boolean));
-  const eligible = (exchangeInfo.symbols || []).filter(row => row.status === 'TRADING' && row.isSpotTradingAllowed !== false);
-  const accountSymbols = eligible
-    .filter(row => activeAssets.has(row.baseAsset) && (SPOT_PREFERRED_QUOTES.has(row.quoteAsset) || activeAssets.has(row.quoteAsset)))
-    .map(row => row.symbol);
-  const openSymbols = (openOrders || []).map(row => row.symbol).filter(Boolean);
-  const orderListSymbols = (orderLists || []).map(row => row.symbol).filter(Boolean);
-  const symbols = [...new Set([...openSymbols, ...orderListSymbols, ...accountSymbols])].sort();
-  return {
-    symbols: symbols.slice(0, SPOT_AUTO_SYMBOL_LIMIT),
-    candidateCount: symbols.length,
-    truncated: symbols.length > SPOT_AUTO_SYMBOL_LIMIT,
-    activeAssets: [...activeAssets].sort(),
-    sources: ['当前挂单', '订单列表', '非零账户资产']
-  };
-}
-
-async function mapWithConcurrency(items, concurrency, mapper) {
-  const result = new Array(items.length);
-  let cursor = 0;
-  const worker = async () => {
-    while (cursor < items.length) {
-      const index = cursor;
-      cursor += 1;
-      result[index] = await mapper(items[index], index);
+  function summarizeTrades(trades) {
+    const groups = new Map();
+    for (const trade of trades) {
+      const key = trade.symbol + ':' + trade.orderId;
+      const item = groups.get(key) || { id: key, symbol: trade.symbol, orderId: trade.orderId, buyQty: 0, sellQty: 0, buyQuote: 0, sellQuote: 0, fees: 0, realizedPnl: 0, firstTime: trade.time, lastTime: trade.time, fills: 0 };
+      if (trade.side === 'BUY') { item.buyQty += trade.quantity; item.buyQuote += trade.quoteQuantity; } else { item.sellQty += trade.quantity; item.sellQuote += trade.quoteQuantity; }
+      item.fees += trade.commission; item.realizedPnl += trade.realizedPnl; item.firstTime = Math.min(item.firstTime, trade.time); item.lastTime = Math.max(item.lastTime, trade.time); item.fills += 1; groups.set(key, item);
     }
-  };
-  await Promise.all(Array.from({ length: Math.min(Math.max(1, concurrency), items.length) }, worker));
-  return result;
-}
+    return [...groups.values()].map(item => ({ ...item, buyPrice: item.buyQty ? item.buyQuote / item.buyQty : null, sellPrice: item.sellQty ? item.sellQuote / item.sellQty : null, netPnl: item.realizedPnl - item.fees, status: item.buyQty && item.sellQty ? 'closed' : 'filled' })).sort((a, b) => b.lastTime - a.lastTime);
+  }
+  function summarizeTotals(orders) {
+    return orders.reduce((total, order) => ({ orders: total.orders + 1, closed: total.closed + (order.status === 'closed' ? 1 : 0), fees: total.fees + order.fees, realizedPnl: total.realizedPnl + order.realizedPnl, netPnl: total.netPnl + order.netPnl, buyQuote: total.buyQuote + order.buyQuote, sellQuote: total.sellQuote + order.sellQuote, totalQuote: total.totalQuote + order.buyQuote + order.sellQuote }), { orders: 0, closed: 0, fees: 0, realizedPnl: 0, netPnl: 0, buyQuote: 0, sellQuote: 0, totalQuote: 0 });
+  }
 
-function uniqueBy(rows, key) {
-  const seen = new Map();
-  for (const row of rows || []) seen.set(key(row), row);
-  return [...seen.values()];
-}
-function normalizeSpotTrade(symbol, row) {
-  return {
-    symbol, tradeId: Number(row.id), orderId: Number(row.orderId), time: Number(row.time),
-    side: row.isBuyer ? 'BUY' : 'SELL', price: Number(row.price), quantity: Number(row.qty),
-    quoteQuantity: Number(row.quoteQty || Number(row.price) * Number(row.qty)),
-    commission: Number(row.commission || 0), commissionAsset: row.commissionAsset || '',
-    maker: Boolean(row.isMaker)
-  };
-}
-function normalizeSpotOrder(symbol, row) {
-  return {
-    symbol, orderId: Number(row.orderId), clientOrderId: row.clientOrderId || '',
-    time: Number(row.updateTime || row.time || 0), side: String(row.side || '').toUpperCase(),
-    type: String(row.type || ''), status: String(row.status || ''),
-    price: Number(row.price || 0), avgPrice: Number(row.executedQty) > 0 ? Number(row.cummulativeQuoteQty || 0) / Number(row.executedQty) : 0,
-    origQty: Number(row.origQty || 0), executedQty: Number(row.executedQty || 0),
-    quoteOrderQty: Number(row.cummulativeQuoteQty || 0), reduceOnly: false, closePosition: false
-  };
-}
-function summarizeSpotTrades(trades) {
-  const groups = new Map();
-  const inventory = new Map();
-  const summary = { orders: 0, closed: 0, fees: 0, realizedPnl: 0, netPnl: 0, buyQuote: 0, sellQuote: 0, totalQuote: 0 };
-  const feeInQuote = trade => {
-    if (trade.commissionAsset === 'USDT' || trade.commissionAsset === 'USDC' || trade.commissionAsset === 'BUSD') return trade.commission;
-    return trade.commission * trade.price;
-  };
-  for (const trade of trades) {
-    const key = trade.symbol + ':' + trade.orderId;
-    const item = groups.get(key) || { id: key, symbol: trade.symbol, orderId: trade.orderId, buyQty: 0, sellQty: 0, buyQuote: 0, sellQuote: 0, fees: 0, realizedPnl: 0, firstTime: trade.time, lastTime: trade.time, fills: 0 };
-    const fee = feeInQuote(trade);
-    const isBuy = trade.side === 'BUY';
-    if (isBuy) {
-      item.buyQty += trade.quantity; item.buyQuote += trade.quoteQuantity;
-      const lots = inventory.get(trade.symbol) || [];
-      lots.push({ quantity: trade.quantity, price: trade.price });
-      inventory.set(trade.symbol, lots);
-      summary.buyQuote += trade.quoteQuantity;
-    } else {
-      item.sellQty += trade.quantity; item.sellQuote += trade.quoteQuantity;
-      summary.sellQuote += trade.quoteQuantity;
-      let remaining = trade.quantity;
-      const lots = inventory.get(trade.symbol) || [];
-      while (remaining > 0 && lots.length) {
-        const lot = lots[0];
-        const matched = Math.min(remaining, lot.quantity);
-        const pnl = (trade.price - lot.price) * matched;
-        item.realizedPnl += pnl; summary.realizedPnl += pnl;
-        lot.quantity -= matched; remaining -= matched;
-        if (lot.quantity <= 1e-12) lots.shift();
-      }
-      inventory.set(trade.symbol, lots);
-    }
-    item.fees += fee; summary.fees += fee; item.firstTime = Math.min(item.firstTime, trade.time); item.lastTime = Math.max(item.lastTime, trade.time); item.fills += 1; groups.set(key, item);
-  }
-  const orders = [...groups.values()].map(item => ({ ...item, buyPrice: item.buyQty ? item.buyQuote / item.buyQty : null, sellPrice: item.sellQty ? item.sellQuote / item.sellQty : null, netPnl: item.realizedPnl - item.fees, status: item.buyQty && item.sellQty ? 'closed' : 'filled' })).sort((a, b) => b.lastTime - a.lastTime);
-  summary.orders = orders.length; summary.closed = orders.filter(order => order.status === 'closed').length; summary.totalQuote = summary.buyQuote + summary.sellQuote; summary.netPnl = summary.realizedPnl - summary.fees;
-  return { orders, summary };
-}
-function normalizeTrade(symbol, row) {
-  return { symbol, tradeId: Number(row.id), orderId: Number(row.orderId), time: Number(row.time), side: String(row.side || '').toUpperCase(), price: Number(row.price), quantity: Number(row.qty), quoteQuantity: Number(row.quoteQty || Number(row.price) * Number(row.qty)), realizedPnl: Number(row.realizedPnl || 0), commission: Number(row.commission || 0), commissionAsset: row.commissionAsset || 'USDT', positionSide: row.positionSide || 'BOTH', maker: Boolean(row.maker) };
-}
-function summarizeTrades(trades) {
-  const groups = new Map();
-  for (const trade of trades) {
-    const key = trade.symbol + ':' + trade.orderId;
-    const item = groups.get(key) || { id: key, symbol: trade.symbol, orderId: trade.orderId, buyQty: 0, sellQty: 0, buyQuote: 0, sellQuote: 0, fees: 0, realizedPnl: 0, firstTime: trade.time, lastTime: trade.time, fills: 0 };
-    if (trade.side === 'BUY') { item.buyQty += trade.quantity; item.buyQuote += trade.quoteQuantity; } else { item.sellQty += trade.quantity; item.sellQuote += trade.quoteQuantity; }
-    item.fees += trade.commission; item.realizedPnl += trade.realizedPnl; item.firstTime = Math.min(item.firstTime, trade.time); item.lastTime = Math.max(item.lastTime, trade.time); item.fills += 1; groups.set(key, item);
-  }
-  return [...groups.values()].map(item => ({ ...item, buyPrice: item.buyQty ? item.buyQuote / item.buyQty : null, sellPrice: item.sellQty ? item.sellQuote / item.sellQty : null, netPnl: item.realizedPnl - item.fees, status: item.buyQty && item.sellQty ? 'closed' : 'filled' })).sort((a, b) => b.lastTime - a.lastTime);
-}
-function summarizeTotals(orders) {
-  return orders.reduce((total, order) => ({ orders: total.orders + 1, closed: total.closed + (order.status === 'closed' ? 1 : 0), fees: total.fees + order.fees, realizedPnl: total.realizedPnl + order.realizedPnl, netPnl: total.netPnl + order.netPnl, buyQuote: total.buyQuote + order.buyQuote, sellQuote: total.sellQuote + order.sellQuote, totalQuote: total.totalQuote + order.buyQuote + order.sellQuote }), { orders: 0, closed: 0, fees: 0, realizedPnl: 0, netPnl: 0, buyQuote: 0, sellQuote: 0, totalQuote: 0 });
-}  return router;
+  return router;
 }
