@@ -17,6 +17,7 @@ import { createStrategyRuntime } from './strategies/index.js';
 import { RISK_RULE } from './shared/strategyGuards.js';
 import { normalizeCloseReason, isStopReason } from '../shared/closeReasons.js';
 import { accountSummary, isTransientOrderError } from './simulatedAccount.js';
+import { buildOpportunityReport as createOpportunityReport } from './opportunityReport.js';
 
 // ── 同币种冷却（2026-09-11 优化：由「仅止损后」扩展到「任意平仓后」）────────
 // 依据：2711 笔真实成交 + 真实 1m K 线回放，统一出场（2ATR 止损/3R 止盈/1R 后移动 1.5ATR/120 根）。
@@ -83,6 +84,9 @@ export class GlobalAutomation {
       totalReviews: 0,
       errors: []
     };
+    // 最近发现的有效策略机会，既供自动化页面展示，也保留给重启后的首次状态读取回填。
+    this.opportunities = [];
+    this.opportunitiesHydrated = false;
     // 4h 结构策略不使用衍生品/BTC 环境上下文。
     // 相关拉取链路保留在下方注释中，避免旧配置或默认值重新启用。
     // this.skillContextCache = new Map();
@@ -429,9 +433,23 @@ export class GlobalAutomation {
             if (strategy.engine !== 'ai') signal.confidenceType = 'rule_strength';
           }
           if (!shouldContinue()) return;
-          await this.archive.save(record);
           const signal = record.analyses[0];
           outcome.signals.push(signal);
+
+          // 现有策略先给出初步方向；只有有效 BUY/SELL 计划才进入独立二次确认，
+          // 避免把 WAIT 或数据不足的币种伪装成机会。
+          if (signal.eligible && signal.plan && ['BUY', 'SELL'].includes(signal.action)) {
+            const opportunity = await this.createOpportunityReport({ symbol, signal, market: planMarket, strategy });
+            if (opportunity) {
+              signal.opportunityReport = opportunity;
+              this.rememberOpportunity(opportunity);
+              console.log(`[GlobalAutomation][机会] ${opportunity.summary}`);
+            }
+          }
+
+          // 机会报告是在归一化后追加的，必须保存更新后的完整 record，
+          // 否则 archive 中会只有策略计划而没有二次确认结论。
+          await this.archive.save(record);
           if (!submit) return { symbol, success: true };
 
           // P3：统计本轮被哪道闸门挡住（不合格时才有拦截原因）
@@ -539,6 +557,45 @@ export class GlobalAutomation {
     return { analysis: analysis || null, auxMarkets: ctx.auxMarkets || {} };
   }
 
+  async createOpportunityReport({ symbol, signal, market, strategy }) {
+    let marketContext = {};
+    if (typeof this.market.opportunityContext === 'function') {
+      try {
+        marketContext = await this.market.opportunityContext(symbol);
+      } catch (error) {
+        marketContext = { errors: { opportunityContext: error.message } };
+      }
+    } else {
+      marketContext = { errors: { opportunityContext: '行情源未提供衍生品机会上下文。' } };
+    }
+    return createOpportunityReport({ signal, market, marketContext, strategy });
+  }
+
+  rememberOpportunity(report) {
+    if (!report?.symbol) return;
+    this.opportunitiesHydrated = true;
+    const key = `${report.symbol}:${report.strategyId || ''}:${report.dataAsOf || report.generatedAt}`;
+    this.opportunities = [report, ...this.opportunities.filter(item =>
+      `${item.symbol}:${item.strategyId || ''}:${item.dataAsOf || item.generatedAt}` !== key
+    )].slice(0, 50);
+  }
+
+  async getOpportunities(limit = 20) {
+    const count = Math.min(50, Math.max(1, Math.trunc(Number(limit) || 20)));
+    if (!this.opportunitiesHydrated) {
+      this.opportunitiesHydrated = true;
+      try {
+        const records = await this.archive?.list?.({ limit: 200 }) || [];
+        this.opportunities = records.flatMap(record => (record.analyses || [])
+          .map(signal => signal.opportunityReport)
+          .filter(Boolean)).slice(0, 50);
+      } catch {
+        // 机会展示不能阻塞自动化状态接口；下一次新机会仍会进入内存队列。
+      }
+    }
+    return this.opportunities.slice(0, count);
+  }
+
   /**
    * 风控闸门 + 按策略落单。
    * 同币种未平仓不重复开仓；止损后 / 任意平仓后的冷却期同样拦截。
@@ -584,6 +641,18 @@ export class GlobalAutomation {
       const leverage = Number.isFinite(strategyLeverage) && strategyLeverage > 0
         ? Math.max(1, Math.min(RISK_RULE.maxLeverage, Math.floor(strategyLeverage)))
         : recommendedLeverage(signal.plan, signal.action === 'BUY' ? 'OPEN_LONG' : 'OPEN_SHORT');
+      // 策略级并发上限（09-17 平衡档上线）：多策略共用一个资金池，但按策略 id 各自限仓。
+      // plan.maxPositions 缺省（旧策略/未配置）时不限制 —— 与既有行为完全一致。
+      const strategyMaxPositions = Math.floor(Number(signal.plan?.maxPositions));
+      if (Number.isFinite(strategyMaxPositions) && strategyMaxPositions >= 1) {
+        const openForStrategy = (simState.orders || [])
+          .filter(o => o.analysisContext?.strategyId === signal.strategyId
+            && (o.status === 'pending' || o.status === 'open')).length;
+        if (openForStrategy >= strategyMaxPositions) {
+          console.log(`[GlobalAutomation][${signal.strategyId}] ${symbol} 并发持仓 ${openForStrategy}/${strategyMaxPositions} 已满，跳过开仓`);
+          return { symbol, success: true, action: 'SKIP_MAX_POSITIONS' };
+        }
+      }
       let explicitMargin = null;
       const skillRisk = Number(signal.plan?.riskPerTrade);
       const skillDailyLoss = Number(signal.plan?.maxDailyLoss);
@@ -619,8 +688,14 @@ export class GlobalAutomation {
         automatic: true,
         strategyId: signal.strategyId
       };
+      // 买入金额：策略级 plan.autoMarginPct（如 4H 均值回归平衡档 0.015）优先 ——
+      // 多策略共用一个资金池，各策略用各自回测验证过的仓位口径（按当前共享权益计）；
+      // 缺省回落全局 NOFX_AUTO_MARGIN_PCT（enhanced-trend 等旧策略行为不变）。
+      const strategyMarginPct = Number(signal.plan?.autoMarginPct);
       if (explicitMargin != null) submitInput.margin = explicitMargin;
-      else submitInput.autoMarginPct = AUTO_MARGIN_PCT;
+      else if (Number.isFinite(strategyMarginPct) && strategyMarginPct > 0 && strategyMarginPct <= 1) {
+        submitInput.autoMarginPct = strategyMarginPct;
+      } else submitInput.autoMarginPct = AUTO_MARGIN_PCT;
       await this.simulation.submit(submitInput);
 
       console.log(`[GlobalAutomation][${signal.strategyId || 'strategy'}] ${symbol} 已提交 ${signal.action} 订单，杠杆 ${leverage}x`);
@@ -959,6 +1034,7 @@ export class GlobalAutomation {
       tasks: this.tasks,
       stats: this.stats,
       account: accountStatus,
+      opportunities: await this.getOpportunities(20),
       uptime: process.uptime()
     };
   }
@@ -1012,6 +1088,16 @@ export function registerGlobalAutomationRoutes(app, automation) {
   app.get('/api/automation/status', async (req, res, next) => {
     try {
       res.json(await automation.getStatus());
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // 最近有效策略机会：包含币种、价格区间、止损止盈和超级确认结论。
+  app.get('/api/automation/opportunities', async (req, res, next) => {
+    try {
+      const limit = Math.min(50, Math.max(1, Math.trunc(Number(req.query.limit) || 20)));
+      res.json({ asOf: new Date().toISOString(), opportunities: await automation.getOpportunities(limit) });
     } catch (error) {
       next(error);
     }

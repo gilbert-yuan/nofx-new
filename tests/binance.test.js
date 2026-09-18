@@ -164,7 +164,8 @@ test('manual order route forwards reduceOnly and positions expose the account mo
     hasCredentials: () => true,
     marketOrder: async args => { submitted = args; return { orderId: 21, status: 'FILLED' }; },
     positions: async () => [{ symbol: 'BTCUSDT', positionAmt: '0.001' }],
-    positionMode: async () => ({ dualSidePosition: false })
+    positionMode: async () => ({ dualSidePosition: false }),
+    dualSidePosition: async () => false
   };
   const router = createBinanceRouter({ store: storeStub, positionMonitor: {}, clientFactory: () => clientStub });
   const invoke = (path, req) => new Promise((resolve, reject) => {
@@ -268,12 +269,20 @@ test('base-asset quantities and TP/SL obey Binance filters; invalid numbers neve
   assert.equal(protectionLevels({ stopLoss: -1, takeProfit: 110 }, 100, true, instrument), null);
 });
 
-test('automation is disabled without explicit Binance activation and refuses hedge accounts', async () => {
+test('automation is disabled without explicit Binance activation and supports hedge accounts', async () => {
   const monitor = new BinancePositionMonitor({ store: store({ trader: {} }), marketDb: {}, clientFactory: () => { throw new Error('must not connect'); } });
   assert.equal((await monitor.reviewAfterKlines({ interval: '15m' })).status, 'disabled');
-  monitor.store = store();
-  monitor.clientFactory = () => ({ hasCredentials: () => true, positionMode: async () => ({ dualSidePosition: true }) });
-  assert.equal((await monitor.reviewAfterKlines({ interval: '15m' })).status, 'blocked');
+  // 双向（Hedge）账户不再被拒绝：下单 positionSide 跟随订单方向自适应，复核与开平仓可继续执行。
+  const hedgeStore = store();
+  hedgeStore.getStrategy = async () => ({});
+  monitor.store = hedgeStore;
+  monitor.clientFactory = () => ({
+    hasCredentials: () => true,
+    positionMode: async () => ({ dualSidePosition: true }),
+    dualSidePosition: async () => true,
+    positions: async () => []
+  });
+  assert.equal((await monitor.reviewAfterKlines({ interval: '15m' })).status, 'ok');
 });
 
 test('one candle claim survives a new monitor instance', async () => {
@@ -300,4 +309,42 @@ test('dry-run entry makes no mutation and cumulative exposure blocks a second pr
   assert.equal(action.status, 'rejected');
   args.decision.confidence = NaN;
   assert.equal((await monitor.applyEntry(args)).status, 'rejected');
+});
+
+test('hedge accounts send positionSide and drop reduceOnly; one-way accounts keep reduceOnly', async () => {
+  // 币安规则：positionSide 与 reduceOnly **互斥** ——
+  // 单向账户靠 reduceOnly 平仓；双向账户必须用 positionSide=LONG/SHORT 指明操作哪一侧，且不允许 reduceOnly。
+  const client = new BinanceClient({ apiKey: 'k', secretKey: 's', demo: true });
+  const sent = [];
+  client.signedRequest = async (method, endpoint, params) => { sent.push(params); return { orderId: 1, status: 'NEW' }; };
+
+  await client.limitOrder({ symbol: 'BTCUSDT', side: 'BUY', quantity: 1, price: 100, reduceOnly: true, positionSide: 'LONG' });
+  assert.equal(sent[0].positionSide, 'LONG');
+  assert.equal('reduceOnly' in sent[0], false, '双向下单不得携带 reduceOnly');
+
+  await client.marketOrder({ symbol: 'BTCUSDT', side: 'SELL', quantity: 1, reduceOnly: true, positionSide: 'SHORT' });
+  assert.equal(sent[1].positionSide, 'SHORT');
+  assert.equal('reduceOnly' in sent[1], false);
+
+  await client.limitOrder({ symbol: 'BTCUSDT', side: 'SELL', quantity: 1, price: 100, reduceOnly: true });
+  assert.equal(sent[2].reduceOnly, true, '单向账户保持原行为');
+  assert.equal('positionSide' in sent[2], false);
+
+  await client.protectionOrder({ symbol: 'BTCUSDT', side: 'SELL', type: 'STOP_MARKET', triggerPrice: 90 });
+  assert.equal(sent[3].positionSide, 'BOTH', '单向保护单默认 BOTH');
+  await client.protectionOrder({ symbol: 'BTCUSDT', side: 'SELL', type: 'STOP_MARKET', triggerPrice: 90, positionSide: 'LONG' });
+  assert.equal(sent[4].positionSide, 'LONG', '双向保护单跟随仓位方向');
+});
+
+test('dualSidePosition is probed once and cached; a failed probe falls back to one-way', async () => {
+  let calls = 0;
+  const client = new BinanceClient({ apiKey: 'k', secretKey: 's', demo: true });
+  client.positionMode = async () => { calls += 1; return { dualSidePosition: true }; };
+  assert.equal(await client.dualSidePosition(), true);
+  assert.equal(await client.dualSidePosition(), true);
+  assert.equal(calls, 1, '持仓模式是账户级设置，只探测一次');
+
+  const broken = new BinanceClient({ apiKey: 'k', secretKey: 's', demo: true });
+  broken.positionMode = async () => { throw new Error('network'); };
+  assert.equal(await broken.dualSidePosition(), false, '探测失败按单向保守处理，不误发 positionSide');
 });

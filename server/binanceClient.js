@@ -58,6 +58,10 @@ export class BinanceClient {
     return this.publicRequest('/fapi/v1/ticker/price', { symbol });
   }
 
+  async ticker24hr(symbol) {
+    return this.publicRequest('/fapi/v1/ticker/24hr', { symbol });
+  }
+
   async klines({ symbol, interval = '4h', limit = 80, startTime, endTime }) {
     return this.publicRequest('/fapi/v1/klines', { symbol, interval, limit, startTime, endTime });
   }
@@ -101,19 +105,19 @@ export class BinanceClient {
     return this.signedRequest('POST', '/fapi/v1/leverage', { symbol, leverage });
   }
 
-  async marketOrder({ symbol, side, quantity, reduceOnly = false, clientOrderId }) {
+  async marketOrder({ symbol, side, quantity, reduceOnly = false, positionSide, clientOrderId }) {
     return this.signedRequest('POST', '/fapi/v1/order', {
       symbol,
       side,
       type: 'MARKET',
       quantity,
-      reduceOnly,
+      ...positionSideFields(reduceOnly, positionSide),
       newClientOrderId: clientOrderId,
       newOrderRespType: 'RESULT'
     });
   }
 
-  async limitOrder({ symbol, side, quantity, price, timeInForce = 'GTC', reduceOnly = false, clientOrderId }) {
+  async limitOrder({ symbol, side, quantity, price, timeInForce = 'GTC', reduceOnly = false, positionSide, clientOrderId }) {
     return this.signedRequest('POST', '/fapi/v1/order', {
       symbol,
       side,
@@ -121,7 +125,7 @@ export class BinanceClient {
       quantity,
       price,
       timeInForce,
-      reduceOnly,
+      ...positionSideFields(reduceOnly, positionSide),
       newClientOrderId: clientOrderId,
       newOrderRespType: 'RESULT'
     });
@@ -144,12 +148,30 @@ export class BinanceClient {
   }
 
   async positionMode() { return this.signedRequest('GET', '/fapi/v1/positionSide/dual'); }
+
+  /**
+   * 账户是否「双向持仓」（Hedge Mode），带实例级缓存。
+   *
+   * 为什么必须知道：合约下单的 positionSide 与 reduceOnly 是**互斥**的两种表达（见 positionSideFields）。
+   * 单向账户发 positionSide=LONG/SHORT 会被 400 拒绝；双向账户不发 positionSide 同样被 400 拒绝
+   * ——「Order's position side does not match user's setting.」正是双向账户收到单向参数时的报错。
+   *
+   * 持仓模式是账户级设置、运行期不会变，故缓存首个结果；探测失败按单向处理
+   * （保守：与本模块历史行为一致，不会把单向账户误判成双向反而发错参数）。
+   */
+  async dualSidePosition() {
+    if (this.dualSideCache === undefined) {
+      try { this.dualSideCache = (await this.positionMode())?.dualSidePosition === true; }
+      catch { this.dualSideCache = false; }
+    }
+    return this.dualSideCache;
+  }
   async openOrders(symbol) { return this.signedRequest('GET', '/fapi/v1/openOrders', { symbol }); }
   async openAlgoOrders(symbol) { return this.signedRequest('GET', '/fapi/v1/openAlgoOrders', { symbol }); }
   async cancelAlgo(algoId) { return this.signedRequest('DELETE', '/fapi/v1/algoOrder', { algoId }); }
-  async protectionOrder({ symbol, side, type, triggerPrice, clientAlgoId }) {
+  async protectionOrder({ symbol, side, type, triggerPrice, positionSide, clientAlgoId }) {
     return this.signedRequest('POST', '/fapi/v1/algoOrder', {
-      algoType: 'CONDITIONAL', symbol, side, positionSide: 'BOTH', type,
+      algoType: 'CONDITIONAL', symbol, side, positionSide: positionSide || 'BOTH', type,
       triggerPrice, closePosition: 'true', workingType: 'MARK_PRICE', clientAlgoId
     });
   }
@@ -275,6 +297,22 @@ async function parseBinanceResponse(res) {
     throw responseError;
   }
   return body;
+}
+
+/**
+ * 单向 / 双向持仓模式的下单参数互斥规则（两类账户能共用同一套下单代码的关键）。
+ *
+ *   · 单向（One-way）：平仓靠 reduceOnly=true；带 positionSide=LONG/SHORT 会被 400 拒绝。
+ *   · 双向（Hedge）  ：必须带 positionSide=LONG/SHORT 指明要操作哪一侧仓位，且**禁止** reduceOnly
+ *                      （币安在 Hedge Mode 下会直接拒绝该参数）。
+ *
+ * 调用方给出 LONG/SHORT 即视为双向账户：用 positionSide 表达方向，并丢掉 reduceOnly。
+ * 双向账户上省略 positionSide 会让「平仓」被当成**反向开仓**，所以宁可少传 reduceOnly，
+ * 也绝不能在双向账户上漏掉 positionSide。
+ */
+function positionSideFields(reduceOnly, positionSide) {
+  const hedge = positionSide === 'LONG' || positionSide === 'SHORT';
+  return hedge ? { positionSide } : { reduceOnly };
 }
 
 function cleanParams(params) {

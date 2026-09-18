@@ -175,10 +175,6 @@ async function loadSymbolInfo(client, symbol) {
 
 export async function paperLimitParams(order, client, environment = 'demo', leverageCache = new Map()) {
   const rawPrice = Number(order.plan?.entryLimit);
-  const rawQuantity = Number(order.notional) / rawPrice;
-  if (!Number.isFinite(rawPrice) || rawPrice <= 0 || !Number.isFinite(rawQuantity) || rawQuantity <= 0) {
-    throw new Error('模拟订单缺少有效 entryLimit 或数量，无法同步 Binance ' + environmentLabel(environment) + '。');
-  }
   const info = await client.exchangeInfo();
   const symbolInfo = (info.symbols || []).find(item => item.symbol === order.symbol);
   if (!symbolInfo || symbolInfo.status !== 'TRADING' || symbolInfo.contractType !== 'PERPETUAL' || symbolInfo.quoteAsset !== 'USDT') {
@@ -197,19 +193,112 @@ export async function paperLimitParams(order, client, environment = 'demo', leve
   const fallbackLeverage = Number(symbolInfo.filters?.find(filter => filter.filterType === 'LEVERAGE_FILTER')?.maxLeverage);
   if (!leverageCache.has(order.symbol) && Number.isFinite(fallbackLeverage) && fallbackLeverage > 0) leverageCache.set(order.symbol, fallbackLeverage);
 
+  const side = order.direction === 'OPEN_LONG' ? 'BUY' : 'SELL';
+  const dualSide = typeof client.dualSidePosition === 'function' ? await client.dualSidePosition() : false;
+  const positionSide = orderPositionSide(dualSide, order.direction);
+
+  // ── 市价型入场（09-17：4H 均值回归/突破是市价策略，plan.entryStyle='market'，
+  //    只有 entryMin/entryMax sanity 区间、没有 entryLimit —— 此前一律被
+  //    「缺少有效 entryLimit」判死且无限重试）。镜像语义：交易所发 MARKET 单，
+  //    数量 = notional ÷ 标记价（纸面单成交在下一根 1m 开盘，市价镜像本身即近似）。
+  if (!(Number.isFinite(rawPrice) && rawPrice > 0)) {
+    const notional = Number(order.notional);
+    if (!(notional > 0)) {
+      throw new Error('模拟订单缺少有效 entryLimit 或数量，无法同步 Binance ' + environmentLabel(environment) + '。');
+    }
+    const lotFilter = symbolInfo.filters?.find(item => item.filterType === 'LOT_SIZE' || item.filterType === 'MARKET_LOT_SIZE');
+    const quantityStep = Number(lotFilter?.stepSize);
+    const minQty = Number(lotFilter?.minQty || 0);
+    const minNotional = Number(symbolInfo.filters?.find(item => item.filterType === 'MIN_NOTIONAL')?.notional || 0);
+    if (!(quantityStep > 0)) throw new Error('Binance ' + environmentLabel(environment) + ' 未返回 ' + order.symbol + ' 的数量过滤器。');
+    let refPrice = NaN;
+    try {
+      const premium = await client.premiumIndex?.(order.symbol);
+      refPrice = Number(Array.isArray(premium) ? premium[0]?.markPrice : premium?.markPrice);
+    } catch { /* 标记价不可得时降级用现价 */ }
+    if (!(refPrice > 0)) {
+      try { refPrice = Number((await client.price?.(order.symbol))?.price); } catch { /* 取不到价就放弃本轮 */ }
+    }
+    if (!(refPrice > 0)) {
+      throw new Error('无法获取 ' + order.symbol + ' 市价，本轮放弃同步 Binance ' + environmentLabel(environment) + '。');
+    }
+    const quantity = floorStep(notional / refPrice, quantityStep);
+    if (!(quantity > 0) || quantity < minQty || (minNotional > 0 && quantity * refPrice < minNotional)) {
+      throw new Error('模拟订单 ' + order.symbol + ' 对齐 Binance ' + environmentLabel(environment) + ' 过滤器后低于最小下单要求。');
+    }
+    // market: true 让 submitEntry 走 marketOrder（发请求前会剥掉该键）。
+    // 市价单没有限价，不受 PERCENT_PRICE 约束。
+    return { market: true, symbol: order.symbol, side, quantity, ...(positionSide ? { positionSide } : {}) };
+  }
+
+  // ── 限价入场（enhanced 等回调挂单策略，plan.entryLimit 存在）──
+  const rawQuantity = Number(order.notional) / rawPrice;
+  if (!Number.isFinite(rawQuantity) || rawQuantity <= 0) {
+    throw new Error('模拟订单缺少有效 entryLimit 或数量，无法同步 Binance ' + environmentLabel(environment) + '。');
+  }
   const priceFilter = symbolInfo.filters?.find(item => item.filterType === 'PRICE_FILTER');
   const lotFilter = symbolInfo.filters?.find(item => item.filterType === 'LOT_SIZE' || item.filterType === 'MARKET_LOT_SIZE');
   const minNotional = Number(symbolInfo.filters?.find(item => item.filterType === 'MIN_NOTIONAL')?.notional || 0);
-  const side = order.direction === 'OPEN_LONG' ? 'BUY' : 'SELL';
   const priceStep = Number(priceFilter?.tickSize);
   const quantityStep = Number(lotFilter?.stepSize);
   if (!(priceStep > 0) || !(quantityStep > 0)) throw new Error('Binance ' + environmentLabel(environment) + ' 未返回 ' + order.symbol + ' 的价格/数量过滤器。');
-  const price = side === 'BUY' ? floorStep(rawPrice, priceStep) : Number((Math.ceil((rawPrice - priceStep * 1e-9) / priceStep) * priceStep).toFixed(12));
+  const alignedPrice = side === 'BUY' ? floorStep(rawPrice, priceStep) : ceilStep(rawPrice, priceStep);
+  // 实盘 PERCENT_PRICE 涨跌幅约束比 Demo 严，越界限价会被 400 拒绝（见 assertPriceInBand，仅实盘校验）。
+  const price = await assertPriceInBand({ client, symbolInfo, symbol: order.symbol, price: alignedPrice, environment });
   const quantity = floorStep(rawQuantity, quantityStep);
   if (!(price > 0) || !(quantity > 0) || quantity < Number(lotFilter.minQty || 0) || (minNotional > 0 && quantity * price < minNotional)) {
     throw new Error('模拟订单 ' + order.symbol + ' 对齐 Binance ' + environmentLabel(environment) + ' 过滤器后低于最小下单要求。');
   }
-  return { symbol: order.symbol, side, quantity, price };
+  // 单向账户**不带该键**（而非 positionSide: undefined），保证返回对象与历史行为逐位一致。
+  return { symbol: order.symbol, side, quantity, price, ...(positionSide ? { positionSide } : {}) };
+}
+
+/**
+ * 这笔订单要操作哪一侧仓位：双向账户返回 LONG/SHORT，单向账户返回 undefined（由交易所默认 BOTH）。
+ * 开仓与平仓都跟随订单自身的 direction —— 一笔 OPEN_LONG 单的仓位自始至终是 LONG。
+ */
+export function orderPositionSide(dualSide, direction) {
+  if (!dualSide) return undefined;
+  return direction === 'OPEN_LONG' ? 'LONG' : 'SHORT';
+}
+
+const ceilStep = (value, size) => Number((Math.ceil((Number(value) - Number(size) * 1e-9) / Number(size)) * Number(size)).toFixed(12));
+
+/**
+ * 校验限价是否落在币安 PERCENT_PRICE 允许的涨跌幅区间内（**仅实盘生效**）。
+ *
+ * 背景：实盘的 PERCENT_PRICE 约束比 Demo 严——限价相对**标记价**只能落在
+ * [multiplierDown, multiplierUp] 之间，越界直接 400（"Limit price can't be higher than X."）。
+ * 策略按已收盘 K 线算出的回调挂单价，在行情快速波动时可能越界，这类单会一直卡在 submit_error。
+ *
+ * 处理：越界即**抛错拒单**，留给下一轮重算——绝不夹取。理由：夹到上限会把「等回调挂单」
+ * 变成「市价追高」（BUY 限价被抬到标记价之上会立刻成交），策略语义被破坏，比单纯拒单更糟。
+ * 标记价每轮都在变，下轮很可能就落回区间内。
+ *
+ * Demo 实测不强制该过滤器（远超区间的价单也能正常挂出），因此 demo/paper 直接放行，避免误伤。
+ */
+async function assertPriceInBand({ client, symbolInfo, symbol, price, environment }) {
+  if (environment !== 'live') return price;
+  const band = symbolInfo.filters?.find(item => item.filterType === 'PERCENT_PRICE');
+  const up = Number(band?.multiplierUp);
+  const down = Number(band?.multiplierDown);
+  if (!(up > 0) || !(down > 0) || !(price > 0)) return price;
+  let markPrice = NaN;
+  try {
+    const premium = await client.premiumIndex?.(symbol);
+    markPrice = Number(Array.isArray(premium) ? premium[0]?.markPrice : premium?.markPrice);
+  } catch { /* 标记价不可得时降级用现价 */ }
+  if (!(markPrice > 0)) {
+    try { markPrice = Number((await client.price?.(symbol))?.price); } catch { /* 取不到价就放弃校验，保持原限价 */ }
+  }
+  if (!(markPrice > 0)) return price;
+  const max = markPrice * up;
+  const min = markPrice * down;
+  if (price > max || price < min) {
+    throw new Error('模拟订单 ' + symbol + ' 限价 ' + price + ' 超出 Binance 涨跌幅区间 ['
+      + min.toPrecision(8) + ', ' + max.toPrecision(8) + ']（标记价 ' + markPrice + '），拒绝下单等待下轮重算。');
+  }
+  return price;
 }
 
 export async function safeSetLeverageForEnvironment(client, symbol, desired, leverageCache = new Map(), environment = 'demo') {
@@ -515,7 +604,11 @@ export class BinancePaperSync {
     try {
       const params = await paperLimitParams(order, client, environment, this.leverageCaches[environment]);
       await safeSetLeverageForEnvironment(client, order.symbol, order.leverage, this.leverageCaches[environment], environment);
-      const result = await client.limitOrder({ ...params, timeInForce: 'GTC', clientOrderId });
+      // 市价型策略（4H 均值回归/突破，plan 无 entryLimit）走 MARKET 单；限价策略走原 GTC 限价。
+      const { market, ...orderParams } = params;
+      const result = market
+        ? await client.marketOrder({ ...orderParams, clientOrderId })
+        : await client.limitOrder({ ...orderParams, timeInForce: 'GTC', clientOrderId });
       await this.updateLink(order.id, environment, current => applyOrderResult(current, result, new Date().toISOString()));
     } catch (error) {
       const resolved = isUnknownExecution(error) ? await this.findExistingOrder(client, order.symbol, clientOrderId) : null;
@@ -629,11 +722,13 @@ export class BinancePaperSync {
     });
     const clientOrderId = prepared?.clientOrderId || action.clientOrderId || paperCloseClientOrderId(order, environment, 0);
     try {
+      const dualSide = typeof client.dualSidePosition === 'function' ? await client.dualSidePosition() : false;
       const result = await client.marketOrder({
         symbol: order.symbol,
         side,
         quantity,
         reduceOnly: true,
+        positionSide: orderPositionSide(dualSide, order.direction),
         clientOrderId
       });
       await this.updateCloseAction(order.id, environment, action.id, current => applyCloseResult(current, result, new Date().toISOString()));

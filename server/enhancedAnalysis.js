@@ -252,6 +252,16 @@ const ENHANCED_DEFAULTS_RAW = {
   minVolumeRatio: MIN_VOLUME_RATIO,
   requireVolumeConfirm: REQUIRE_VOLUME_CONFIRM,
   longOnly: LONG_ONLY.enabled,
+  // 15 分钟周期趋势闸门（2026-09-17 新增）：主周期 1m 的更高层趋势 / 波动率确认。
+  // 动机：全量回测（bf365-1m 428 币）毛收益本身为负（−11.8bps vs 费 12bps），
+  // 1m 原生参数已被证明救不回；15m 周期的 EMA 排列 / ATR 分层是尚未检验过的新因子轴。
+  // 数据来源：线上 ctx.auxMarkets['15m']（needsAux=['15m']），回测 BT_AUX_15M_DIR 语料。
+  trend15Enabled: false,
+  trend15EmaFast: 20,
+  trend15EmaSlow: 50,
+  trend15MinSepAtr: 0,
+  trend15MinAtrPct: 0,
+  trend15MaxAtrPct: 0,
   // 入场与挂单
   entryBandAtr: ENTRY_BAND_ATR,
   pullbackAtrShallow: ENTRY_MODEL_DEFAULTS.shallow,
@@ -334,6 +344,17 @@ export const ENHANCED_PARAM_SCHEMA = Object.freeze([
   numSpec('minVolumeRatio', '最低量比', 'filter', 0, 5, 0.05, '近 5 根均量 ÷ 前 15 根均量的下限。'),
   boolSpec('requireVolumeConfirm', '强制量能确认', 'filter', '关闭即回到无量能门槛的旧行为。'),
   boolSpec('longOnly', '仅做多（禁空）', 'filter', '开启后空头信号一律被拦截。'),
+  boolSpec('trend15Enabled', '启用 15m 趋势闸门', 'filter',
+    '开启后多单要求 15m EMA 快线 > 慢线（可选最小间距与波动率带），空单相反。'
+    + '15m 行情取 ctx.auxMarkets["15m"]；启用但数据缺失时观望而不是放行。'),
+  numSpec('trend15EmaFast', '15m EMA 快线', 'filter', 2, 100, 1, '15m 决策窗口上的快线周期（20 根 = 5 小时）。'),
+  numSpec('trend15EmaSlow', '15m EMA 慢线', 'filter', 3, 150, 1, '15m 决策窗口上的慢线周期（50 根 = 12.5 小时）。需大于快线。'),
+  numSpec('trend15MinSepAtr', '15m 均线间距下限（ATR）', 'filter', 0, 5, 0.05,
+    '(快线−慢线)/15m ATR 在信号方向上的最小值，过滤 15m 均线粘合的伪趋势。0 = 仅要求方向。'),
+  numSpec('trend15MinAtrPct', '15m 波动率下限（ATR/价格）', 'filter', 0, 0.05, 0.0005,
+    '15m ATR/价格 下限，过滤低波动死水。0 = 不启用。'),
+  numSpec('trend15MaxAtrPct', '15m 波动率上限（ATR/价格）', 'filter', 0, 0.5, 0.001,
+    '15m ATR/价格 上限，回避极端波动（止损易被跳空穿越）。0 = 不启用。'),
   numSpec('entryBandAtr', '入场区间半宽（ATR）', 'entry', 0, 2, 0.05, '入场区间 close ± N×ATR。越大越易成交但净盈亏比越低。'),
   numSpec('pullbackAtrShallow', '回调深度·高评分（ATR）', 'entry', 0, 10, 0.01, '评分最高时的限价回调深度。越小越急于入场。'),
   numSpec('pullbackAtrDeep', '回调深度·低评分（ATR）', 'entry', 0, 10, 0.01, '评分最低时的限价回调深度。越大越耐心等价。'),
@@ -783,13 +804,27 @@ function calculateTrendStrength(market) {
 }
 
 /**
+ * 序列末端的 EMA 值（标准递推 e = v·k + e·(1−k)，k = 2/(n+1)）。
+ * 供 15m 趋势闸门使用；与主周期指标的局部实现风格一致，不引入外部依赖。
+ */
+function emaLast(vals, n) {
+  const period = Math.max(2, Math.floor(Number(n) || 2));
+  const k = 2 / (period + 1);
+  let e = vals[0];
+  for (let i = 1; i < vals.length; i++) e = vals[i] * k + e * (1 - k);
+  return e;
+}
+
+/**
  * 增强版本地分析
  *
  * @param {object} market     行情（需 klines / symbol / interval）
  * @param {object} [overrides] 策略级参数覆盖（键同 ENHANCED_PARAM_SCHEMA）。
  *   不传时行为与改造前完全一致（默认值来自同名 NOFX_* 环境变量）。
+ * @param {object} [ctx]      运行上下文（可含 auxMarkets['15m'] 供 15m 趋势闸门使用）。
+ *   trend15Enabled=false（默认）时本参数被完全忽略，行为零变化。
  */
-export function enhancedAnalysis(market, overrides) {
+export function enhancedAnalysis(market, overrides, ctx = {}) {
   // 每次调用解析一份局部参数：多策略并发分析互不污染。
   const P = resolveEnhancedParams(overrides);
   const rows = market.klines;
@@ -911,6 +946,8 @@ export function enhancedAnalysis(market, overrides) {
 
   // 确定方向
   let direction = null;
+  // 15m 趋势闸门的通过读数（未启用 / 未通过时为 null），最终随信号透出供归因。
+  let trend15FilterResult = null;
   if (isBullish && (macdConfirm || trendStrength.score >= 70)) {
     direction = 'long';
   } else if (isBearish && (macdConfirm || trendStrength.score >= 70)) {
@@ -926,6 +963,59 @@ export function enhancedAnalysis(market, overrides) {
   // 方向限制：策略参数 longOnly 开启时统一拦截空头。
   if (P.longOnly && direction === 'short') {
     return wait(LONG_ONLY.reason, [], trendStrength);
+  }
+
+  // 15 分钟周期趋势闸门（仅在 trend15Enabled=true 时激活；顺序即优先级）：
+  //   1. 15m 行情缺失/根数不足 → 观望（显式拒绝而非静默放行：回测与线上口径必须一致）；
+  //   2. 15m ATR% 越界（死水 or 极端波动，两个边界均可单独关闭）→ 观望；
+  //   3. 15m EMA 排列与信号方向不一致 / 间距不足（均线粘合的伪趋势）→ 观望。
+  // 全部通过后把 15m 读数写进信号 trend15Filter 字段，便于回测归因与线上审计。
+  if (P.trend15Enabled) {
+    const aux15 = ctx?.auxMarkets?.['15m'];
+    const rows15 = aux15 && Array.isArray(aux15.klines) ? aux15.klines : null;
+    const need15 = Math.max(P.trend15EmaFast, P.trend15EmaSlow, 14) + 2;
+    if (!rows15 || rows15.length < need15) {
+      return wait(
+        `15m 趋势闸门已启用但 15m 行情缺失（需 ≥${need15} 根，实际 ${rows15 ? rows15.length : 0} 根；`
+        + `线上需 needsAux=["15m"]，回测需 BT_AUX_15M_DIR），本轮观望。`,
+        ['15m 数据不可用，无法确认高层趋势。'], trendStrength
+      );
+    }
+    const closes15 = rows15.map(r => r.close);
+    const eF15 = emaLast(closes15, P.trend15EmaFast);
+    const eS15 = emaLast(closes15, P.trend15EmaSlow);
+    const atr15 = rows15.slice(-14).reduce((sum, r, i) => {
+      const previous = rows15[rows15.length - 15 + i].close;
+      return sum + Math.max(r.high - r.low, Math.abs(r.high - previous), Math.abs(r.low - previous));
+    }, 0) / 14;
+    const price15 = closes15.at(-1);
+    const atrPct15 = atr15 > 0 ? atr15 / price15 : NaN;
+    const sepAtr15 = atr15 > 0 ? (eF15 - eS15) / atr15 : NaN;
+    const trend15Metrics = {
+      emaFast: eF15, emaSlow: eS15, atr: atr15, atrPct: atrPct15, sepAtr: sepAtr15,
+      emaFastPeriod: P.trend15EmaFast, emaSlowPeriod: P.trend15EmaSlow
+    };
+    if (!Number.isFinite(atrPct15) || !Number.isFinite(sepAtr15)) {
+      return wait('15m 指标未就绪（ATR/EMA 无效），本轮观望。', [], trendStrength);
+    }
+    if (atrPct15 < P.trend15MinAtrPct) {
+      return wait(`15m 波动率过低（${(atrPct15 * 100).toFixed(3)}% < ${(P.trend15MinAtrPct * 100).toFixed(2)}%，死水行情），本轮观望。`,
+        [], trendStrength);
+    }
+    if (P.trend15MaxAtrPct > 0 && atrPct15 > P.trend15MaxAtrPct) {
+      return wait(`15m 波动率过高（${(atrPct15 * 100).toFixed(3)}% > ${(P.trend15MaxAtrPct * 100).toFixed(2)}%，极端波动），本轮观望。`,
+        [], trendStrength);
+    }
+    const sepOk = direction === 'long'
+      ? sepAtr15 >= P.trend15MinSepAtr
+      : -sepAtr15 >= P.trend15MinSepAtr;
+    const alignOk = direction === 'long' ? eF15 > eS15 : eF15 < eS15;
+    if (!alignOk || !sepOk) {
+      return wait(`15m 趋势与信号方向不一致（EMA${P.trend15EmaFast} ${eF15.toPrecision(6)} / EMA${P.trend15EmaSlow} ${eS15.toPrecision(6)}，`
+        + `间距 ${sepAtr15.toFixed(2)}×ATR，要求方向一致且 ≥ ${P.trend15MinSepAtr}×ATR），本轮观望。`,
+        [], trendStrength);
+    }
+    trend15FilterResult = trend15Metrics;
   }
 
   // 追高/追空过滤：价格偏离20均线超过1.5倍ATR时放弃入场，等待回调。
@@ -1057,7 +1147,11 @@ export function enhancedAnalysis(market, overrides) {
     symbol,
     action: direction === 'long' ? 'BUY' : 'SELL',
     confidence,
-    reason: `增强分析(${trendStrength.score}/100分)：${trendStrength.reasons.slice(0, 3).join('；')}`,
+    reason: `增强分析(${trendStrength.score}/100分)：${trendStrength.reasons.slice(0, 3).join('；')}`
+      + (trend15FilterResult
+        ? `；15m闸门通过(EMA${trend15FilterResult.emaFastPeriod}/${trend15FilterResult.emaSlowPeriod}，`
+          + `间距${trend15FilterResult.sepAtr.toFixed(2)}×ATR，ATR%${(trend15FilterResult.atrPct * 100).toFixed(3)}%)`
+        : ''),
     risk: [
       rsiWarning,
       `波动率${(volatility * 100).toFixed(2)}%`,
@@ -1088,6 +1182,7 @@ export function enhancedAnalysis(market, overrides) {
       riskRewardRatio,
       recommendedLeverage,
       trendStrengthScore: trendStrength.score,
+      trend15Filter: trend15FilterResult,
       indicators: {
         ma20,
         ma50,

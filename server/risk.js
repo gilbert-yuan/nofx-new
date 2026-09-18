@@ -14,8 +14,14 @@ export function validateOrder({ order, config, account, price, positions }) {
   const notional = quantity * price;
   if (!Number.isFinite(notional)) return reject('Order notional is invalid.');
   if (order.reduceOnly) {
-    if (held.length !== 1 || (held[0].positionSide && held[0].positionSide !== 'BOTH')) return reject('A single one-way position is required to close.');
+    if (held.length !== 1) return reject('A single position is required to close.');
     const amount = Number(held[0].positionAmt);
+    // 单向账户 positionSide=BOTH；双向账户为 LONG/SHORT，且必须与实际仓位方向一致
+    //（positionSide 传错会把「平仓」变成反向开仓）。
+    const positionSide = String(held[0].positionSide || 'BOTH').toUpperCase();
+    const consistent = positionSide === 'BOTH'
+      || ((positionSide === 'LONG' || positionSide === 'SHORT') && (positionSide === 'LONG') === (amount > 0));
+    if (!consistent) return reject('Position side does not match the held position.');
     if (side !== (amount > 0 ? 'SELL' : 'BUY') || quantity > Math.abs(amount)) return reject('Close direction or quantity does not match position.');
     return { ok: true, reason: 'Validated reduce-only close.', notional };
   }

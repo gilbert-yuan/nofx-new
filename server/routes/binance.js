@@ -152,8 +152,16 @@ export function createBinanceRouter(container) {
     const quantity = positiveNumber(body.quantity, 'quantity');
     const reduceOnly = body.reduceOnly === true || body.reduceOnly === 'true';
     const clientOrderId = body.clientOrderId ? String(body.clientOrderId) : undefined;
+    const requestedPositionSide = String(body.positionSide || '').toUpperCase();
+    if (requestedPositionSide && !['LONG', 'SHORT', 'BOTH'].includes(requestedPositionSide)) {
+      throw new ApiError('positionSide 只能是 LONG / SHORT / BOTH', 422);
+    }
     const { client } = await tradeClient();
-    const orderArgs = { symbol, side, quantity, reduceOnly, ...(clientOrderId ? { clientOrderId } : {}) };
+    // 双向账户必须显式给 positionSide（BOTH 只在单向模式合法）；未显式指定时按买卖方向推导，
+    // 单向账户则保持原样（由交易所默认 BOTH + reduceOnly 表达）。
+    let positionSide = requestedPositionSide && requestedPositionSide !== 'BOTH' ? requestedPositionSide : undefined;
+    if (!positionSide && typeof client.dualSidePosition === 'function' && await client.dualSidePosition()) positionSide = side === 'BUY' ? 'LONG' : 'SHORT';
+    const orderArgs = { symbol, side, quantity, reduceOnly, ...(positionSide ? { positionSide } : {}), ...(clientOrderId ? { clientOrderId } : {}) };
     const order = type === 'LIMIT'
       ? await client.limitOrder({ ...orderArgs, price: positiveNumber(body.price, 'price') })
       : await client.marketOrder(orderArgs);

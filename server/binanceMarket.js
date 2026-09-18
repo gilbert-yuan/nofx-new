@@ -127,6 +127,31 @@ export class BinanceMarket {
       errors: Object.fromEntries(results.filter(([, , error]) => error).map(([key, , error]) => [key, error]))
     };
   }
+
+  /**
+   * 机会报告所需的轻量衍生品上下文。
+   * 每个公开接口独立失败，价格判断仍可生成，同时把失败原因显式返回。
+   */
+  async opportunityContext(symbol) {
+    const calls = {
+      ticker24h: () => this.client.ticker24hr(symbol),
+      premium: () => this.client.premiumIndex(symbol),
+      funding: () => this.client.fundingRate({ symbol, limit: 1 }),
+      oi: () => this.client.openInterestHist({ symbol, period: '15m', limit: 2 })
+    };
+    const results = await Promise.all(Object.entries(calls).map(async ([key, fn]) => {
+      try { return [key, await fn(), null]; }
+      catch (error) { return [key, null, error.message]; }
+    }));
+    return {
+      symbol,
+      ticker24h: results.find(([key]) => key === 'ticker24h')?.[1] || null,
+      premium: results.find(([key]) => key === 'premium')?.[1] || null,
+      funding: results.find(([key]) => key === 'funding')?.[1] || [],
+      oi: results.find(([key]) => key === 'oi')?.[1] || [],
+      errors: Object.fromEntries(results.filter(([, , error]) => error).map(([key, , error]) => [key, error]))
+    };
+  }
 }
 
 export const binanceMarket = new BinanceMarket();

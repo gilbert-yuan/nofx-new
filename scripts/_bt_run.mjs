@@ -57,6 +57,35 @@ const STOP_COOLDOWN = Math.max(1, Math.round(60 / TF_MIN));     // NOFX_STOP_COO
 const MIN_HOLD = Number(process.env.NOFX_MIN_HOLD_BARS ?? 0); // 实验：最小持仓根数（智能退出保护）
 
 const OUT_NAME = process.env.BT_OUT || 'result.json';
+// 15m 辅助行情（供 enhanced-trend-v1 的 trend15* 闸门实验）：设 BT_AUX_15M_DIR 后，
+// 每次 analyze 的 ctx 会带上 auxMarkets['15m']（最近 150 根**已收盘** 15m K 线）。
+// 未设置时完全不加载 15m 数据，与历史行为逐位一致。
+const AUX15_DIR = process.env.BT_AUX_15M_DIR
+  ? path.resolve(process.env.BT_AUX_15M_DIR)
+  : null;
+const AUX15_TF = 900000;
+const AUX15_WINDOW = 150;
+const aux15Cache = new Map();   // symbol -> bars[]（惰性加载，未命中且文件不存在记 null）
+let aux15MissingLogged = 0;
+function loadAux15(symbol) {
+  if (aux15Cache.has(symbol)) return aux15Cache.get(symbol);
+  let bars = null;
+  try {
+    const txt = fs.readFileSync(path.join(AUX15_DIR, 'klines', symbol + '.ndjson'), 'utf8');
+    bars = txt.split('\n').filter(Boolean).map(line => {
+      const [t, o, h, l, c, v] = line.split(',').map(Number);
+      return { openTime: t, open: o, high: h, low: l, close: c, volume: v };
+    }).sort((a, b) => a.openTime - b.openTime);
+  } catch { /* 语料缺失：闸门会显式观望，不静默放行 */ }
+  if (!bars || !bars.length) {
+    if (aux15MissingLogged < 3) {
+      console.warn(`[aux15] ${symbol} 无 15m 语料（${AUX15_DIR}），trend15 闸门对该币观望`);
+      aux15MissingLogged++;
+    }
+  }
+  aux15Cache.set(symbol, bars);
+  return bars;
+}
 // 参数覆盖（仅回测 harness，生产未用）：JSON 形式的 ENHANCED_PARAM_SCHEMA 字段。
 // 例：BT_PARAM_OVERRIDES='{"pullbackAtrShallow":2,"pullbackAtrDeep":2}' → 限价挂单深度
 // 钉死在 2 ATR（不再随评分在 1.5~2.0 之间滑动）。不设则完全走 env 默认值，老行为零变化。
@@ -161,6 +190,7 @@ async function runSymbol(symbol, bars) {
   const sim = new TradingSimulator({ mode: 'account', maxPositions: Infinity, allowDuplicateSymbol: false });
   const trades = [], cancels = [], placed = [];
   let active = null, cooldownUntil = -1, signalCount = 0;
+  let auxCtx = null;   // 15m 辅助行情指针（AUX15_DIR 启用时逐币独立）
   const N = bars.length;
 
   for (let i = WINDOW; i < N; i++) {
@@ -245,12 +275,31 @@ async function runSymbol(symbol, bars) {
     // 直接跳过（精确等价：被跳过的 sig 在该状态下无任何消费方）。币多时冷却 bar 占比可观。
     if (needSignal && !(!active && (i < cooldownUntil || i + 2 >= N))) {
       const market = { symbol, interval: INTERVAL, klines: bars.slice(i - WINDOW + 1, i + 1) };
+      // 15m 辅助行情：只取「已收盘」的 15m 根（openTime + 15m ≤ 当前决策时刻），
+      // 决策 K 线与辅助窗口无未来函数。指针单调推进，逐币只扫一遍。
+      let auxMarkets;
+      if (AUX15_DIR) {
+        const aux15 = loadAux15(symbol);
+        if (aux15 && aux15.length) {
+          if (!auxCtx) auxCtx = { ai: 0 };
+          const nowMs = bars[i].openTime + TF;
+          while (auxCtx.ai < aux15.length && aux15[auxCtx.ai].openTime + AUX15_TF <= nowMs) auxCtx.ai++;
+          const slice = auxCtx.ai > 0 ? aux15.slice(Math.max(0, auxCtx.ai - AUX15_WINDOW), auxCtx.ai) : [];
+          auxMarkets = {
+            '15m': { symbol, interval: '15m', klines: slice, dataAsOf: new Date(nowMs).toISOString() }
+          };
+        } else {
+          // 语料缺失也带上空窗口：闸门按「15m 行情缺失」显式观望，而不是静默放行
+          auxMarkets = { '15m': { symbol, interval: '15m', klines: [], dataAsOf: new Date(bars[i].openTime + TF).toISOString() } };
+        }
+      }
       if (IS_FORMAL_STRATEGY) {
         sig = await STRATEGY_DEF.analyze(market, {
           params: STRATEGY_PARAMS,
           config: STRATEGY_CONFIG,
           interval: INTERVAL,
-          planInterval: STRATEGY_DEF.planInterval || INTERVAL
+          planInterval: STRATEGY_DEF.planInterval || INTERVAL,
+          ...(auxMarkets ? { auxMarkets } : {})
         });
       } else {
         sig = await pumpFadeShortAnalysis(market, PARAM_OVERRIDES ? { params: PARAM_OVERRIDES } : {});

@@ -29,8 +29,9 @@ export class BinancePositionMonitor {
       if (interval !== '15m') return this.finish({ status: 'skipped', reason: '仅在 15 分钟 K 线后复核。' });
       const client = this.clientFactory(config.binance);
       if (!client.hasCredentials()) return this.finish({ status: 'blocked', reason: '请先配置币安 API Key 和 Secret Key。' });
-      const mode = await client.positionMode();
-      if (mode.dualSidePosition !== false) return this.finish({ status: 'blocked', reason: '当前自动交易仅支持币安单向持仓模式，请在币安检查持仓模式。' });
+      // 单向 / 双向持仓模式都支持：下单参数由 BinanceClient 的 positionSideFields 自适应
+      //（单向用 reduceOnly、双向用 positionSide，二者互斥）。取不到时按单向处理。
+      const dualSide = typeof client.dualSidePosition === 'function' ? await client.dualSidePosition() : false;
       const market = new BinanceMarket({ client }); // Execution rules only; candles come from publicMarket.
       const strategy = { ...await this.store.getStrategy(), interval: '15m' };
       const positions = await client.positions();
@@ -57,7 +58,7 @@ export class BinancePositionMonitor {
             const decision = await this.decide({ config, strategy, market: candles, account, positions: freshPositions });
             const action = await this.applyEntry({ client, config, market, candles, symbol, decision, account, positions: freshPositions });
             entries.push({ symbol, decision, action });
-            if (['sent', 'dry_run'].includes(action.status)) reserved.push({ symbol, positionAmt: action.quantity, markPrice: action.price, positionSide: 'BOTH' });
+            if (['sent', 'dry_run'].includes(action.status)) reserved.push({ symbol, positionAmt: action.quantity, markPrice: action.price, positionSide: dualSide ? (decision.action === 'BUY' ? 'LONG' : 'SHORT') : 'BOTH' });
             if (action.status === 'uncertain') break;
           } catch (error) { entries.push({ symbol, action: { status: 'error', reason: error.message } }); break; }
         }
@@ -92,15 +93,22 @@ export class BinancePositionMonitor {
     if (!validConfidence(review.confidence, config.trader.minConfidence)) return reject('置信度无效或低于阈值。');
     if (!fresh(candles)) return reject('分析期间已跨越 K 线周期，请等待下次复核。');
     const current = (await client.positions(position.symbol)).filter(p => Number(p.positionAmt) !== 0);
-    if (current.length !== 1 || !Number.isFinite(Number(current[0].positionAmt)) || current[0].positionSide !== 'BOTH' || Math.sign(Number(current[0].positionAmt)) !== Math.sign(Number(position.positionAmt))) return reject('持仓已变化或不是单向持仓。');
-    position = current[0];
+    const single = current.length === 1 ? current[0] : null;
+    const currentAmount = Number(single?.positionAmt);
+    const currentSide = String(single?.positionSide || 'BOTH').toUpperCase();
+    // 单向账户 positionSide=BOTH；双向账户为 LONG/SHORT，且必须与实际仓位方向一致
+    // ——后续平仓单要靠它指明「操作哪一侧」，传错会变成反向开仓。
+    const sideConsistent = currentSide === 'BOTH'
+      || ((currentSide === 'LONG' || currentSide === 'SHORT') && (currentSide === 'LONG') === (currentAmount > 0));
+    if (!single || !Number.isFinite(currentAmount) || !sideConsistent || Math.sign(currentAmount) !== Math.sign(Number(position.positionAmt))) return reject('持仓已变化或仓位方向不一致。');
+    position = single;
     const symbol = position.symbol;
     if (!compatibleMarketPrice(candles, Number(position.markPrice))) return reject('币安价格与参考行情偏差超过 2% 或无效，暂停本次操作。');
     if (review.action === 'CLOSE') {
       if (config.trader.allowCloseOrders !== true) return { status: 'proposed', reason: '自动平仓未开启。' };
       if (config.trader.dryRun !== false) return { status: 'dry_run', action: 'CLOSE' };
       if (!await this.claim(symbol, candles)) return reject('本根 K 线已提交过操作。');
-      const result = await client.marketOrder({ symbol, side: Number(position.positionAmt) > 0 ? 'SELL' : 'BUY', quantity: Math.abs(Number(position.positionAmt)), reduceOnly: true, clientOrderId: id() });
+      const result = await client.marketOrder({ symbol, side: Number(position.positionAmt) > 0 ? 'SELL' : 'BUY', quantity: Math.abs(Number(position.positionAmt)), reduceOnly: true, positionSide: position.positionSide, clientOrderId: id() });
       if (result.status !== 'FILLED') return { status: 'uncertain', reason: '平仓未确认全部成交，请检查币安订单。' };
       for (const order of (await client.openAlgoOrders(symbol)).filter(owned)) await client.cancelAlgo(order.algoId);
       return { status: 'sent', action: 'CLOSE', orderId: result.orderId };
@@ -111,9 +119,9 @@ export class BinancePositionMonitor {
     if (!levels) return reject('止盈止损价格无效或不符合价格步长。');
     if (config.trader.dryRun !== false) return { status: 'dry_run', action: 'UPDATE_PROTECTION', ...levels };
     if (!await this.claim(symbol, candles)) return reject('本根 K 线已提交过操作。');
-    return this.replaceProtection({ client, symbol, side: Number(position.positionAmt) > 0 ? 'SELL' : 'BUY', levels, minBps: config.trader.minProtectionMoveBps });
+    return this.replaceProtection({ client, symbol, side: Number(position.positionAmt) > 0 ? 'SELL' : 'BUY', levels, minBps: config.trader.minProtectionMoveBps, positionSide: position.positionSide });
   }
-  async replaceProtection({ client, symbol, side, levels, minBps = 25 }) {
+  async replaceProtection({ client, symbol, side, levels, minBps = 25, positionSide }) {
     const pending = await client.openAlgoOrders(symbol);
     if (!Array.isArray(pending)) throw new Error('币安保护单快照无效。');
     if (pending.some(o => !owned(o))) throw new Error('存在手动保护单，请先在币安检查，系统不会覆盖。');
@@ -127,7 +135,7 @@ export class BinancePositionMonitor {
       const previous = sameType[0];
       if (previous && Math.abs(Number(previous.triggerPrice) - triggerPrice) / triggerPrice * 10000 < Math.max(0, Number(minBps) || 0)) continue;
       // Establish replacement first: a rejected new stop must never delete the existing stop.
-      await client.protectionOrder({ symbol, side, type, triggerPrice, clientAlgoId: id() });
+      await client.protectionOrder({ symbol, side, type, triggerPrice, positionSide, clientAlgoId: id() });
       if (previous) await client.cancelAlgo(previous.algoId);
     }
     return { status: 'sent', action: 'UPDATE_PROTECTION', ...levels };
@@ -151,14 +159,17 @@ export class BinancePositionMonitor {
     if (config.trader.dryRun !== false) return { status: 'dry_run', ...proposal };
     if (!await this.claim(symbol, candles)) return reject('本根 K 线已提交过操作。');
     await client.setLeverage({ symbol, leverage: proposal.leverage });
-    const result = await client.marketOrder({ symbol, side: decision.action, quantity, clientOrderId: id() });
+    // 开仓方向即仓位方向：双向账户必须显式指明（单向账户传 undefined，由交易所默认 BOTH）。
+    const dualSide = typeof client.dualSidePosition === 'function' ? await client.dualSidePosition() : false;
+    const positionSide = dualSide ? (decision.action === 'BUY' ? 'LONG' : 'SHORT') : undefined;
+    const result = await client.marketOrder({ symbol, side: decision.action, quantity, positionSide, clientOrderId: id() });
     if (result.status !== 'FILLED') return { status: 'uncertain', reason: '开仓未确认全部成交，请检查币安订单。' };
     try {
-      await this.replaceProtection({ client, symbol, side: decision.action === 'BUY' ? 'SELL' : 'BUY', levels });
+      await this.replaceProtection({ client, symbol, side: decision.action === 'BUY' ? 'SELL' : 'BUY', levels, positionSide });
     } catch (error) {
       // A filled entry without confirmed protection is immediately reduced; never open another entry on this path.
       try {
-        const close = await client.marketOrder({ symbol, side: decision.action === 'BUY' ? 'SELL' : 'BUY', quantity: Number(result.executedQty), reduceOnly: true, clientOrderId: id() });
+        const close = await client.marketOrder({ symbol, side: decision.action === 'BUY' ? 'SELL' : 'BUY', quantity: Number(result.executedQty), reduceOnly: true, positionSide, clientOrderId: id() });
         if (close.status !== 'FILLED') throw new Error('Emergency close is not filled.');
       } catch { throw new Error(`保护单设置失败，紧急平仓也未确认，请立即检查 ${symbol}：${error.message}`); }
       throw new Error(`保护单设置失败，已发送紧急减仓指令，请检查 ${symbol}：${error.message}`);

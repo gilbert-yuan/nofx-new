@@ -108,7 +108,9 @@ export class TraderRunner {
       symbol: order.symbol,
       side: order.side,
       quantity: order.quantity,
-      reduceOnly: decision.action === 'CLOSE'
+      reduceOnly: decision.action === 'CLOSE',
+      // 双向账户靠 positionSide 指明平的是哪一侧；取实盘持仓自身的 positionSide（单向为 BOTH，将走 reduceOnly）。
+      positionSide: matching.length === 1 ? matching[0].positionSide : undefined
     });
 
     return { status: 'sent', orderId: result.orderId, result };

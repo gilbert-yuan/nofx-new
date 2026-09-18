@@ -13,6 +13,8 @@ import { enhancedAnalysis, enhancedProtectionReview, ENHANCED_PARAM_SCHEMA, ENHA
 import { localProtectionReview } from '../shared/protectionReview.js';
 import { structureShortAnalysis, STRUCTURE_SHORT_PARAM_SCHEMA } from '../structureShortAnalysis.js';
 import { structureLongAnalysis, STRUCTURE_LONG_PARAM_SCHEMA } from '../structureLongAnalysis.js';
+import { h4BreakoutAnalysis, h4BreakoutReview, H4_BREAKOUT_PARAM_SCHEMA } from '../h4BreakoutAnalysis.js';
+import { h4ReversionAnalysis, h4ReversionReview, H4_REVERSION_PARAM_SCHEMA } from '../h4ReversionAnalysis.js';
 
 /** 出场规则参数（移动止损 / 智能退出 / 分批止盈）—— 各策略共用同一套，避免重复定义。 */
 const EXIT_PARAM_SCHEMA = ENHANCED_PARAM_SCHEMA.filter(spec => spec.group === 'exit');
@@ -40,8 +42,15 @@ defineStrategy({
   engine: 'enhanced',
   modelId: 'enhanced-rules-v1',
   priority: 10,
+  // 15m 趋势闸门（2026-09-17 上线，t15-e48s96 两阶段验证）：主行情 1m，
+  // 15m 决策窗口由 needsAux 提供 → ctx.auxMarkets['15m']。闸门 fail-closed：
+  // 15m 数据缺失/不足时该币种本轮观望（engine 内 trend15Enabled 控制，见策略参数）。
+  needsAux: ['15m'],
+  marketWindows: { '15m': 200 },
   paramSchema: ENHANCED_PARAM_SCHEMA,
-  analyze: (market, ctx = {}) => enhancedAnalysis(market, ctx.params),
+  // 第三参透传整个 ctx（含 auxMarkets['15m']）：仅当策略参数 trend15Enabled=true 时
+  // 引擎才会读它（15m 趋势闸门）；默认关闭，行为与改造前逐位一致。
+  analyze: (market, ctx = {}) => enhancedAnalysis(market, ctx.params, ctx),
   review: (order, market, ctx = {}) => enhancedProtectionReview(order, market, ctx)
 });
 
@@ -128,6 +137,66 @@ defineStrategy({
 });
 
 /**
+ * 策略 10：4H 趋势突破（默认关闭 —— 2026-09-17 新建，三阶段回测见 output/h4-strategy-report.html）
+ * 引擎 h4BreakoutAnalysis：**只吃 4H 已收盘 K 线**，不依赖 1H/15m 结构确认。
+ * 收盘突破近 N 根通道边界 + 均线同向排列 + 可选 ADX/量能闸门 → **市价**顺势入场，
+ * 止损按 ATR、止盈按 R 倍数、移动止损阶梯保护利润。
+ *
+ * ⚠️ 入场刻意用市价而非限价：本项目实测过限价挂单在粗粒度 K 线上会被「成交当根污染」
+ *    系统性虚高（同一批 4H 信号 4h 粒度 +313U / 1m 粒度 −74U）。市价在下一根开盘成交，
+ *    与决策 K 线无时间重叠，不存在该偏差。
+ * ⚠️ 线上依赖：主行情是 1m，4H 数据由 needsAux=['4h'] 提供（引擎从 ctx.auxMarkets['4h'] 取）。
+ */
+defineStrategy({
+  id: 'h4-trend-breakout-v1',
+  name: '4H 趋势突破 v1',
+  description: '【4H 决策】4H 收盘有效突破近 N 根唐奇安通道边界 + EMA 快慢线同向排列（可选 ADX/量能确认）'
+    + '时，市价顺势开仓（可做多/做空，longOnly·shortOnly 可锁方向）。'
+    + '止损 = max(stopAtr×ATR, minStopPct)；止盈按 R 倍数或 ATR 倍数；移动止损阶梯 + 分批止盈。'
+    + '与 enhanced-trend-v1（1m 限价回调）方向暴露与入场时机完全不同：不做回调、不等确认 K 线。'
+    + '⚠️ 默认关闭；参数与三阶段验证结论见 output/h4-strategy-report.html。',
+  engine: 'h4-breakout',
+  modelId: 'h4-trend-breakout-v1',
+  priority: 60,
+  // 主行情是 1m，4H 决策数据必须显式声明为辅助周期，否则线上拿不到 4H 窗口
+  needsAux: ['4h'],
+  marketWindow: 120,
+  marketWindows: { '4h': 300 },
+  planInterval: '4h',
+  paramSchema: H4_BREAKOUT_PARAM_SCHEMA,
+  analyze: (market, ctx = {}) => h4BreakoutAnalysis(market, ctx),
+  // 订单自带的 exitRules 快照决定移动止损阶梯；复核直接复用跨引擎单一事实源
+  review: (order, market) => h4BreakoutReview(order, market)
+});
+
+/**
+ * 策略 11：4H 均值回归（默认关闭 —— 2026-09-17 新建，与策略 10 互补假设）
+ * 引擎 h4ReversionAnalysis：价格偏离 4H EMA 超 N×ATR 且 RSI 进入极端区、并出现反向企稳 K 线时
+ * 市价逆势入场，目标回归 4H 均线。与「4H 趋势突破」在行情适配上是镜像关系，
+ * 两者独立回测、独立验证，**不应视为可叠加的组合**。
+ */
+defineStrategy({
+  id: 'h4-mean-reversion-v1',
+  name: '4H 均值回归 v1',
+  description: '【4H 决策】价格偏离 4H EMA 超过 N×ATR 且 RSI 进入极端区（默认 35/70），'
+    + '市价逆势开仓，止盈回到 4H 均线，止损按 ATR。可选 ADX 上限过滤强趋势市。'
+    + '09-17 平衡档定案（全量 428 币 × 365d）：maxAtrPct=0.06 低波动分层、minNetRr=1.625、'
+    + 'maxHoldBars=17、买入金额=权益×1.5%（autoMarginPct）、并发上限 50（maxPositions）。'
+    + '与 4H 趋势突破是互补假设，不应叠加。'
+    + '⚠️ 默认关闭，勾选即按平衡档参数运行；验证结论见 output/h4-leverage-optimization-report.html。',
+  engine: 'h4-reversion',
+  modelId: 'h4-mean-reversion-v1',
+  priority: 65,
+  needsAux: ['4h'],
+  marketWindow: 120,
+  marketWindows: { '4h': 300 },
+  planInterval: '4h',
+  paramSchema: H4_REVERSION_PARAM_SCHEMA,
+  analyze: (market, ctx = {}) => h4ReversionAnalysis(market, ctx),
+  review: (order, market) => h4ReversionReview(order, market)
+});
+
+/**
  * 引擎 → 默认策略映射（用于首次运行时把既有 config.analysis.engine 平移为启用集）
  *
  * ⚠️ 历史下线记录：`local`（本地多周期 v1）2026-09-12 下线；`super`/`ai`/`pin`/
@@ -136,5 +205,8 @@ defineStrategy({
  *    统一回落到 enhanced-trend-v1（runtime.defaultEnabled 的兜底行为）。
  */
 export const ENGINE_DEFAULT_STRATEGY = Object.freeze({
-  enhanced: 'enhanced-trend-v1'
+  enhanced: 'enhanced-trend-v1',
+  // 4H 原生引擎（2026-09-17 新增）：仅当配置里的 engine 显式写成它们时才作为默认启用项。
+  'h4-breakout': 'h4-trend-breakout-v1',
+  'h4-reversion': 'h4-mean-reversion-v1'
 });
