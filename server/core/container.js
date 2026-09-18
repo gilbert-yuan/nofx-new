@@ -66,7 +66,11 @@ export class Container {
     this.klineSync.automation = this.globalAutomation;
     registerGlobalAutomationRoutes(app, this.globalAutomation);
     // 策略管理：勾选启用 / 覆盖参数（运行时即 GlobalAutomation 里的策略运行时）
-    app.use(createStrategiesRouter({ strategies: this.globalAutomation.strategies, store: this.store }));
+    app.use(createStrategiesRouter({
+      strategies: this.globalAutomation.strategies,
+      store: this.store,
+      globalAutomation: this.globalAutomation
+    }));
     return this.globalAutomation;
   }
 

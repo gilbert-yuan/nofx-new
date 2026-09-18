@@ -12,7 +12,7 @@ import express from 'express';
 import { asyncHandler } from '../core/errors.js';
 import { PARAM_GROUP_LABELS } from '../enhancedAnalysis.js';
 
-export function createStrategiesRouter({ strategies, store }) {
+export function createStrategiesRouter({ strategies, store, globalAutomation = null }) {
   const router = express.Router();
 
   const config = () => store.getConfig();
@@ -39,11 +39,14 @@ export function createStrategiesRouter({ strategies, store }) {
       return res.status(400).json({ error: '请求体需包含 enabled（布尔）、params（对象）或 notes（字符串）。' });
     }
     const result = await strategies.update(req.params.id, patch, await config());
+    globalAutomation?.invalidateRuntimeConfig();
     res.json(result);
   }));
 
   router.post('/api/strategies/:id/reset', asyncHandler(async (req, res) => {
-    res.json(await strategies.reset(req.params.id, await config()));
+    const result = await strategies.reset(req.params.id, await config());
+    globalAutomation?.invalidateRuntimeConfig();
+    res.json(result);
   }));
 
   return router;

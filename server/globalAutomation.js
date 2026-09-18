@@ -73,6 +73,8 @@ export class GlobalAutomation {
       positionReview: { enabled: true, interval: 1000, lastRun: null, running: false }
     };
     this.inFlight = new Map();
+    // 保存配置后递增修订号，令当前扫描 context 在下一个币种/订单前刷新。
+    this.runtimeConfigRevision = 0;
 
     this.timers = {};
     // 递归调度的代际标记：重新调度/停止时递增，使旧循环自然退出，避免重复循环
@@ -90,6 +92,23 @@ export class GlobalAutomation {
     // 4h 结构策略不使用衍生品/BTC 环境上下文。
     // 相关拉取链路保留在下方注释中，避免旧配置或默认值重新启用。
     // this.skillContextCache = new Map();
+  }
+
+  /** 标记配置或旧版策略提示词已变更，避免重启进程才能刷新运行时快照。 */
+  invalidateRuntimeConfig() {
+    this.runtimeConfigRevision += 1;
+    return this.runtimeConfigRevision;
+  }
+
+  /** 按修订号加载自动化共用的配置上下文。 */
+  async loadRuntimeConfig(context = {}) {
+    const revision = this.runtimeConfigRevision;
+    if (context.configRevision !== revision || !context.config) {
+      context.config = await this.store.getConfig();
+      context.strategyPrompt = await this.store.getStrategy();
+      context.configRevision = revision;
+    }
+    return context;
   }
 
   /** 策略分析/复核共用的依赖注入（策略定义里通过 ctx.deps 取用） */
@@ -243,11 +262,10 @@ export class GlobalAutomation {
       console.warn('[GlobalAutomation] 代理不可用，跳过本轮行情分析（OKX 行情中断）。');
       return [];
     }
-    const config = context.config ??= await this.store.getConfig();
-    const strategyPrompt = context.strategyPrompt ??= await this.store.getStrategy();
-    // ⚠️ 启用集**不缓存**：syncKlines 整轮（全市场数百币种、数分钟）共用同一个 context，
-    // 若在这里按轮缓存，前端「策略管理」勾选/改参后要等下一整轮才生效（体验上像"没反应"）。
-    // 每币种重读一次 data/strategies.json（小文件、毫秒级）换来「勾选后下一币种即生效」。
+    await this.loadRuntimeConfig(context);
+    const { config, strategyPrompt } = context;
+    // 启用集和参数来自 data/strategies.json；配置保存后由修订号令共用 context 失效，
+    // 因此当前轮下一个币种即可使用新配置，不必重启服务或等待整轮结束。
     const enabledStrategies = explicitStrategies || await this.strategies.enabled(config);
     if (!enabledStrategies.length) {
       console.warn('[GlobalAutomation] ⚠️ 未启用任何策略，本轮不做分析。请到「策略管理」勾选至少一个策略。');
@@ -774,17 +792,17 @@ export class GlobalAutomation {
       return;
     }
 
-    const config = await this.store.getConfig();
+    let config = await this.store.getConfig();
     // 多策略：启用集只用于无 strategyId 的旧订单回退；有 strategyId 的存量订单
     // 由 strategyForOrder 从订单快照/配置文件恢复，即使原策略已被停用也继续复核。
-    const strategies = await this.strategies.enabled(config);
+    let strategies = await this.strategies.enabled(config);
     if (!strategies.length) {
       console.warn('[GlobalAutomation] ⚠️ 当前未启用新策略，但仍继续复核已有订单的策略快照。');
     }
 
     // 轻量快照直接传给复核链路：此前 reviewPendingOrder → runAnalysis 拿不到 state 时
     // 会退化为每秒一次全量 simulation.read()（含 9 万行 extensions hydrate，单次 8~19s）。
-    const context = { config, state };
+    const context = { config, state, configRevision: this.runtimeConfigRevision };
     // 清理已不活跃订单的复核记忆，防 Map 无界增长
     const activeIds = new Set(openOrders.map(o => o.id));
     for (const id of this._reviewedCandle.keys()) if (!activeIds.has(id)) this._reviewedCandle.delete(id);
@@ -793,6 +811,11 @@ export class GlobalAutomation {
     const markets = new Map();
     for (const snapshot of openOrders) {
       if (!shouldContinue()) break;
+      if (context.configRevision !== this.runtimeConfigRevision) {
+        await this.loadRuntimeConfig(context);
+        config = context.config;
+        strategies = await this.strategies.enabled(config);
+      }
       progress.symbol = snapshot.symbol;
       const curCandle = candleOpenAt(Date.now(), snapshot.interval);
       if (this._reviewedCandle.get(snapshot.id) === curCandle) {
@@ -849,7 +872,9 @@ export class GlobalAutomation {
           console.warn(`[GlobalAutomation] ${order.symbol} 找不到所属策略，跳过复核。`);
           continue;
         }
-        if (orderStrategy.engine === 'ai') context.strategyPrompt ??= await this.store.getStrategy();
+        if (orderStrategy.engine === 'ai' && !context.strategyPrompt) {
+          context.strategyPrompt = await this.store.getStrategy();
+        }
         progress.stage = 'strategy-review';
         const proposal = await orderStrategy.review(order, market, {
           config,

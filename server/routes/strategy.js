@@ -14,6 +14,7 @@ export function createStrategyRouter(container) {
   router.put('/api/strategy', asyncHandler(async (req, res) => {
     const strategy = normalizeStrategy(req.body || {});
     await store.saveStrategy(strategy);
+    container.globalAutomation?.invalidateRuntimeConfig();
     res.json(strategy);
   }));
 

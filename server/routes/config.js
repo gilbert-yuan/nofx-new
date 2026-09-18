@@ -16,6 +16,9 @@ export function createConfigRouter(container) {
     const current = await store.getConfig();
     const nextConfig = mergeConfig(current, stripMaskedSecrets(current, req.body || {}));
     await store.saveConfig(nextConfig);
+    // 配置文件落盘后通知全局自动化丢弃当前轮的配置快照，
+    // 让下一枚币种/下一笔复核读取新配置，不需要重启 API 进程。
+    container.globalAutomation?.invalidateRuntimeConfig();
     if (req.body.marketSync) await klineSync.configureFromStore();
     res.json(maskConfig(nextConfig));
   }));

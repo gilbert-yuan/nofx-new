@@ -64,6 +64,33 @@ test('GlobalAutomation - 初始化', () => {
   assert.ok(automation.tasks.positionReview, '持仓复核任务已配置');
 });
 
+test('配置保存后，自动化 context 会在修订号变化时刷新', async () => {
+  let config = { version: 1 };
+  let strategy = { rules: 'v1' };
+  const automation = new GlobalAutomation({
+    simulation: {}, market: {}, marketDb: {}, archive: {},
+    store: {
+      getConfig: async () => ({ ...config }),
+      getStrategy: async () => ({ ...strategy })
+    }
+  });
+  const context = {};
+
+  await automation.loadRuntimeConfig(context);
+  assert.equal(context.config.version, 1);
+  assert.equal(context.strategyPrompt.rules, 'v1');
+
+  config = { version: 2 };
+  strategy = { rules: 'v2' };
+  await automation.loadRuntimeConfig(context);
+  assert.equal(context.config.version, 1, '没有失效通知时保留当前操作的一致性');
+
+  automation.invalidateRuntimeConfig();
+  await automation.loadRuntimeConfig(context);
+  assert.equal(context.config.version, 2);
+  assert.equal(context.strategyPrompt.rules, 'v2');
+});
+
 test('GlobalAutomation - 4h 结构路径忽略残留衍生品/BTC 配置', async () => {
   let capturedContext;
   let derivativeCalls = 0;
