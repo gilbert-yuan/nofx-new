@@ -93,6 +93,38 @@ export function buildOpportunityReport({ signal, market, marketContext = {}, str
   };
 }
 
+/**
+ * 把机会报告里的参考价和保护价转换成实际下单使用的计划。
+ *
+ * 订单仍保留原始策略信号和报告用于审计；这里只生成 executionPlan，
+ * 让模拟撮合和 Binance Paper Sync 使用同一组入场、止损、止盈价格。
+ */
+export function buildExecutionPlanFromOpportunity(signal) {
+  const basePlan = signal?.plan;
+  const levels = signal?.opportunityReport?.levels;
+  if (!basePlan || !levels || typeof levels !== 'object') return null;
+
+  const entry = finitePositive(levels.optimalEntry);
+  if (entry == null) return null;
+
+  const plan = { ...basePlan, entryLimit: entry };
+  const stopLoss = finitePositive(levels.stopLoss);
+  if (stopLoss != null) plan.stopLoss = stopLoss;
+
+  const takeProfits = Array.isArray(levels.takeProfits)
+    ? levels.takeProfits.map(finitePositive).filter(value => value != null)
+    : [];
+  if (takeProfits.length) {
+    // 最后一档作为主止盈；前面档位保留给现有分批止盈/复核逻辑。
+    plan.takeProfit = takeProfits.at(-1);
+    for (const [index, key] of ['takeProfit1', 'takeProfit2', 'takeProfit3'].entries()) {
+      if (takeProfits[index] != null) plan[key] = takeProfits[index];
+      else delete plan[key];
+    }
+  }
+  return plan;
+}
+
 function normalizeAction(signal) {
   const action = String(signal?.action || '').toUpperCase();
   if (action === 'BUY' || action === 'SELL') return action;

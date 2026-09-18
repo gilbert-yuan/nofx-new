@@ -17,7 +17,7 @@ import { createStrategyRuntime } from './strategies/index.js';
 import { RISK_RULE } from './shared/strategyGuards.js';
 import { normalizeCloseReason, isStopReason } from '../shared/closeReasons.js';
 import { accountSummary, isTransientOrderError } from './simulatedAccount.js';
-import { buildOpportunityReport as createOpportunityReport } from './opportunityReport.js';
+import { buildOpportunityReport as createOpportunityReport, buildExecutionPlanFromOpportunity } from './opportunityReport.js';
 
 // ── 同币种冷却（2026-09-11 优化：由「仅止损后」扩展到「任意平仓后」）────────
 // 依据：2711 笔真实成交 + 真实 1m K 线回放，统一出场（2ATR 止损/3R 止盈/1R 后移动 1.5ATR/120 根）。
@@ -457,7 +457,13 @@ export class GlobalAutomation {
 
           if (signal.eligible && signal.plan && ['BUY', 'SELL'].includes(signal.action)) {
             outcome.eligible++;
-            const submission = await this.submitSignal({ symbol, signal, recordId: record.id, shouldContinue });
+            const submission = await this.submitSignal({
+              symbol,
+              signal,
+              recordId: record.id,
+              executionPlan: buildExecutionPlanFromOpportunity(signal),
+              shouldContinue
+            });
             if (submission.action === 'SUBMITTED') outcome.submitted++;
             if (submission.error) {
               outcome.failed++;
@@ -600,7 +606,7 @@ export class GlobalAutomation {
    * 风控闸门 + 按策略落单。
    * 同币种未平仓不重复开仓；止损后 / 任意平仓后的冷却期同样拦截。
    */
-  async submitSignal({ symbol, signal, recordId, shouldContinue }) {
+  async submitSignal({ symbol, signal, recordId, executionPlan, shouldContinue }) {
     try {
       const simState = this.simulation.readLight ? await this.simulation.readLight()
         : this.simulation.read ? await this.simulation.read() : { orders: [] };
@@ -686,7 +692,8 @@ export class GlobalAutomation {
         symbol,
         leverage,
         automatic: true,
-        strategyId: signal.strategyId
+        strategyId: signal.strategyId,
+        ...(executionPlan ? { executionPlan } : {})
       };
       // 买入金额：策略级 plan.autoMarginPct（如 4H 均值回归平衡档 0.015）优先 ——
       // 多策略共用一个资金池，各策略用各自回测验证过的仓位口径（按当前共享权益计）；

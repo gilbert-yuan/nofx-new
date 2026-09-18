@@ -12,6 +12,7 @@ import { optimizeStrategyFromOrders } from './adaptiveStrategy.js';
 import { BinanceClient } from './binanceClient.js';
 import { binanceMarket } from './binanceMarket.js';
 import { BinancePaperSync, createExchangeSyncState } from './binancePaperSync.js';
+import { buildExecutionPlanFromOpportunity } from './opportunityReport.js';
 
 export { safeSetLeverage } from './binancePaperSync.js';
 
@@ -89,7 +90,14 @@ export function submitPaperOrder(state, record, input, now = Date.now()) {
   const leverage = Math.max(1, Math.min(requestedLeverage, effectiveMax));
   if (!state.unlimitedCapital && state.orders.filter(active).length >= 20) fail('最多同时持有 20 个模拟挂单或持仓。');
   if (!state.unlimitedCapital && state.orders.some(o => active(o) && o.symbol === input.symbol)) fail('该币种已有模拟挂单或持仓。');
-  const plan = { ...signal.plan, stopLoss: Number(input.stopLoss ?? signal.plan.stopLoss), takeProfit: Number(input.takeProfit ?? signal.plan.takeProfit) };
+  // 自动化报告给出的参考入场价、止损和止盈优先固化到订单计划；
+  // 手动 input.stopLoss/takeProfit 仍可显式覆盖，兼容原有手动下单接口。
+  const executionPlan = input.executionPlan || buildExecutionPlanFromOpportunity(signal) || signal.plan;
+  const plan = {
+    ...executionPlan,
+    stopLoss: Number(input.stopLoss ?? executionPlan.stopLoss),
+    takeProfit: Number(input.takeProfit ?? executionPlan.takeProfit)
+  };
   const long = signal.positionRecommendation === 'OPEN_LONG';
   if (![plan.stopLoss, plan.takeProfit].every(v => Number.isFinite(v) && v > 0) || (long ? !(plan.stopLoss < plan.entryMin && plan.takeProfit > plan.entryMax) : !(plan.takeProfit < plan.entryMin && plan.stopLoss > plan.entryMax))) fail('止盈止损必须位于入场区间两侧，且符合多空方向。');
   const notional = margin * leverage;
