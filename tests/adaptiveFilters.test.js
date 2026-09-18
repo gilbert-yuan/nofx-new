@@ -90,6 +90,21 @@ describe('adaptiveFilters', () => {
       expect(result.filteredOut).toHaveLength(0);
     });
 
+    it('应该按保证金归一化期望值，避免大仓位盈利掩盖小仓位亏损', () => {
+      const orders = [
+        { symbol: 'SCALEUSDT', status: 'closed', net: 10, margin: 1000 },
+        { symbol: 'SCALEUSDT', status: 'closed', net: -9, margin: 100 }
+      ];
+      const result = filterSymbolsByPerformance(['SCALEUSDT'], orders, {
+        minSampleSize: 2,
+        minSampleSizeToExclude: 2
+      });
+
+      expect(result.filtered).not.toContain('SCALEUSDT');
+      expect(result.filteredOut[0].avgNet).toBeCloseTo(0.5, 2);
+      expect(result.filteredOut[0].avgRoi).toBeLessThan(0);
+    });
+
     it('禁用时应该返回所有币种', () => {
       const symbols = ['BTCUSDT', 'ETHUSDT'];
       const orders = [
@@ -155,6 +170,29 @@ describe('adaptiveFilters', () => {
       });
 
       expect(result.highProbHours).toHaveLength(0);
+    });
+
+    it('应该按实际成交时间归因，而不是按挂单创建时间归因', () => {
+      const orders = [];
+      for (let i = 0; i < 5; i++) {
+        orders.push({
+          status: 'closed',
+          createdAt: new Date(Date.UTC(2024, 0, 1, 12, i)).toISOString(),
+          entryAt: new Date(Date.UTC(2024, 0, 1, 8, i)).toISOString(),
+          net: 10
+        });
+        orders.push({
+          status: 'closed',
+          createdAt: new Date(Date.UTC(2024, 0, 1, 8, i)).toISOString(),
+          entryAt: new Date(Date.UTC(2024, 0, 1, 12, i)).toISOString(),
+          net: -5
+        });
+      }
+
+      const result = identifyHighProbabilityHours(orders, { minSampleSize: 5 });
+
+      expect(result.highProbHours).toContain(8);
+      expect(result.highProbHours).not.toContain(12);
     });
   });
 

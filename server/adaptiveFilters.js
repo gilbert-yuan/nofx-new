@@ -7,6 +7,18 @@
 // 就把一个长期赚钱的币误杀。
 const MIN_SAMPLE_SIZE_TO_EXCLUDE = 10;
 
+// 订单保证金会随账户权益、策略和时间变化，直接比较 USDT 净额会让大仓位
+// 的历史样本支配币种过滤。优先使用订单自身 ROI，没有 ROI 时再按保证金归一化；
+// 旧订单没有仓位字段则回退到净额，保持兼容。
+function normalizedOrderReturn(order) {
+  const roi = Number(order?.roi);
+  if (Number.isFinite(roi)) return roi;
+  const net = Number(order?.net);
+  const margin = Number(order?.margin);
+  if (Number.isFinite(net) && Number.isFinite(margin) && margin > 0) return net / margin;
+  return Number.isFinite(net) ? net : 0;
+}
+
 /**
  * 基于币种历史表现过滤符号列表
  * @param {string[]} symbols - 候选币种列表
@@ -36,12 +48,14 @@ export function filterSymbolsByPerformance(symbols, historicalOrders, options = 
         count: 0,
         wins: 0,
         totalNet: 0,
+        totalRoi: 0,
         orders: []
       };
     }
     symbolStats[symbol].count++;
     if (order.net > 0) symbolStats[symbol].wins++;
     symbolStats[symbol].totalNet += order.net;
+    symbolStats[symbol].totalRoi += normalizedOrderReturn(order);
     symbolStats[symbol].orders.push(order);
   }
 
@@ -66,19 +80,21 @@ export function filterSymbolsByPerformance(symbols, historicalOrders, options = 
 
     const winRate = stats.wins / stats.count;
     const avgNet = stats.totalNet / stats.count;
+    const avgRoi = stats.totalRoi / stats.count;
 
-    // P1-3：改用期望值(avgNet)过滤，而非单纯胜率。
+    // P1-3：改用归一化期望值(avgRoi)过滤，而非单纯胜率或绝对 USDT 净额。
     // 胜率30%但盈亏比4:1的赚钱币不应被误杀；只有样本足够且净期望为负才排除。
     // P3：排除还要求样本量 >= excludeSampleSize，避免小样本误杀。
-    if (avgNet > 0 || stats.count < excludeSampleSize) {
+    if (avgRoi > 0 || stats.count < excludeSampleSize) {
       filtered.push(symbol);
     } else {
       filteredOut.push({
         symbol,
         winRate,
         avgNet,
+        avgRoi,
         count: stats.count,
-        reason: `期望收益 ${avgNet.toFixed(2)} USDT/单为负（胜率${(winRate * 100).toFixed(1)}%，样本${stats.count}），停止交易`
+        reason: `归一化期望收益 ${(avgRoi * 100).toFixed(3)}%/单为负（绝对均值${avgNet.toFixed(2)}U，胜率${(winRate * 100).toFixed(1)}%，样本${stats.count}），停止交易`
       });
     }
   }
@@ -90,7 +106,8 @@ export function filterSymbolsByPerformance(symbols, historicalOrders, options = 
       enrichedStats[symbol] = {
         ...stats,
         winRate: stats.wins / stats.count,
-        avgNet: stats.totalNet / stats.count
+        avgNet: stats.totalNet / stats.count,
+        avgRoi: stats.totalRoi / stats.count
       };
     }
   }
@@ -135,8 +152,11 @@ export function identifyHighProbabilityHours(historicalOrders, options = {}) {
   }));
 
   for (const order of historicalOrders.filter(o => o.status === 'closed')) {
-    if (!order.createdAt) continue;
-    const hour = new Date(order.createdAt).getUTCHours();
+    // 时段表现应归因到实际成交时刻；挂单等待时间可能跨小时，createdAt
+    // 反映的是发现机会的时间而不是承担风险的时间。
+    const timestamp = order.entryAt || order.createdAt;
+    if (!timestamp) continue;
+    const hour = new Date(timestamp).getUTCHours();
     hourStats[hour].count++;
     if (order.net > 0) hourStats[hour].wins++;
     hourStats[hour].totalNet += order.net;

@@ -30,6 +30,7 @@ import { recommendedLeverage } from '../server/localAnalysis.js';
 import { LONG_ONLY, RISK_RULE } from '../server/shared/strategyGuards.js';
 import { pumpFadeShortAnalysis } from '../server/pumpFadeShortAnalysis.js';
 import { localProtectionReview } from '../server/shared/protectionReview.js';
+import { buildOpportunityReport, buildExecutionPlanFromOpportunity } from '../server/opportunityReport.js';
 
 // 正式策略入口：enhanced / enhanced-trend-v1 都解析到注册表策略。
 // pump-short 是历史未注册引擎，保留兼容分支供旧实验复现；新策略应先注册再接入此入口。
@@ -137,6 +138,27 @@ const EARLY_CUT_BARS = Number(process.env.NOFX_BT_EARLY_CUT_BARS ?? 5);
 const NEED_EXIT_SNAPSHOT = !!(PARAM_OVERRIDES
   && Object.keys(PARAM_OVERRIDES).some(k => String(k).startsWith('smartExit')));
 const meta = JSON.parse(fs.readFileSync(path.join(DIR, 'meta.json'), 'utf8'));
+
+/**
+ * 回测与实盘共用机会报告生成的执行计划。
+ *
+ * 回测语料没有实时 OI/资金费率上下文，因此只传已收盘 K 线；机会报告的
+ * 参考入场、止损和止盈级别仍由同一个生产模块计算，缺少上下文时不会伪造
+ * 市场结论。这样模拟撮合至少不会绕过实盘使用的 executionPlan 归一化链路。
+ */
+function applyOpportunityExecutionPlan(signal, market) {
+  if (!IS_FORMAL_STRATEGY || !signal?.plan) return signal;
+  const report = buildOpportunityReport({
+    signal: { ...signal, symbol: signal.symbol || market.symbol, interval: signal.interval || market.interval },
+    market,
+    marketContext: { errors: { opportunityContext: 'backtest_context_unavailable' } },
+    strategy: STRATEGY_DEF
+  });
+  if (!report) return signal;
+  const withReport = { ...signal, opportunityReport: report };
+  const executionPlan = buildExecutionPlanFromOpportunity(withReport);
+  return executionPlan ? { ...withReport, plan: executionPlan } : withReport;
+}
 // 只回测数据完整的币种（补齐替换后，原数据不足的币仍留在磁盘上）
 // 派生语料（bf90-15mrs 等）meta 没有 barsTarget —— 用样本最大根数兜底。
 const BARS_TARGET_BT = Number(meta.barsTarget) || Math.max(...(meta.symbols || []).map(s => Number(s.bars) || 0));
@@ -322,6 +344,8 @@ async function runSymbol(symbol, bars) {
           plan: { ...sig.plan, exitRules: buildExitRules(STRATEGY_PARAMS) }
         };
       }
+      // 与生产提交路径一致：先生成机会报告，再把参考入场/止损/止盈写入执行计划。
+      sig = applyOpportunityExecutionPlan(sig, market);
     }
 
     // ── B. 挂单复核（方向反转立即撤 / 软门槛连续不合格 30 分钟宽限）
@@ -404,14 +428,25 @@ async function runSymbol(symbol, bars) {
         nextTime: bars[i + 2].openTime,
         notional: MARGIN * leverage, leverage, margin: MARGIN,
         costs: { ...PAPER_COSTS }, protectionRevisions: [],
-        analysisContext: { strategyId: STRATEGY, strategyParams: STRATEGY_PARAMS },
+        analysisContext: {
+          strategyId: STRATEGY,
+          strategyParams: STRATEGY_PARAMS,
+          opportunityDecision: sig.opportunityReport?.decision?.code || null
+        },
+        opportunityReport: sig.opportunityReport || null,
         status: 'pending', error: '', ineligibleRounds: 0, ineligibleSince: null,
         createdAt: new Date(now).toISOString(), nextTimeIdx: i + 2,
         _score: plan.trendStrengthScore ?? null,
         _atrPct: plan.indicators?.atr ? plan.indicators.atr / close : null,
         _hour: new Date(bars[i].openTime + 8 * 3600000).getUTCHours()
       };
-      placed.push({ symbol, direction: dir, at: bars[i].openTime, score: active._score, atrPct: active._atrPct });
+      placed.push({
+        symbol, direction: dir, at: bars[i].openTime, score: active._score, atrPct: active._atrPct,
+        referenceEntry: Number(plan.entryLimit) || null,
+        stopLoss: Number(plan.stopLoss) || null,
+        takeProfit: Number(plan.takeProfit) || null,
+        opportunityDecision: sig.opportunityReport?.decision?.code || null
+      });
     }
   }
   if (active) trades.push({ symbol, status: active.status, unfinished: true });

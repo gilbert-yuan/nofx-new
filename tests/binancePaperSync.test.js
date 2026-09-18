@@ -230,3 +230,277 @@ test('limit price outside the PERCENT_PRICE band is rejected on live, ignored on
   const demo = await paperLimitParams({ symbol: 'BTCUSDT', direction: 'OPEN_SHORT', plan: { entryLimit: 130 }, notional: 100 }, bandClient(), 'demo', new Map());
   assert.equal(demo.price, 130);
 });
+
+test('filled paper orders create native Binance stop/take-profit protection once and persist the link', async () => {
+  const order = makeOrder({
+    status: 'open',
+    plan: { entryLimit: 100, stopLoss: 90.07, takeProfit: 110.09 },
+    exchangeSync: {
+      demo: { status: 'filled', orderId: 17, clientOrderId: 'nofxpaper-entry', executedQty: 1, origQty: 1 },
+      live: { status: 'not_submitted' }
+    }
+  });
+  const remote = [];
+  const protectionCalls = [];
+  const lifecycle = [];
+  const client = hedgeClient({
+    exchangeInfo: async () => ({
+      symbols: [{
+        symbol: 'BTCUSDT', status: 'TRADING', contractType: 'PERPETUAL', quoteAsset: 'USDT',
+        filters: [
+          { filterType: 'PRICE_FILTER', tickSize: '0.1' },
+          { filterType: 'LOT_SIZE', stepSize: '0.001', minQty: '0.001' }
+        ]
+      }]
+    }),
+    order: async () => ({ orderId: 17, status: 'FILLED', executedQty: '1', origQty: '1', avgPrice: '100' }),
+    openAlgoOrders: async () => remote,
+    protectionOrder: async params => {
+      const type = params.type;
+      const result = { algoId: remote.length + 100, status: 'NEW', clientAlgoId: params.clientAlgoId };
+      protectionCalls.push(params);
+      remote.push({ ...params, orderType: type, triggerPrice: String(params.triggerPrice), ...result });
+      lifecycle.push(`protect:${type}`);
+      return result;
+    },
+    cancelAlgo: async algoId => { lifecycle.push(`cancel:${algoId}`); }
+  });
+  const sync = new BinancePaperSync({ simulation: makeSimulation(order), store, clientFactory: () => client, intervalMs: 60000 });
+
+  await sync.process(order.id, { submit: false, cancel: false, pull: true, closeActions: new Map() });
+  await sync.process(order.id, { submit: false, cancel: false, pull: true, closeActions: new Map() });
+
+  assert.deepEqual(protectionCalls.map(item => [item.type, item.side, item.positionSide, item.triggerPrice]), [
+    ['STOP_MARKET', 'SELL', 'LONG', 90],
+    ['TAKE_PROFIT_MARKET', 'SELL', 'LONG', 110]
+  ]);
+  assert.equal(protectionCalls.length, 2, '第二次对账只复用已有保护单，不重复下单');
+  assert.equal(order.exchangeSync.demo.protection.stopLoss.status, 'new');
+  assert.equal(order.exchangeSync.demo.protection.stopLoss.algoId, 100);
+  assert.equal(order.exchangeSync.demo.protection.stopLoss.triggerPrice, 90);
+  assert.equal(order.exchangeSync.demo.protection.takeProfit.algoId, 101);
+  assert.deepEqual(lifecycle, ['protect:STOP_MARKET', 'protect:TAKE_PROFIT_MARKET']);
+});
+
+test('paper close cancels owned native protections before reduce-only market close', async () => {
+  const action = {
+    id: 'close-1', reason: 'take_profit', paperQuantity: 1, originalPaperQuantity: 1,
+    status: 'not_requested', clientOrderId: 'nofxpaper-close', orderId: null,
+    executedQty: 0, retryAt: null, retryCount: 0
+  };
+  const order = makeOrder({
+    status: 'closed', quantity: 1, plan: { stopLoss: 90, takeProfit: 110 },
+    exchangeSync: {
+      demo: { status: 'filled', orderId: 17, clientOrderId: 'nofxpaper-entry', executedQty: 1, origQty: 1,
+        closeOrders: [action] },
+      live: { status: 'not_submitted' }
+    }
+  });
+  const lifecycle = [];
+  const client = hedgeClient({
+    exchangeInfo: async () => ({
+      symbols: [{
+        symbol: 'BTCUSDT', status: 'TRADING', contractType: 'PERPETUAL', quoteAsset: 'USDT',
+        filters: [{ filterType: 'LOT_SIZE', stepSize: '0.001', minQty: '0.001' }]
+      }]
+    }),
+    openAlgoOrders: async () => [
+      { orderType: 'STOP_MARKET', algoId: 100, clientAlgoId: 'nofxd-stop', positionSide: 'LONG', side: 'SELL' },
+      { orderType: 'TAKE_PROFIT_MARKET', algoId: 101, clientAlgoId: 'nofxd-take', positionSide: 'LONG', side: 'SELL' }
+    ],
+    cancelAlgo: async algoId => { lifecycle.push(`cancel:${algoId}`); },
+    marketOrder: async () => { lifecycle.push('market-close'); return { orderId: 77, status: 'FILLED', executedQty: '1', avgPrice: '110' }; }
+  });
+  const sync = new BinancePaperSync({ simulation: makeSimulation(order), store, clientFactory: () => client, intervalMs: 60000 });
+
+  await sync.process(order.id, { submit: false, cancel: false, pull: true, closeActions: new Map() });
+
+  assert.deepEqual(lifecycle, ['cancel:100', 'cancel:101', 'market-close']);
+  assert.equal(action.status, 'filled');
+  assert.equal(order.exchangeSync.demo.protection.stopLoss.status, 'canceled');
+  assert.equal(order.exchangeSync.demo.protection.takeProfit.status, 'canceled');
+});
+
+test('hedge-mode close only cancels protections for the matching position side', async () => {
+  const action = {
+    id: 'close-hedge-isolated', reason: 'take_profit', paperQuantity: 1, originalPaperQuantity: 1,
+    status: 'not_requested', clientOrderId: 'nofxpaper-close-hedge', orderId: null,
+    executedQty: 0, retryAt: null, retryCount: 0
+  };
+  const order = makeOrder({
+    status: 'closed',
+    exchangeSync: {
+      demo: { status: 'filled', orderId: 17, clientOrderId: 'nofxpaper-entry', executedQty: 1, origQty: 1, closeOrders: [action] },
+      live: { status: 'not_submitted' }
+    }
+  });
+  const canceled = [];
+  const remote = [
+    { orderType: 'STOP_MARKET', algoId: 100, clientAlgoId: 'nofx-long-stop', positionSide: 'LONG', side: 'SELL' },
+    { orderType: 'TAKE_PROFIT_MARKET', algoId: 101, clientAlgoId: 'nofx-long-take', positionSide: 'LONG', side: 'SELL' },
+    { orderType: 'STOP_MARKET', algoId: 200, clientAlgoId: 'nofx-short-stop', positionSide: 'SHORT', side: 'BUY' },
+    { orderType: 'TAKE_PROFIT_MARKET', algoId: 201, clientAlgoId: 'nofx-short-take', positionSide: 'SHORT', side: 'BUY' }
+  ];
+  const client = hedgeClient({
+    exchangeInfo: async () => ({ symbols: [{ symbol: 'BTCUSDT', status: 'TRADING', contractType: 'PERPETUAL', quoteAsset: 'USDT', filters: [{ filterType: 'LOT_SIZE', stepSize: '0.001', minQty: '0.001' }] }] }),
+    openAlgoOrders: async () => remote,
+    cancelAlgo: async algoId => { canceled.push(algoId); },
+    marketOrder: async () => ({ orderId: 78, status: 'FILLED', executedQty: '1', avgPrice: '110' })
+  });
+  const sync = new BinancePaperSync({ simulation: makeSimulation(order), store, clientFactory: () => client, intervalMs: 60000 });
+
+  await sync.process(order.id, { submit: false, cancel: false, pull: true, closeActions: new Map() });
+
+  assert.deepEqual(canceled, [100, 101]);
+  assert.deepEqual(remote.filter(item => item.positionSide === 'SHORT').map(item => item.algoId), [200, 201]);
+});
+
+test('paper close reconciles an externally closed Binance position without sending another market order', async () => {
+  const action = {
+    id: 'close-external', reason: 'manual', paperQuantity: 1, originalPaperQuantity: 1,
+    status: 'not_requested', clientOrderId: 'nofxpaper-close-external', orderId: null,
+    executedQty: 0, retryAt: null, retryCount: 0
+  };
+  const order = makeOrder({
+    status: 'closed',
+    exchangeSync: {
+      demo: { status: 'filled', orderId: 17, clientOrderId: 'nofxpaper-entry', executedQty: 1, origQty: 1, closeOrders: [action] },
+      live: { status: 'not_submitted' }
+    }
+  });
+  let marketCalls = 0;
+  const client = hedgeClient({
+    positions: async () => [{ symbol: 'BTCUSDT', positionSide: 'LONG', positionAmt: '0' }],
+    marketOrder: async () => { marketCalls++; return { orderId: 77, status: 'FILLED' }; }
+  });
+  const sync = new BinancePaperSync({ simulation: makeSimulation(order), store, clientFactory: () => client, intervalMs: 60000 });
+
+  await sync.process(order.id, { submit: false, cancel: false, pull: true, closeActions: new Map() });
+
+  assert.equal(marketCalls, 0);
+  assert.equal(action.status, 'reconciled_no_position');
+});
+
+test('live filled entry fails closed with one idempotent emergency reduce-only close when protection cannot be read', async () => {
+  const order = makeOrder({
+    status: 'open',
+    plan: { entryLimit: 100, stopLoss: 90, takeProfit: 110 },
+    exchangeSync: {
+      demo: { status: 'not_submitted' },
+      live: { status: 'filled', orderId: 17, clientOrderId: 'nofxlive-entry', executedQty: 1, origQty: 1 }
+    }
+  });
+  const calls = [];
+  const client = hedgeClient({
+    exchangeInfo: async () => ({
+      symbols: [{
+        symbol: 'BTCUSDT', status: 'TRADING', contractType: 'PERPETUAL', quoteAsset: 'USDT',
+        filters: [{ filterType: 'PRICE_FILTER', tickSize: '0.1' }, { filterType: 'LOT_SIZE', stepSize: '0.001', minQty: '0.001' }]
+      }]
+    }),
+    openAlgoOrders: async () => { throw new Error('protection endpoint unavailable'); },
+    protectionOrder: async () => { throw new Error('protection endpoint unavailable'); },
+    marketOrder: async params => {
+      calls.push(params);
+      return { orderId: 77, status: 'FILLED', executedQty: '1', avgPrice: '99' };
+    }
+  });
+  const liveStore = {
+    getConfig: async () => ({
+      binance: { liveApiKey: 'k', liveSecretKey: 's' },
+      trader: { syncPaperOrdersToLive: true }
+    })
+  };
+  const sync = new BinancePaperSync({ simulation: makeSimulation(order), store: liveStore, clientFactory: () => client, intervalMs: 60000 });
+
+  await sync.process(order.id, { submit: false, cancel: false, pull: true, closeActions: new Map() });
+  await sync.process(order.id, { submit: false, cancel: false, pull: true, closeActions: new Map() });
+
+  assert.equal(calls.length, 1, '保护单读取失败后只发送一次紧急减仓，后续轮次按终态对账');
+  assert.equal(calls[0].side, 'SELL');
+  assert.equal(calls[0].reduceOnly, true);
+  assert.equal(calls[0].positionSide, 'LONG');
+  assert.equal(order.exchangeSync.live.emergencyClose.status, 'filled');
+  assert.equal(order.exchangeSync.live.emergencyClose.orderId, 77);
+  assert.equal(order.exchangeSync.live.protection.stopLoss.status, 'sync_error');
+});
+
+test('unknown emergency close response is reconciled on the next poll without resubmitting', async () => {
+  const order = makeOrder({
+    status: 'open',
+    plan: { entryLimit: 100, stopLoss: 90, takeProfit: 110 },
+    exchangeSync: {
+      demo: { status: 'not_submitted' },
+      live: { status: 'filled', orderId: 17, clientOrderId: 'nofxlive-entry', executedQty: 1, origQty: 1 }
+    }
+  });
+  let marketCalls = 0;
+  let orderLookups = 0;
+  const unknown = Object.assign(new Error('execution status is unknown'), { status: 503 });
+  const client = hedgeClient({
+    exchangeInfo: async () => ({
+      symbols: [{
+        symbol: 'BTCUSDT', status: 'TRADING', contractType: 'PERPETUAL', quoteAsset: 'USDT',
+        filters: [{ filterType: 'PRICE_FILTER', tickSize: '0.1' }, { filterType: 'LOT_SIZE', stepSize: '0.001', minQty: '0.001' }]
+      }]
+    }),
+    openAlgoOrders: async () => { throw new Error('protection endpoint unavailable'); },
+    protectionOrder: async () => { throw new Error('protection endpoint unavailable'); },
+    marketOrder: async () => { marketCalls++; throw unknown; },
+    order: async () => {
+      orderLookups++;
+      if (orderLookups === 1) throw new Error('order not visible yet');
+      return { orderId: 78, status: 'FILLED', executedQty: '1', avgPrice: '99' };
+    }
+  });
+  const liveStore = {
+    getConfig: async () => ({ binance: { liveApiKey: 'k', liveSecretKey: 's' }, trader: { syncPaperOrdersToLive: true } })
+  };
+  const sync = new BinancePaperSync({ simulation: makeSimulation(order), store: liveStore, clientFactory: () => client, intervalMs: 60000 });
+
+  await sync.process(order.id, { submit: false, cancel: false, pull: true, closeActions: new Map() });
+  assert.equal(order.exchangeSync.live.emergencyClose.status, 'unknown');
+  await sync.process(order.id, { submit: false, cancel: false, pull: true, closeActions: new Map() });
+
+  assert.equal(marketCalls, 1, '未知响应恢复期间不重复发送市价单');
+  assert.equal(order.exchangeSync.live.emergencyClose.status, 'filled');
+  assert.equal(order.exchangeSync.live.emergencyClose.orderId, 78);
+});
+
+test('emergency close retries residual protection cleanup after a transient protection API failure', async () => {
+  const order = makeOrder({
+    status: 'open',
+    plan: { entryLimit: 100, stopLoss: 90, takeProfit: 110 },
+    exchangeSync: {
+      demo: { status: 'not_submitted' },
+      live: { status: 'filled', orderId: 17, clientOrderId: 'nofxlive-entry', executedQty: 1, origQty: 1 }
+    }
+  });
+  let openCalls = 0;
+  const canceled = [];
+  const client = hedgeClient({
+    exchangeInfo: async () => ({ symbols: [{ symbol: 'BTCUSDT', status: 'TRADING', contractType: 'PERPETUAL', quoteAsset: 'USDT', filters: [
+      { filterType: 'PRICE_FILTER', tickSize: '0.1' },
+      { filterType: 'LOT_SIZE', stepSize: '0.001', minQty: '0.001' }
+    ] }] }),
+    openAlgoOrders: async () => {
+      openCalls++;
+      if (openCalls <= 2) throw new Error('protection endpoint temporarily unavailable');
+      return [{ orderType: 'STOP_MARKET', algoId: 300, clientAlgoId: 'nofxlive-stop', positionSide: 'LONG', side: 'SELL' }];
+    },
+    protectionOrder: async () => { throw new Error('protection endpoint temporarily unavailable'); },
+    cancelAlgo: async algoId => { canceled.push(algoId); },
+    marketOrder: async () => ({ orderId: 79, status: 'FILLED', executedQty: '1', avgPrice: '99' })
+  });
+  const sync = new BinancePaperSync({ simulation: makeSimulation(order), store: {
+    getConfig: async () => ({ binance: { demo: true, liveApiKey: 'k', liveSecretKey: 's' }, trader: { syncPaperOrdersToLive: true } })
+  }, clientFactory: () => client, intervalMs: 60000 });
+  await sync.process(order.id, { submit: false, cancel: false, pull: true, closeActions: new Map() });
+  assert.equal(order.exchangeSync.live.emergencyClose.status, 'filled');
+  assert.equal(order.exchangeSync.live.emergencyClose.cleanupStatus, 'pending');
+
+  order.exchangeSync.live.emergencyClose.retryAt = new Date(Date.now() - 1).toISOString();
+  await sync.process(order.id, { submit: false, cancel: false, pull: true, closeActions: new Map() });
+  assert.deepEqual(canceled, [300]);
+  assert.equal(order.exchangeSync.live.emergencyClose.cleanupStatus, 'clean');
+});

@@ -19,6 +19,64 @@ import { normalizeCloseReason, isStopReason } from '../shared/closeReasons.js';
 import { accountSummary, isTransientOrderError } from './simulatedAccount.js';
 import { buildOpportunityReport as createOpportunityReport, buildExecutionPlanFromOpportunity } from './opportunityReport.js';
 
+/**
+ * 对一轮扫描得到的机会做确定性排序。
+ *
+ * 旧逻辑在每个 20 币批次中边分析边提交，CPU/行情响应更快的币会抢先占用
+ * 账户仓位，导致同一轮的候选质量无法比较。这里把策略分数、计划盈亏比和
+ * 策略优先级统一成一个稳定排序，随后由 submitSignal 再执行重复币种、冷却、
+ * 并发和资金检查。
+ */
+const candidateNumberOr = (value, fallback = 0) => Number.isFinite(Number(value)) ? Number(value) : fallback;
+const candidateScore = candidate => {
+  const signal = candidate?.signal || {};
+  const plan = signal.plan || {};
+  const explicitScore = [plan.trendStrengthScore, signal.score, signal.entryQuality]
+    .map(value => Number(value))
+    .find(Number.isFinite);
+  if (explicitScore != null) return explicitScore;
+  const confidence = candidateNumberOr(signal.confidence, 0);
+  return confidence > 1 ? confidence : confidence * 100;
+};
+const candidateRr = candidate => {
+  const plan = candidate?.signal?.plan || {};
+  const report = candidate?.signal?.opportunityReport || {};
+  return candidateNumberOr(plan.netRr ?? plan.riskReward ?? plan.rr ?? report.risk?.rewardRisk, 0);
+};
+const candidatePriority = candidate => candidateNumberOr(candidate?.strategy?.priority, Number.MAX_SAFE_INTEGER);
+const compareAutomationCandidates = (a, b) => {
+  const scoreDiff = candidateScore(b) - candidateScore(a);
+  if (scoreDiff) return scoreDiff;
+  const rrDiff = candidateRr(b) - candidateRr(a);
+  if (rrDiff) return rrDiff;
+  const priorityDiff = candidatePriority(a) - candidatePriority(b);
+  if (priorityDiff) return priorityDiff;
+  return String(a?.symbol || '').localeCompare(String(b?.symbol || ''));
+};
+
+export function rankAutomationCandidates(candidates = []) {
+  return [...candidates].sort(compareAutomationCandidates);
+}
+
+/**
+ * 同一币种可能同时命中多个策略。策略优先级是该场景的硬仲裁规则，
+ * 不能因为低优先级策略的分数更高就先占用仓位；同优先级才按质量排序。
+ */
+export function selectAutomationCandidates(candidates = []) {
+  const selected = new Map();
+  for (const candidate of candidates) {
+    const symbol = String(candidate?.symbol || '');
+    if (!symbol) continue;
+    const current = selected.get(symbol);
+    if (!current || candidatePriority(candidate) < candidatePriority(current)
+      || (candidatePriority(candidate) === candidatePriority(current)
+        && compareAutomationCandidates(candidate, current) < 0)) {
+      selected.set(symbol, candidate);
+    }
+  }
+  return [...selected.values()];
+}
+
 // ── 同币种冷却（2026-09-11 优化：由「仅止损后」扩展到「任意平仓后」）────────
 // 依据：2711 笔真实成交 + 真实 1m K 线回放，统一出场（2ATR 止损/3R 止盈/1R 后移动 1.5ATR/120 根）。
 // 策略期望为负（均单 -0.0108，t=-9.64），因此「少交易」是唯一确定的减亏手段。
@@ -218,21 +276,22 @@ export class GlobalAutomation {
     return work;
   }
 
-  // Task 1: finish fetch -> analysis -> optional submission for each symbol.
+  // Task 1: fetch the round first, then analyze/rank/submit the whole candidate set.
   async syncKlines(shouldContinue = () => true) {
     const symbols = (await this.market.perpetualUsdtContracts()).map(c => c.symbol);
     const context = {};
     const progress = this.tasks.klineSync.progress = { total: symbols.length, completed: 0, failed: 0, symbol: null };
     const roundStart = Date.now();
-    let roundSignals = 0;
+    const preparedMarkets = {};
+    const scannableSymbols = [];
     for (const symbol of symbols) {
       if (!shouldContinue()) break;
       progress.symbol = symbol;
       try {
         const market = await this.getFreshMarket(symbol, MAIN_INTERVAL, true);
         if (!shouldContinue()) break;
-        const signals = await this.runAnalysis({ symbols: [symbol], preparedMarket: market, shouldContinue, context });
-        roundSignals += Array.isArray(signals) ? signals.length : 0;
+        preparedMarkets[symbol] = market;
+        scannableSymbols.push(symbol);
       } catch (error) {
         progress.failed++;
         this.tasks.klineSync.error = `${symbol}: ${error.message}`;
@@ -240,8 +299,21 @@ export class GlobalAutomation {
       progress.completed++;
       await new Promise(resolve => setImmediate(resolve));
     }
+    // 行情先收集完，再把本轮全部币种交给同一个 runAnalysis：这样候选排序、
+    // 每轮开仓上限和总敞口限制才真正覆盖全市场，而不是只覆盖单个币种调用。
+    if (shouldContinue() && scannableSymbols.length) {
+      const signals = await this.runAnalysis({
+        symbols: scannableSymbols,
+        preparedMarkets,
+        shouldContinue,
+        context
+      });
+      progress.signals = Array.isArray(signals) ? signals.length : 0;
+    } else {
+      progress.signals = 0;
+    }
     progress.symbol = null;
-    console.log(`[GlobalAutomation][klineSync 轮] 全市场 ${progress.completed} 币（失败 ${progress.failed}）· 新信号 ${roundSignals} · 耗时 ${((Date.now() - roundStart) / 1000).toFixed(0)}s`);
+    console.log(`[GlobalAutomation][klineSync 轮] 全市场 ${progress.completed} 币（失败 ${progress.failed}）· 新信号 ${progress.signals} · 耗时 ${((Date.now() - roundStart) / 1000).toFixed(0)}s`);
   }
 
   /**
@@ -255,7 +327,7 @@ export class GlobalAutomation {
    * @param {object} [options]
    * @param {Array}  [options.strategies] 显式指定策略（挂单复核时只跑该订单所属策略）
    */
-  async runAnalysis({ symbols: requestedSymbols, preparedMarket, submit = true, interval = MAIN_INTERVAL,
+  async runAnalysis({ symbols: requestedSymbols, preparedMarket, preparedMarkets, submit = true, interval = MAIN_INTERVAL,
     shouldContinue = () => true, context = {}, strategies: explicitStrategies } = {}) {
     // 代理宕机时跳过本轮分析，避免对全市场币种逐个刷 fetch failed。
     if (!proxyHealth.isAlive()) {
@@ -309,12 +381,13 @@ export class GlobalAutomation {
     }
 
     const totals = { analyzed: 0, eligible: 0, submitted: 0, failed: 0 };
+    const candidates = [];
     // P3 可观测性：区分"正常降频"与"门槛过严导致 0 开单"。每币种最多计一次（最靠前的那道闸）。
     const blockedBy = { score: 0, volume: 0, riskReward: 0 };
 
     for (const strategy of enabledStrategies) {
       if (!shouldContinue()) break;
-      let candidates = symbols;
+      let strategyCandidates = symbols;
 
       // 策略级候选预筛选（如超级增强的市值 / 流动性过滤）
       if (strategy.prefilter) {
@@ -325,7 +398,7 @@ export class GlobalAutomation {
             if (result.reasons) {
               console.log(`[GlobalAutomation][${strategy.id}] 过滤原因: 市值${result.reasons.lowMarketCap}, 流动性${result.reasons.lowLiquidity}, 波动${result.reasons.extremeVolatility}`);
             }
-            candidates = result.filtered;
+            strategyCandidates = result.filtered;
           }
         } catch (error) {
           console.warn(`[GlobalAutomation][${strategy.id}] 预筛选失败，跳过本轮该策略: ${error.message}`);
@@ -346,7 +419,7 @@ export class GlobalAutomation {
       }
 
       const outcome = await this.scanWithStrategy({
-        strategy, symbols: candidates, preparedMarket, submit, interval, shouldContinue,
+        strategy, symbols: strategyCandidates, preparedMarket, preparedMarkets, submit, interval, shouldContinue,
         config, strategyPrompt, runId, state, adaptiveConfig, adaptiveOverrides, localHistory
       });
       totals.analyzed += outcome.analyzed;
@@ -355,7 +428,51 @@ export class GlobalAutomation {
       totals.failed += outcome.failed;
       failures.push(...outcome.failures);
       signals.push(...outcome.signals);
+      candidates.push(...outcome.candidates);
       for (const key of Object.keys(blockedBy)) blockedBy[key] += outcome.blockedBy[key];
+    }
+
+    // 所有策略、所有币种分析结束后统一排序再提交，避免批次完成顺序决定仓位归属。
+    // submitSignal 仍保留最终的重复币种、冷却、并发和余额校验，因此这一步只改变
+    // 候选分配顺序，不会绕过既有风控。
+    const configuredCycleCap = Number(config?.trader?.maxNewEntriesPerCycle);
+    const maxNewEntriesPerCycle = Number.isFinite(configuredCycleCap) && configuredCycleCap >= 1
+      ? Math.min(5, Math.floor(configuredCycleCap))
+      : null;
+    let submittedThisCycle = 0;
+
+    if (submit && candidates.length && shouldContinue()) {
+      const ranked = rankAutomationCandidates(selectAutomationCandidates(candidates));
+      const preview = ranked.slice(0, 5).map(item => {
+        const plan = item.signal?.plan || {};
+        const score = Number(plan.trendStrengthScore ?? item.signal?.score ?? item.signal?.confidence ?? 0);
+        return `${item.symbol}:${Number.isFinite(score) ? score.toFixed(1) : '0.0'}`;
+      }).join(', ');
+      console.log(`[GlobalAutomation][候选分配] 汇总 ${ranked.length} 个机会，优先提交: ${preview}`);
+
+      for (const candidate of ranked) {
+        if (!shouldContinue()) break;
+        if (maxNewEntriesPerCycle != null && submittedThisCycle >= maxNewEntriesPerCycle) {
+          console.log(`[GlobalAutomation][候选分配] 已达到本轮最多新开仓数 ${maxNewEntriesPerCycle}，剩余机会留待下一轮`);
+          break;
+        }
+        const submission = await this.submitSignal({
+          symbol: candidate.symbol,
+          signal: candidate.signal,
+          recordId: candidate.recordId,
+          executionPlan: candidate.executionPlan,
+          shouldContinue,
+          config
+        });
+        if (submission.action === 'SUBMITTED') {
+          totals.submitted++;
+          submittedThisCycle++;
+        }
+        if (submission.error) {
+          totals.failed++;
+          failures.push({ symbol: candidate.symbol, error: submission.error });
+        }
+      }
     }
 
     this.stats.totalAnalyzed += totals.analyzed;
@@ -373,15 +490,22 @@ export class GlobalAutomation {
       console.warn(`[GlobalAutomation][告警] 本轮 0 个合格信号 —— 门槛可能过严（候选${symbols.length}/已分析${totals.analyzed}），`
         + `请核对上面漏斗计数；可在「策略管理」下调对应策略的评分门槛 / 盈亏比门槛。`);
     }
-    if (requestedSymbols && failures.length) throw new Error(failures.map(item => `${item.symbol}: ${item.error}`).join('; '));
+    // 单币种复核需要把失败抛给调用方，便于保留原挂单；全市场批量扫描则
+    // 记录失败并继续提交其它已完成分析的候选，不能因为一个币种异常丢掉整轮。
+    if (requestedSymbols && requestedSymbols.length === 1 && failures.length) {
+      throw new Error(failures.map(item => `${item.symbol}: ${item.error}`).join('; '));
+    }
+    if (requestedSymbols && requestedSymbols.length > 1 && failures.length) {
+      console.warn(`[GlobalAutomation] 本轮有 ${failures.length} 个币种分析失败，其余候选继续处理`);
+    }
     return signals;
   }
 
-  /** 单个策略的扫描循环：逐批（20 币）分析 → 合格即按该策略挂单。 */
+  /** 单个策略的扫描循环：逐批（20 币）分析，先收集机会，统一排序后再挂单。 */
   async scanWithStrategy({ strategy, symbols, preparedMarket, submit, interval, shouldContinue,
-    config, strategyPrompt, runId, state, adaptiveConfig, adaptiveOverrides, localHistory }) {
+    preparedMarkets, config, strategyPrompt, runId, state, adaptiveConfig, adaptiveOverrides, localHistory }) {
     const outcome = { analyzed: 0, eligible: 0, submitted: 0, failed: 0, failures: [], signals: [],
-      blockedBy: { score: 0, volume: 0, riskReward: 0 } };
+      candidates: [], blockedBy: { score: 0, volume: 0, riskReward: 0 } };
     const tallyBlock = reason => {
       const text = String(reason || '');
       if (text.includes('综合信号强度不足')) outcome.blockedBy.score++;
@@ -396,7 +520,7 @@ export class GlobalAutomation {
 
       const results = await Promise.all(batch.map(async symbol => {
         try {
-          const market = preparedMarket || await this.getFreshMarket(symbol, interval);
+          const market = preparedMarkets?.[symbol] || preparedMarket || await this.getFreshMarket(symbol, interval);
           const strategyOutcome = await this.runStrategyAnalysis({
             strategy, symbol, market, submit, interval, config, strategyPrompt,
             state, adaptiveConfig, adaptiveOverrides, localHistory
@@ -479,19 +603,14 @@ export class GlobalAutomation {
 
           if (signal.eligible && signal.plan && ['BUY', 'SELL'].includes(signal.action)) {
             outcome.eligible++;
-            const submission = await this.submitSignal({
+            outcome.candidates.push({
               symbol,
               signal,
               recordId: record.id,
               executionPlan: buildExecutionPlanFromOpportunity(signal),
-              shouldContinue
+              strategy
             });
-            if (submission.action === 'SUBMITTED') outcome.submitted++;
-            if (submission.error) {
-              outcome.failed++;
-              outcome.failures.push({ symbol, error: submission.error });
-            }
-            return submission;
+            return { symbol, success: true, action: 'CANDIDATE' };
           }
           return { symbol, success: true, action: 'WAIT' };
         } catch (error) {
@@ -540,7 +659,13 @@ export class GlobalAutomation {
         }
       }
       // 复核挂单时（submit=false）辅助数据不完整就保持原挂单，不用残缺数据改判方向。
-      if (!submit && incomplete) throw new Error('Auxiliary market data incomplete; retaining pending order');
+      if (incomplete) {
+        // 挂单复核时保留原订单；首轮下单时则 fail-closed，避免只拿到部分周期的
+        // K 线就把多周期策略误判成有效机会。
+        if (!submit) throw new Error('Auxiliary market data incomplete; retaining pending order');
+        console.warn(`[GlobalAutomation] ${symbol} 辅助周期数据不完整，本轮不提交新信号`);
+        return { analysis: null, auxMarkets };
+      }
       ctx.auxMarkets = auxMarkets;
     }
 
@@ -628,7 +753,7 @@ export class GlobalAutomation {
    * 风控闸门 + 按策略落单。
    * 同币种未平仓不重复开仓；止损后 / 任意平仓后的冷却期同样拦截。
    */
-  async submitSignal({ symbol, signal, recordId, executionPlan, shouldContinue }) {
+  async submitSignal({ symbol, signal, recordId, executionPlan, shouldContinue, config = {} }) {
     try {
       const simState = this.simulation.readLight ? await this.simulation.readLight()
         : this.simulation.read ? await this.simulation.read() : { orders: [] };
@@ -666,9 +791,13 @@ export class GlobalAutomation {
       // 正式策略已经按自己的 params 计算并固化了推荐杠杆。
       // 只有旧策略没有输出该字段时，才回退到全局风控默认值。
       const strategyLeverage = Number(signal.recommendedLeverage ?? signal.plan?.recommendedLeverage);
+      const configuredMaxLeverage = Number(config?.trader?.maxLeverage);
+      const leverageCap = Number.isFinite(configuredMaxLeverage) && configuredMaxLeverage >= 1
+        ? Math.min(RISK_RULE.maxLeverage, Math.floor(configuredMaxLeverage))
+        : RISK_RULE.maxLeverage;
       const leverage = Number.isFinite(strategyLeverage) && strategyLeverage > 0
-        ? Math.max(1, Math.min(RISK_RULE.maxLeverage, Math.floor(strategyLeverage)))
-        : recommendedLeverage(signal.plan, signal.action === 'BUY' ? 'OPEN_LONG' : 'OPEN_SHORT');
+        ? Math.max(1, Math.min(leverageCap, Math.floor(strategyLeverage)))
+        : Math.max(1, Math.min(leverageCap, recommendedLeverage(signal.plan, signal.action === 'BUY' ? 'OPEN_LONG' : 'OPEN_SHORT')));
       // 策略级并发上限（09-17 平衡档上线）：多策略共用一个资金池，但按策略 id 各自限仓。
       // plan.maxPositions 缺省（旧策略/未配置）时不限制 —— 与既有行为完全一致。
       const strategyMaxPositions = Math.floor(Number(signal.plan?.maxPositions));
@@ -709,6 +838,37 @@ export class GlobalAutomation {
         }
       }
       if (!shouldContinue()) return { symbol, success: true, action: 'ABORTED' };
+      const strategyMarginPct = Number(signal.plan?.autoMarginPct);
+      const marginPct = Number.isFinite(strategyMarginPct) && strategyMarginPct > 0 && strategyMarginPct <= 1
+        ? strategyMarginPct : AUTO_MARGIN_PCT;
+      const summary = accountSummary(simState);
+      const equity = Number(summary.equity ?? summary.initialBalance);
+      const maxPositionNotionalPct = Number(config?.trader?.maxPositionNotionalPct);
+      const maxTotalNotionalPct = Number(config?.trader?.maxTotalNotionalPct);
+      const hasPositionCap = Number.isFinite(maxPositionNotionalPct) && maxPositionNotionalPct > 0 && maxPositionNotionalPct <= 1;
+      const hasTotalCap = Number.isFinite(maxTotalNotionalPct) && maxTotalNotionalPct > 0 && maxTotalNotionalPct <= 1;
+      let cappedMargin = explicitMargin;
+      if (cappedMargin == null && Number.isFinite(equity) && equity > 0) {
+        cappedMargin = Math.floor(equity * marginPct * 100) / 100;
+      }
+      if ((hasPositionCap || hasTotalCap) && Number.isFinite(equity) && equity > 0) {
+        if (cappedMargin == null) cappedMargin = 100;
+        if (hasPositionCap) {
+          cappedMargin = Math.min(cappedMargin, equity * maxPositionNotionalPct / leverage);
+        }
+        if (hasTotalCap) {
+          const activeNotional = (simState.orders || [])
+            .filter(order => order.status === 'pending' || order.status === 'open')
+            .reduce((sum, order) => sum + Math.max(0, Number(order.notional) || 0), 0);
+          const remainingNotional = equity * maxTotalNotionalPct - activeNotional;
+          cappedMargin = Math.min(cappedMargin, remainingNotional / leverage);
+        }
+        cappedMargin = Math.floor(cappedMargin * 100) / 100;
+        if (!Number.isFinite(cappedMargin) || cappedMargin < 1) {
+          console.log(`[GlobalAutomation] ${symbol} 受单仓/总敞口限制，剩余可用保证金不足 1 USDT，跳过开仓`);
+          return { symbol, success: true, action: 'SKIP_RISK_SIZE' };
+        }
+      }
       const submitInput = {
         recordId,
         symbol,
@@ -720,8 +880,8 @@ export class GlobalAutomation {
       // 买入金额：策略级 plan.autoMarginPct（如 4H 均值回归平衡档 0.015）优先 ——
       // 多策略共用一个资金池，各策略用各自回测验证过的仓位口径（按当前共享权益计）；
       // 缺省回落全局 NOFX_AUTO_MARGIN_PCT（enhanced-trend 等旧策略行为不变）。
-      const strategyMarginPct = Number(signal.plan?.autoMarginPct);
-      if (explicitMargin != null) submitInput.margin = explicitMargin;
+      if (cappedMargin != null && (hasPositionCap || hasTotalCap || explicitMargin != null)) submitInput.margin = cappedMargin;
+      else if (explicitMargin != null) submitInput.margin = explicitMargin;
       else if (Number.isFinite(strategyMarginPct) && strategyMarginPct > 0 && strategyMarginPct <= 1) {
         submitInput.autoMarginPct = strategyMarginPct;
       } else submitInput.autoMarginPct = AUTO_MARGIN_PCT;

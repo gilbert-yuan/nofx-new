@@ -2,11 +2,23 @@ import { BinanceClient } from './binanceClient.js';
 import { binanceMarket } from './binanceMarket.js';
 // 环境判定/凭证解析的唯一实现在 shared/binanceEnvironment.js；这里 re-export 保持旧引用（含测试）兼容。
 import { isBinanceDemo, binanceEnvironmentConfig } from '../shared/binanceEnvironment.js';
+import {
+  acquireBinanceExecutionLock,
+  assertBinanceExecutionLock,
+  createExecutionOwner,
+  executionLockKey,
+  releaseBinanceExecutionLock,
+  startBinanceExecutionLease
+} from './binanceExecutionGuard.js';
 export { binanceEnvironmentConfig };
 
 export const BINANCE_SYNC_ENVIRONMENTS = ['demo', 'live'];
 const CLOSE_ACTIVE = new Set(['submitting', 'submitted', 'new', 'partially_filled', 'unknown']);
-const CLOSE_TERMINAL = new Set(['filled', 'canceled', 'cancelled', 'expired', 'rejected', 'skipped_no_fill']);
+const CLOSE_TERMINAL = new Set(['filled', 'canceled', 'cancelled', 'expired', 'rejected', 'skipped_no_fill', 'reconciled_no_position']);
+const PROTECTION_TYPES = Object.freeze([
+  ['stopLoss', 'STOP_MARKET'],
+  ['takeProfit', 'TAKE_PROFIT_MARKET']
+]);
 const RETRY_BASE_MS = 5000;
 const RETRY_MAX_MS = 60000;
 
@@ -35,6 +47,50 @@ export function paperCloseClientOrderId(order, environment, sequence) {
   return ((environment === 'demo' ? 'nofxpaper' : 'nofxlive') + base + 'c' + String(sequence).padStart(2, '0')).slice(0, 36);
 }
 
+function createProtectionState(type) {
+  return {
+    type,
+    status: 'not_submitted',
+    algoId: null,
+    clientAlgoId: null,
+    triggerPrice: null,
+    submittedAt: null,
+    lastSyncedAt: null,
+    lastError: '',
+    retryAt: null,
+    retryCount: 0
+  };
+}
+
+function normalizeProtectionState(protection = {}) {
+  return Object.fromEntries(PROTECTION_TYPES.map(([key, type]) => [
+    key,
+    { ...createProtectionState(type), ...(protection?.[key] || {}), type }
+  ]));
+}
+
+function createEmergencyCloseState() {
+  return {
+    status: 'not_requested',
+    clientOrderId: null,
+    orderId: null,
+    origQty: null,
+    executedQty: 0,
+    avgPrice: null,
+    requestedAt: null,
+    lastSyncedAt: null,
+    lastError: '',
+    retryAt: null,
+    retryCount: 0,
+    cleanupStatus: 'not_needed',
+    cleanupError: ''
+  };
+}
+
+function normalizeEmergencyCloseState(state = {}) {
+  return { ...createEmergencyCloseState(), ...(state || {}) };
+}
+
 export function createExchangeSyncState(environment) {
   return {
     environment,
@@ -51,7 +107,9 @@ export function createExchangeSyncState(environment) {
     lastError: '',
     retryAt: null,
     retryCount: 0,
-    closeOrders: []
+    closeOrders: [],
+    protection: normalizeProtectionState(),
+    emergencyClose: createEmergencyCloseState()
   };
 }
 
@@ -62,7 +120,9 @@ function copyLegacyDemoState(legacy) {
     ...legacy,
     environment: 'demo',
     provider: legacy.provider || 'binance-demo',
-    closeOrders: Array.isArray(legacy.closeOrders) ? legacy.closeOrders : []
+    closeOrders: Array.isArray(legacy.closeOrders) ? legacy.closeOrders : [],
+    protection: normalizeProtectionState(legacy.protection),
+    emergencyClose: normalizeEmergencyCloseState(legacy.emergencyClose)
   };
 }
 
@@ -78,7 +138,9 @@ export function ensureExchangeSync(order) {
     const current = order.exchangeSync[environment];
     order.exchangeSync[environment] = current && typeof current === 'object'
       ? { ...createExchangeSyncState(environment), ...current, environment, provider: current.provider || 'binance-' + environment,
-          closeOrders: Array.isArray(current.closeOrders) ? current.closeOrders : [] }
+          closeOrders: Array.isArray(current.closeOrders) ? current.closeOrders : [],
+          protection: normalizeProtectionState(current.protection),
+          emergencyClose: normalizeEmergencyCloseState(current.emergencyClose) }
       : environment === 'demo' && legacyDemo
         ? legacyDemo
         : createExchangeSyncState(environment);
@@ -361,6 +423,58 @@ function linkCanRetry(link) {
   return isRetryDue(link) && !['filled', 'canceled', 'cancelled', 'expired'].includes(link.status);
 }
 
+const ownedProtection = order => String(order?.clientAlgoId || '').startsWith('nofx');
+const protectionClientAlgoId = (order, environment, type) => {
+  const base = String(order.id).replaceAll('-', '').slice(0, 20);
+  return `nofx${environment === 'demo' ? 'd' : 'l'}${base}${type === 'STOP_MARKET' ? 's' : 't'}`.slice(0, 36);
+};
+const emergencyCloseClientOrderId = (order, environment) =>
+  (paperCloseClientOrderId(order, environment, 99) + 'e').slice(0, 36);
+
+function protectionPrice(order, key, symbolInfo) {
+  const raw = Number(order.plan?.[key]);
+  const filter = symbolInfo?.filters?.find(item => item.filterType === 'PRICE_FILTER');
+  const tick = Number(filter?.tickSize);
+  const min = Number(filter?.minPrice || 0);
+  const max = Number(filter?.maxPrice || 0);
+  if (!(raw > 0) || !(tick > 0)) return null;
+  const aligned = floorStep(raw, tick);
+  return Number.isFinite(aligned) && aligned > 0 && (!min || aligned >= min) && (!max || aligned <= max)
+    ? aligned : null;
+}
+
+function protectionSide(order) {
+  return order.direction === 'OPEN_LONG' ? 'SELL' : 'BUY';
+}
+
+function protectionPositionSide(dualSide, order) {
+  if (!dualSide) return undefined;
+  return order.direction === 'OPEN_LONG' ? 'LONG' : 'SHORT';
+}
+
+function protectionMatchesPosition(item, { dualSide, positionSide, side }) {
+  const remotePositionSide = String(item?.positionSide || 'BOTH').toUpperCase();
+  const expectedPositionSide = String(positionSide || 'BOTH').toUpperCase();
+  if (dualSide ? remotePositionSide !== expectedPositionSide : !['BOTH', ''].includes(remotePositionSide)) return false;
+  const remoteSide = String(item?.side || '').toUpperCase();
+  return !remoteSide || remoteSide === String(side || '').toUpperCase();
+}
+
+async function remotePositionQuantity(client, order, dualSide) {
+  if (typeof client.positions !== 'function') return { known: false, quantity: null };
+  try {
+    const expectedSide = order.direction === 'OPEN_LONG' ? 'LONG' : 'SHORT';
+    const rows = await client.positions(order.symbol);
+    const row = (Array.isArray(rows) ? rows : []).find(item =>
+      item.symbol === order.symbol && (!dualSide || String(item.positionSide || '').toUpperCase() === expectedSide)
+    );
+    const quantity = row ? Math.abs(Number(row.positionAmt)) : 0;
+    return { known: Number.isFinite(quantity), quantity: Number.isFinite(quantity) ? quantity : null };
+  } catch (error) {
+    return { known: false, quantity: null, error: shortError(error) };
+  }
+}
+
 export class BinancePaperSync {
   constructor({ simulation, store, clientFactory = config => new BinanceClient(config), intervalMs = process.env.BINANCE_PAPER_SYNC_INTERVAL_MS } = {}) {
     this.simulation = simulation;
@@ -375,6 +489,7 @@ export class BinancePaperSync {
     this.lastPollAt = null;
     this.lastError = '';
     this.leverageCaches = { demo: new Map(), live: new Map() };
+    this.executionOwner = createExecutionOwner('paper-sync');
   }
 
   start() {
@@ -501,6 +616,24 @@ export class BinancePaperSync {
     return this.drainPromise;
   }
 
+  async deferExecution(orderId, environment, order, reason) {
+    const retryAt = new Date(Date.now() + 15000).toISOString();
+    await this.updateLink(orderId, environment, current => {
+      current.lastError = reason;
+      current.retryAt = retryAt;
+      if (order.status === 'pending' && ['not_submitted', 'submit_error', 'not_configured', 'unknown'].includes(current.status)) {
+        current.status = 'submit_error';
+      }
+      for (const action of current.closeOrders || []) {
+        if (!CLOSE_TERMINAL.has(action.status)) {
+          action.status = 'submit_error';
+          action.lastError = reason;
+          action.retryAt = retryAt;
+        }
+      }
+    });
+  }
+
   async process(orderId, item) {
     if (item.closeActions.size) await this.registerCloseActions(orderId, [...item.closeActions.values()]);
     let order = await this.simulation.getOrder(orderId);
@@ -520,6 +653,26 @@ export class BinancePaperSync {
         continue;
       }
       const client = this.clientFactory(environmentConfig);
+      let dualSideForLock = false;
+      try { dualSideForLock = typeof client.dualSidePosition === 'function' ? await client.dualSidePosition() : false; } catch { /* 后续执行逻辑会按单向账户继续对账 */ }
+      const lockPositionSide = dualSideForLock
+        ? (order.direction === 'OPEN_LONG' ? 'LONG' : 'SHORT')
+        : 'BOTH';
+      const executionLock = await acquireBinanceExecutionLock(
+        this.store,
+        executionLockKey({ environment, symbol: order.symbol, positionSide: lockPositionSide }),
+        this.executionOwner
+      );
+      if (!executionLock.acquired) {
+        await this.deferExecution(orderId, environment, order, '同一币种/持仓方向正在由其他执行任务处理，已延迟重试。');
+        continue;
+      }
+      const executionLease = startBinanceExecutionLease(this.store, executionLock);
+      try {
+      if (!await assertBinanceExecutionLock(this.store, executionLock)) {
+        await this.deferExecution(orderId, environment, order, '执行锁已失效，已延迟本次 Binance 操作。');
+        continue;
+      }
       const link = ensureExchangeSync(order)[environment];
 
       if (item.submit && ['pending', 'closed'].includes(order.status) && ['not_submitted', 'submit_error', 'not_configured', 'unknown'].includes(link.status) && linkCanRetry(link)) {
@@ -535,7 +688,37 @@ export class BinancePaperSync {
       await this.pullEntryIfNeeded(order, environment, client);
       order = await this.simulation.getOrder(orderId);
 
-      const currentLink = ensureExchangeSync(order)[environment];
+      await this.pullEmergencyClose(order, environment, client);
+      order = await this.simulation.getOrder(orderId);
+      await this.cleanupEmergencyProtection(order, environment, client);
+      order = await this.simulation.getOrder(orderId);
+
+      let currentLink = ensureExchangeSync(order)[environment];
+      const emergencyStatus = currentLink.emergencyClose?.status;
+      const emergencyInFlight = ['submitting', 'submitted', 'new', 'partially_filled', 'unknown', 'filled'].includes(emergencyStatus);
+      if (environment === 'live' && emergencyStatus === 'unknown' && isRetryDue(currentLink.emergencyClose)) {
+        await this.emergencyCloseUnprotected(order, environment, client);
+        order = await this.simulation.getOrder(orderId);
+        await this.cleanupEmergencyProtection(order, environment, client);
+        order = await this.simulation.getOrder(orderId);
+        currentLink = ensureExchangeSync(order)[environment];
+      }
+      if (order.status !== 'closed' && !emergencyInFlight && (currentLink.status === 'filled' || currentLink.status === 'partially_filled'
+        || Number(currentLink.executedQty) > 0)) {
+        const protection = await this.ensureNativeProtection(order, environment, client);
+        order = await this.simulation.getOrder(orderId);
+        if (environment === 'live' && protection?.requiresEmergencyClose) {
+          await this.emergencyCloseUnprotected(order, environment, client);
+          order = await this.simulation.getOrder(orderId);
+          await this.cleanupEmergencyProtection(order, environment, client);
+          order = await this.simulation.getOrder(orderId);
+        }
+        currentLink = ensureExchangeSync(order)[environment];
+      }
+      if (['cancelled', 'expired'].includes(order.status)) {
+        await this.cancelNativeProtection(order, environment, client);
+        order = await this.simulation.getOrder(orderId);
+      }
       for (const action of currentLink.closeOrders || []) {
         if (!CLOSE_TERMINAL.has(action.status) && isRetryDue(action)) {
           await this.submitClose(order, environment, client, action);
@@ -543,6 +726,10 @@ export class BinancePaperSync {
         }
       }
       await this.pullCloseOrders(order, environment, client);
+      } finally {
+        await executionLease.stop();
+        await releaseBinanceExecutionLock(this.store, executionLock);
+      }
     }
 
     // 环境错配自愈：所有「已启用同步且已配置凭证」的环境都判定不支持该合约时，
@@ -631,6 +818,289 @@ export class BinancePaperSync {
     }
   }
 
+  /**
+   * 成交后在 Binance 交易所侧建立保护单。
+   *
+   * 本地 TradingSimulator 仍然负责纸面分批止盈和移动保护；交易所侧使用
+   * 最终止盈 + 当前止损作为进程宕机时的兜底保护。新保护单先建立，确认成功
+   * 后才撤旧单，避免替换过程中出现裸仓窗口。
+   */
+  async ensureNativeProtection(order, environment, client) {
+    if (typeof client.protectionOrder !== 'function' || typeof client.openAlgoOrders !== 'function') {
+      return { protected: false, requiresEmergencyClose: false, unavailable: true };
+    }
+    const links = ensureExchangeSync(order);
+    const link = links[environment];
+    let symbolInfo;
+    let dualSide = false;
+    try {
+      symbolInfo = await loadSymbolInfo(client, order.symbol);
+      dualSide = typeof client.dualSidePosition === 'function' ? await client.dualSidePosition() : false;
+    } catch (error) {
+      for (const [key] of PROTECTION_TYPES) {
+        await this.updateProtection(order.id, environment, key, current => {
+          current.status = 'sync_error';
+          current.lastError = shortError(error);
+          current.retryAt = new Date(errorRetryAt(current)).toISOString();
+        });
+      }
+      return { protected: false, requiresEmergencyClose: true, error: shortError(error) };
+    }
+    const positionSide = protectionPositionSide(dualSide, order);
+    let remote;
+    try {
+      remote = await client.openAlgoOrders(order.symbol);
+      if (!Array.isArray(remote)) throw new Error('Binance 保护单快照无效。');
+    } catch (error) {
+      for (const [key] of PROTECTION_TYPES) {
+        await this.updateProtection(order.id, environment, key, current => {
+          current.status = 'sync_error';
+          current.lastError = shortError(error);
+          current.retryAt = new Date(errorRetryAt(current)).toISOString();
+        });
+      }
+      return { protected: false, requiresEmergencyClose: true, error: shortError(error) };
+    }
+
+    let requiresEmergencyClose = false;
+    for (const [key, type] of PROTECTION_TYPES) {
+      const desired = protectionPrice(order, key, symbolInfo);
+      if (!(desired > 0)) {
+        await this.updateProtection(order.id, environment, key, current => {
+          current.status = 'invalid_plan';
+          current.lastError = `订单缺少有效 ${key} 保护价。`;
+          current.retryAt = null;
+        });
+        requiresEmergencyClose = true;
+        continue;
+      }
+      const matching = remote.filter(item => (item.orderType || item.type) === type
+        && protectionMatchesPosition(item, { dualSide, positionSide, side: protectionSide(order) }));
+      const manual = matching.filter(item => !ownedProtection(item));
+      if (manual.length) {
+        await this.updateProtection(order.id, environment, key, current => {
+          current.status = 'manual_conflict';
+          current.lastError = `发现非系统创建的 ${type}，不会覆盖人工保护单。`;
+          current.retryAt = null;
+        });
+        continue;
+      }
+      const currentState = link.protection?.[key] || createProtectionState(type);
+      const previous = matching.find(item => String(item.algoId || '') === String(currentState.algoId || '')) || matching[0];
+      if (previous && Math.abs(Number(previous.triggerPrice) - desired) <= Math.max(Number(symbolInfo.filters?.find(item => item.filterType === 'PRICE_FILTER')?.tickSize) || 0, desired * 1e-8)) {
+        await this.updateProtection(order.id, environment, key, current => {
+          current.status = String(previous.status || 'new').toLowerCase();
+          current.algoId = previous.algoId ?? current.algoId;
+          current.clientAlgoId = previous.clientAlgoId || current.clientAlgoId;
+          current.triggerPrice = Number(previous.triggerPrice) || desired;
+          current.lastSyncedAt = new Date().toISOString();
+          current.lastError = '';
+          current.retryAt = null;
+        });
+        continue;
+      }
+
+      const clientAlgoId = protectionClientAlgoId(order, environment, type);
+      try {
+        const result = await client.protectionOrder({
+          symbol: order.symbol,
+          side: protectionSide(order),
+          type,
+          triggerPrice: desired,
+          positionSide,
+          clientAlgoId
+        });
+        const algoId = result?.algoId ?? result?.orderId ?? null;
+        await this.updateProtection(order.id, environment, key, current => {
+          current.status = String(result?.status || 'new').toLowerCase();
+          current.algoId = algoId;
+          current.clientAlgoId = result?.clientAlgoId || clientAlgoId;
+          current.triggerPrice = desired;
+          current.submittedAt = current.submittedAt || new Date().toISOString();
+          current.lastSyncedAt = new Date().toISOString();
+          current.lastError = '';
+          current.retryAt = null;
+          current.retryCount = 0;
+        });
+        if (previous?.algoId && String(previous.algoId) !== String(algoId)) {
+          await client.cancelAlgo(previous.algoId);
+        }
+        for (const duplicate of matching.filter(item => item !== previous && String(item.algoId || '') !== String(algoId || ''))) {
+          if (duplicate.algoId) await client.cancelAlgo(duplicate.algoId);
+        }
+      } catch (error) {
+        await this.updateProtection(order.id, environment, key, current => {
+          current.status = 'submit_error';
+          current.lastError = shortError(error);
+          current.retryAt = new Date(errorRetryAt(current)).toISOString();
+        });
+        requiresEmergencyClose = true;
+      }
+    }
+    return { protected: !requiresEmergencyClose, requiresEmergencyClose };
+  }
+
+  /**
+   * 实盘保护单无法确认时的最后一道保险：用固定 clientOrderId 发送一次
+   * reduceOnly 市价减仓，并在后续轮询中按订单状态对账，避免超时重发造成重复减仓。
+   */
+  async emergencyCloseUnprotected(order, environment, client) {
+    if (environment !== 'live' || typeof client.marketOrder !== 'function') return;
+    const link = ensureExchangeSync(order)[environment];
+    const current = link.emergencyClose = normalizeEmergencyCloseState(link.emergencyClose);
+    if (['filled', 'reconciled_no_position'].includes(current.status)) return;
+
+    if (current.status === 'unknown' && current.clientOrderId) {
+      const resolved = await this.findExistingOrder(client, order.symbol, current.clientOrderId);
+      if (resolved) {
+        await this.updateEmergencyClose(order.id, environment, state => applyOrderResult(state, resolved, new Date().toISOString()));
+        return;
+      }
+    }
+
+    let dualSide = false;
+    let remoteQuantity = null;
+    try {
+      dualSide = typeof client.dualSidePosition === 'function' ? await client.dualSidePosition() : false;
+      const remote = await remotePositionQuantity(client, order, dualSide);
+      if (remote.known) remoteQuantity = remote.quantity;
+      if (remote.error) current.lastError = remote.error;
+    } catch (error) {
+      // 持仓接口失败时回退到入口单已成交数量；不能因对账接口短暂失败而放弃保护。
+      current.lastError = shortError(error);
+    }
+    if (remoteQuantity !== null && !(remoteQuantity > 0)) {
+      await this.updateEmergencyClose(order.id, environment, state => {
+        state.status = 'reconciled_no_position';
+        state.lastSyncedAt = new Date().toISOString();
+        state.lastError = 'Binance 当前仓位已为 0，未重复发送紧急平仓单。';
+        state.retryAt = null;
+      });
+      return;
+    }
+
+    const requestedQuantity = remoteQuantity ?? Number(link.executedQty || link.origQty || order.quantity);
+    let quantity = requestedQuantity;
+    try {
+      const symbolInfo = await loadSymbolInfo(client, order.symbol);
+      const lotFilter = symbolInfo.filters?.find(item => item.filterType === 'LOT_SIZE' || item.filterType === 'MARKET_LOT_SIZE');
+      const step = Number(lotFilter?.stepSize);
+      const minQty = Number(lotFilter?.minQty || 0);
+      quantity = step > 0 ? floorStep(requestedQuantity, step) : requestedQuantity;
+      if (!(quantity > 0) || quantity < minQty) throw new Error('紧急平仓数量对齐 Binance 过滤器后低于最小下单数量。');
+    } catch (error) {
+      await this.updateEmergencyClose(order.id, environment, state => {
+        state.status = 'submit_error';
+        state.lastError = shortError(error);
+        state.retryAt = new Date(errorRetryAt(state)).toISOString();
+      });
+      return;
+    }
+
+    const clientOrderId = current.clientOrderId || emergencyCloseClientOrderId(order, environment);
+    await this.updateEmergencyClose(order.id, environment, state => {
+      state.clientOrderId = clientOrderId;
+      state.status = 'submitting';
+      state.requestedAt = state.requestedAt || new Date().toISOString();
+      state.lastError = '';
+    });
+    try {
+      const result = await client.marketOrder({
+        symbol: order.symbol,
+        side: order.direction === 'OPEN_LONG' ? 'SELL' : 'BUY',
+        quantity,
+        reduceOnly: true,
+        positionSide: orderPositionSide(dualSide, order.direction),
+        clientOrderId
+      });
+      await this.updateEmergencyClose(order.id, environment, state => applyOrderResult(state, result, new Date().toISOString()));
+    } catch (error) {
+      const resolved = isUnknownExecution(error) ? await this.findExistingOrder(client, order.symbol, clientOrderId) : null;
+      if (resolved) {
+        await this.updateEmergencyClose(order.id, environment, state => applyOrderResult(state, resolved, new Date().toISOString()));
+        return;
+      }
+      await this.updateEmergencyClose(order.id, environment, state => {
+        state.status = isUnknownExecution(error) ? 'unknown' : 'submit_error';
+        state.lastError = shortError(error);
+        state.retryAt = new Date(errorRetryAt(state)).toISOString();
+      });
+    }
+  }
+
+  async pullEmergencyClose(order, environment, client) {
+    if (typeof client.order !== 'function') return;
+    const link = ensureExchangeSync(order)[environment];
+    const current = normalizeEmergencyCloseState(link.emergencyClose);
+    if (!['submitting', 'submitted', 'new', 'partially_filled', 'unknown'].includes(current.status)
+      || !(current.orderId || current.clientOrderId)) return;
+    try {
+      const result = await client.order({
+        symbol: order.symbol,
+        orderId: current.orderId,
+        clientOrderId: current.orderId ? undefined : current.clientOrderId
+      });
+      await this.updateEmergencyClose(order.id, environment, state => applyOrderResult(state, result, new Date().toISOString()));
+    } catch (error) {
+      await this.updateEmergencyClose(order.id, environment, state => {
+        state.lastError = shortError(error);
+        state.retryAt = new Date(errorRetryAt(state)).toISOString();
+      });
+    }
+  }
+
+  async cancelNativeProtection(order, environment, client) {
+    if (typeof client.openAlgoOrders !== 'function' || typeof client.cancelAlgo !== 'function') return true;
+    let dualSide = false;
+    try { dualSide = typeof client.dualSidePosition === 'function' ? await client.dualSidePosition() : false; } catch { return false; }
+    const positionSide = protectionPositionSide(dualSide, order);
+    const side = protectionSide(order);
+    let remote;
+    try { remote = await client.openAlgoOrders(order.symbol); } catch { return false; }
+    if (!Array.isArray(remote)) return false;
+    let success = true;
+    for (const item of remote.filter(item => ownedProtection(item)
+      && ((item.orderType || item.type) === 'STOP_MARKET' || (item.orderType || item.type) === 'TAKE_PROFIT_MARKET')
+      && protectionMatchesPosition(item, { dualSide, positionSide, side }))) {
+      if ((item.orderType || item.type) === 'STOP_MARKET' || (item.orderType || item.type) === 'TAKE_PROFIT_MARKET') {
+        try { await client.cancelAlgo(item.algoId); } catch { success = false; /* 下轮继续对账 */ }
+      }
+    }
+    if (!success) return false;
+    for (const [key] of PROTECTION_TYPES) {
+      await this.updateProtection(order.id, environment, key, current => {
+        current.status = 'canceled';
+        current.lastSyncedAt = new Date().toISOString();
+      });
+    }
+    return true;
+  }
+
+  async cleanupEmergencyProtection(order, environment, client) {
+    if (environment !== 'live') return;
+    const link = ensureExchangeSync(order)[environment];
+    const emergency = normalizeEmergencyCloseState(link.emergencyClose);
+    if (!['filled', 'reconciled_no_position'].includes(emergency.status)) return;
+    if (emergency.cleanupStatus === 'clean') return;
+    if (emergency.cleanupStatus === 'pending' && !isRetryDue(emergency)) return;
+
+    const cleaned = await this.cancelNativeProtection(order, environment, client);
+    if (cleaned) {
+      await this.updateEmergencyClose(order.id, environment, current => {
+        current.cleanupStatus = 'clean';
+        current.cleanupError = '';
+        current.retryAt = null;
+        current.lastSyncedAt = new Date().toISOString();
+      });
+      return;
+    }
+    await this.updateEmergencyClose(order.id, environment, current => {
+      current.cleanupStatus = 'pending';
+      current.cleanupError = '紧急减仓已完成，但残留保护单尚未确认清理。';
+      current.retryAt = new Date(Date.now() + 15000).toISOString();
+    });
+  }
+
   async findExistingOrder(client, symbol, clientOrderId) {
     if (!clientOrderId || typeof client.order !== 'function') return null;
     try { return await client.order({ symbol, clientOrderId }); } catch { return null; }
@@ -694,7 +1164,17 @@ export class BinancePaperSync {
       });
       return;
     }
-    const entryQty = Number(link.executedQty || link.origQty);
+    const dualSide = typeof client.dualSidePosition === 'function' ? await client.dualSidePosition() : false;
+    const remote = await remotePositionQuantity(client, order, dualSide);
+    if (remote.known && !(remote.quantity > 0)) {
+      await this.updateCloseAction(order.id, environment, action.id, current => {
+        current.status = 'reconciled_no_position';
+        current.lastError = 'Binance 当前仓位已为 0，认为该平仓动作已由外部操作完成。';
+        current.retryAt = null;
+      });
+      return;
+    }
+    const entryQty = remote.known ? remote.quantity : Number(link.executedQty || link.origQty);
     const paperQuantity = Number(action.paperQuantity);
     const originalPaperQuantity = Number(action.originalPaperQuantity) || paperQuantity;
     const ratio = originalPaperQuantity > 0 ? Math.min(1, Math.max(0, paperQuantity / originalPaperQuantity)) : 1;
@@ -711,6 +1191,17 @@ export class BinancePaperSync {
       });
       return;
     }
+    // 本地纸面出场与交易所原生保护单可能同时触发。先撤销由本系统创建的
+    // STOP/TAKE_PROFIT，再发 reduceOnly 市价平仓，避免双重减仓或保护单残留。
+    const protectionsCancelled = await this.cancelNativeProtection(order, environment, client);
+    if (protectionsCancelled === false) {
+      await this.updateCloseAction(order.id, environment, action.id, current => {
+        current.status = 'submit_error';
+        current.lastError = 'Binance 原生止盈止损尚未确认撤销，暂不发送重复平仓单。';
+        current.retryAt = new Date(errorRetryAt(current)).toISOString();
+      });
+      return;
+    }
     const side = order.direction === 'OPEN_LONG' ? 'SELL' : 'BUY';
     const prepared = await this.updateCloseAction(order.id, environment, action.id, current => {
       current.status = 'submitting';
@@ -722,7 +1213,6 @@ export class BinancePaperSync {
     });
     const clientOrderId = prepared?.clientOrderId || action.clientOrderId || paperCloseClientOrderId(order, environment, 0);
     try {
-      const dualSide = typeof client.dualSidePosition === 'function' ? await client.dualSidePosition() : false;
       const result = await client.marketOrder({
         symbol: order.symbol,
         side,
@@ -788,6 +1278,32 @@ export class BinancePaperSync {
       update(action, order, link);
       mirrorLegacyDemo(order);
       return action;
+    }, { exchangeSync: true });
+  }
+
+  async updateProtection(orderId, environment, key, update) {
+    return this.simulation.mutateLight(state => {
+      const order = state.orders.find(item => item.id === orderId);
+      if (!order) return null;
+      const link = ensureExchangeSync(order)[environment];
+      link.protection = normalizeProtectionState(link.protection);
+      const protection = link.protection[key];
+      if (!protection) return null;
+      update(protection, order, link);
+      mirrorLegacyDemo(order);
+      return protection;
+    }, { exchangeSync: true });
+  }
+
+  async updateEmergencyClose(orderId, environment, update) {
+    return this.simulation.mutateLight(state => {
+      const order = state.orders.find(item => item.id === orderId);
+      if (!order) return null;
+      const link = ensureExchangeSync(order)[environment];
+      link.emergencyClose = normalizeEmergencyCloseState(link.emergencyClose);
+      update(link.emergencyClose, order, link);
+      mirrorLegacyDemo(order);
+      return link.emergencyClose;
     }, { exchangeSync: true });
   }
 }

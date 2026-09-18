@@ -21,7 +21,7 @@ const ineligibleAt = (t, extra = {}) => signal({ eligible: false, positionRecomm
 const makeAutomation = (extra = {}) => new GlobalAutomation({ simulation: {}, market: {}, marketDb: {}, archive: {}, store: {}, ...extra });
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
-test('only two tasks exist; each symbol is fetched and analyzed before the next fetch', async () => {
+test('only two tasks exist; a full market fetch completes before global analysis and submission', async () => {
   const events = [];
   const automation = makeAutomation({ market: { perpetualUsdtContracts: async () => ['A', 'B', 'C'].map(symbol => ({ symbol })) } });
   assert.deepEqual(Object.keys(automation.tasks), ['klineSync', 'positionReview']);
@@ -30,12 +30,13 @@ test('only two tasks exist; each symbol is fetched and analyzed before the next 
     if (symbol === 'B') throw Error('market unavailable');
     return { symbol };
   };
-  automation.runAnalysis = async ({ symbols, preparedMarket }) => {
-    assert.equal(preparedMarket.symbol, symbols[0]);
-    events.push(`analyze:${symbols[0]}`); events.push(`submit:${symbols[0]}`);
+  automation.runAnalysis = async ({ symbols, preparedMarkets }) => {
+    assert.deepEqual(symbols, ['A', 'C']);
+    assert.deepEqual(Object.keys(preparedMarkets), ['A', 'C']);
+    events.push(`analyze:${symbols.join(',')}`); events.push('submit:batch');
   };
   await automation.syncKlines();
-  assert.deepEqual(events, ['fetch:A', 'analyze:A', 'submit:A', 'fetch:B', 'fetch:C', 'analyze:C', 'submit:C']);
+  assert.deepEqual(events, ['fetch:A', 'fetch:B', 'fetch:C', 'analyze:A,C', 'submit:batch']);
   assert.equal(automation.tasks.klineSync.progress.failed, 1);
   assert.equal(automation.tasks.klineSync.progress.completed, 3);
   assert.throws(() => automation.configure('analysis', { enabled: true }), /Unknown/);

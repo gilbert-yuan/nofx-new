@@ -5,14 +5,38 @@ import { marketData } from './marketData.js';
 import { makeDecision, reviewPosition } from './ai.js';
 import { candleOpenAt, prepareMarket } from './research.js';
 import { validateOrder } from './risk.js';
+import { isBinanceDemo } from '../shared/binanceEnvironment.js';
+import {
+  acquireBinanceExecutionLock,
+  assertBinanceExecutionLock,
+  createExecutionOwner,
+  deterministicBinanceClientOrderId,
+  executionLockKey,
+  releaseBinanceExecutionLock,
+  startBinanceExecutionLease
+} from './binanceExecutionGuard.js';
 
 const owned = order => String(order.clientAlgoId || '').startsWith('nofx');
 const id = () => `nofx${randomUUID().replaceAll('-', '').slice(0, 28)}`;
 const reject = reason => ({ status: 'rejected', reason });
+const positionLifecycle = (position, fallback = 'active') => String(
+  position?.entryTime ?? position?.entryTimestamp ?? position?.entryPrice ?? position?.avgEntryPrice ?? fallback
+);
+const protectionMatchesPosition = (order, { positionSide, side }) => {
+  const remotePositionSide = String(order?.positionSide || 'BOTH').toUpperCase();
+  const expectedPositionSide = String(positionSide || 'BOTH').toUpperCase();
+  if (remotePositionSide !== expectedPositionSide) return false;
+  const remoteSide = String(order?.side || '').toUpperCase();
+  return !remoteSide || remoteSide === String(side || '').toUpperCase();
+};
 
 export class BinancePositionMonitor {
   constructor({ store, marketDb, clientFactory = config => new BinanceClient(config), publicMarket = marketData, decide = makeDecision, review = reviewPosition }) {
-    Object.assign(this, { store, marketDb, clientFactory, publicMarket, decide, review, busy: false, lastRunAt: null, lastResult: null, lastError: '' });
+    Object.assign(this, {
+      store, marketDb, clientFactory, publicMarket, decide, review,
+      busy: false, lastRunAt: null, lastResult: null, lastError: '',
+      executionOwner: createExecutionOwner('position-monitor')
+    });
   }
   async status() {
     const state = await this.store.getState();
@@ -88,6 +112,145 @@ export class BinancePositionMonitor {
     });
     return accepted;
   }
+
+  executionEnvironment(config) {
+    return isBinanceDemo(config?.binance) ? 'demo' : 'live';
+  }
+
+  executionIntentKey(environment, action, symbol, positionSide = 'BOTH') {
+    return [environment, action, String(symbol || '').toUpperCase(), String(positionSide || 'BOTH').toUpperCase()].join(':');
+  }
+
+  async getExecutionIntent(key) {
+    const state = await this.store.getState();
+    return state.binanceExecutionIntents?.[key] || null;
+  }
+
+  async findExecutionIntent(prefix, statuses) {
+    const state = await this.store.getState();
+    const allowed = new Set(statuses);
+    return Object.entries(state.binanceExecutionIntents || {})
+      .find(([key, intent]) => key.startsWith(prefix) && allowed.has(intent?.status));
+  }
+
+  async updateExecutionIntent(key, update) {
+    return this.store.mutateState(state => {
+      const intents = { ...(state.binanceExecutionIntents || {}) };
+      const current = intents[key] || {};
+      intents[key] = typeof update === 'function' ? update(current) : { ...current, ...update };
+      return { ...state, binanceExecutionIntents: Object.fromEntries(Object.entries(intents).slice(-499)) };
+    });
+  }
+
+  async beginExecutionIntent(key, metadata) {
+    let intent;
+    await this.store.mutateState(state => {
+      const intents = { ...(state.binanceExecutionIntents || {}) };
+      const current = intents[key] || {};
+      const next = {
+        ...current,
+        ...metadata,
+        clientOrderId: current.clientOrderId || metadata.clientOrderId,
+        status: 'submitting',
+        submittedAt: current.submittedAt || new Date().toISOString(),
+        lastError: '',
+        retryAt: null
+      };
+      intents[key] = next;
+      intent = next;
+      return { ...state, binanceExecutionIntents: Object.fromEntries(Object.entries(intents).slice(-499)) };
+    });
+    return intent;
+  }
+
+  async findExistingExecution(client, symbol, intent) {
+    if (!intent?.clientOrderId || typeof client.order !== 'function') return null;
+    try {
+      return await client.order({ symbol, clientOrderId: intent.clientOrderId });
+    } catch {
+      return null;
+    }
+  }
+
+  async reconcileExecution(client, symbol, key, intent, action) {
+    const result = await this.findExistingExecution(client, symbol, intent);
+    if (!result) {
+      await this.updateExecutionIntent(key, current => ({
+        ...current,
+        status: 'unknown',
+        lastCheckedAt: new Date().toISOString(),
+        retryAt: new Date(Date.now() + 15000).toISOString(),
+        lastError: '无法确认 Binance 订单状态，暂不重复提交。'
+      }));
+      return { status: 'uncertain', reason: 'Binance 订单状态未知，暂不重复下单。' };
+    }
+
+    const status = String(result.status || '').toUpperCase();
+    const normalized = ['FILLED', 'NEW', 'PARTIALLY_FILLED', 'CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED'].includes(status)
+      ? status.toLowerCase()
+      : 'unknown';
+    await this.updateExecutionIntent(key, current => ({
+      ...current,
+      status: normalized,
+      orderId: result.orderId ?? current.orderId ?? null,
+      executedQty: Number(result.executedQty ?? current.executedQty ?? 0),
+      avgPrice: Number(result.avgPrice ?? current.avgPrice ?? 0) || null,
+      lastCheckedAt: new Date().toISOString(),
+      lastError: '',
+      retryAt: null
+    }));
+    if (status === 'FILLED') return { status: 'sent', action, orderId: result.orderId, reconciled: true };
+    if (['NEW', 'PARTIALLY_FILLED'].includes(status)) return { status: 'uncertain', reason: 'Binance 订单已存在但尚未完全成交。', orderId: result.orderId };
+    return { status: 'rejected', reason: `Binance 订单状态为 ${status || '未知'}。`, orderId: result.orderId };
+  }
+
+  async withExecutionLock(config, symbol, positionSide, fn) {
+    const environment = this.executionEnvironment(config);
+    const key = executionLockKey({ environment, symbol, positionSide });
+    const lock = await acquireBinanceExecutionLock(this.store, key, this.executionOwner);
+    if (!lock.acquired) return { status: 'skipped', reason: '该币种/持仓方向正在由另一个执行任务处理。' };
+    const lease = startBinanceExecutionLease(this.store, lock);
+    try {
+      if (!await assertBinanceExecutionLock(this.store, lock)) return { status: 'skipped', reason: '执行锁已失效，已停止本次下单。' };
+      return await fn({ environment, key, lock, lease });
+    } finally {
+      await lease.stop();
+      await releaseBinanceExecutionLock(this.store, lock);
+    }
+  }
+
+  async submitReduceOnly({ client, config, symbol, positionSide, side, quantity, action = 'emergency_close', reason = '', identity = '' }) {
+    const environment = this.executionEnvironment(config);
+    const key = this.executionIntentKey(environment, action, symbol, positionSide) + ':' + identity;
+    const clientOrderId = deterministicBinanceClientOrderId(action, environment, symbol, positionSide, identity);
+    const existing = await this.getExecutionIntent(key);
+    if (existing?.status === 'filled') return { status: 'sent', action, orderId: existing.orderId, reconciled: true };
+    if (existing && ['submitting', 'submitted', 'new', 'partially_filled', 'unknown'].includes(existing.status)) {
+      return this.reconcileExecution(client, symbol, key, existing, action);
+    }
+
+    const intent = await this.beginExecutionIntent(key, { action, symbol, positionSide, side, quantity, clientOrderId, reason });
+    try {
+      const result = await client.marketOrder({ symbol, side, quantity, reduceOnly: true, positionSide, clientOrderId: intent.clientOrderId });
+      const status = String(result?.status || 'unknown').toLowerCase();
+      await this.updateExecutionIntent(key, current => ({
+        ...current,
+        status,
+        orderId: result?.orderId ?? null,
+        executedQty: Number(result?.executedQty || 0),
+        avgPrice: Number(result?.avgPrice || 0) || null,
+        lastCheckedAt: new Date().toISOString(),
+        lastError: '',
+        retryAt: null
+      }));
+      if (status !== 'filled') return { status: 'uncertain', reason: '减仓订单未确认全部成交，请检查 Binance。', orderId: result?.orderId };
+      return { status: 'sent', action, orderId: result.orderId };
+    } catch (error) {
+      const reconciled = await this.reconcileExecution(client, symbol, key, intent, action);
+      if (reconciled.status !== 'uncertain') return reconciled;
+      throw new Error(`${reason || '减仓'}执行结果未知，请勿重复下单：${error.message}`);
+    }
+  }
   async applyReview({ client, config, market, candles, position, review }) {
     if (!['CLOSE', 'UPDATE_PROTECTION'].includes(review?.action)) return { status: 'held', reason: review?.reason || '保持持仓。' };
     if (!validConfidence(review.confidence, config.trader.minConfidence)) return reject('置信度无效或低于阈值。');
@@ -107,35 +270,92 @@ export class BinancePositionMonitor {
     if (review.action === 'CLOSE') {
       if (config.trader.allowCloseOrders !== true) return { status: 'proposed', reason: '自动平仓未开启。' };
       if (config.trader.dryRun !== false) return { status: 'dry_run', action: 'CLOSE' };
-      if (!await this.claim(symbol, candles)) return reject('本根 K 线已提交过操作。');
-      const result = await client.marketOrder({ symbol, side: Number(position.positionAmt) > 0 ? 'SELL' : 'BUY', quantity: Math.abs(Number(position.positionAmt)), reduceOnly: true, positionSide: position.positionSide, clientOrderId: id() });
-      if (result.status !== 'FILLED') return { status: 'uncertain', reason: '平仓未确认全部成交，请检查币安订单。' };
-      for (const order of (await client.openAlgoOrders(symbol)).filter(owned)) await client.cancelAlgo(order.algoId);
-      return { status: 'sent', action: 'CLOSE', orderId: result.orderId };
+      const positionSide = String(position.positionSide || 'BOTH').toUpperCase();
+      const environment = this.executionEnvironment(config);
+      const lifecycle = positionLifecycle(position, candles.dataAsOf);
+      const intentKey = this.executionIntentKey(environment, 'close', symbol, positionSide) + ':' + lifecycle;
+      const clientOrderId = deterministicBinanceClientOrderId('close', environment, symbol, positionSide, lifecycle);
+      const existing = await this.getExecutionIntent(intentKey);
+      if (existing?.status === 'filled') return { status: 'sent', action: 'CLOSE', orderId: existing.orderId, reconciled: true };
+
+      return this.withExecutionLock(config, symbol, positionSide, async () => {
+        const currentIntent = await this.getExecutionIntent(intentKey);
+        if (currentIntent && ['submitting', 'submitted', 'new', 'partially_filled', 'unknown'].includes(currentIntent.status)) {
+          return this.reconcileExecution(client, symbol, intentKey, currentIntent, 'CLOSE');
+        }
+        if (currentIntent?.status === 'submit_error' && Date.parse(currentIntent.retryAt || '') > Date.now()) {
+          return { status: 'uncertain', reason: '上一次平仓请求失败，等待退避后重试。' };
+        }
+        if (!await this.claim(symbol, candles)) return reject('本根 K 线已提交过操作。');
+        const intent = await this.beginExecutionIntent(intentKey, {
+          action: 'CLOSE', symbol, positionSide,
+          side: Number(position.positionAmt) > 0 ? 'SELL' : 'BUY',
+          quantity: Math.abs(Number(position.positionAmt)), clientOrderId, lifecycle
+        });
+        try {
+          const result = await client.marketOrder({
+            symbol,
+            side: Number(position.positionAmt) > 0 ? 'SELL' : 'BUY',
+            quantity: Math.abs(Number(position.positionAmt)),
+            reduceOnly: true,
+            positionSide,
+            clientOrderId: intent.clientOrderId
+          });
+          const status = String(result?.status || 'unknown').toLowerCase();
+          await this.updateExecutionIntent(intentKey, current => ({
+            ...current,
+            status,
+            orderId: result?.orderId ?? null,
+            executedQty: Number(result?.executedQty || 0),
+            avgPrice: Number(result?.avgPrice || 0) || null,
+            lastCheckedAt: new Date().toISOString(),
+            lastError: '',
+            retryAt: null
+          }));
+          if (status !== 'filled') return { status: 'uncertain', reason: '平仓未确认全部成交，请检查 Binance。', orderId: result?.orderId };
+          const closeSide = Number(position.positionAmt) > 0 ? 'SELL' : 'BUY';
+          for (const order of (await client.openAlgoOrders(symbol)).filter(item => owned(item)
+            && protectionMatchesPosition(item, { positionSide, side: closeSide }))) await client.cancelAlgo(order.algoId);
+          return { status: 'sent', action: 'CLOSE', orderId: result.orderId };
+        } catch (error) {
+          const reconciled = await this.reconcileExecution(client, symbol, intentKey, intent, 'CLOSE');
+          return reconciled.status === 'uncertain'
+            ? { status: 'uncertain', reason: '平仓结果未知，已停止重复下单。' }
+            : reconciled;
+        }
+      });
     }
     if (config.trader.allowProtectionUpdates !== true) return { status: 'proposed', reason: '保护单调整未开启。' };
     const instrument = (await market.perpetualUsdtContracts()).find(s => s.symbol === symbol);
     const levels = protectionLevels(review, Number(position.markPrice), Number(position.positionAmt) > 0, instrument);
     if (!levels) return reject('止盈止损价格无效或不符合价格步长。');
     if (config.trader.dryRun !== false) return { status: 'dry_run', action: 'UPDATE_PROTECTION', ...levels };
-    if (!await this.claim(symbol, candles)) return reject('本根 K 线已提交过操作。');
-    return this.replaceProtection({ client, symbol, side: Number(position.positionAmt) > 0 ? 'SELL' : 'BUY', levels, minBps: config.trader.minProtectionMoveBps, positionSide: position.positionSide });
+    const positionSide = String(position.positionSide || 'BOTH').toUpperCase();
+    return this.withExecutionLock(config, symbol, positionSide, async ({ environment }) => {
+      if (!await this.claim(symbol, candles)) return reject('本根 K 线已提交过操作。');
+      return this.replaceProtection({
+        client, symbol, side: Number(position.positionAmt) > 0 ? 'SELL' : 'BUY', levels,
+        minBps: config.trader.minProtectionMoveBps, positionSide, environment
+      });
+    });
   }
-  async replaceProtection({ client, symbol, side, levels, minBps = 25, positionSide }) {
+  async replaceProtection({ client, symbol, side, levels, minBps = 25, positionSide, environment = 'live' }) {
     const pending = await client.openAlgoOrders(symbol);
     if (!Array.isArray(pending)) throw new Error('币安保护单快照无效。');
-    if (pending.some(o => !owned(o))) throw new Error('存在手动保护单，请先在币安检查，系统不会覆盖。');
+    const relevant = pending.filter(item => protectionMatchesPosition(item, { positionSide, side }));
+    if (relevant.some(o => !owned(o))) throw new Error('存在手动保护单，请先在币安检查，系统不会覆盖。');
     for (const type of ['STOP_MARKET', 'TAKE_PROFIT_MARKET']) {
-      if (pending.filter(o => (o.orderType || o.type) === type).length > 1) throw new Error('发现多个同类保护单，请先检查币安订单。');
+      if (relevant.filter(o => (o.orderType || o.type) === type).length > 1) throw new Error('发现多个同类保护单，请先检查币安订单。');
     }
     for (const [type, triggerPrice] of [['STOP_MARKET', levels.stopLoss], ['TAKE_PROFIT_MARKET', levels.takeProfit]]) {
-      const sameType = pending.filter(o => (o.orderType || o.type) === type);
+      const sameType = relevant.filter(o => (o.orderType || o.type) === type);
       if (sameType.some(o => !owned(o))) throw new Error('存在手动保护单，请先在币安检查，系统不会覆盖。');
       if (sameType.length > 1) throw new Error('发现多个同类保护单，请先检查币安订单。');
-      const previous = sameType[0];
+      const clientAlgoId = deterministicBinanceClientOrderId('protect', environment, symbol, positionSide || 'BOTH', type);
+      const previous = sameType.find(item => String(item.clientAlgoId || '') === clientAlgoId) || sameType[0];
       if (previous && Math.abs(Number(previous.triggerPrice) - triggerPrice) / triggerPrice * 10000 < Math.max(0, Number(minBps) || 0)) continue;
       // Establish replacement first: a rejected new stop must never delete the existing stop.
-      await client.protectionOrder({ symbol, side, type, triggerPrice, positionSide, clientAlgoId: id() });
+      await client.protectionOrder({ symbol, side, type, triggerPrice, positionSide, clientAlgoId });
       if (previous) await client.cancelAlgo(previous.algoId);
     }
     return { status: 'sent', action: 'UPDATE_PROTECTION', ...levels };
@@ -157,24 +377,81 @@ export class BinancePositionMonitor {
     if ((await client.openOrders(symbol)).length || (await client.openAlgoOrders(symbol)).length) return reject('该币种存在挂单，请等待或检查后再开仓。');
     const proposal = { quantity, price, ...levels, leverage: Number(decision.leverage) };
     if (config.trader.dryRun !== false) return { status: 'dry_run', ...proposal };
-    if (!await this.claim(symbol, candles)) return reject('本根 K 线已提交过操作。');
-    await client.setLeverage({ symbol, leverage: proposal.leverage });
     // 开仓方向即仓位方向：双向账户必须显式指明（单向账户传 undefined，由交易所默认 BOTH）。
     const dualSide = typeof client.dualSidePosition === 'function' ? await client.dualSidePosition() : false;
     const positionSide = dualSide ? (decision.action === 'BUY' ? 'LONG' : 'SHORT') : undefined;
-    const result = await client.marketOrder({ symbol, side: decision.action, quantity, positionSide, clientOrderId: id() });
-    if (result.status !== 'FILLED') return { status: 'uncertain', reason: '开仓未确认全部成交，请检查币安订单。' };
-    try {
-      await this.replaceProtection({ client, symbol, side: decision.action === 'BUY' ? 'SELL' : 'BUY', levels, positionSide });
-    } catch (error) {
-      // A filled entry without confirmed protection is immediately reduced; never open another entry on this path.
+    const lockPositionSide = positionSide || 'BOTH';
+    return this.withExecutionLock(config, symbol, lockPositionSide, async ({ environment }) => {
+      if ((positions || []).some(item => item.symbol === symbol && Number(item.positionAmt) !== 0)) {
+        return reject('该币种已有活动仓位，跳过重复开仓。');
+      }
+      const signalIdentity = candles.dataAsOf || String(Date.now());
+      const intentPrefix = this.executionIntentKey(environment, 'entry_' + decision.action, symbol, lockPositionSide) + ':';
+      const intentKey = intentPrefix + signalIdentity;
+      const clientOrderId = deterministicBinanceClientOrderId('entry', environment, symbol, decision.action, lockPositionSide, signalIdentity);
+      const protectEntry = async entryResult => {
+        try {
+          await this.replaceProtection({
+            client, symbol, side: decision.action === 'BUY' ? 'SELL' : 'BUY', levels, positionSide, environment
+          });
+        } catch (error) {
+          // A filled entry without confirmed protection is immediately reduced. The
+          // emergency close uses its own durable intent and will never be submitted twice.
+          const emergency = await this.submitReduceOnly({
+            client, config, symbol, positionSide: lockPositionSide,
+            side: decision.action === 'BUY' ? 'SELL' : 'BUY',
+            quantity: Number(entryResult.executedQty) > 0 ? Number(entryResult.executedQty) : quantity,
+            action: 'emergency_close', reason: '保护单设置失败',
+            identity: entryResult.clientOrderId || clientOrderId
+          });
+          if (emergency.status !== 'sent') throw new Error(`保护单设置失败，紧急平仓未确认，请立即检查 ${symbol}：${error.message}`);
+          throw new Error(`保护单设置失败，已发送紧急减仓指令，请检查 ${symbol}：${error.message}`);
+        }
+        return { status: 'sent', ...proposal, orderId: entryResult.orderId, reconciled: Boolean(entryResult.reconciled) };
+      };
+      const existing = await this.getExecutionIntent(intentKey);
+      if (existing?.status === 'filled') return protectEntry({ ...existing, reconciled: true });
+      const pending = await this.findExecutionIntent(intentPrefix, ['submitting', 'submitted', 'new', 'partially_filled', 'unknown']);
+      if (pending && pending[0] !== intentKey) {
+        const recovered = await this.reconcileExecution(client, symbol, pending[0], pending[1], 'ENTRY');
+        return recovered.status === 'sent' ? protectEntry({ ...recovered, executedQty: pending[1].executedQty, clientOrderId: pending[1].clientOrderId, reconciled: true }) : recovered;
+      }
+      if (existing && ['submitting', 'submitted', 'new', 'partially_filled', 'unknown'].includes(existing.status)) {
+        const recovered = await this.reconcileExecution(client, symbol, intentKey, existing, 'ENTRY');
+        return recovered.status === 'sent' ? protectEntry({ ...recovered, executedQty: existing.executedQty, reconciled: true }) : recovered;
+      }
+      if (existing?.status === 'submit_error' && Date.parse(existing.retryAt || '') > Date.now()) {
+        return { status: 'uncertain', reason: '上一次开仓请求失败，等待退避后重试。' };
+      }
+      if (!await this.claim(symbol, candles)) return reject('本根 K 线已提交过操作。');
+
+      await client.setLeverage({ symbol, leverage: proposal.leverage });
+      const intent = await this.beginExecutionIntent(intentKey, {
+        action: 'ENTRY', symbol, positionSide: lockPositionSide,
+        side: decision.action, quantity, clientOrderId, signalIdentity
+      });
+      let result;
       try {
-        const close = await client.marketOrder({ symbol, side: decision.action === 'BUY' ? 'SELL' : 'BUY', quantity: Number(result.executedQty), reduceOnly: true, positionSide, clientOrderId: id() });
-        if (close.status !== 'FILLED') throw new Error('Emergency close is not filled.');
-      } catch { throw new Error(`保护单设置失败，紧急平仓也未确认，请立即检查 ${symbol}：${error.message}`); }
-      throw new Error(`保护单设置失败，已发送紧急减仓指令，请检查 ${symbol}：${error.message}`);
-    }
-    return { status: 'sent', ...proposal, orderId: result.orderId };
+        result = await client.marketOrder({ symbol, side: decision.action, quantity, positionSide, clientOrderId: intent.clientOrderId });
+      } catch (error) {
+        const recovered = await this.reconcileExecution(client, symbol, intentKey, intent, 'ENTRY');
+        return recovered.status === 'sent' ? protectEntry({ ...recovered, executedQty: intent.quantity, clientOrderId: intent.clientOrderId, reconciled: true }) : recovered;
+      }
+
+      const entryStatus = String(result?.status || 'unknown').toLowerCase();
+      await this.updateExecutionIntent(intentKey, current => ({
+        ...current,
+        status: entryStatus,
+        orderId: result?.orderId ?? null,
+        executedQty: Number(result?.executedQty || 0),
+        avgPrice: Number(result?.avgPrice || 0) || null,
+        lastCheckedAt: new Date().toISOString(),
+        lastError: '',
+        retryAt: null
+      }));
+      if (entryStatus !== 'filled') return { status: 'uncertain', reason: '开仓未确认全部成交，请检查 Binance。', orderId: result?.orderId };
+      return protectEntry(result);
+    });
   }
 }
 

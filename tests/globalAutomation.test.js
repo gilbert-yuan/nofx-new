@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { GlobalAutomation, selectAnalysisEngine } from '../server/globalAutomation.js';
+import { GlobalAutomation, rankAutomationCandidates, selectAnalysisEngine, selectAutomationCandidates } from '../server/globalAutomation.js';
 import { localProtectionReview, averageTrueRange } from '../server/shared/protectionReview.js';
 import { TRAILING_RULE } from '../server/shared/strategyGuards.js';
 
@@ -62,6 +62,88 @@ test('GlobalAutomation - 初始化', () => {
   assert.ok(automation.tasks.klineSync, 'K线同步任务已配置');
   assert.deepEqual(Object.keys(automation.tasks), ['klineSync', 'positionReview']);
   assert.ok(automation.tasks.positionReview, '持仓复核任务已配置');
+});
+
+test('GlobalAutomation - 全市场机会按质量稳定排序后再分配仓位', () => {
+  const ranked = rankAutomationCandidates([
+    { symbol: 'SLOWUSDT', strategy: { priority: 60 }, signal: { confidence: 0.99, plan: { trendStrengthScore: 72, netRr: 4 } } },
+    { symbol: 'BESTUSDT', strategy: { priority: 60 }, signal: { confidence: 0.80, plan: { trendStrengthScore: 90, netRr: 2 } } },
+    { symbol: 'TIE-BUSDT', strategy: { priority: 60 }, signal: { confidence: 0.80, plan: { trendStrengthScore: 90, netRr: 3 } } },
+    { symbol: 'TIE-AUSDT', strategy: { priority: 10 }, signal: { confidence: 0.80, plan: { trendStrengthScore: 90, netRr: 3 } } }
+  ]);
+
+  assert.deepEqual(ranked.map(item => item.symbol), [
+    'TIE-AUSDT', 'TIE-BUSDT', 'BESTUSDT', 'SLOWUSDT'
+  ]);
+});
+
+test('GlobalAutomation - 同币种候选先按策略优先级仲裁', () => {
+  const selected = selectAutomationCandidates([
+    { symbol: 'BTCUSDT', strategy: { id: 'late', priority: 60 }, signal: { confidence: 0.99 } },
+    { symbol: 'BTCUSDT', strategy: { id: 'primary', priority: 10 }, signal: { confidence: 0.70 } },
+    { symbol: 'ETHUSDT', strategy: { id: 'same-priority', priority: 10 }, signal: { confidence: 0.80 } }
+  ]);
+  assert.deepEqual(selected.map(item => item.strategy.id).sort(), ['primary', 'same-priority']);
+});
+
+test('GlobalAutomation - 模拟下单遵守单仓与总敞口上限', async () => {
+  const submitted = [];
+  const automation = new GlobalAutomation({
+    simulation: {
+      readLight: async () => ({ initialBalance: 100, orders: [] }),
+      submit: async input => { submitted.push(input); return {}; }
+    },
+    market: {}, marketDb: {}, archive: {}, store: {}
+  });
+  const signal = {
+    action: 'BUY', positionRecommendation: 'OPEN_LONG', strategyId: 'risk-test', recommendedLeverage: 10,
+    plan: { entryMin: 99, entryMax: 101, entryLimit: 100, stopLoss: 95, takeProfit: 110, autoMarginPct: 0.5 }
+  };
+
+  const first = await automation.submitSignal({
+    symbol: 'BTCUSDT', signal, recordId: 'record-1',
+    executionPlan: { entryMin: 99, entryMax: 101, entryLimit: 100, stopLoss: 95, takeProfit: 110 },
+    shouldContinue: () => true,
+    config: { trader: { maxPositionNotionalPct: 0.2, maxTotalNotionalPct: 0.5 } }
+  });
+  assert.equal(first.action, 'SUBMITTED');
+  assert.equal(submitted[0].margin, 4, '单仓 20% 名义价值 ÷ 全局 5 倍杠杆 = 4 USDT 保证金');
+
+  automation.simulation.readLight = async () => ({
+    initialBalance: 100,
+    orders: [{ status: 'open', symbol: 'SOLUSDT', notional: 40, margin: 4, entryFee: 0, unrealized: 0 }]
+  });
+  const second = await automation.submitSignal({
+    symbol: 'ETHUSDT', signal, recordId: 'record-2', shouldContinue: () => true,
+    config: { trader: { maxPositionNotionalPct: 0.8, maxTotalNotionalPct: 0.5 } }
+  });
+  assert.equal(second.action, 'SUBMITTED');
+  assert.equal(submitted[1].margin, 2, '总敞口还剩 10 USDT 名义价值，按全局 5 倍杠杆只允许 2 USDT 保证金');
+});
+
+test('GlobalAutomation - 每轮新开仓上限作用于整个市场候选集', async () => {
+  const submitted = [];
+  const automation = new GlobalAutomation({
+    simulation: { readAutomation: async () => ({ orders: [] }) },
+    market: {}, marketDb: {}, archive: {},
+    store: {
+      getConfig: async () => ({ trader: { maxNewEntriesPerCycle: 1 } }),
+      getStrategy: async () => ({})
+    }
+  });
+  automation.strategies.enabled = async () => [{ id: 'test-strategy', priority: 10 }];
+  automation.scanWithStrategy = async () => ({
+    analyzed: 2, eligible: 2, submitted: 0, failed: 0, failures: [], blockedBy: { score: 0, volume: 0, riskReward: 0 },
+    signals: [],
+    candidates: [
+      { symbol: 'LOWUSDT', strategy: { id: 'test-strategy', priority: 10 }, signal: { action: 'BUY', confidence: 0.8, plan: { trendStrengthScore: 80 } } },
+      { symbol: 'BESTUSDT', strategy: { id: 'test-strategy', priority: 10 }, signal: { action: 'BUY', confidence: 0.9, plan: { trendStrengthScore: 95 } } }
+    ]
+  });
+  automation.submitSignal = async ({ symbol }) => { submitted.push(symbol); return { action: 'SUBMITTED' }; };
+
+  await automation.runAnalysis({ symbols: ['LOWUSDT', 'BESTUSDT'], shouldContinue: () => true });
+  assert.deepEqual(submitted, ['BESTUSDT']);
 });
 
 test('配置保存后，自动化 context 会在修订号变化时刷新', async () => {

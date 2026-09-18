@@ -311,6 +311,128 @@ test('dry-run entry makes no mutation and cumulative exposure blocks a second pr
   assert.equal((await monitor.applyEntry(args)).status, 'rejected');
 });
 
+test('live close uses a durable client order id and reconciles an unknown response without resubmitting', async () => {
+  const liveConfig = {
+    ...config,
+    binance: { apiKey: 'k', secretKey: 's', demo: false, testnet: false },
+    trader: { ...config.trader, dryRun: false }
+  };
+  const sharedStore = store(liveConfig);
+  let submissions = 0;
+  let lookups = 0;
+  const client = {
+    positions: async () => [{ symbol: 'BTCUSDT', positionAmt: '1', positionSide: 'BOTH', markPrice: '100' }],
+    marketOrder: async () => {
+      submissions++;
+      throw new Error('execution status is unknown');
+    },
+    order: async ({ clientOrderId }) => {
+      lookups++;
+      assert.match(clientOrderId, /^nofx_close_/);
+      return { status: 'FILLED', orderId: 77, executedQty: '1' };
+    },
+    openAlgoOrders: async () => [],
+    cancelAlgo: async () => {}
+  };
+  const monitor = new BinancePositionMonitor({ store: sharedStore });
+  const args = {
+    client,
+    config: liveConfig,
+    market: {},
+    candles: candles(),
+    position: { symbol: 'BTCUSDT', positionAmt: '1', positionSide: 'BOTH', markPrice: '100' },
+    review: { action: 'CLOSE', confidence: 0.9 }
+  };
+
+  const first = await monitor.applyReview(args);
+  const second = await monitor.applyReview(args);
+  assert.equal(first.status, 'sent');
+  assert.equal(first.reconciled, true);
+  assert.equal(second.status, 'sent');
+  assert.equal(submissions, 1);
+  assert.equal(lookups, 1);
+  const state = await sharedStore.getState();
+  assert.equal(Object.values(state.binanceExecutionIntents)[0].status, 'filled');
+});
+
+test('live entry failure to create protection uses one durable emergency reduce-only close', async () => {
+  const liveConfig = {
+    ...config,
+    binance: { apiKey: 'k', secretKey: 's', demo: false, testnet: false },
+    trader: { ...config.trader, dryRun: false }
+  };
+  const sharedStore = store(liveConfig);
+  const calls = [];
+  const client = {
+    price: async () => ({ price: '100' }),
+    openOrders: async () => [],
+    openAlgoOrders: async () => [],
+    setLeverage: async () => {},
+    protectionOrder: async () => { throw new Error('protection rejected'); },
+    marketOrder: async args => {
+      calls.push(args);
+      return { status: 'FILLED', orderId: calls.length, executedQty: String(args.quantity) };
+    }
+  };
+  const monitor = new BinancePositionMonitor({ store: sharedStore });
+  await assert.rejects(() => monitor.applyEntry({
+    client,
+    config: liveConfig,
+    market: { perpetualUsdtContracts: async () => [instrument] },
+    candles: candles(),
+    symbol: 'BTCUSDT',
+    decision: { action: 'BUY', symbol: 'BTCUSDT', quantity: 1, leverage: 2, confidence: 0.8, stopLoss: 90, takeProfit: 110 },
+    account: { totalWalletBalance: 1000 },
+    positions: []
+  }), /已发送紧急减仓指令/);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].reduceOnly, true);
+  assert.match(calls[1].clientOrderId, /^nofx_emergency_/);
+  const state = await sharedStore.getState();
+  assert.equal(Object.values(state.binanceExecutionIntents).find(item => item.action === 'emergency_close').status, 'filled');
+});
+
+test('two monitor instances cannot submit the same live close concurrently', async () => {
+  const liveConfig = {
+    ...config,
+    binance: { apiKey: 'k', secretKey: 's', demo: false, testnet: false },
+    trader: { ...config.trader, dryRun: false }
+  };
+  const sharedStore = store(liveConfig);
+  let entered;
+  let release;
+  const enteredPromise = new Promise(resolve => { entered = resolve; });
+  const releasePromise = new Promise(resolve => { release = resolve; });
+  let submissions = 0;
+  const client = {
+    positions: async () => [{ symbol: 'BTCUSDT', positionAmt: '1', positionSide: 'BOTH', markPrice: '100' }],
+    marketOrder: async () => {
+      submissions++;
+      entered();
+      await releasePromise;
+      return { status: 'FILLED', orderId: submissions, executedQty: '1' };
+    },
+    openAlgoOrders: async () => [],
+    cancelAlgo: async () => {}
+  };
+  const args = {
+    client,
+    config: liveConfig,
+    market: {},
+    candles: candles(),
+    position: { symbol: 'BTCUSDT', positionAmt: '1', positionSide: 'BOTH', markPrice: '100' },
+    review: { action: 'CLOSE', confidence: 0.9 }
+  };
+  const firstPromise = new BinancePositionMonitor({ store: sharedStore }).applyReview(args);
+  await enteredPromise;
+  const second = await new BinancePositionMonitor({ store: sharedStore }).applyReview(args);
+  release();
+  const first = await firstPromise;
+  assert.equal(first.status, 'sent');
+  assert.equal(second.status, 'skipped');
+  assert.equal(submissions, 1);
+});
+
 test('hedge accounts send positionSide and drop reduceOnly; one-way accounts keep reduceOnly', async () => {
   // 币安规则：positionSide 与 reduceOnly **互斥** ——
   // 单向账户靠 reduceOnly 平仓；双向账户必须用 positionSide=LONG/SHORT 指明操作哪一侧，且不允许 reduceOnly。
