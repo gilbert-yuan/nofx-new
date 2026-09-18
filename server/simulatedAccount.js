@@ -263,6 +263,8 @@ export class SimulatedAccount {
   async read() { return this.repository.read(); }
   /** 轻量读取：只加载活跃订单的明细子表，供不需要历史明细的运行时路径使用 */
   async readLight() { return this.repository.read({ light: true }); }
+  /** 自动化扫描快照：保留活跃订单明细及历史订单的策略模型，避免搬运全部历史扩展字段。 */
+  async readAutomation() { return this.repository.read({ light: true, automation: true }); }
   async mutate(fn) {
     return this.repository.mutate(fn);
   }

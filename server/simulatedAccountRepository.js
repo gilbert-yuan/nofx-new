@@ -79,6 +79,9 @@ CREATE INDEX IF NOT EXISTS simulated_order_analysis_strategy_idx ON simulated_or
 CREATE INDEX IF NOT EXISTS simulated_order_exchange_sync_idx
   ON simulated_order_extensions(account_id, (path[1]))
   WHERE path[1] IN ('exchangeSync', 'exchange');
+CREATE INDEX IF NOT EXISTS simulated_order_exchange_sync_order_idx
+  ON simulated_order_extensions(account_id, order_id)
+  WHERE path[1] IN ('exchangeSync', 'exchange');
 CREATE TABLE IF NOT EXISTS simulated_account_migrations (
   version INTEGER PRIMARY KEY, migrated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   source_order_count INTEGER NOT NULL, source_digest TEXT NOT NULL
@@ -275,6 +278,11 @@ export class SimulatedAccountRepository {
       ON simulated_order_extensions(account_id, (path[1]))
       WHERE path[1] IN ('exchangeSync', 'exchange')
     `);
+    await this.pool.query(`
+      CREATE INDEX IF NOT EXISTS simulated_order_exchange_sync_order_idx
+      ON simulated_order_extensions(account_id, order_id)
+      WHERE path[1] IN ('exchangeSync', 'exchange')
+    `);
   }
   /**
    * @param {object} options
@@ -282,6 +290,8 @@ export class SimulatedAccountRepository {
    * @param {string} [options.orderId] 只加载指定订单（订单级表）
    * @param {boolean} [options.light] 轻量模式：订单级明细表（extensions/reviews/plans…）
    *   只加载「活跃订单」的数据。历史（已平仓）订单的明细不参与读取与写回。
+   * @param {boolean} [options.automation] 自动化扫描快照：在 light 基础上，为历史订单保留
+   *   analysisContext.strategyModel，供自适应策略样本筛选使用；其余历史明细仍不加载。
    *
    *   背景：simulated_order_extensions 已达 9 万行，其中已平仓订单占 99.6%，
    *   而每次 mutate 要把它们全部读出、深拷贝、逐行深比较，实测单次阻塞 8~19 秒，
@@ -291,7 +301,7 @@ export class SimulatedAccountRepository {
    *   历史行既不在 previous 也不在 next，因此不会被误删，也不会被重新插入。
    *   代价是 mutate 回调内读不到历史订单的明细，故仅限确认不需要历史数据的写路径使用。
    */
-  async readFrom(client, { summary = false, orderId, light = false, exchangeSync = false } = {}) {
+  async readFrom(client, { summary = false, orderId, light = false, exchangeSync = false, automation = false } = {}) {
     const tables = {};
     const summaryTables = new Set(['simulated_accounts', 'simulated_orders', 'simulated_order_costs', 'simulated_order_plans', 'simulated_automation_settings', 'simulated_automation_jobs', 'simulated_account_extensions']);
     let activeOrderIds = null;
@@ -314,6 +324,9 @@ export class SimulatedAccountRepository {
       } else if (light && childTable) {
         if (exchangeSync && def.name === 'simulated_order_extensions') {
           sql += " AND path[1] IN ('exchangeSync', 'exchange')";
+        } else if (automation && def.name === 'simulated_order_extensions') {
+          sql += " AND (order_id = ANY($1::text[]) OR path = ARRAY['analysisContext', 'strategyModel']::text[])";
+          params.push(activeOrderIds);
         } else {
           sql += ' AND order_id = ANY($1::text[])';
           params.push(activeOrderIds);

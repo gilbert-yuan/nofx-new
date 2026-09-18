@@ -283,7 +283,11 @@ export class GlobalAutomation {
     const failures = [];
 
     // P3 修复：币种黑名单不再依赖引擎分支，任何策略都先做一次「负期望值币种拉黑」。
-    const state = context.state ??= this.simulation.read ? await this.simulation.read() : { orders: [] };
+    // 自动化只需要订单主字段、账户自适应配置、活跃订单明细及历史订单的 strategyModel。
+    // 使用专用快照可避免每轮扫描搬运大量已平仓订单扩展数据；旧模拟器仍回退到 read()。
+    const state = context.state ??= this.simulation.readAutomation
+      ? await this.simulation.readAutomation()
+      : this.simulation.read ? await this.simulation.read() : { orders: [] };
     const adaptiveConfig = getAdaptiveConfig(state.adaptiveConfig);
     const adaptiveOverrides = state.adaptiveOverrides || {};
     // 自适应参数只信任「同一模型 id 的本地策略样本」，避免用别的引擎结果调本地参数。

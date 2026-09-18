@@ -29,6 +29,7 @@ test('relational projection round-trips every value, including nulls, zero, orde
   const state = fixture();
   assert.deepEqual(hydrateAccount(projectAccount(state)), state);
   assert.doesNotMatch(simulatedAccountSchema, /\bJSONB?\b/i);
+  assert.match(simulatedAccountSchema, /simulated_order_exchange_sync_order_idx/);
   const tables = projectAccount(state);
   assert.equal(tables.simulated_order_plans.length, 2);
   assert.equal(tables.simulated_automation_symbols.length, 2);
@@ -39,6 +40,32 @@ test('relational projection round-trips every value, including nulls, zero, orde
 test('duplicate order IDs are rejected before writing any row', () => {
   const state = fixture(); state.orders.push(structuredClone(state.orders[0]));
   assert.throws(() => projectAccount(state), /duplicate/);
+});
+
+test('automation snapshot only keeps active order details and historical strategy model', async () => {
+  const queries = [];
+  const client = {
+    async query(sql, params = []) {
+      queries.push({ sql, params });
+      if (sql.includes("SELECT order_id FROM simulated_orders WHERE account_id=1 AND status IN ('pending','open')")) {
+        return { rows: [{ order_id: 'active-1' }] };
+      }
+      return { rows: [] };
+    }
+  };
+  const repo = new SimulatedAccountRepository({});
+  await repo.readFrom(client, { light: true, automation: true });
+
+  const extensionQuery = queries.find(item => item.sql.includes('FROM simulated_order_extensions'));
+  assert.ok(extensionQuery, 'automation snapshot should query order extensions');
+  assert.match(extensionQuery.sql, /order_id = ANY\(\$1::text\[\]\)/);
+  assert.match(extensionQuery.sql, /path = ARRAY\['analysisContext', 'strategyModel'\]::text\[\]/);
+  assert.deepEqual(extensionQuery.params, [['active-1']]);
+
+  const planQuery = queries.find(item => item.sql.includes('FROM simulated_order_plans'));
+  assert.ok(planQuery, 'automation snapshot should still load active order plans');
+  assert.match(planQuery.sql, /order_id = ANY\(\$1::text\[\]\)/);
+  assert.deepEqual(planQuery.params, [['active-1']]);
 });
 
 test('PostgreSQL migration is lossless, transactional, repeatable and preserves its original snapshot', { skip: process.env.SIMULATED_DB_TEST !== '1' }, async () => {
