@@ -23,6 +23,8 @@ export class BinanceMarket {
     this.updatedAt = null;
     this.lastError = '';
     this.pending = null;
+    this.ticker24hCache = null;
+    this.ticker24hAt = 0;
     /** 币种 → 最大杠杆（来自 exchangeInfo 的 LEVERAGE_FILTER）；下单前用于截断超限杠杆。 */
     this.leverageBySymbol = new Map();
   }
@@ -96,6 +98,25 @@ export class BinanceMarket {
     const count = Math.min(this.maxPageSize, Math.max(1, Number(limit) || 80));
     const rows = await this.client.klines({ symbol, interval, limit: count, startTime, endTime });
     return rows.map(row => ({ ...normalizeBinanceKline(row), confirmed: nextOpenTime(Number(row[0]), interval) <= Date.now() }));
+  }
+
+  /**
+   * 批量读取 USDT 永续合约 24h ticker。
+   * 妖币预测每轮只需要一份全市场快照，短缓存也能避免状态页刷新重复打交易所。
+   */
+  async ticker24hAll({ refresh = false } = {}) {
+    if (!refresh && this.ticker24hCache && Date.now() - this.ticker24hAt < 60000) {
+      return new Map(this.ticker24hCache);
+    }
+    if (typeof this.client.ticker24hr !== 'function') return new Map();
+    const response = await this.client.ticker24hr();
+    const rows = Array.isArray(response) ? response : response ? [response] : [];
+    const map = new Map(rows
+      .filter(row => row?.symbol)
+      .map(row => [row.symbol, row]));
+    this.ticker24hCache = map;
+    this.ticker24hAt = Date.now();
+    return new Map(map);
   }
 
   /**

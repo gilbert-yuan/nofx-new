@@ -170,14 +170,31 @@ export function costAwareRr({ entry, stopLoss, takeProfit, maxHoldBars, costs })
 }
 
 /**
- * 由止损距离反推推荐杠杆：杠杆 ≈ 风险预算 ÷ 止损距离，受 maxLeverage 与全局硬上限双重截断。
+ * 由止损距离反推推荐杠杆：杠杆 ≈ 风险预算 ÷ 止损距离，受策略/系统硬上限截断。
+ *
+ * 4H 策略可选地对高评分信号放宽「策略杠杆上限」：
+ *   - 普通信号仍使用 params.maxLeverage；
+ *   - signalScore >= scoreLeverageThreshold 时，允许使用 scoreLeverageMax；
+ *   - scoreLeverageMax 仍受 RISK_RULE.maxLeverage、globalAutomation 的交易所配置上限
+ *     和 5U 最低保证金/名义敞口闸门约束。
+ *
+ * 这样评分只影响已通过全部入场与成本闸门的信号，不会把低质量信号直接放大。
  * 与 localAnalysis.recommendedLeverage 同公式，但不依赖 planRefEntry（市价单没有 entryLimit）。
  */
-export function h4Leverage(stopDistancePct, params) {
-  const cap = Math.max(1, Math.min(
+export function h4Leverage(stopDistancePct, params, signalScore = null) {
+  const baseCap = Math.max(1, Math.min(
     RISK_RULE.maxLeverage,
     Math.floor(Number(params?.maxLeverage) || RISK_RULE.maxLeverage)
   ));
+  let cap = baseCap;
+  const score = Number(signalScore);
+  const threshold = Number(params?.scoreLeverageThreshold);
+  const scoreCap = Math.floor(Number(params?.scoreLeverageMax));
+  if (params?.scoreLeverageEnabled === true
+    && Number.isFinite(score) && Number.isFinite(threshold)
+    && score >= threshold && Number.isFinite(scoreCap) && scoreCap >= 1) {
+    cap = Math.max(baseCap, Math.min(RISK_RULE.maxLeverage, scoreCap));
+  }
   const budget = Number.isFinite(Number(params?.riskBudgetPct)) ? Number(params.riskBudgetPct) : RISK_RULE.riskBudgetPct;
   if (!(stopDistancePct > 0)) return 1;
   return Math.max(1, Math.min(cap, Math.floor(budget / stopDistancePct)));
@@ -236,13 +253,13 @@ export function resolveH4Market(market, ctx) {
  */
 export function buildH4Plan({
   direction, refPrice, atr, stopAtr, minStopPct, takeProfit, maxHoldBars,
-  entryBandAtr, exitRules, params, targetSource = null, extra = {}
+  entryBandAtr, exitRules, params, signalScore = null, targetSource = null, extra = {}
 }) {
   const long = direction === 1;
   const rawStop = Math.max(Number(stopAtr) * Number(atr), Number(minStopPct) * refPrice);
   const stopLoss = long ? refPrice - rawStop : refPrice + rawStop;
   const stopDistancePct = rawStop / refPrice;
-  const leverage = h4Leverage(stopDistancePct, params);
+  const leverage = h4Leverage(stopDistancePct, params, signalScore);
   const band = Math.max(0.01, Number(entryBandAtr) || 0.5) * Number(atr);
   // 策略级仓位/资金池参数（09-17 平衡档上线）：随 plan 下发，globalAutomation 读取。
   // 非法/缺省时置 null，下单链路回落全局默认 —— 旧策略 plan 里没有这两个字段，行为不变。
@@ -260,6 +277,7 @@ export function buildH4Plan({
     maxHoldBars: Math.round(Number(maxHoldBars)),
     recommendedLeverage: leverage,
     marginRiskPct: leverage * stopDistancePct,
+    signalScore: Number.isFinite(Number(signalScore)) ? Number(signalScore) : null,
     autoMarginPct: Number.isFinite(marginPct) && marginPct > 0 && marginPct <= 1 ? marginPct : null,
     maxPositions: Number.isFinite(maxPos) && maxPos >= 1 ? maxPos : null,
     targetSource,

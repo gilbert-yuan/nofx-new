@@ -45,7 +45,7 @@ export function validateOrder({ order, config, account, price, positions }) {
     return reject(`Order notional ${notional.toFixed(2)} exceeds max ${maxNotional.toFixed(2)}.`);
   }
   const totalLimit = Number(config.trader.maxTotalNotionalPct ?? config.trader.maxPositionNotionalPct);
-  if (!Number.isFinite(totalLimit) || totalLimit <= 0 || totalLimit > 1) return reject('Total exposure limit is invalid.');
+  if (!Number.isFinite(totalLimit) || totalLimit <= 0 || totalLimit > 2) return reject('Total exposure limit is invalid.');
   let exposure = 0;
   for (const position of positions) {
     if (Number(position.positionAmt) === 0) continue;

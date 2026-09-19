@@ -15,6 +15,7 @@ import { structureShortAnalysis, STRUCTURE_SHORT_PARAM_SCHEMA } from '../structu
 import { structureLongAnalysis, STRUCTURE_LONG_PARAM_SCHEMA } from '../structureLongAnalysis.js';
 import { h4BreakoutAnalysis, h4BreakoutReview, H4_BREAKOUT_PARAM_SCHEMA } from '../h4BreakoutAnalysis.js';
 import { h4ReversionAnalysis, h4ReversionReview, H4_REVERSION_PARAM_SCHEMA } from '../h4ReversionAnalysis.js';
+import { yaoCoinAmbushAnalysis, yaoCoinAmbushReview, YAO_AMBUSH_PARAM_SCHEMA } from '../yaoCoinAmbushAnalysis.js';
 
 /** 出场规则参数（移动止损 / 智能退出 / 分批止盈）—— 各策略共用同一套，避免重复定义。 */
 const EXIT_PARAM_SCHEMA = ENHANCED_PARAM_SCHEMA.filter(spec => spec.group === 'exit');
@@ -134,6 +135,29 @@ defineStrategy({
     ...plan,
     exitRules: buildExitRules({ ...ENHANCED_DEFAULTS, ...(ctx.params || {}) })
   })
+});
+
+/**
+ * 策略 12：妖币埋伏（默认关闭 —— 必须先经过样本外回测与 shadow 验证）
+ * 1m 负责启动前动量/量能/波动特征，15m 最近 96 根负责构造不含未来数据的 24h 快照；
+ * 只做 PRE_LAUNCH 候选，达到 ±50% 后不追，方向上下双向，参考价以回踩/反弹限价成交。
+ */
+defineStrategy({
+  id: 'yao-coin-ambush-v1',
+  name: '妖币埋伏 v1',
+  description: '【1m 埋伏】用 1m 动量/量能/波动放大 + 15m 滚动24h快照预测上涨或下跌方向；'
+    + '只在达到 ±50% 目标前挂回踩/反弹限价单，给出预测幅度、目标价、止损与分档止盈。'
+    + '默认关闭，必须先通过样本外回测与 shadow 验证；规则置信度不是统计学胜率。',
+  engine: 'yao-ambush',
+  modelId: 'yao-coin-ambush-v1',
+  priority: 70,
+  needsAux: ['15m'],
+  marketWindow: 80,
+  marketWindows: { '15m': 150 },
+  planInterval: '1m',
+  paramSchema: YAO_AMBUSH_PARAM_SCHEMA,
+  analyze: (market, ctx = {}) => yaoCoinAmbushAnalysis(market, ctx),
+  review: (order, market) => yaoCoinAmbushReview(order, market)
 });
 
 /**

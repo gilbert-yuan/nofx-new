@@ -28,7 +28,7 @@ defineEmits(['save', 'test', 'review']);
       <label>最低置信度<input v-model.number="trader.minConfidence" type="number" min="0" max="1" step="0.05" /></label>
       <label>最大杠杆<input v-model.number="trader.maxLeverage" type="number" min="1" max="20" /></label>
       <label>单仓最大权益占比<input v-model.number="trader.maxPositionNotionalPct" type="number" min="0.01" max="1" step="0.01" /></label>
-      <label>总仓最大权益占比<input v-model.number="trader.maxTotalNotionalPct" type="number" min="0.01" max="1" step="0.01" /></label>
+      <label>总仓最大权益占比<input v-model.number="trader.maxTotalNotionalPct" type="number" min="0.01" max="2" step="0.01" /></label>
     </div>
     <p class="muted">实盘发单需要同时关闭“欧意模拟盘”和“仅模拟指令”，并开启对应的开仓、平仓或止盈止损权限。手动创建的欧意条件单不会被本系统修改。</p>
     <p v-if="status?.lastResult" class="muted">上次复核：{{ status.lastRunAt ? new Date(status.lastRunAt).toLocaleString() : '尚未执行' }} · {{ status.lastResult.status }} · 已检查 {{ status.lastResult.reviewed || 0 }} 个持仓</p>

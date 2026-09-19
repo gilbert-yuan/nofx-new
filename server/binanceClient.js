@@ -59,7 +59,10 @@ export class BinanceClient {
   }
 
   async ticker24hr(symbol) {
-    return this.publicRequest('/fapi/v1/ticker/24hr', { symbol });
+    // Binance accepts an omitted symbol to return the full 24h ticker list.
+    // Keep the single-symbol call compatible while allowing one batched scan
+    // for the妖币 predictor instead of issuing one request per contract.
+    return this.publicRequest('/fapi/v1/ticker/24hr', symbol ? { symbol } : {});
   }
 
   async klines({ symbol, interval = '4h', limit = 80, startTime, endTime }) {

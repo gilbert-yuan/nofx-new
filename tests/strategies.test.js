@@ -7,6 +7,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { StrategyRuntime, normalizeNotes, MAX_NOTES_LENGTH } from '../server/strategies/runtime.js';
 import { getStrategy } from '../server/strategies/registry.js';
+import { h4Leverage, buildH4Plan } from '../server/shared/h4StrategyCommon.js';
 import '../server/strategies/builtins.js';
 
 const makeStore = (initial = null) => ({
@@ -16,6 +17,22 @@ const makeStore = (initial = null) => ({
 });
 
 const runtime = (store) => new StrategyRuntime({ store, resolveEngine: () => 'enhanced' });
+
+test('4H 评分杠杆档只放大达到门槛的信号，并把同一结果写入计划', () => {
+  const params = {
+    maxLeverage: 2, riskBudgetPct: 0.5,
+    scoreLeverageEnabled: true, scoreLeverageThreshold: 72, scoreLeverageMax: 4
+  };
+  assert.equal(h4Leverage(0.1, params, 71), 2, '门槛以下保持基础上限');
+  assert.equal(h4Leverage(0.1, params, 72), 4, '达到门槛才进入高分杠杆档');
+  const plan = buildH4Plan({
+    direction: 1, refPrice: 100, atr: 1, stopAtr: 1.5, minStopPct: 0.008,
+    takeProfit: 105, maxHoldBars: 17, entryBandAtr: 0.2,
+    exitRules: {}, params, signalScore: 72
+  });
+  assert.equal(plan.recommendedLeverage, 4);
+  assert.equal(plan.signalScore, 72);
+});
 
 test('normalizeNotes 折叠空白、限长，非字符串归为空串', () => {
   assert.equal(normalizeNotes('  做多  '), '做多');

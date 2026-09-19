@@ -51,16 +51,15 @@ export const H4_REVERSION_DEFAULTS = Object.freeze({
   adxPeriod: 14,
   // ── 波动率闸门 ──
   minAtrPct: 0.002,
-  // maxAtrPct 0.06：**本策略真正的边际来源**（低波动分层）。
-  // 全量口径 PF 1.261(0.15) → 1.388(0.06)、剔 Top3 币由负转正；高波动币的「超卖」多为趋势性下跌起点。
-  maxAtrPct: 0.06,
+  // maxAtrPct 0.035：收益档仍限制极端波动；高波动超卖更容易是单边下跌起点。
+  maxAtrPct: 0.035,
   // ── 极端偏离闸门 ──
   entryExtAtr: 2.0,
-  // rsiOversold 35：平衡档定案值（比 30 宽一档：35~30 区间的超卖在低波动币上是有效样本）。
-  rsiOversold: 35,
+  // RSI 30：只保留更极端的回撤，减少普通噪声信号。
+  rsiOversold: 30,
   rsiOverbought: 70,
-  // adxMax 50：只做「不强的趋势」，把 ADX>50 的单边行情挡在外面（逆势最容易死在这里）。
-  // 0 = 关闭该闸门 —— 关掉后一年期净 bps 由 +21.5 掉到 -219（optimization.json 基线）。
+  // ADX 50：收益档允许更多中等强度回归机会，但仍挡住极端单边行情。
+  // 0 = 关闭该闸门。
   adxMax: 50,
   // requireReversalCandle false：要求「当根收阳/收阴且收在上/下半部」等于等反弹启动后才进，
   // 4H 粒度下价格已经回归一半，入场价与目标均线之间的空间被吃掉。证伪：开启后成交样本 82 → 3 笔。
@@ -83,19 +82,20 @@ export const H4_REVERSION_DEFAULTS = Object.freeze({
   // maxHoldBars 17：收益顶点（三证据同向：配对反事实 / 闸门随动 / 补偿闸门 12 组无优）。
   // 放长不会更高；17 根 4H ≈ 2.8 天。上限 120 根 = 20 天，与 normalizePlan 的订单校验一致。
   maxHoldBars: 17,
-  // ── 仓位 / 资金池（09-17 平衡档上线）──
-  // ⚠️ 多策略共用一个资金池（单一 simulatedAccount）：autoMarginPct 按当前共享权益计，
-  // 每笔保证金 = 权益 × 0.015；0.015 是可用下限（0.01 时单笔保证金 1U、名义过小全被拒）。
-  // globalAutomation 优先读本值，未提供时回落全局 NOFX_AUTO_MARGIN_PCT（enhanced 仍用 0.05）。
-  autoMarginPct: 0.015,
-  // 并发持仓上限（按策略 id 计数，资金池共用但各策略独立限仓），对应回测 mp=50 口径。
-  maxPositions: 50,
+  // ── 仓位 / 资金池（100U 账户、Binance 最低 5U）──
+  // 每笔基础保证金 = 权益 × 0.05；交易链路仍会把低于 5U 的结果补足到 5U。
+  autoMarginPct: 0.05,
+  // 收益档允许 10 笔并发，名义敞口由 trader 的单仓/总额上限二次约束。
+  maxPositions: 10,
   // ── 风控 / 出场规则 ──
   ...H4_RISK_DEFAULTS,
   ...H4_EXIT_DEFAULTS,
-  // ⚠️ 必须排在 ...H4_RISK_DEFAULTS 之后：平衡档杠杆旋钮（lev ≈ 0.3 ÷ 止损距离%，
-  // 受 maxLeverage=5 截断），共享默认是 0.1；0.3 距爆仓硬边界 rb<0.995 余量充足。
-  riskBudgetPct: 0.3,
+  // 普通信号使用 2 倍杠杆；高分信号单独进入评分杠杆档，避免把整个信号池一起放大。
+  maxLeverage: 2,
+  riskBudgetPct: 0.5,
+  scoreLeverageEnabled: true,
+  scoreLeverageThreshold: 72,
+  scoreLeverageMax: 4,
   // ⚠️ 以下两项必须在 H4_EXIT_DEFAULTS 之后：分批止盈的目标必须**排在 minNetRr 之后**。
   // minNetRr 抬到 1.5 后，若第一档仍挂在 1.0R、第二档仍挂在 2.0R，
   // 第一档就会在「还没跑回成本门槛」时先落袋，把已经通过闸门的好单提前拆散。
@@ -135,6 +135,12 @@ const REVERSION_PARAM_SCHEMA = [
     '每笔保证金 = 当前账户权益 × 该比例（多策略共用一个资金池，按权益复利）。'
     + '由 globalAutomation 优先采用，未提供时回落全局 NOFX_AUTO_MARGIN_PCT。'),
   ...H4_RISK_PARAM_SCHEMA,
+  boolSpec(N, 'scoreLeverageEnabled', '高评分杠杆档', 'risk',
+    '开启后仅当信号评分达到门槛时，才允许使用 scoreLeverageMax；普通信号仍使用策略杠杆上限。'),
+  numSpec(N, 'scoreLeverageThreshold', '高评分门槛', 'risk', 50, 100, 1,
+    '信号 score ≥ 该值时进入高评分杠杆档。评分只是排序强度，不代表胜率。'),
+  numSpec(N, 'scoreLeverageMax', '高评分杠杆上限', 'risk', 1, 5, 1,
+    '高评分信号可用的最大杠杆，仍受系统硬上限、交易所配置和名义敞口约束。'),
   ...H4_EXIT_PARAM_SCHEMA
 ];
 
@@ -255,6 +261,18 @@ export function h4ReversionAnalysis(market, ctx = {}, costs = PAPER_COSTS) {
     { metrics });
   }
 
+  // 候选排序分（0~100）。在组装计划之前计算，使评分杠杆与评分本身使用同一个快照；
+  // 回测、自动化下单和订单审计都能看到同一 score → leverage 映射。
+  const score = Math.round(Math.max(0, Math.min(100,
+    10
+    + 30 * clamp01((Math.abs(extension) - p.entryExtAtr) / 2)
+    + ((direction === 1 ? (p.rsiOversold - (rsiNow ?? p.rsiOversold)) : ((rsiNow ?? p.rsiOverbought) - p.rsiOverbought)) > 0 ? 20 : 5)
+    + (reversalOk ? 15 : 5)
+    + 15 * (Number.isFinite(adxNow) ? clamp01(1 - adxNow / 50) : 0.5)
+    + 10 * clamp01(1 - Math.abs(atrPct - 0.01) / 0.02)
+  )));
+  const confidence = Math.max(0, Math.min(0.95, score / 100));
+
   // 计划几何
   const riskUnit = Math.max(p.stopAtr * atr, p.minStopPct * price);
   let takeProfit;
@@ -278,8 +296,8 @@ export function h4ReversionAnalysis(market, ctx = {}, costs = PAPER_COSTS) {
   const plan = buildH4Plan({
     direction, refPrice: price, atr, stopAtr: p.stopAtr, minStopPct: p.minStopPct,
     takeProfit, maxHoldBars: p.maxHoldBars, entryBandAtr: p.entryBandAtr,
-    exitRules: h4ExitRules(p), params: p, targetSource,
-    extra: { mean, extension, atrPct }
+    exitRules: h4ExitRules(p), params: p, signalScore: score, targetSource,
+    extra: { mean, extension, atrPct, trendStrengthScore: score }
   });
   if (!planIsSane(plan, direction)) {
     return wait(`计划几何非法（止损 ${plan.stopLoss.toPrecision(6)} / 区间 [${plan.entryMin.toPrecision(6)}, `
@@ -297,17 +315,6 @@ export function h4ReversionAnalysis(market, ctx = {}, costs = PAPER_COSTS) {
       + `（最不利入场 ${worstEntry.toPrecision(6)}、毛 ${rr.grossRr.toFixed(2)}R、成本 ${(rr.costAbs / worstEntry * 10000).toFixed(1)}bps），本轮观望。`,
     { metrics, rr: { grossRr: rr.grossRr, netRr: rr.netRr } });
   }
-
-  // 候选排序分（0~100）
-  const score = Math.round(Math.max(0, Math.min(100,
-    10
-    + 30 * clamp01((Math.abs(extension) - p.entryExtAtr) / 2)
-    + ((direction === 1 ? (p.rsiOversold - (rsiNow ?? p.rsiOversold)) : ((rsiNow ?? p.rsiOverbought) - p.rsiOverbought)) > 0 ? 20 : 5)
-    + (reversalOk ? 15 : 5)
-    + 15 * (Number.isFinite(adxNow) ? clamp01(1 - adxNow / 50) : 0.5)
-    + 10 * clamp01(1 - Math.abs(atrPct - 0.01) / 0.02)
-  )));
-  const confidence = Math.max(0, Math.min(0.95, score / 100));
 
   const dirText = direction === 1 ? '多' : '空';
   const reason = `4H 均值回归·${dirText}：收盘 ${price.toPrecision(6)} 偏离 EMA${pe.meanPeriod.actual} `

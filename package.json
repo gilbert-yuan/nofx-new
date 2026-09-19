@@ -24,7 +24,7 @@
     "pm2:status": "set \"PM2_HOME=%CD%\\.pm2\" && pm2 status",
     "pm2:logs": "set \"PM2_HOME=%CD%\\.pm2\" && pm2 logs",
     "backtest:4h:optimize": "node --max-old-space-size=2048 scripts/_bt_4h_optimize.mjs",
-    "check": "node --check server/index.js && node --check server/ai.js && node --check server/binanceClient.js && node --check server/binanceMarket.js && node --check server/binancePositionMonitor.js && node --check server/researchRoutes.js && node --check server/research.js && node --check server/store.js && node --check server/marketDb.js && node --check server/klineSync.js"
+    "check": "node --check server/index.js && node --check server/ai.js && node --check server/binanceClient.js && node --check server/binanceMarket.js && node --check server/binancePositionMonitor.js && node --check server/globalAutomation.js && node --check server/yaoCoinPrediction.js && node --check server/yaoCoinCalibration.js && node --check server/yaoCoinAmbushAnalysis.js && node --check scripts/_bt_run.mjs && node --check scripts/bt_yao_ambush.mjs && node --check scripts/calibrate_yao_ambush.mjs && node --check scripts/explore_yao_ambush.mjs && node --check server/researchRoutes.js && node --check server/research.js && node --check server/store.js && node --check server/marketDb.js && node --check server/klineSync.js"
   },
   "dependencies": {
     "@vitejs/plugin-vue": "^5.2.4",

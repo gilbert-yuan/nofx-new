@@ -18,6 +18,7 @@ import { RISK_RULE } from './shared/strategyGuards.js';
 import { normalizeCloseReason, isStopReason } from '../shared/closeReasons.js';
 import { accountSummary, isTransientOrderError } from './simulatedAccount.js';
 import { buildOpportunityReport as createOpportunityReport, buildExecutionPlanFromOpportunity } from './opportunityReport.js';
+import { YAO_COIN_DEFAULTS, predictYaoCoins } from './yaoCoinPrediction.js';
 
 /**
  * 对一轮扫描得到的机会做确定性排序。
@@ -147,6 +148,10 @@ export class GlobalAutomation {
     // 最近发现的有效策略机会，既供自动化页面展示，也保留给重启后的首次状态读取回填。
     this.opportunities = [];
     this.opportunitiesHydrated = false;
+    // 独立的妖币候选缓存：只用于观察和入场参考，不参与现有下单链路。
+    this.yaoCoins = [];
+    this.yaoCoinsAt = null;
+    this.yaoCoinError = '';
     // 4h 结构策略不使用衍生品/BTC 环境上下文。
     // 相关拉取链路保留在下方注释中，避免旧配置或默认值重新启用。
     // this.skillContextCache = new Map();
@@ -298,6 +303,9 @@ export class GlobalAutomation {
       }
       progress.completed++;
       await new Promise(resolve => setImmediate(resolve));
+    }
+    if (shouldContinue() && scannableSymbols.length) {
+      await this.refreshYaoCoins({ symbols: scannableSymbols, preparedMarkets });
     }
     // 行情先收集完，再把本轮全部币种交给同一个 runAnalysis：这样候选排序、
     // 每轮开仓上限和总敞口限制才真正覆盖全市场，而不是只覆盖单个币种调用。
@@ -750,6 +758,30 @@ export class GlobalAutomation {
   }
 
   /**
+   * 运行独立的妖币预测器。失败时保留上一轮候选，避免一次行情接口抖动让页面闪空。
+   */
+  async refreshYaoCoins({ symbols = [], preparedMarkets = {}, now = Date.now() } = {}) {
+    let tickers = new Map();
+    this.yaoCoinError = '';
+    if (typeof this.market.ticker24hAll === 'function') {
+      try {
+        tickers = await this.market.ticker24hAll();
+      } catch (error) {
+        this.yaoCoinError = error.message;
+      }
+    }
+    const predictions = predictYaoCoins({ symbols, preparedMarkets, tickers, now });
+    this.yaoCoins = predictions;
+    this.yaoCoinsAt = new Date(now).toISOString();
+    return predictions;
+  }
+
+  async getYaoCoins(limit = 20) {
+    const count = Math.min(50, Math.max(1, Math.trunc(Number(limit) || 20)));
+    return this.yaoCoins.slice(0, count);
+  }
+
+  /**
    * 风控闸门 + 按策略落单。
    * 同币种未平仓不重复开仓；止损后 / 任意平仓后的冷却期同样拦截。
    */
@@ -843,16 +875,25 @@ export class GlobalAutomation {
         ? strategyMarginPct : AUTO_MARGIN_PCT;
       const summary = accountSummary(simState);
       const equity = Number(summary.equity ?? summary.initialBalance);
+      // Binance USDT 永续的生产下单口径：最低保证金按配置硬下限执行。
+      // 低于该下限的订单即使纸面模拟可以创建，也可能在交易所被拒绝。
+      const exchange = String(config?.trader?.exchange || '').toLowerCase();
+      const configuredMinMargin = Number(config?.trader?.minOrderMargin);
+      const minOrderMargin = exchange === 'binance'
+        ? Math.max(5, Number.isFinite(configuredMinMargin) ? configuredMinMargin : 5)
+        : 0;
       const maxPositionNotionalPct = Number(config?.trader?.maxPositionNotionalPct);
       const maxTotalNotionalPct = Number(config?.trader?.maxTotalNotionalPct);
       const hasPositionCap = Number.isFinite(maxPositionNotionalPct) && maxPositionNotionalPct > 0 && maxPositionNotionalPct <= 1;
-      const hasTotalCap = Number.isFinite(maxTotalNotionalPct) && maxTotalNotionalPct > 0 && maxTotalNotionalPct <= 1;
+      // 总名义敞口可以高于权益（由杠杆提供），但保留 2 倍硬上限；默认配置仍是 1 倍。
+      const hasTotalCap = Number.isFinite(maxTotalNotionalPct) && maxTotalNotionalPct > 0 && maxTotalNotionalPct <= 2;
       let cappedMargin = explicitMargin;
       if (cappedMargin == null && Number.isFinite(equity) && equity > 0) {
-        cappedMargin = Math.floor(equity * marginPct * 100) / 100;
+        cappedMargin = Math.floor(Math.max(equity * marginPct, minOrderMargin) * 100) / 100;
       }
       if ((hasPositionCap || hasTotalCap) && Number.isFinite(equity) && equity > 0) {
         if (cappedMargin == null) cappedMargin = 100;
+        cappedMargin = Math.max(cappedMargin, minOrderMargin);
         if (hasPositionCap) {
           cappedMargin = Math.min(cappedMargin, equity * maxPositionNotionalPct / leverage);
         }
@@ -869,6 +910,10 @@ export class GlobalAutomation {
           return { symbol, success: true, action: 'SKIP_RISK_SIZE' };
         }
       }
+      if (minOrderMargin > 0 && (!Number.isFinite(cappedMargin) || cappedMargin < minOrderMargin)) {
+        console.log(`[GlobalAutomation] ${symbol} 受单仓/总敞口限制，无法满足 Binance 最低保证金 ${minOrderMargin} USDT，跳过开仓`);
+        return { symbol, success: true, action: 'SKIP_MIN_MARGIN' };
+      }
       const submitInput = {
         recordId,
         symbol,
@@ -880,7 +925,7 @@ export class GlobalAutomation {
       // 买入金额：策略级 plan.autoMarginPct（如 4H 均值回归平衡档 0.015）优先 ——
       // 多策略共用一个资金池，各策略用各自回测验证过的仓位口径（按当前共享权益计）；
       // 缺省回落全局 NOFX_AUTO_MARGIN_PCT（enhanced-trend 等旧策略行为不变）。
-      if (cappedMargin != null && (hasPositionCap || hasTotalCap || explicitMargin != null)) submitInput.margin = cappedMargin;
+      if (cappedMargin != null && (hasPositionCap || hasTotalCap || explicitMargin != null || minOrderMargin > 0)) submitInput.margin = cappedMargin;
       else if (explicitMargin != null) submitInput.margin = explicitMargin;
       else if (Number.isFinite(strategyMarginPct) && strategyMarginPct > 0 && strategyMarginPct <= 1) {
         submitInput.autoMarginPct = strategyMarginPct;
@@ -1231,6 +1276,13 @@ export class GlobalAutomation {
       stats: this.stats,
       account: accountStatus,
       opportunities: await this.getOpportunities(20),
+      yaoCoins: await this.getYaoCoins(20),
+      yaoCoinMeta: {
+        targetAmplitudePct: YAO_COIN_DEFAULTS.targetAmplitudePct,
+        asOf: this.yaoCoinsAt,
+        total: this.yaoCoins.length,
+        error: this.yaoCoinError || null
+      },
       uptime: process.uptime()
     };
   }
@@ -1294,6 +1346,21 @@ export function registerGlobalAutomationRoutes(app, automation) {
     try {
       const limit = Math.min(50, Math.max(1, Math.trunc(Number(req.query.limit) || 20)));
       res.json({ asOf: new Date().toISOString(), opportunities: await automation.getOpportunities(limit) });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // 独立妖币候选：不改变策略机会和自动下单行为。
+  app.get('/api/automation/yao-coins', async (req, res, next) => {
+    try {
+      const limit = Math.min(50, Math.max(1, Math.trunc(Number(req.query.limit) || 20)));
+      res.json({
+        asOf: automation.yaoCoinsAt,
+        targetAmplitudePct: YAO_COIN_DEFAULTS.targetAmplitudePct,
+        candidates: await automation.getYaoCoins(limit),
+        error: automation.yaoCoinError || null
+      });
     } catch (error) {
       next(error);
     }

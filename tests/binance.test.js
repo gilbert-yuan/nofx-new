@@ -52,6 +52,26 @@ test('symbols use exchangeInfo only; cache coalesces refreshes and candles do no
   assert.match(market.status().lastError, /unavailable/);
 });
 
+test('all 24h tickers are fetched once, normalized to a symbol map, and cached briefly', async () => {
+  let tickerCalls = 0;
+  const client = {
+    ticker24hr: async symbol => {
+      assert.equal(symbol, undefined);
+      tickerCalls++;
+      return [
+        { symbol: 'UPUSDT', lastPrice: '12', priceChangePercent: '55' },
+        { symbol: 'DOWNUSDT', lastPrice: '8', priceChangePercent: '-51' }
+      ];
+    }
+  };
+  const market = new BinanceMarket({ client });
+  const first = await market.ticker24hAll();
+  const second = await market.ticker24hAll();
+  assert.equal(tickerCalls, 1);
+  assert.equal(first.get('UPUSDT').priceChangePercent, '55');
+  assert.equal(second.get('DOWNUSDT').lastPrice, '8');
+});
+
 test('Binance request signing uses the selected environment and correct algo/close parameters', async () => {
   const client = new BinanceClient({ apiKey: 'fake', secretKey: 'fake', testnet: true });
   client.timeOffset = 0; // 跳过时间同步，避免多一次 request 调用

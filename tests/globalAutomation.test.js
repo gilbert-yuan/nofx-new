@@ -121,6 +121,61 @@ test('GlobalAutomation - 模拟下单遵守单仓与总敞口上限', async () =
   assert.equal(submitted[1].margin, 2, '总敞口还剩 10 USDT 名义价值，按全局 5 倍杠杆只允许 2 USDT 保证金');
 });
 
+test('GlobalAutomation - Binance 最低保证金不足时补足或跳过', async () => {
+  const submitted = [];
+  const automation = new GlobalAutomation({
+    simulation: {
+      readLight: async () => ({ initialBalance: 99, orders: [] }),
+      submit: async input => { submitted.push(input); return {}; }
+    },
+    market: {}, marketDb: {}, archive: {}, store: {}
+  });
+  const signal = {
+    action: 'BUY', strategyId: 'min-margin-test', recommendedLeverage: 2,
+    plan: { entryMin: 99, entryMax: 101, entryLimit: 100, stopLoss: 95, takeProfit: 110, autoMarginPct: 0.05 }
+  };
+  const floored = await automation.submitSignal({
+    symbol: 'BTCUSDT', signal, recordId: 'record-min-1', shouldContinue: () => true,
+    config: { trader: { exchange: 'binance', maxPositionNotionalPct: 0.18, maxTotalNotionalPct: 1 } }
+  });
+  assert.equal(floored.action, 'SUBMITTED');
+  assert.equal(submitted[0].margin, 5, '99U 权益下 5% sizing 低于 Binance 最低保证金时补到 5U');
+
+  const blocked = await automation.submitSignal({
+    symbol: 'ETHUSDT', signal, recordId: 'record-min-2', shouldContinue: () => true,
+    config: { trader: { exchange: 'binance', maxPositionNotionalPct: 0.04, maxTotalNotionalPct: 1 } }
+  });
+  assert.equal(blocked.action, 'SKIP_MIN_MARGIN');
+  assert.equal(submitted.length, 1, '单仓名义上限不足以容纳 5U 时不提交订单');
+});
+
+test('GlobalAutomation - 高评分计划可使用高杠杆且遵守 5U/125% 名义敞口约束', async () => {
+  const submitted = [];
+  const automation = new GlobalAutomation({
+    simulation: {
+      readLight: async () => ({ initialBalance: 100, orders: [] }),
+      submit: async input => { submitted.push(input); return {}; }
+    },
+    market: {}, marketDb: {}, archive: {}, store: {}
+  });
+  const signal = {
+    action: 'BUY', strategyId: 'h4-mean-reversion-v1', score: 72, recommendedLeverage: 4,
+    plan: { entryMin: 99, entryMax: 101, entryLimit: 100, stopLoss: 95, takeProfit: 110, autoMarginPct: 0.05 }
+  };
+  const result = await automation.submitSignal({
+    symbol: 'BTCUSDT', signal, recordId: 'record-high-score', shouldContinue: () => true,
+    config: {
+      trader: {
+        exchange: 'binance', maxLeverage: 10, maxPositionNotionalPct: 0.25,
+        maxTotalNotionalPct: 1.25, minOrderMargin: 5
+      }
+    }
+  });
+  assert.equal(result.action, 'SUBMITTED');
+  assert.equal(submitted[0].leverage, 4);
+  assert.equal(submitted[0].margin, 5);
+});
+
 test('GlobalAutomation - 每轮新开仓上限作用于整个市场候选集', async () => {
   const submitted = [];
   const automation = new GlobalAutomation({

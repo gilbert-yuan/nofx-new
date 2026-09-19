@@ -120,7 +120,7 @@ function closePosition(position) {
           <label>最大杠杆<input v-model.number="trader.maxLeverage" type="number" min="1" max="20" /></label>
           <label>最低模型置信度<input v-model.number="trader.minConfidence" type="number" min="0" max="1" step="0.05" /></label>
           <label>单仓名义价值 / 权益<input v-model.number="trader.maxPositionNotionalPct" type="number" min="0.01" max="1" step="0.01" /></label>
-          <label>总仓名义价值 / 权益<input v-model.number="trader.maxTotalNotionalPct" type="number" min="0.01" max="1" step="0.01" /></label>
+          <label>总仓名义价值 / 权益<input v-model.number="trader.maxTotalNotionalPct" type="number" min="0.01" max="2" step="0.01" /></label>
           <label>保护价最小调整幅度（基点）<input v-model.number="trader.minProtectionMoveBps" type="number" min="0" step="5" /></label>
         </div>
         <p class="muted">比例 0.2 表示账户权益的 20%；置信度是模型自评，不代表实际胜率。Demo 同步只接受限价计划，不会补发历史模拟挂单。</p>

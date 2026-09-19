@@ -174,6 +174,17 @@ test('unknown account or positions and invalid numbers fail closed', () => {
   for (const args of [{ ...riskArgs, account: null }, { ...riskArgs, positions: undefined }, { ...riskArgs, order: { ...order, confidence: 'bad' } }, { ...riskArgs, order: { ...order, leverage: NaN } }]) assert.equal(validateOrder(args).ok, false);
   assert.equal(validateOrder(riskArgs).ok, true);
 });
+test('风险校验允许配置的 125% 总名义敞口，但仍受单仓上限约束', () => {
+  const expanded = {
+    ...riskArgs,
+    config: { trader: { ...config.trader, maxLeverage: 4, maxPositionNotionalPct: 0.25, maxTotalNotionalPct: 1.25 } },
+    order: { ...order, quantity: 1, leverage: 4 },
+    account: { totalWalletBalance: 1000 },
+    price: 100
+  };
+  assert.equal(validateOrder(expanded).ok, true);
+  assert.equal(validateOrder({ ...expanded, positions: [{ symbol: 'ETHUSDT', positionAmt: 13, markPrice: 100 }] }).ok, false);
+});
 test('existing positions and total exposure prevent accumulated entries', () => {
   assert.equal(validateOrder({ ...riskArgs, positions: [{ symbol: 'BTCUSDT', positionAmt: 1, markPrice: 100 }] }).ok, false);
   assert.equal(validateOrder({ ...riskArgs, positions: [{ symbol: 'ETHUSDT', positionAmt: 3, markPrice: 100 }] }).ok, false);

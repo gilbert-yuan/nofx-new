@@ -32,16 +32,12 @@ import { pumpFadeShortAnalysis } from '../server/pumpFadeShortAnalysis.js';
 import { localProtectionReview } from '../server/shared/protectionReview.js';
 import { buildOpportunityReport, buildExecutionPlanFromOpportunity } from '../server/opportunityReport.js';
 
-// 正式策略入口：enhanced / enhanced-trend-v1 都解析到注册表策略。
-// pump-short 是历史未注册引擎，保留兼容分支供旧实验复现；新策略应先注册再接入此入口。
+// 正式策略入口：enhanced / enhanced-trend-v1 以及注册表中的其它正式策略
+// 都走同一条生产策略链路。pump-short 是历史未注册引擎，保留兼容分支供旧实验复现。
 // pump-short 用法：BT_STRATEGY=pump-short BT_TF_MS=900000 BT_DIR=data/backtest/bf90-15mrs
 const STRATEGY_REQUEST = process.env.BT_STRATEGY || 'enhanced';
 const STRATEGY = STRATEGY_REQUEST === 'enhanced' ? 'enhanced-trend-v1' : STRATEGY_REQUEST;
-const IS_FORMAL_STRATEGY = STRATEGY === 'enhanced-trend-v1';
-if (!IS_FORMAL_STRATEGY && STRATEGY !== 'pump-short') {
-  console.error('BT_STRATEGY 必须是 enhanced | enhanced-trend-v1 | pump-short，得到 ' + STRATEGY_REQUEST);
-  process.exit(1);
-}
+const IS_FORMAL_STRATEGY = STRATEGY !== 'pump-short';
 const STRATEGY_CONFIG_PATH = process.env.BT_STRATEGY_CONFIG || 'data/strategies.json';
 
 const DIR = path.resolve(process.env.BT_DIR || 'data/backtest');
@@ -56,10 +52,13 @@ const INTERVAL = TF === 60000 ? '1m' : TF === 900000 ? '15m' : TF === 3600000 ? 
 const SYMBOL_COOLDOWN = Math.max(1, Math.round(30 / TF_MIN));   // NOFX_SYMBOL_COOLDOWN_MIN 默认 30
 const STOP_COOLDOWN = Math.max(1, Math.round(60 / TF_MIN));     // NOFX_STOP_COOLDOWN_MIN 默认 60
 const MIN_HOLD = Number(process.env.NOFX_MIN_HOLD_BARS ?? 0); // 实验：最小持仓根数（智能退出保护）
+// 研究对照开关：hold 只关闭复核层的动态保护，TradingSimulator 的固定止损/止盈、
+// 分批止盈和超时仍照常运行。默认 strategy，生产口径不变。
+const REVIEW_MODE = String(process.env.BT_REVIEW_MODE || 'strategy').toLowerCase();
 
 const OUT_NAME = process.env.BT_OUT || 'result.json';
-// 15m 辅助行情（供 enhanced-trend-v1 的 trend15* 闸门实验）：设 BT_AUX_15M_DIR 后，
-// 每次 analyze 的 ctx 会带上 auxMarkets['15m']（最近 150 根**已收盘** 15m K 线）。
+// 15m 辅助行情（供正式策略使用）：设 BT_AUX_15M_DIR 后，每次 analyze 的 ctx
+// 会带上 auxMarkets['15m']（最近 150 根**已收盘** 15m K 线）。
 // 未设置时完全不加载 15m 数据，与历史行为逐位一致。
 const AUX15_DIR = process.env.BT_AUX_15M_DIR
   ? path.resolve(process.env.BT_AUX_15M_DIR)
@@ -183,6 +182,7 @@ console.log('  策略 ' + STRATEGY + '（请求=' + STRATEGY_REQUEST + '）'
 if (IS_FORMAL_STRATEGY) console.log('  参数 ' + JSON.stringify(STRATEGY_PARAMS));
 console.log('  禁空 LONG_ONLY=' + (IS_FORMAL_STRATEGY ? STRATEGY_PARAMS.longOnly === true : LONG_ONLY.enabled) + '   评分门槛 NOFX_MIN_TREND_SCORE=' + (process.env.NOFX_MIN_TREND_SCORE ?? '(默认66)'));
 console.log(`  周期 ${INTERVAL}  窗口 ${WINDOW} 根  保证金 ${MARGIN}U/单  冷却 平仓${SYMBOL_COOLDOWN}根(${Math.round(SYMBOL_COOLDOWN * TF_MIN)}分)/止损${STOP_COOLDOWN}根(${Math.round(STOP_COOLDOWN * TF_MIN)}分)`);
+console.log(`  持仓复核 ${REVIEW_MODE === 'hold' ? '固定保护对照（无动态复核）' : '策略复核'}`);
 console.log(`  成本 fee=${PAPER_COSTS.feeBps}bps slip=${PAPER_COSTS.slippageBps}bps funding=${PAPER_COSTS.fundingBpsPer8h}bps/8h`);
 console.log(`  币种数 ${files.length}\n`);
 
@@ -374,14 +374,16 @@ async function runSymbol(symbol, bars) {
       const market = { symbol, interval: INTERVAL, klines: bars.slice(Math.max(0, i - WINDOW + 1), i + 1) };
       // pump-short 用生产同款 localProtectionReview（R 口径移动止损阶梯，方向对称），
       // 它只出 HOLD/REVISE，不出 CLOSE —— 该策略生产上 SMART_EXIT 也是关闭的，口径一致。
-      const proposal = IS_FORMAL_STRATEGY
-        ? await STRATEGY_DEF.review(active, market, {
-            params: STRATEGY_PARAMS,
-            config: STRATEGY_CONFIG,
-            interval: INTERVAL,
-            planInterval: STRATEGY_DEF.planInterval || INTERVAL
-          })
-        : await localProtectionReview(active, market);
+      const proposal = REVIEW_MODE === 'hold'
+        ? { action: 'HOLD', reason: '回测对照：关闭复核层动态保护，仅保留固定计划保护。' }
+        : IS_FORMAL_STRATEGY
+          ? await STRATEGY_DEF.review(active, market, {
+              params: STRATEGY_PARAMS,
+              config: STRATEGY_CONFIG,
+              interval: INTERVAL,
+              planInterval: STRATEGY_DEF.planInterval || INTERVAL
+            })
+          : await localProtectionReview(active, market);
       // 最小持仓保护（实验用）：入场后 MIN_HOLD 根内不允许「智能退出」直接平仓，
       // 移动止损 / 止损止盈 / 超时照常生效。用于验证「过早离场」的修复空间。
       const inMinHold = Number(active.heldBars || 0) < MIN_HOLD;
@@ -518,6 +520,7 @@ fs.writeFileSync(OUT_PATH, JSON.stringify({
     minTrendScore: process.env.NOFX_MIN_TREND_SCORE ?? null,
     days: meta.days, seed: meta.seed, minHoldBars: MIN_HOLD,
     earlyCutR: EARLY_CUT_R, earlyCutBars: EARLY_CUT_BARS,
+    reviewMode: REVIEW_MODE,
     paramOverrides: PARAM_OVERRIDES,
     systemMaxLeverage: RISK_RULE.maxLeverage,
     symbolCooldown: SYMBOL_COOLDOWN, stopCooldown: STOP_COOLDOWN
