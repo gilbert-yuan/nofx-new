@@ -15,10 +15,14 @@
 import { PAPER_COSTS } from './research.js';
 import { localProtectionReview } from './shared/protectionReview.js';
 import { predictYaoCoin } from './yaoCoinPrediction.js';
+import { filterYaoCoinUniverse, YAO_MARKET_PROFILE_DEFAULTS } from './yaoCoinUniverse.js';
 
 const RISK_NOTE = '妖币埋伏：只在 24h 涨跌幅/振幅尚未达到 ±50% 时，依据短线动量、量能和波动放大特征提前埋伏；等待回踩/反弹限价成交，不追涨杀跌。';
 
 export const YAO_AMBUSH_DEFAULTS = Object.freeze({
+  marketUniverseEnabled: true,
+  marketUniverseMinScore: 55,
+  marketUniverseAllowUnknown: false,
   targetAmplitudePct: 50,
   // 回测最终采用的保守候选档：策略仍默认关闭，启用前必须继续 shadow；
   // 这里的严格门槛用于防止用户启用时误跑早期宽松版本。
@@ -61,6 +65,9 @@ const boolSpec = (key, label, description) => ({
 });
 
 export const YAO_AMBUSH_PARAM_SCHEMA = Object.freeze([
+  boolSpec('marketUniverseEnabled', '启用动态币种画像', '每轮按市值、流通率、流动性和当前波动重选妖币候选池；不是固定白名单。'),
+  numSpec('marketUniverseMinScore', '市场画像最低分', 'filter', 0, 100, 1, '动态市场画像最低分；分数不是收益概率。'),
+  boolSpec('marketUniverseAllowUnknown', '画像缺失时保留', '市值/流通率数据源暂不可用或币种未匹配时是否保留，避免外部数据故障阻断全市场。'),
   numSpec('targetAmplitudePct', '妖币目标振幅', 'filter', 20, 100, 1,
     '24h 涨跌幅绝对值或高低振幅达到该值即视为已触发；埋伏策略只交易触发前。'),
   numSpec('minProbabilityPct', '校准方向概率下限', 'filter', 40, 99, 1,
@@ -135,6 +142,26 @@ function resolveParams(overrides = {}) {
     if (Number.isFinite(n) && n >= spec.min && n <= spec.max) params[spec.key] = n;
   }
   return params;
+}
+
+/**
+ * 自动化扫描前的动态候选池。市场画像由 deps.superAnalysis 负责缓存/刷新，
+ * 过滤结果只影响本轮新信号，不影响已存在订单。
+ */
+export async function prefilterYaoCoinSymbols(symbols = [], ctx = {}) {
+  const params = { ...YAO_MARKET_PROFILE_DEFAULTS, ...(ctx.params || {}) };
+  if (params.enabled === false) return { filtered: [...symbols], filteredOut: [], profiles: [], unavailable: false };
+  const provider = ctx.deps?.superAnalysis;
+  if (typeof provider?.getMarketDataBatch !== 'function') {
+    return { filtered: [...symbols], filteredOut: [], profiles: [], unavailable: true, reason: '市场画像提供方不可用，保留本轮币种' };
+  }
+  const rows = await provider.getMarketDataBatch(symbols);
+  return filterYaoCoinUniverse(symbols, rows, {
+    ...params,
+    minScore: Number(ctx.params?.marketUniverseMinScore ?? YAO_MARKET_PROFILE_DEFAULTS.minScore),
+    allowUnknown: ctx.params?.marketUniverseAllowUnknown !== false,
+    enabled: ctx.params?.marketUniverseEnabled !== false
+  });
 }
 
 function finiteRows(rows) {

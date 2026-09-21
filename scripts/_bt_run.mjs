@@ -57,34 +57,51 @@ const MIN_HOLD = Number(process.env.NOFX_MIN_HOLD_BARS ?? 0); // 实验：最小
 const REVIEW_MODE = String(process.env.BT_REVIEW_MODE || 'strategy').toLowerCase();
 
 const OUT_NAME = process.env.BT_OUT || 'result.json';
-// 15m 辅助行情（供正式策略使用）：设 BT_AUX_15M_DIR 后，每次 analyze 的 ctx
-// 会带上 auxMarkets['15m']（最近 150 根**已收盘** 15m K 线）。
-// 未设置时完全不加载 15m 数据，与历史行为逐位一致。
-const AUX15_DIR = process.env.BT_AUX_15M_DIR
-  ? path.resolve(process.env.BT_AUX_15M_DIR)
-  : null;
-const AUX15_TF = 900000;
-const AUX15_WINDOW = 150;
-const aux15Cache = new Map();   // symbol -> bars[]（惰性加载，未命中且文件不存在记 null）
-let aux15MissingLogged = 0;
-function loadAux15(symbol) {
-  if (aux15Cache.has(symbol)) return aux15Cache.get(symbol);
+// 辅助行情（供正式策略使用）：
+// - BT_AUX_15M_DIR（旧接口）：等价于 BT_AUX_MAP='{"15m":<dir>}'，历史行为逐位一致。
+// - BT_AUX_MAP（新接口）：JSON，如 '{"15m":"data/backtest/bf365-15mrs","1h":"data/backtest/bf365-1hrs","4h":"data/backtest/bf365-4h"}'。
+// 每次 analyze 的 ctx.auxMarkets[tf] 携带最近 N 根**已收盘** K 线；N 取策略
+// marketWindows[tf]（声明了就用，上限 500），否则默认 150。
+// 未配置任何周期时完全不加载辅助数据，与历史行为逐位一致。
+const AUX_TF_MS = { '5m': 300000, '15m': 900000, '30m': 1800000, '1h': 3600000, '2h': 7200000, '4h': 14400000, '1d': 86400000 };
+const AUX_MAP = (() => {
+  const m = {};
+  if (process.env.BT_AUX_MAP) {
+    try { Object.assign(m, JSON.parse(process.env.BT_AUX_MAP)); }
+    catch (e) { console.error('BT_AUX_MAP 解析失败:', e.message); process.exit(1); }
+  }
+  if (process.env.BT_AUX_15M_DIR) m['15m'] = process.env.BT_AUX_15M_DIR;
+  for (const tf of Object.keys(m)) {
+    if (!AUX_TF_MS[tf]) { console.error(`BT_AUX_MAP 含不支持的周期: ${tf}`); process.exit(1); }
+    m[tf] = path.resolve(m[tf]);
+  }
+  return m;
+})();
+const AUX_DEFAULT_WINDOW = 150;
+// 不做跨 symbol 缓存：逐币在 runSymbol 内一次性加载本币全部周期，
+// 用完即弃 —— 526 币 × 多周期全量跑时内存恒定，不会随币数线性膨胀。
+function loadAuxTf(tf, symbol) {
   let bars = null;
   try {
-    const txt = fs.readFileSync(path.join(AUX15_DIR, 'klines', symbol + '.ndjson'), 'utf8');
+    const txt = fs.readFileSync(path.join(AUX_MAP[tf], 'klines', symbol + '.ndjson'), 'utf8');
     bars = txt.split('\n').filter(Boolean).map(line => {
       const [t, o, h, l, c, v] = line.split(',').map(Number);
       return { openTime: t, open: o, high: h, low: l, close: c, volume: v };
     }).sort((a, b) => a.openTime - b.openTime);
   } catch { /* 语料缺失：闸门会显式观望，不静默放行 */ }
   if (!bars || !bars.length) {
-    if (aux15MissingLogged < 3) {
-      console.warn(`[aux15] ${symbol} 无 15m 语料（${AUX15_DIR}），trend15 闸门对该币观望`);
-      aux15MissingLogged++;
+    bars = null;
+    if (auxMissingLogged < 6) {
+      console.warn(`[aux] ${symbol} 无 ${tf} 语料（${AUX_MAP[tf]}），相关闸门对该币观望`);
+      auxMissingLogged++;
     }
   }
-  aux15Cache.set(symbol, bars);
   return bars;
+}
+let auxMissingLogged = 0;
+function auxWindowFor(tf) {
+  const w = Number(STRATEGY_DEF?.marketWindows?.[tf]);
+  return Number.isFinite(w) && w > 0 ? Math.min(Math.floor(w), 500) : AUX_DEFAULT_WINDOW;
 }
 // 参数覆盖（仅回测 harness，生产未用）：JSON 形式的 ENHANCED_PARAM_SCHEMA 字段。
 // 例：BT_PARAM_OVERRIDES='{"pullbackAtrShallow":2,"pullbackAtrDeep":2}' → 限价挂单深度
@@ -212,7 +229,13 @@ async function runSymbol(symbol, bars) {
   const sim = new TradingSimulator({ mode: 'account', maxPositions: Infinity, allowDuplicateSymbol: false });
   const trades = [], cancels = [], placed = [];
   let active = null, cooldownUntil = -1, signalCount = 0;
-  let auxCtx = null;   // 15m 辅助行情指针（AUX15_DIR 启用时逐币独立）
+  let auxCtx = null;   // 辅助行情指针（AUX_MAP 启用时逐币逐周期独立）
+  // 本币辅助行情一次性加载（避免逐 bar 读盘），用完即弃，内存不随币数累积
+  const auxData = {};
+  for (const tf of Object.keys(AUX_MAP)) {
+    const arr = loadAuxTf(tf, symbol);
+    if (arr && arr.length) auxData[tf] = { bars: arr, ai: 0 };
+  }
   const N = bars.length;
 
   for (let i = WINDOW; i < N; i++) {
@@ -297,22 +320,25 @@ async function runSymbol(symbol, bars) {
     // 直接跳过（精确等价：被跳过的 sig 在该状态下无任何消费方）。币多时冷却 bar 占比可观。
     if (needSignal && !(!active && (i < cooldownUntil || i + 2 >= N))) {
       const market = { symbol, interval: INTERVAL, klines: bars.slice(i - WINDOW + 1, i + 1) };
-      // 15m 辅助行情：只取「已收盘」的 15m 根（openTime + 15m ≤ 当前决策时刻），
+      // 辅助行情：只取「已收盘」的辅助周期 K 线（openTime + tf ≤ 当前决策时刻），
       // 决策 K 线与辅助窗口无未来函数。指针单调推进，逐币只扫一遍。
       let auxMarkets;
-      if (AUX15_DIR) {
-        const aux15 = loadAux15(symbol);
-        if (aux15 && aux15.length) {
-          if (!auxCtx) auxCtx = { ai: 0 };
-          const nowMs = bars[i].openTime + TF;
-          while (auxCtx.ai < aux15.length && aux15[auxCtx.ai].openTime + AUX15_TF <= nowMs) auxCtx.ai++;
-          const slice = auxCtx.ai > 0 ? aux15.slice(Math.max(0, auxCtx.ai - AUX15_WINDOW), auxCtx.ai) : [];
-          auxMarkets = {
-            '15m': { symbol, interval: '15m', klines: slice, dataAsOf: new Date(nowMs).toISOString() }
-          };
-        } else {
-          // 语料缺失也带上空窗口：闸门按「15m 行情缺失」显式观望，而不是静默放行
-          auxMarkets = { '15m': { symbol, interval: '15m', klines: [], dataAsOf: new Date(bars[i].openTime + TF).toISOString() } };
+      if (Object.keys(AUX_MAP).length) {
+        if (!auxCtx) auxCtx = {};
+        const nowMs = bars[i].openTime + TF;
+        auxMarkets = {};
+        for (const tf of Object.keys(AUX_MAP)) {
+          const arr = auxData[tf];
+          if (!arr) {
+            // 语料缺失也带上空窗口：闸门按「该周期行情缺失」显式观望，而不是静默放行
+            auxMarkets[tf] = { symbol, interval: tf, klines: [], dataAsOf: new Date(nowMs).toISOString() };
+            continue;
+          }
+          if (!auxCtx[tf]) auxCtx[tf] = { ai: 0 };
+          const st = auxCtx[tf];
+          while (st.ai < arr.bars.length && arr.bars[st.ai].openTime + AUX_TF_MS[tf] <= nowMs) st.ai++;
+          const slice = st.ai > 0 ? arr.bars.slice(Math.max(0, st.ai - auxWindowFor(tf)), st.ai) : [];
+          auxMarkets[tf] = { symbol, interval: tf, klines: slice, dataAsOf: new Date(nowMs).toISOString() };
         }
       }
       if (IS_FORMAL_STRATEGY) {

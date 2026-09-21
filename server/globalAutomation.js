@@ -400,11 +400,14 @@ export class GlobalAutomation {
       // 策略级候选预筛选（如超级增强的市值 / 流动性过滤）
       if (strategy.prefilter) {
         try {
-          const result = await strategy.prefilter(symbols, { deps: this.strategyDeps(), config, state });
+          const result = await strategy.prefilter(symbols, { deps: this.strategyDeps(), config, state, params: strategy.params });
           if (Array.isArray(result?.filtered)) {
             console.log(`[GlobalAutomation][${strategy.id}] 预筛选: ${symbols.length - result.filtered.length} 个币种被过滤`);
             if (result.reasons) {
-              console.log(`[GlobalAutomation][${strategy.id}] 过滤原因: 市值${result.reasons.lowMarketCap}, 流动性${result.reasons.lowLiquidity}, 波动${result.reasons.extremeVolatility}`);
+              const reasonText = Object.entries(result.reasons)
+                .map(([reason, count]) => `${reason}=${count}`)
+                .join('，');
+              console.log(`[GlobalAutomation][${strategy.id}] 过滤原因: ${reasonText || '无'}`);
             }
             strategyCandidates = result.filtered;
           }

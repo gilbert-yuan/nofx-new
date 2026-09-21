@@ -15,7 +15,8 @@ import { structureShortAnalysis, STRUCTURE_SHORT_PARAM_SCHEMA } from '../structu
 import { structureLongAnalysis, STRUCTURE_LONG_PARAM_SCHEMA } from '../structureLongAnalysis.js';
 import { h4BreakoutAnalysis, h4BreakoutReview, H4_BREAKOUT_PARAM_SCHEMA } from '../h4BreakoutAnalysis.js';
 import { h4ReversionAnalysis, h4ReversionReview, H4_REVERSION_PARAM_SCHEMA } from '../h4ReversionAnalysis.js';
-import { yaoCoinAmbushAnalysis, yaoCoinAmbushReview, YAO_AMBUSH_PARAM_SCHEMA } from '../yaoCoinAmbushAnalysis.js';
+import { h4ChandelierBreakoutAnalysis, h4ChandelierReview, H4_CHANDELIER_PARAM_SCHEMA } from '../h4ChandelierBreakoutAnalysis.js';
+import { yaoCoinAmbushAnalysis, yaoCoinAmbushReview, prefilterYaoCoinSymbols, YAO_AMBUSH_PARAM_SCHEMA } from '../yaoCoinAmbushAnalysis.js';
 
 /** 出场规则参数（移动止损 / 智能退出 / 分批止盈）—— 各策略共用同一套，避免重复定义。 */
 const EXIT_PARAM_SCHEMA = ENHANCED_PARAM_SCHEMA.filter(spec => spec.group === 'exit');
@@ -145,7 +146,7 @@ defineStrategy({
 defineStrategy({
   id: 'yao-coin-ambush-v1',
   name: '妖币埋伏 v1',
-  description: '【1m 埋伏】用 1m 动量/量能/波动放大 + 15m 滚动24h快照预测上涨或下跌方向；'
+  description: '【动态币种池 + 1m 埋伏】每轮先按市值、流通率、流动性和当前波动重选候选币，再用 1m 动量/量能/波动放大 + 15m 滚动24h快照预测方向；'
     + '只在达到 ±50% 目标前挂回踩/反弹限价单，给出预测幅度、目标价、止损与分档止盈。'
     + '默认关闭，必须先通过样本外回测与 shadow 验证；规则置信度不是统计学胜率。',
   engine: 'yao-ambush',
@@ -156,6 +157,7 @@ defineStrategy({
   marketWindows: { '15m': 150 },
   planInterval: '1m',
   paramSchema: YAO_AMBUSH_PARAM_SCHEMA,
+  prefilter: (symbols, ctx = {}) => prefilterYaoCoinSymbols(symbols, ctx),
   analyze: (market, ctx = {}) => yaoCoinAmbushAnalysis(market, ctx),
   review: (order, market) => yaoCoinAmbushReview(order, market)
 });
@@ -218,6 +220,31 @@ defineStrategy({
   paramSchema: H4_REVERSION_PARAM_SCHEMA,
   analyze: (market, ctx = {}) => h4ReversionAnalysis(market, ctx),
   review: (order, market) => h4ReversionReview(order, market)
+});
+
+/**
+ * 策略 13：4H 吊灯突破（默认关闭 —— 2026-09-19 新建，待样本回测验证）
+ * 引擎 h4ChandelierBreakoutAnalysis：海龟式 55 根通道突破 + EMA20/50 排列 + ADX/量能确认，
+ * 市价入场；出场与突破 v1 根本不同 —— 1R/2R 分批止盈并抬保本（moon bag），
+ * 剩余仓位由吊灯止损（持仓以来极值 ∓ 3×ATR22，只紧不松）收尾，远端 12R 主止盈仅作上限。
+ */
+defineStrategy({
+  id: 'h4-chandelier-breakout-v1',
+  name: '4H 吊灯突破 v1',
+  description: '【4H 决策】55 根唐奇安通道突破 + EMA20/50 同向排列 + ADX≥20 + 量比≥1.2 时市价顺势入场（默认仅多）。'
+    + '出场：1R 平 40% 抬保本、2R 再平 20%，剩余 40% 由吊灯移动止损（持仓以来极值 ∓ 3×ATR22）收尾，'
+    + '远端 12R 主止盈仅作上限，超时 45 根 4H（7.5 天）。'
+    + '⚠️ 默认关闭；启用前须通过 365 天样本回测与 shadow 验证。',
+  engine: 'h4-chandelier',
+  modelId: 'h4-chandelier-breakout-v1',
+  priority: 62,
+  needsAux: ['4h'],
+  marketWindow: 120,
+  marketWindows: { '4h': 300 },
+  planInterval: '4h',
+  paramSchema: H4_CHANDELIER_PARAM_SCHEMA,
+  analyze: (market, ctx = {}) => h4ChandelierBreakoutAnalysis(market, ctx),
+  review: (order, market) => h4ChandelierReview(order, market)
 });
 
 /**

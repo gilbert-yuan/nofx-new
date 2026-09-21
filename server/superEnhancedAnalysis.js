@@ -72,6 +72,26 @@ export class SuperEnhancedAnalysis {
     return null;
   }
 
+  /** 批量读取市场画像，复用单币缓存并按 CoinGecko 上限分批，供策略级预筛选使用。 */
+  async getMarketDataBatch(symbols = []) {
+    const unique = [...new Set((Array.isArray(symbols) ? symbols : []).map(symbol => String(symbol || '').trim().toUpperCase()).filter(Boolean))];
+    const rows = [];
+    const missing = [];
+    for (const symbol of unique) {
+      const cached = this.marketDataCache.get(symbol);
+      if (cached && Date.now() - cached.time < 5 * 60 * 1000) rows.push(cached.data);
+      else missing.push(symbol);
+    }
+    for (let index = 0; index < missing.length; index += 250) {
+      const batch = await coinGecko.getMarketData(missing.slice(index, index + 250));
+      for (const data of batch) {
+        this.marketDataCache.set(data.symbol, { data, time: Date.now() });
+        rows.push(data);
+      }
+    }
+    return rows;
+  }
+
   /**
    * 获取市场情绪（带缓存）
    */

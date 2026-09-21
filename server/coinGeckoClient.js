@@ -53,7 +53,7 @@ export class CoinGeckoClient {
 
     // 批量查询（最多250个）
     const ids = symbols.slice(0, 250).map(s => {
-      const symbol = s.replace('USDT', '').toUpperCase();
+      const symbol = baseCoinSymbol(s);
       return idMap[symbol] || symbol.toLowerCase();
     }).join(',');
 
@@ -215,7 +215,7 @@ export class CoinGeckoClient {
    * @private
    */
   symbolToCoinId(symbol) {
-    const cleanSymbol = symbol.replace('USDT', '').replace('BUSD', '').toUpperCase();
+    const cleanSymbol = baseCoinSymbol(symbol).replace('BUSD', '');
 
     const idMap = {
       'BTC': 'bitcoin',
@@ -262,3 +262,12 @@ export class CoinGeckoClient {
 
 // 单例导出
 export const coinGecko = new CoinGeckoClient();
+
+/** 币安数量乘数合约共享基础币种的市值/流通量画像。 */
+function baseCoinSymbol(symbol) {
+  return String(symbol || '')
+    .replace(/USDT$/i, '')
+    .replace(/BUSD$/i, '')
+    .toUpperCase()
+    .replace(/^(1000|1000000)(?=[A-Z])/, '');
+}
