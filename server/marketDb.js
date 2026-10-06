@@ -22,6 +22,7 @@ export class MarketDb {
         quote_volume DOUBLE PRECISION NOT NULL,
         trade_count INTEGER NOT NULL,
         taker_buy_volume DOUBLE PRECISION,
+        taker_buy_quote_volume DOUBLE PRECISION,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         PRIMARY KEY (symbol, interval, open_time)
@@ -75,6 +76,7 @@ export class MarketDb {
     `);
     // Existing installations predate the SKILL-compatible taker volume field.
     await this.pool.query('ALTER TABLE market_klines ADD COLUMN IF NOT EXISTS taker_buy_volume DOUBLE PRECISION');
+    await this.pool.query('ALTER TABLE market_klines ADD COLUMN IF NOT EXISTS taker_buy_quote_volume DOUBLE PRECISION');
   }
 
   async saveKlines({ symbol, interval, rows }) {
@@ -92,18 +94,20 @@ export class MarketDb {
         const tuples = batch.map(row => {
           const start = values.length;
           values.push(symbol, interval, row.openTime, row.open, row.high, row.low, row.close,
-            row.volume, row.closeTime, row.quoteVolume, row.tradeCount, row.takerBuyVolume ?? null);
-          return '(' + Array.from({ length: 12 }, (_, i) => '$' + (start + i + 1)).join(',') + ')';
+            row.volume, row.closeTime, row.quoteVolume, row.tradeCount, row.takerBuyVolume ?? null,
+            row.takerBuyQuoteVolume ?? null);
+          return '(' + Array.from({ length: 13 }, (_, i) => '$' + (start + i + 1)).join(',') + ')';
         });
         await client.query(`
           INSERT INTO market_klines(symbol, interval, open_time, open, high, low, close,
-            volume, close_time, quote_volume, trade_count, taker_buy_volume)
+            volume, close_time, quote_volume, trade_count, taker_buy_volume, taker_buy_quote_volume)
           VALUES ${tuples.join(',')}
           ON CONFLICT(symbol, interval, open_time) DO UPDATE SET
             open = EXCLUDED.open, high = EXCLUDED.high, low = EXCLUDED.low,
             close = EXCLUDED.close, volume = EXCLUDED.volume, close_time = EXCLUDED.close_time,
             quote_volume = EXCLUDED.quote_volume, trade_count = EXCLUDED.trade_count,
-            taker_buy_volume = EXCLUDED.taker_buy_volume, updated_at = NOW()
+            taker_buy_volume = EXCLUDED.taker_buy_volume,
+            taker_buy_quote_volume = EXCLUDED.taker_buy_quote_volume, updated_at = NOW()
         `, values);
       }
       await client.query('COMMIT');
@@ -131,7 +135,8 @@ export class MarketDb {
           close_time AS "closeTime",
           quote_volume AS "quoteVolume",
           trade_count AS "tradeCount",
-          taker_buy_volume AS "takerBuyVolume"
+          taker_buy_volume AS "takerBuyVolume",
+          taker_buy_quote_volume AS "takerBuyQuoteVolume"
         FROM market_klines
         WHERE symbol = $1 AND interval = $2
           AND ($4::bigint IS NULL OR open_time >= $4)
@@ -453,7 +458,8 @@ export function normalizeBinanceKline(row) {
     closeTime: Number(row[6]),
     quoteVolume: Number(row[7]),
     tradeCount: Number(row[8]),
-    takerBuyVolume: Number.isFinite(Number(row[9])) ? Number(row[9]) : null
+    takerBuyVolume: Number.isFinite(Number(row[9])) ? Number(row[9]) : null,
+    takerBuyQuoteVolume: Number.isFinite(Number(row[10])) ? Number(row[10]) : null
   };
 }
 

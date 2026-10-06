@@ -65,7 +65,9 @@ export const marketApi = {
   symbols: () => api(API.market.symbols),
   refresh: () => api(API.market.refresh, { method: 'POST' }),
   status: () => api(API.market.status),
-  klines: (params) => api(`${API.market.klines}${qs(params)}`)
+  klines: (params) => api(`${API.market.klines}${qs(params)}`),
+  flowAnalysis: (params) => api(`${API.market.flowAnalysis}${qs(params)}`),
+  analyzeFlowData: (body) => api(API.market.flowAnalysis, { method: 'POST', body })
 };
 
 export const historyApi = {

@@ -11,6 +11,9 @@ npm-debug.log*
 /server*.log
 logs/
 scripts/
+!scripts/
+scripts/*
+!scripts/backtest-flow-analysis.mjs
 output/
 .claude/
 .codegraph/

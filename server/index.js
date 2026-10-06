@@ -15,6 +15,7 @@ import { createConfigRouter } from './routes/config.js';
 import { createBinanceRouter } from './routes/binance.js';
 import { createStrategyRouter } from './routes/strategy.js';
 import { createMarketRouter } from './routes/market.js';
+import { createFlowAnalysisRouter } from './routes/flowAnalysis.js';
 import { createHistoryRouter } from './routes/history.js';
 import { createStatsRouter } from './routes/stats.js';
 
@@ -41,6 +42,7 @@ app.use(createConfigRouter(container));
 app.use(createBinanceRouter(container));
 app.use(createStrategyRouter(container));
 app.use(createMarketRouter(container));
+app.use(createFlowAnalysisRouter(container));
 app.use(createHistoryRouter(container));
 app.use(createStatsRouter(container));
 

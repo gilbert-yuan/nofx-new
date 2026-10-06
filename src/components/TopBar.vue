@@ -45,6 +45,7 @@ function toggleThemeMenu() {
       <button :class="{ active: activeView === 'strategy-stats' }" @click="$emit('change-view', 'strategy-stats')">策略统计</button>
       <button :class="{ active: activeView === 'automation' }" @click="$emit('change-view', 'automation')">自动化任务</button>
       <button :class="{ active: activeView === 'daily-trend' }" @click="$emit('change-view', 'daily-trend')">每日趋势</button>
+      <button :class="{ active: activeView === 'flow-analysis' }" @click="$emit('change-view', 'flow-analysis')">量价研判</button>
     </nav>
     <div class="theme-switcher">
       <button class="theme-toggle" @click="toggleThemeMenu">

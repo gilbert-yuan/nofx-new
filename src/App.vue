@@ -11,6 +11,7 @@ import TradingView from './components/TradingView.vue';
 import BinanceSettings from './components/BinanceSettings.vue';
 import BinanceOrdersView from './components/BinanceOrdersView.vue';
 import DailyTrendView from './components/DailyTrendView.vue';
+import FlowAnalysisView from './components/FlowAnalysisView.vue';
 import StrategiesView from './components/StrategiesView.vue';
 import StrategyStatsView from './components/StrategyStatsView.vue';
 import AutomationView from './components/AutomationView.vue';
@@ -32,7 +33,7 @@ const loadStatus = () => { if (typeof document !== 'undefined' && document.hidde
 
 // 前端已下线的视图：「历史分析」「模型设置」（导航入口已移除）。
 // 老书签 / 历史 URL 落到这些视图时回落到工作台，避免白屏。
-const AVAILABLE_VIEWS = ['workbench', 'trading', 'binance-orders', 'trading-simulation', 'strategies', 'strategy-stats', 'automation', 'daily-trend'];
+const AVAILABLE_VIEWS = ['workbench', 'trading', 'binance-orders', 'trading-simulation', 'strategies', 'strategy-stats', 'automation', 'daily-trend', 'flow-analysis'];
 const normalizeView = view => (AVAILABLE_VIEWS.includes(view) ? view : 'workbench');
 
 const activeView = ref('workbench');
@@ -243,6 +244,7 @@ let statusTimer;
         <StrategyStatsView v-else-if="activeView === 'strategy-stats'" />
         <AutomationView v-else-if="activeView === 'automation'" />
         <DailyTrendView v-else-if="activeView === 'daily-trend'" />
+        <FlowAnalysisView v-else-if="activeView === 'flow-analysis'" />
         <BinanceSettings v-else-if="activeView === 'trading'" :binance="config.binance" :trader="config.trader" :status="tradingStatus" :saved-mode="savedMode" :loading="Boolean(loadingAreas.settings)" :smoke-result="binanceSmokeResult" :control="binanceControl" @save="saveBinanceSettings" @test="testBinance" @review="reviewBinance" @smoke="smokeBinance" @refresh-account="testBinance" @refresh-orders="refreshBinanceOrders" @refresh-positions="refreshBinancePositions" @place-order="placeBinanceOrder" @cancel-order="cancelBinanceOrder" @close-position="placeBinanceOrder" />
       </main></div>
   </div>

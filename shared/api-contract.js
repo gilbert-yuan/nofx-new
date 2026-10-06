@@ -58,7 +58,8 @@ export const API = {
     symbols: '/api/market/symbols',
     refresh: '/api/market/symbols/refresh',
     status: '/api/market/symbols/status',
-    klines: '/api/market/klines'
+    klines: '/api/market/klines',
+    flowAnalysis: '/api/market/flow-analysis'
   },
 
   history: {
