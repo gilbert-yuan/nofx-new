@@ -1,7 +1,7 @@
 const API_BASE = import.meta.env?.VITE_API_BASE || '/api';
 
 export async function api(path, options = {}) {
-  const { timeoutMs = path.includes('analyze-') || path === '/history/fetch' || path.includes('performance/refresh') ? 1800000 : path.includes('analyze') || path.includes('/binance/review') ? 180000 : 45000, signal: externalSignal, headers, body: input, ...request } = options;
+  const { timeoutMs = path.includes('analyze-') || path === '/history/fetch' || path.includes('performance/refresh') ? 1800000 : path.includes('analyze') || path.includes('flow-analysis') || path.includes('/binance/review') ? 180000 : 45000, signal: externalSignal, headers, body: input, ...request } = options;
   const controller = new AbortController();
   const abort = () => controller.abort(externalSignal.reason);
   if (externalSignal?.aborted) abort();

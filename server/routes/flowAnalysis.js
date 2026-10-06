@@ -38,7 +38,7 @@ function symbolName(value) {
 /** Multi-timeframe live and user-supplied rule-based flow analysis. */
 export function createFlowAnalysisRouter(container) {
   const router = express.Router();
-  const { marketData, marketDb } = container;
+  const { marketData } = container;
 
   router.get('/api/market/flow-analysis', asyncHandler(async (req, res) => {
     const symbol = symbolName(req.query.symbol || 'BTCUSDT').toUpperCase();
@@ -48,20 +48,11 @@ export function createFlowAnalysisRouter(container) {
     const datasets = {};
     const dataWarnings = [];
 
-    const results = await Promise.all(FLOW_ANALYSIS_INTERVALS.map(async interval => {
+    await Promise.all(FLOW_ANALYSIS_INTERVALS.map(async interval => {
       try {
-        const rows = await marketData.klines({ symbol, interval, limit });
-        try {
-          const confirmed = rows.filter(row => row.confirmed !== false);
-          await marketDb.saveKlines({ symbol: marketData.storageSymbol(symbol), interval, rows: confirmed });
-        } catch (error) {
-          dataWarnings.push(`${interval} K 线已获取，但写入历史库失败：${error.message}`);
-        }
-        datasets[interval] = rows;
-        return { interval, ok: true, count: rows.length };
+        datasets[interval] = await marketData.klines({ symbol, interval, limit });
       } catch (error) {
         dataWarnings.push(`${interval} 数据不可用：${error.message}`);
-        return { interval, ok: false, error: error.message };
       }
     }));
 

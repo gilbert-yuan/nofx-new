@@ -86,7 +86,7 @@ export const TIMEOUT = {
 /** 判断某路径是否应走长耗时超时档 */
 export function timeoutFor(path) {
   if (path.includes('analyze-') || path === API.history.fetch || path.includes('performance/refresh')) return TIMEOUT.longRunning;
-  if (path.includes('analyze') || path.includes('/binance/review')) return TIMEOUT.analyze;
+  if (path.includes('analyze') || path.includes('flow-analysis') || path.includes('/binance/review')) return TIMEOUT.analyze;
   return TIMEOUT.short;
 }
 

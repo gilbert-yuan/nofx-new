@@ -3,32 +3,13 @@
  * These are configurable pattern matches, not proof of coordinated trading or
  * statistically calibrated probabilities.
  */
-export const FLOW_ANALYSIS_INTERVALS = ['1m', '5m', '1h', '1d'];
+import {
+  DEFAULT_FLOW_ANALYSIS_PARAMS,
+  FLOW_ANALYSIS_INTERVALS,
+  FLOW_ANALYSIS_PARAM_BOUNDS
+} from '../shared/flowAnalysis.js';
 
-export const DEFAULT_FLOW_ANALYSIS_PARAMS = Object.freeze({
-  lookbackBars: 20,
-  recentBars: 5,
-  minBars: 30,
-  consolidationRangeMaxPct: 8,
-  accumulationVolumeRatioMin: 0.65,
-  accumulationVolumeRatioMax: 1.4,
-  accumulationGentleVolumeRatioMin: 1.05,
-  accumulationGentleVolumeRatioMax: 1.8,
-  positiveFlowRatioMin: 0.02,
-  washoutDropMinPct: 3,
-  washoutVolumeRatioMax: 1.05,
-  washoutRecoveryRatioMin: 0.65,
-  breakoutVolumeRatioMin: 1.5,
-  breakoutRiseMinPct: 2,
-  distributionVolumeRatioMin: 2,
-  distributionStallMaxPct: 1,
-  distributionUpperWickMin: 0.45,
-  distributionTurnoverRateMinPct: 5,
-  largeRiseMinPct: 8,
-  forecastMediumScore: 40,
-  forecastHighScore: 70,
-  lookaheadBarsByInterval: Object.freeze({ '1m': 60, '5m': 48, '1h': 72, '1d': 20 })
-});
+export { DEFAULT_FLOW_ANALYSIS_PARAMS, FLOW_ANALYSIS_INTERVALS };
 
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 const numeric = value => Number.isFinite(Number(value)) ? Number(value) : null;
@@ -37,19 +18,7 @@ const pct = (value, base) => base > 0 ? (value / base - 1) * 100 : null;
 
 function normalizeParams(input = {}) {
   const p = { ...DEFAULT_FLOW_ANALYSIS_PARAMS };
-  const bounds = {
-    lookbackBars: [10, 100], recentBars: [2, 12], minBars: [20, 500],
-    consolidationRangeMaxPct: [0.5, 40], accumulationVolumeRatioMin: [0.1, 5],
-    accumulationVolumeRatioMax: [0.2, 10], positiveFlowRatioMin: [0, 0.8],
-    accumulationGentleVolumeRatioMin: [0.5, 10], accumulationGentleVolumeRatioMax: [0.5, 15],
-    washoutDropMinPct: [0.5, 30], washoutVolumeRatioMax: [0.1, 5],
-    washoutRecoveryRatioMin: [0.1, 1], breakoutVolumeRatioMin: [1, 10],
-    breakoutRiseMinPct: [0.1, 30], distributionVolumeRatioMin: [1, 10],
-    distributionStallMaxPct: [0.1, 10], distributionUpperWickMin: [0.1, 0.95],
-    distributionTurnoverRateMinPct: [0.1, 50],
-    largeRiseMinPct: [2, 50], forecastMediumScore: [10, 80], forecastHighScore: [20, 100]
-  };
-  for (const [key, [min, max]] of Object.entries(bounds)) {
+  for (const [key, [min, max]] of Object.entries(FLOW_ANALYSIS_PARAM_BOUNDS)) {
     const value = numeric(input[key]);
     if (value !== null) p[key] = clamp(value, min, max);
   }
@@ -247,7 +216,7 @@ const PATTERN_LABELS = {
 function analyzeInterval(interval, rawRows, params) {
   const candles = normalizeCandles(rawRows);
   if (!candles.length) return {
-    interval, usableBars: 0, label: '数据不足', confidence: 0,
+    interval, usableBars: 0, label: '数据不足', confidence: 0, patternKey: null,
     metrics: {}, patterns: [], warnings: ['该周期没有可用的已收盘 K 线。']
   };
   const metrics = metricsFor(candles, params);

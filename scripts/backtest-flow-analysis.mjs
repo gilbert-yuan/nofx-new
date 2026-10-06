@@ -105,7 +105,7 @@ function auc(rows) {
   return (positiveRankSum - positives * (positives + 1) / 2) / (positives * negatives);
 }
 
-function summarize(rows) {
+function summarize(rows, baseline = null) {
   if (!rows.length) return { samples: 0, hitRate: null, closeConfirmRate: null, liftVsBase: null };
   const hits = rows.filter(row => row.hit);
   const closes = rows.filter(row => row.closeHit);
@@ -113,9 +113,10 @@ function summarize(rows) {
   const downCloses = rows.filter(row => row.downCloseHit);
   const upsides = rows.map(row => row.maxUpsidePct);
   const drawdowns = rows.map(row => row.maxAdversePct);
-  const baseRate = rows[0].baseRate;
-  const baseDownRate = rows[0].baseDownRate;
   const hitRate = hits.length / rows.length;
+  const downsideHitRate = downHits.length / rows.length;
+  const baseRate = baseline?.hitRate ?? hitRate;
+  const baseDownRate = baseline?.downsideHitRate ?? downsideHitRate;
   return {
     samples: rows.length,
     timeBlocks: new Set(rows.map(row => row.timeBlock)).size,
@@ -127,9 +128,9 @@ function summarize(rows) {
     closeConfirmRate: closes.length / rows.length,
     liftVsBase: baseRate > 0 ? hitRate / baseRate : null,
     downsideHits: downHits.length,
-    downsideHitRate: downHits.length / rows.length,
+    downsideHitRate,
     downsideCloseConfirmRate: downCloses.length / rows.length,
-    downsideLiftVsBase: baseDownRate > 0 ? downHits.length / rows.length / baseDownRate : null,
+    downsideLiftVsBase: baseDownRate > 0 ? downsideHitRate / baseDownRate : null,
     meanMaxUpsidePct: upsides.reduce((sum, value) => sum + value, 0) / rows.length,
     medianMaxUpsidePct: percentile(upsides, 0.5),
     meanMaxAdversePct: drawdowns.reduce((sum, value) => sum + value, 0) / rows.length,
@@ -240,9 +241,7 @@ for (const file of selectedFiles) {
       barsToHit,
       maxUpsidePct: (maxHigh / bars[index].close - 1) * 100,
       maxAdversePct: Math.min(0, (minLow / bars[index].close - 1) * 100),
-      terminalClosePct: (forward.at(-1).close / bars[index].close - 1) * 100,
-      baseRate: 0,
-      baseDownRate: 0
+      terminalClosePct: (forward.at(-1).close / bars[index].close - 1) * 100
     };
     samples.push(row);
     symbolRows.push(row);
@@ -263,24 +262,18 @@ for (const file of selectedFiles) {
 }
 
 if (!samples.length) throw new Error('No eligible samples. Try a longer historical corpus or fewer requested constraints.');
-const overallHitRate = samples.filter(row => row.hit).length / samples.length;
-const overallDownRate = samples.filter(row => row.downHit).length / samples.length;
 const holdoutRows = samples.filter(row => row.decisionAt >= holdoutStart);
 const earlyRows = samples.filter(row => row.decisionAt < holdoutStart);
-const holdoutBaseRate = holdoutRows.length ? holdoutRows.filter(row => row.hit).length / holdoutRows.length : 0;
-const holdoutDownBaseRate = holdoutRows.length ? holdoutRows.filter(row => row.downHit).length / holdoutRows.length : 0;
-const earlyBaseRate = earlyRows.length ? earlyRows.filter(row => row.hit).length / earlyRows.length : 0;
-const earlyDownBaseRate = earlyRows.length ? earlyRows.filter(row => row.downHit).length / earlyRows.length : 0;
-for (const row of samples) { row.baseRate = overallHitRate; row.baseDownRate = overallDownRate; }
-for (const row of holdoutRows) { row.baseRate = holdoutBaseRate; row.baseDownRate = holdoutDownBaseRate; }
-for (const row of earlyRows) { row.baseRate = earlyBaseRate; row.baseDownRate = earlyDownBaseRate; }
-const tierRows = ['高', '中', '低'].map(tier => ({ tier, ...summarize(holdoutRows.filter(row => row.tier === tier)) }));
-const fullTierRows = ['高', '中', '低'].map(tier => ({ tier, ...summarize(samples.filter(row => row.tier === tier)) }));
+const allPeriodSummary = summarize(samples);
+const earlyPeriodSummary = summarize(earlyRows);
+const holdoutSummary = summarize(holdoutRows);
+const tierRows = ['高', '中', '低'].map(tier => ({ tier, ...summarize(holdoutRows.filter(row => row.tier === tier), holdoutSummary) }));
+const fullTierRows = ['高', '中', '低'].map(tier => ({ tier, ...summarize(samples.filter(row => row.tier === tier), allPeriodSummary) }));
 const stageRows = [...new Set(holdoutRows.map(row => row.stageKey))]
   .map(stageKey => ({
     stageKey,
     stage: holdoutRows.find(row => row.stageKey === stageKey)?.stageLabel || stageKey,
-    ...summarize(holdoutRows.filter(row => row.stageKey === stageKey))
+    ...summarize(holdoutRows.filter(row => row.stageKey === stageKey), holdoutSummary)
   }))
   .sort((a, b) => b.samples - a.samples);
 const holdoutMonthMap = new Map();
@@ -291,7 +284,7 @@ for (const row of holdoutRows) {
   holdoutMonthMap.set(month, bucket);
 }
 const monthlyRows = [...holdoutMonthMap.entries()].sort(([a], [b]) => a.localeCompare(b))
-  .map(([month, rows]) => ({ month, ...summarize(rows) }));
+  .map(([month, rows]) => ({ month, ...summarize(rows, holdoutSummary) }));
 const coverage = {
   corpusSymbols: selectedFiles.length,
   evaluatedSymbols: symbolSummaries.length,
@@ -331,14 +324,12 @@ const report = {
   },
   coverage,
   allPeriod: {
-    ...summarize(samples),
-    baseRate: overallHitRate,
+    ...allPeriodSummary,
     tiers: fullTierRows
   },
-  earlyPeriod: summarize(earlyRows),
+  earlyPeriod: earlyPeriodSummary,
   holdout: {
-    ...summarize(holdoutRows),
-    baseRate: holdoutRows.length ? holdoutRows.filter(row => row.hit).length / holdoutRows.length : null,
+    ...holdoutSummary,
     tiers: tierRows,
     stages: stageRows,
     monthly: monthlyRows

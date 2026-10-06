@@ -1,19 +1,10 @@
 <script setup>
 import { computed, reactive, ref } from 'vue';
 import { marketApi } from '../api/client.js';
+import { DEFAULT_FLOW_ANALYSIS_PARAMS, FLOW_ANALYSIS_INTERVALS } from '../../shared/flowAnalysis.js';
 
-const INTERVALS = ['1m', '5m', '1h', '1d'];
-const DEFAULTS = {
-  lookbackBars: 20, recentBars: 5, minBars: 30,
-  consolidationRangeMaxPct: 8, accumulationVolumeRatioMin: 0.65, accumulationVolumeRatioMax: 1.4,
-  accumulationGentleVolumeRatioMin: 1.05, accumulationGentleVolumeRatioMax: 1.8,
-  positiveFlowRatioMin: 0.02, washoutDropMinPct: 3, washoutVolumeRatioMax: 1.05,
-  washoutRecoveryRatioMin: 0.65, breakoutVolumeRatioMin: 1.5, breakoutRiseMinPct: 2,
-  distributionVolumeRatioMin: 2, distributionStallMaxPct: 1, distributionUpperWickMin: 0.45,
-  distributionTurnoverRateMinPct: 5,
-  largeRiseMinPct: 8, forecastMediumScore: 40, forecastHighScore: 70,
-  lookaheadBarsByInterval: { '1m': 60, '5m': 48, '1h': 72, '1d': 20 }
-};
+const INTERVALS = FLOW_ANALYSIS_INTERVALS;
+const DEFAULTS = structuredClone(DEFAULT_FLOW_ANALYSIS_PARAMS);
 
 const mode = ref('live');
 const symbol = ref('BTCUSDT');
@@ -259,7 +250,7 @@ function downloadTemplate() {
           <p>分数表示当前数据与所选规则的匹配程度，不代表识别到真实操盘主体。</p>
         </article>
         <article class="flow-forecast-card panel-card" :class="`tone-${forecastTone}`">
-          <div class="card-kicker">近期大幅拉升评估 <span class="forecast-tag">{{ result.forecast.level }}概率</span></div>
+          <div class="card-kicker">近期大幅拉升评估 <span class="forecast-tag">{{ result.forecast.level }}符合度</span></div>
           <div class="forecast-score"><strong>{{ result.forecast.ruleScore }}</strong><span>规则评分</span></div>
           <div class="forecast-window">参考窗口 <b>{{ result.forecast.referenceWindow }}</b></div>
           <p>{{ result.forecast.scoreMeaning }}</p>
