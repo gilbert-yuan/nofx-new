@@ -4,6 +4,7 @@
  * 现有策略负责「选币 + 初步方向 + 风控计划」，本模块不重新选币，也不下单；
  * 它只把策略信号和最新价格/24h/OI/资金费率整理成可读的继续或等待结论。
  */
+import { isMarketEntryPlan, marketEntryBlock } from '../shared/entryExecution.js';
 
 /**
  * 把一个已通过策略计划校验的信号整理成机会报告。
@@ -26,10 +27,12 @@ export function buildOpportunityReport({ signal, market, marketContext = {}, str
   const entryMin = finitePositive(plan.entryMin);
   const entryMax = finitePositive(plan.entryMax);
   const entryLimit = finitePositive(plan.entryLimit);
-  const optimalEntry = entryLimit ?? midpoint(entryMin, entryMax) ?? closedPrice;
+  const marketEntry = isMarketEntryPlan(plan);
+  const signalReference = finitePositive(plan.entryReference) ?? midpoint(entryMin, entryMax) ?? closedPrice;
   const entryRange = entryMin != null && entryMax != null ? { min: entryMin, max: entryMax } : null;
   const context = normalizeMarketContext(marketContext);
   const currentPrice = context.lastPrice ?? context.markPrice ?? closedPrice;
+  const optimalEntry = marketEntry ? currentPrice : entryLimit;
   const takeProfits = collectTakeProfits(plan, long);
   const warnings = buildWarnings(context, action);
   const momentumCrowded = context.change24hPct != null && context.change24hPct >= 10
@@ -39,11 +42,15 @@ export function buildOpportunityReport({ signal, market, marketContext = {}, str
     ? (long ? currentPrice > entryLimit * 1.001 : currentPrice < entryLimit * 0.999)
     : (long ? currentPrice > entryMax * 1.001 : currentPrice < entryMin * 0.999);
   const waitForBetterPrice = long ? priceExtended || momentumCrowded : priceExtended;
-  const decision = resolveDecision({ action, waitForBetterPrice, momentumCrowded });
+  const marketBlock = marketEntry ? marketEntryBlock(plan, currentPrice, action) : null;
+  const decision = marketBlock
+    ? { code: 'WAIT_REANALYSIS', label: '价格偏离原计划，等待重新分析', canProceed: false, reason: marketBlock }
+    : resolveDecision({ action, waitForBetterPrice, momentumCrowded });
   const levels = {
     entryRange,
     optimalEntry,
-    entryMode: entryLimit != null ? 'LIMIT_PULLBACK' : 'MARKET_OR_NEXT_OPEN',
+    entryMode: marketEntry ? 'MARKET_OR_NEXT_OPEN' : 'LIMIT_PULLBACK',
+    signalReference,
     stopLoss: finitePositive(plan.stopLoss),
     takeProfits,
     riskUnit: finitePositive(plan.riskUnit)
@@ -107,7 +114,12 @@ export function buildExecutionPlanFromOpportunity(signal) {
   const entry = finitePositive(levels.optimalEntry);
   if (entry == null) return null;
 
-  const plan = { ...basePlan, entryLimit: entry };
+  // A displayed market quote is informational; it must never become a limit order.
+  const marketEntry = isMarketEntryPlan(basePlan);
+  const plan = { ...basePlan, entryStyle: marketEntry ? 'market' : 'limit',
+    entryRule: marketEntry ? 'next_candle_open_in_range' : 'limit_pullback' };
+  if (marketEntry) delete plan.entryLimit;
+  else plan.entryLimit = entry;
   const stopLoss = finitePositive(levels.stopLoss);
   if (stopLoss != null) plan.stopLoss = stopLoss;
 
@@ -168,8 +180,10 @@ function buildSummary({ symbol, action, decision, currentPrice, optimalEntry, en
   const parts = [
     `${symbol} 初步判断${direction}`,
     `当前价 ${formatPrice(currentPrice)}`,
-    `理想入场 ${formatRange(entryRange) || formatPrice(optimalEntry)}`,
-    `参考挂单 ${formatPrice(optimalEntry)}`,
+    levels.entryMode === 'MARKET_OR_NEXT_OPEN'
+      ? `信号参考 ${formatPrice(levels.signalReference)}；允许入场 ${formatRange(entryRange)}`
+      : `理想入场 ${formatRange(entryRange) || formatPrice(optimalEntry)}`,
+    levels.entryMode === 'MARKET_OR_NEXT_OPEN' ? `市价参考 ${formatPrice(optimalEntry)}（以实际成交为准）` : `参考挂单 ${formatPrice(optimalEntry)}`,
     `止损 ${formatPrice(levels.stopLoss)}`,
     `止盈 ${levels.takeProfits.length ? levels.takeProfits.map(formatPrice).join(' / ') : '—'}`
   ];

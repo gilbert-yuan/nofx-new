@@ -3,6 +3,8 @@ import { asyncHandler, ApiError } from '../core/errors.js';
 import { BinanceClient } from '../binanceClient.js';
 import { binanceEnvironmentConfig, isBinanceDemo } from '../../shared/binanceEnvironment.js';
 import { createBinanceSpotDemoRouter } from './binanceSpotDemo.js';
+import { deterministicBinanceClientOrderId } from '../binanceExecutionGuard.js';
+import { randomUUID } from 'node:crypto';
 
 /**
  * 币安路由（装配层）：
@@ -151,20 +153,46 @@ export function createBinanceRouter(container) {
     if (!['LIMIT', 'MARKET'].includes(type)) throw new ApiError('type 只能是 LIMIT / MARKET', 422);
     const quantity = positiveNumber(body.quantity, 'quantity');
     const reduceOnly = body.reduceOnly === true || body.reduceOnly === 'true';
-    const clientOrderId = body.clientOrderId ? String(body.clientOrderId) : undefined;
+    const clientOrderId = body.clientOrderId ? String(body.clientOrderId) : deterministicBinanceClientOrderId('entry', randomUUID());
     const requestedPositionSide = String(body.positionSide || '').toUpperCase();
     if (requestedPositionSide && !['LONG', 'SHORT', 'BOTH'].includes(requestedPositionSide)) {
       throw new ApiError('positionSide 只能是 LONG / SHORT / BOTH', 422);
     }
-    const { client } = await tradeClient();
+    const { client, environment } = await tradeClient();
     // 双向账户必须显式给 positionSide（BOTH 只在单向模式合法）；未显式指定时按买卖方向推导，
     // 单向账户则保持原样（由交易所默认 BOTH + reduceOnly 表达）。
     let positionSide = requestedPositionSide && requestedPositionSide !== 'BOTH' ? requestedPositionSide : undefined;
     if (!positionSide && typeof client.dualSidePosition === 'function' && await client.dualSidePosition()) positionSide = side === 'BUY' ? 'LONG' : 'SHORT';
     const orderArgs = { symbol, side, quantity, reduceOnly, ...(positionSide ? { positionSide } : {}), ...(clientOrderId ? { clientOrderId } : {}) };
-    const order = type === 'LIMIT'
-      ? await client.limitOrder({ ...orderArgs, price: positiveNumber(body.price, 'price') })
-      : await client.marketOrder(orderArgs);
+    const simulation = container.researchInstances?.simulation;
+    const closing = reduceOnly || (positionSide === 'LONG' && side === 'SELL') || (positionSide === 'SHORT' && side === 'BUY');
+    let reservationId;
+    if (!closing) {
+      if (!simulation) throw new ApiError('统一资金池尚未就绪，暂不能开仓。', 503);
+      await simulation.accountSync.refresh({ forceIncome: true });
+      const risks = await client.positions(symbol);
+      const risk = risks.find(row => (row.positionSide || 'BOTH') === (positionSide || 'BOTH'));
+      const leverage = positiveNumber(risk?.leverage, '实际杠杆');
+      const price = type === 'LIMIT' ? positiveNumber(body.price, 'price') : positiveNumber((await client.price(symbol)).price, '市场价格');
+      // MARKET sizing reserves a small price buffer; it uses only local pool funds.
+      const notional = quantity * price * (type === 'MARKET' ? 1.01 : 1);
+      reservationId = await simulation.reserveCapital({ environment, symbol, clientOrderId,
+        direction: side === 'BUY' ? 'OPEN_LONG' : 'OPEN_SHORT', margin: notional / leverage, feeReserve: notional * 12 / 10000 });
+    }
+    let order;
+    try {
+      order = type === 'LIMIT'
+        ? await client.limitOrder({ ...orderArgs, price: positiveNumber(body.price, 'price') })
+        : await client.marketOrder(orderArgs);
+      if (reservationId) await simulation.updateCapitalReservation(reservationId, { status: 'submitted', orderId: order.orderId });
+    } catch (error) {
+      const unknown = /timeout|timed out|ECONN|fetch failed|network|socket|execution status unknown/i.test(String(error.message))
+        || [-1006, -1007].includes(Number(error.code)) || Number(error.status) >= 500;
+      if (reservationId) await simulation.updateCapitalReservation(reservationId, { status: unknown ? 'unknown' : 'rejected' });
+      simulation?.accountSync?.requestRefresh();
+      throw error;
+    }
+    simulation?.accountSync?.requestRefresh();
     res.json({ ok: true, order });
   }));
 
@@ -173,7 +201,9 @@ export function createBinanceRouter(container) {
     const orderId = Number(req.body?.orderId);
     if (!Number.isInteger(orderId) || orderId <= 0) throw new ApiError('orderId 必须为正整数', 422);
     const { client } = await tradeClient();
-    res.json({ ok: true, result: await client.cancelOrder({ symbol, orderId }) });
+    const result = await client.cancelOrder({ symbol, orderId });
+    container.researchInstances?.simulation?.accountSync?.requestRefresh();
+    res.json({ ok: true, result });
   }));
 
   /**

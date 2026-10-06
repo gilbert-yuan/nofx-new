@@ -270,6 +270,7 @@ export function buildH4Plan({
     // 宽度取 ATR 倍数（必须窄于止损距离，否则 planIsSane 会拒绝）。
     entryMin: refPrice - band,
     entryMax: refPrice + band,
+    entryReference: refPrice,
     stopLoss,
     takeProfit,
     riskUnit: rawStop,

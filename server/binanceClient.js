@@ -65,6 +65,14 @@ export class BinanceClient {
     return this.publicRequest('/fapi/v1/ticker/24hr', symbol ? { symbol } : {});
   }
 
+  async bookTicker(symbol) {
+    return this.publicRequest('/fapi/v1/ticker/bookTicker', symbol ? { symbol } : {});
+  }
+
+  async depth({ symbol, limit = 5 } = {}) {
+    return this.publicRequest('/fapi/v1/depth', { symbol, limit });
+  }
+
   async klines({ symbol, interval = '4h', limit = 80, startTime, endTime }) {
     return this.publicRequest('/fapi/v1/klines', { symbol, interval, limit, startTime, endTime });
   }
@@ -88,6 +96,10 @@ export class BinanceClient {
 
   async account() {
     return this.signedRequest('GET', '/fapi/v2/account');
+  }
+
+  async incomeHistory({ incomeType, symbol, startTime, endTime, page = 1, limit = 1000 } = {}) {
+    return this.signedRequest('GET', '/fapi/v1/income', { incomeType, symbol, startTime, endTime, page, limit });
   }
 
   async positions(symbol) {

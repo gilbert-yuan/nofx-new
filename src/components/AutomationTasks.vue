@@ -11,6 +11,7 @@ const range = value => value ? `${price(value.min)}～${price(value.max)}` : '�
 const pct = value => Number.isFinite(Number(value)) ? `${Number(value) >= 0 ? '+' : ''}${Number(value).toFixed(2)}%` : '—';
 const funding = value => Number.isFinite(Number(value)) ? `${(Number(value) * 100).toFixed(4)}%` : '—';
 const decisionClass = code => code === 'BUY_NOW' || code === 'SELL_NOW' ? 'opportunity-go' : 'opportunity-wait';
+const marketEntry = item => item.levels?.entryMode === 'MARKET_OR_NEXT_OPEN';
 const yaoDirectionClass = direction => direction === 'UP' ? 'yao-up' : direction === 'DOWN' ? 'yao-down' : 'yao-neutral';
 const yaoEntryLabel = direction => direction === 'UP' ? '最佳买入' : direction === 'DOWN' ? '最佳做空' : '最佳入场';
 const yaoReasons = reasons => Array.isArray(reasons) && reasons.length ? reasons.join('；') : '—';
@@ -80,7 +81,12 @@ onBeforeUnmount(() => { disposed = true; clearInterval(timer); });
             <div><span>资金费率</span><strong>{{ funding(item.current?.fundingRate) }}</strong></div>
           </div>
           <dl class="opportunity-levels">
-            <div><dt>理想入场</dt><dd>{{ range(item.levels?.entryRange) }} · 参考 {{ price(item.levels?.optimalEntry) }}</dd></div>
+            <template v-if="marketEntry(item)">
+              <div><dt>市价参考</dt><dd>{{ price(item.current?.price) }} · 以实际成交为准</dd></div>
+              <div><dt>信号参考价</dt><dd>{{ price(item.levels?.signalReference ?? ((item.levels?.entryRange?.min + item.levels?.entryRange?.max) / 2)) }} · 已收盘 K线</dd></div>
+              <div><dt>允许入场区间</dt><dd>{{ range(item.levels?.entryRange) }}</dd></div>
+            </template>
+            <div v-else><dt>理想入场</dt><dd>{{ range(item.levels?.entryRange) }} · 参考 {{ price(item.levels?.optimalEntry) }}</dd></div>
             <div><dt>止损</dt><dd>{{ price(item.levels?.stopLoss) }}</dd></div>
             <div><dt>止盈</dt><dd>{{ item.levels?.takeProfits?.length ? item.levels.takeProfits.map(price).join(' / ') : '—' }}</dd></div>
           </dl>

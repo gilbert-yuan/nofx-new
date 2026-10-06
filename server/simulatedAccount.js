@@ -13,6 +13,12 @@ import { BinanceClient } from './binanceClient.js';
 import { binanceMarket } from './binanceMarket.js';
 import { BinancePaperSync, createExchangeSyncState } from './binancePaperSync.js';
 import { buildExecutionPlanFromOpportunity } from './opportunityReport.js';
+import { isMarketEntryPlan, marketEntryBlock } from '../shared/entryExecution.js';
+import { BinanceAccountSync } from './binanceAccountSync.js';
+import { buildPaperActivity } from '../shared/paperOrderActivity.js';
+import { fusedAccountSummary, fusedPaperOrders, reconcileFusedLocalOrders } from '../shared/fusedPaperAccount.js';
+import { FusedExchangeLedger } from './fusedExchangeLedger.js';
+import { FusedOrderExecution } from './fusedOrderExecution.js';
 
 export { safeSetLeverage } from './binancePaperSync.js';
 
@@ -44,24 +50,37 @@ export function expirePendingOrder(order, now = Date.now()) {
 export const initialPaperAccount = () => ({ initialBalance: 10000, orders: [] });
 
 export function accountSummary(state) {
-  const orders = state.orders;
-  const realized = orders.filter(o => o.status === 'closed').reduce((sum, o) => sum + o.net, 0);
-  const entryFees = orders.filter(o => o.status === 'open').reduce((sum, o) => sum + o.entryFee, 0);
-  const usedMargin = orders.filter(active).reduce((sum, o) => sum + o.margin, 0);
-  const feeReserve = orders.filter(o => o.status === 'pending').reduce((sum, o) => sum + o.notional * o.costs.feeBps / 10000, 0);
+  if (state.fusedPoolStartedAt) return fusedAccountSummary(state);
+  const orders = state.orders || [];
+  const number = value => Number.isFinite(Number(value)) ? Number(value) : 0;
+  const remainingShare = order => {
+    const remaining = number(order.quantity), exited = number(order.realizedQty);
+    return exited > 0 && remaining + exited > 0 ? remaining / (remaining + exited) : 1;
+  };
+  const realized = orders.reduce((sum, o) => sum + (o.status === 'closed' ? number(o.net) : o.status === 'open' ? number(o.realizedNet) : 0), 0);
+  // Partial exits already include their share of entry fees in realizedNet.
+  const entryFees = orders.filter(o => o.status === 'open').reduce((sum, o) => sum + number(o.entryFee) * remainingShare(o), 0);
+  const usedMargin = orders.filter(active).reduce((sum, o) => sum + number(o.margin) * (o.status === 'open' ? remainingShare(o) : 1), 0);
+  const feeReserve = orders.filter(o => o.status === 'pending').reduce((sum, o) => sum + number(o.notional) * number(o.costs?.feeBps) / 10000, 0);
   const floating = orders.filter(o => o.status === 'open').reduce((sum, o) => sum + (o.unrealized || 0), 0);
   const balance = state.initialBalance + realized - entryFees;
   const investedMargin = orders.filter(o => o.entry).reduce((sum, o) => sum + o.margin, 0);
   const closedMargin = orders.filter(o => o.status === 'closed').reduce((sum, o) => sum + o.margin, 0);
   return { unlimitedCapital: !!state.unlimitedCapital, investedMargin, closedMargin, realizedReturn: closedMargin ? realized / closedMargin : null,
     initialBalance: state.initialBalance, balance: state.unlimitedCapital ? null : balance, available: state.unlimitedCapital ? null : balance - usedMargin - feeReserve,
-    equity: state.unlimitedCapital ? null : balance + floating, usedMargin, realized, unrealized: floating,
+    equity: state.unlimitedCapital ? null : balance + floating, usedMargin, feeReserve, entryFees, realized, unrealized: floating,
     net: realized - entryFees + floating, openCount: orders.filter(active).length };
 }
 
 export function submitPaperOrder(state, record, input, now = Date.now()) {
-  const signal = record?.analyses?.find(s => s.symbol === input.symbol);
-  const existing = state.orders.find(o => o.recordId === record?.id && o.symbol === input.symbol);
+  const requestedStrategyId = input.strategyId || record?.strategyId;
+  const candidates = (record?.analyses || []).filter(signal => signal.symbol === input.symbol);
+  const signal = requestedStrategyId
+    ? candidates.find(signal => signal.strategyId === requestedStrategyId)
+      || (candidates.length === 1 && !candidates[0].strategyId ? candidates[0] : null)
+    : candidates[0];
+  const existing = state.orders.find(o => o.recordId === record?.id && o.symbol === input.symbol
+    && (!requestedStrategyId || (o.analysisContext?.strategyId || o.strategyId) === requestedStrategyId));
   if (existing) return existing;
   if (!signal?.eligible || !signal.plan || !['OPEN_LONG', 'OPEN_SHORT'].includes(signal.positionRecommendation)) fail('该分析为观望或没有有效开仓计划，不能模拟下单。');
   const marketProvider = signal.marketProvider || record.marketProvider;
@@ -88,8 +107,9 @@ export function submitPaperOrder(state, record, input, now = Date.now()) {
   const perSymbolMax = binanceMarket.getMaxLeverage(input.symbol);
   const effectiveMax = (perSymbolMax && perSymbolMax > 0) ? Math.min(RISK_RULE.maxLeverage, perSymbolMax) : RISK_RULE.maxLeverage;
   const leverage = Math.max(1, Math.min(requestedLeverage, effectiveMax));
-  if (!state.unlimitedCapital && state.orders.filter(active).length >= 20) fail('最多同时持有 20 个模拟挂单或持仓。');
-  if (!state.unlimitedCapital && state.orders.some(o => active(o) && o.symbol === input.symbol)) fail('该币种已有模拟挂单或持仓。');
+  if (!state.fusedPoolStartedAt && !state.unlimitedCapital && state.orders.filter(active).length >= 20) fail('最多同时持有 20 个模拟挂单或持仓。');
+  if (!state.fusedPoolStartedAt && !state.unlimitedCapital && state.orders.some(o => active(o) && o.symbol === input.symbol)) fail('该币种已有模拟挂单或持仓。');
+  if (state.fusedPoolStartedAt && fusedPaperOrders(state).activeOrders.some(order => order.symbol === input.symbol && order.direction !== signal.positionRecommendation)) fail('该币种存在反向持仓或挂单，请先平仓，避免单向账户的仓位互相抵消。');
   // 自动化报告给出的参考入场价、止损和止盈优先固化到订单计划；
   // 手动 input.stopLoss/takeProfit 仍可显式覆盖，兼容原有手动下单接口。
   const executionPlan = input.executionPlan || buildExecutionPlanFromOpportunity(signal) || signal.plan;
@@ -100,8 +120,15 @@ export function submitPaperOrder(state, record, input, now = Date.now()) {
   };
   const long = signal.positionRecommendation === 'OPEN_LONG';
   if (![plan.stopLoss, plan.takeProfit].every(v => Number.isFinite(v) && v > 0) || (long ? !(plan.stopLoss < plan.entryMin && plan.takeProfit > plan.entryMax) : !(plan.takeProfit < plan.entryMin && plan.stopLoss > plan.entryMax))) fail('止盈止损必须位于入场区间两侧，且符合多空方向。');
+  if (isMarketEntryPlan(plan) && signal.opportunityReport?.current?.price != null) {
+    const blocked = marketEntryBlock(plan, signal.opportunityReport.current.price, signal.positionRecommendation);
+    if (blocked) fail(blocked);
+  }
   const notional = margin * leverage;
-  if (!state.unlimitedCapital && margin + notional * PAPER_COSTS.feeBps / 10000 > accountSummary(state).available) fail('模拟可用余额不足。');
+  const funds = accountSummary(state);
+  if (state.entriesPaused) fail('统一资金池已暂停开仓，请先恢复开仓。');
+  if (state.fusedPoolStartedAt && !funds.syncReady) fail(funds.warnings.join(' ') || '成交与持仓同步尚未完成，请稍后重试。');
+  if ((state.fusedPoolStartedAt || !state.unlimitedCapital) && margin + notional * PAPER_COSTS.feeBps * (state.fusedPoolStartedAt ? 2 : 1) / 10000 > funds.available + 1e-8) fail('共享资金池可用余额不足：持仓、挂单保证金和手续费预留不能超过总权益。');
 
   // 保存完整的分析上下文，用于后续策略优化
   // ⚠️ 多策略关键字段：strategyId 决定「这笔订单后续用哪个策略做持仓复核 / 出场判定」，
@@ -248,15 +275,25 @@ export function advancePaperOrder(order, rows, now = Date.now()) {
 
 export class SimulatedAccount {
   constructor({ pool, market, archive, marketDb, store = null, clientFactory = config => new BinanceClient(config) }) {
-    Object.assign(this, { pool, market, archive, marketDb, store, clientFactory, busy: false, lastError: '', lastRunAt: null });
+    Object.assign(this, { pool, market, archive, marketDb, store, clientFactory, busy: false, lastError: '', lastRunAt: null, stateRevision: 0 });
     this.repository = new SimulatedAccountRepository(pool);
     this.exchangeSync = new BinancePaperSync({ simulation: this, store, clientFactory });
+    this.accountSync = new BinanceAccountSync({ simulation: this, store, clientFactory });
+    this.orderLedger = new FusedExchangeLedger({ simulation: this, pool });
+    this.manualExecution = new FusedOrderExecution(this);
   }
   async init() {
     await this.repository.init();
+    await this.orderLedger.init();
+    await this.mutateLight(state => {
+      state.fusedPoolStartedAt ||= new Date().toISOString();
+      state.unlimitedCapital = false;
+    });
+    await this.orderLedger.rebuildStoredMetrics();
+    await this.mutateLight(state => reconcileFusedLocalOrders(state));
   }
-  startExchangeSync() { this.exchangeSync.start(); }
-  stopExchangeSync() { this.exchangeSync.stop(); }
+  startExchangeSync() { this.exchangeSync.start(); this.accountSync.start(); }
+  stopExchangeSync() { this.exchangeSync.stop(); this.accountSync.stop(); }
   exchangeSyncStatus() { return this.exchangeSync.status(); }
   async exchangeSyncOrders() { return this.repository.readExchangeSync(); }
   enqueueExchangeSync(orderId, event) { this.exchangeSync.enqueue(orderId, event); }
@@ -266,14 +303,18 @@ export class SimulatedAccount {
   /** 自动化扫描快照：保留活跃订单明细及历史订单的策略模型，避免搬运全部历史扩展字段。 */
   async readAutomation() { return this.repository.read({ light: true, automation: true }); }
   async mutate(fn) {
-    return this.repository.mutate(fn);
+    const result = await this.repository.mutate(fn);
+    this.stateRevision++;
+    return result;
   }
   /**
    * 轻量写入：只加载活跃订单的明细子表。
    * 适用于确认不读取历史（已平仓）订单明细的写路径，可避免搬运近 9 万行历史数据。
    */
   async mutateLight(fn, options = {}) {
-    return this.repository.mutate(fn, { light: true, ...options });
+    const result = await this.repository.mutate(fn, { light: true, ...options });
+    this.stateRevision++;
+    return result;
   }
   async status({ summary = false } = {}) {
     // 默认走 light read：只给活跃订单加载明细子表（plans/costs/reviews/extensions），
@@ -282,7 +323,15 @@ export class SimulatedAccount {
     // 收益：跳过 ~9 万行 simulated_order_extensions 的拉取与 hydrate，把每次轮询从 3-8s 压到亚秒级。
     // 想要某笔已平仓订单的完整明细，用 GET /api/paper/orders/:id（走 read({orderId})）。
     const state = summary ? await this.repository.read({ summary: true }) : await this.readLight();
-    return { ...accountSummary(state), orders: state.orders, busy: this.busy, lastRunAt: this.lastRunAt, error: this.lastError,
+    const activity = state.fusedPoolStartedAt ? fusedPaperOrders(state) : { activeOrders: buildPaperActivity(state.orders, state.exchangeAccounts), closedOrders: state.orders.filter(order => order.status === 'closed') };
+    const activeOrders = activity.activeOrders;
+    const exchangeAccounts = Object.fromEntries(Object.entries(state.exchangeAccounts || {}).map(([environment, snapshot]) => {
+      const { accountKey, ...publicSnapshot } = snapshot;
+      return [environment, publicSnapshot];
+    }));
+    return { ...accountSummary(state), orders: state.orders, activeOrders, closedOrders: activity.closedOrders, exchangeAccounts, entriesPaused: !!state.entriesPaused,
+      activityCounts: { positions: activeOrders.filter(order => order.status === 'open').length, pending: activeOrders.filter(order => order.status === 'pending').length },
+      busy: this.busy, lastRunAt: this.lastRunAt, error: this.lastError,
       autoMarginPct: Math.min(1, Math.max(0.01, Number(process.env.NOFX_AUTO_MARGIN_PCT ?? 0.05))) };
   }
   async getOrder(id) { return (await this.repository.read({ orderId: id })).orders[0]; }
@@ -294,10 +343,46 @@ export class SimulatedAccount {
     if (!Number.isFinite(v) || v < 1 || v > 1000000) fail('初始金额须为 1～1000000 USDT。');
     return this.mutateLight(state => {
       state.initialBalance = v;
-      state.unlimitedCapital = unlimitedCapital === true;
+      state.unlimitedCapital = state.fusedPoolStartedAt ? false : unlimitedCapital === true;
       return { initialBalance: state.initialBalance, unlimitedCapital: state.unlimitedCapital };
     });
   }
+  async setEntriesPaused(paused) {
+    return this.mutateLight(state => {
+      if (paused !== true && accountSummary(state).reservationMargin > 0) fail('仍有下单请求正在确认，请同步后再恢复开仓。');
+      state.entriesPaused = paused === true;
+      return { entriesPaused: state.entriesPaused };
+    });
+  }
+  async reserveCapital({ id = randomUUID(), environment, symbol, direction, margin, feeReserve, clientOrderId }) {
+    if (![margin, feeReserve].every(Number.isFinite) || margin <= 0 || feeReserve < 0) fail('保证金或手续费预留无效。');
+    return this.mutateLight(state => {
+      const funds = accountSummary(state);
+      if (state.entriesPaused || (state.fusedPoolStartedAt && !funds.syncReady)) fail('开仓已暂停或成交数据尚未同步，请先同步资金池。');
+      if (margin + feeReserve > funds.available + 1e-8) fail('统一资金池可用余额不足，保证金加手续费预留不能超过总权益。');
+      if (fusedPaperOrders(state).activeOrders.some(order => order.symbol === symbol && order.direction !== direction)) fail('该币种已有反向持仓或挂单，请先处理。');
+      state.capitalReservations ||= {};
+      if (Object.values(state.capitalReservations).some(row => row.environment === environment && row.clientOrderId === clientOrderId
+        && ['submitting', 'submitted', 'unknown'].includes(row.status))) fail('同一下单请求正在确认，请先同步订单。');
+      state.capitalReservations[id] = { id, environment, symbol, direction, margin, feeReserve, clientOrderId,
+        status: 'submitting', createdAt: new Date().toISOString() };
+      return id;
+    });
+  }
+  async updateCapitalReservation(id, update) {
+    await this.mutateLight(state => {
+      const reservation = state.capitalReservations?.[id];
+      if (reservation) Object.assign(reservation, update, { updatedAt: new Date().toISOString() });
+    });
+  }
+  async capitalExecutionAllowed(orderId) {
+    const state = await this.readLight(), order = state.orders.find(row => row.id === orderId);
+    if (!order || order.manualCloseRequested || order.manualEntryCancelled || state.entriesPaused) return false;
+    const funds = accountSummary(state);
+    return !state.fusedPoolStartedAt || (funds.syncReady && funds.committed <= funds.equity + 1e-8);
+  }
+  closeActivity(id) { return this.manualExecution.close(id); }
+  closeAllActivity() { return this.manualExecution.closeAll(); }
   /** 每日趋势：纯 SQL 聚合，不把订单读进内存（见 server/dailyTrend.js） */
   async dailyTrend() { return this.repository.dailyTrend(); }
   // 开仓只新增一个订单，不依赖历史订单明细
@@ -333,12 +418,12 @@ export class SimulatedAccount {
     finally { if (this.refreshPromise === work) this.refreshPromise = null; }
   }
 
-  async refreshOrders({ symbols, shouldContinue = () => true } = {}) {
+  async refreshOrders({ symbols, shouldContinue = () => true, includeManual = false } = {}) {
     this.busy = true;
     try {
       const state = await this.readLight(), now = Date.now();
       const groups = new Map();
-      for (const order of state.orders.filter(o => active(o) && (!symbols || symbols.includes(o.symbol)))) {
+      for (const order of state.orders.filter(o => active(o) && (includeManual || !o.manualCloseRequested) && (!symbols || symbols.includes(o.symbol)))) {
         const key = `${order.marketProvider}:${order.symbol}:${order.interval}`;
         if (!groups.has(key)) groups.set(key, []);
         groups.get(key).push(order);
@@ -376,13 +461,14 @@ export class SimulatedAccount {
           if (!shouldContinue()) return;
           for (const snapshot of orders) {
             const order = current.orders.find(o => o.id === snapshot.id);
-            if (!order || !active(order) || order.nextTime !== snapshot.nextTime) continue;
+            if (!order || !active(order) || (!includeManual && order.manualCloseRequested) || order.nextTime !== snapshot.nextTime) continue;
             const previousStatus = order.status;
             const previousQuantity = Number(order.quantity) || 0;
             const previousRealizedQty = Number(order.realizedQty) || 0;
             advancePaperOrder(order, rows, now);
             if (failure && active(order)) order.error = failure;
             else if (active(order) && order.error && isTransientOrderError(order.error)) order.error = '';
+            if (order.manualCloseRequested) continue;
             if (previousStatus === 'pending' && ['expired', 'cancelled'].includes(order.status)) {
               syncEvents.push({ orderId: order.id, event: { type: 'cancel' } });
             }
@@ -417,7 +503,10 @@ export class SimulatedAccount {
   }
 
   async close(id, { refresh = true, reason = 'manual' } = {}) {
-    if (refresh) await this.refresh();
+    if (refresh) {
+      const target = await this.getOrder(id);
+      await this.refresh({ symbols: target ? [target.symbol] : [], includeManual: true });
+    }
     const closeReason = normalizeCloseReason(reason);
     // 只操作单个目标订单，不需要历史订单明细
     let syncEvent = null;
@@ -462,25 +551,33 @@ export function registerSimulationRoutes(app, simulation) {
   // 用 stale-while-revalidate：首次加载照常等（冷），之后**永远返回上次缓存值（毫秒级），
   // 同时在后台异步刷新**。这样高频轮询不再被冷加载阻塞，事件循环也被解放。
   // 写操作（submit/close/refresh）主动失效，确保动作后能看到最新状态。
-  const memo = (loader, ttlMs, staleMs = ttlMs * 12) => {
-    const slot = { value: undefined, at: 0, pending: null };
+  const memo = (loader, ttlMs, staleMs = ttlMs * 12, revision = () => 0) => {
+    const slot = { value: undefined, at: 0, pending: null, generation: 0, revision: -1 };
     const refresh = req => {
       if (slot.pending) return slot.pending; // 防惊群：并发只触发一次底层加载
+      const generation = slot.generation, loadingRevision = revision();
       slot.pending = (async () => {
-        try { const v = await loader(req); slot.value = v; slot.at = Date.now(); return v; }
+        try {
+          const v = await loader(req);
+          if (generation === slot.generation) { slot.value = v; slot.at = Date.now(); slot.revision = loadingRevision; }
+          return v;
+        }
         finally { slot.pending = null; }
       })();
       return slot.pending;
     };
     const fn = async (req) => {
       const now = Date.now();
-      if (slot.value !== undefined) {
+      if (slot.value !== undefined && slot.revision === revision()) {
         if (now - slot.at < ttlMs) return slot.value;        // 新鲜：直接返回
-        if (now - slot.at < staleMs) { refresh(req); return slot.value; } // 陈旧：先返回旧值，后台刷新
+        if (now - slot.at < staleMs) { void refresh(req).catch(() => {}); return slot.value; } // 保留缓存，后台失败不产生未处理拒绝
       }
-      return refresh(req); // 首次：必须等冷加载
+      let value = await refresh(req);
+      // Retry an in-flight stale read once; continuous background updates must not starve HTTP responses.
+      if (slot.value === undefined || slot.revision !== revision()) value = await refresh(req);
+      return value;
     };
-    fn.invalidate = () => { slot.at = 0; slot.value = undefined; };
+    fn.invalidate = () => { slot.generation++; slot.at = 0; slot.value = undefined; };
     return fn;
   };
 
@@ -489,7 +586,7 @@ export function registerSimulationRoutes(app, simulation) {
   const accountHandler = req => {
     const view = req.query.view;
     let h = accountHandlers.get(view);
-    if (!h) { h = memo(() => simulation.status({ summary: view === 'summary' }), 30000, 180000); accountHandlers.set(view, h); }
+    if (!h) { h = memo(() => simulation.status({ summary: view === 'summary' }), 30000, 180000, () => simulation.stateRevision || 0); accountHandlers.set(view, h); }
     return h(req);
   };
   // statistics：fresh 60s / stale 600s
@@ -510,7 +607,15 @@ export function registerSimulationRoutes(app, simulation) {
   app.post('/api/paper/orders', route(async req => { const r = await simulation.submit(req.body || {}); invalidateReadCaches(); return r; }));
   app.put('/api/paper/capital', route(async req => { const r = await simulation.setCapital(req.body || {}); invalidateReadCaches(); return r; }));
   app.post('/api/paper/refresh', route(async () => { const r = await simulation.refresh(); invalidateReadCaches(); return r; }));
+  app.post('/api/paper/exchange-refresh', route(async () => {
+    await simulation.accountSync.refresh({ forceIncome: true });
+    invalidateReadCaches();
+    return simulation.status({ summary: true });
+  }));
   app.post('/api/paper/orders/:id/close', route(async req => { const r = await simulation.close(req.params.id); invalidateReadCaches(); return r; }));
+  app.post('/api/paper/activity/:id/close', route(async req => { const r = await simulation.closeActivity(req.params.id); invalidateReadCaches(); return r; }));
+  app.post('/api/paper/close-all', route(async () => { const r = await simulation.closeAllActivity(); invalidateReadCaches(); return r; }));
+  app.put('/api/paper/entries-paused', route(async req => { const r = await simulation.setEntriesPaused(req.body?.paused); invalidateReadCaches(); return r; }));
 
   // 策略优化接口
   app.get('/api/paper/optimize', route(async () => {

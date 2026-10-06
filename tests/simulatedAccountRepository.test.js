@@ -68,6 +68,19 @@ test('automation snapshot only keeps active order details and historical strateg
   assert.deepEqual(planQuery.params, [['active-1']]);
 });
 
+test('summary loads active exchange bindings without reading historical order extensions', async () => {
+  const queries = [];
+  const client = { query: async (sql, params = []) => {
+    queries.push({ sql, params });
+    return { rows: sql.includes("SELECT order_id FROM simulated_orders") ? [{ order_id: 'active-1' }] : [] };
+  } };
+  await new SimulatedAccountRepository({}).readFrom(client, { summary: true });
+  const extension = queries.find(item => item.sql.includes('FROM simulated_order_extensions'));
+  assert.match(extension.sql, /order_id = ANY\(\$1::text\[\]\)/);
+  assert.match(extension.sql, /path\[1\] IN \('exchangeSync', 'exchange', 'realizedNet', 'realizedQty'\)/);
+  assert.deepEqual(extension.params, [['active-1']]);
+});
+
 test('PostgreSQL migration is lossless, transactional, repeatable and preserves its original snapshot', { skip: process.env.SIMULATED_DB_TEST !== '1' }, async () => {
   const db = await isolatedSimulatedDatabase();
   try {

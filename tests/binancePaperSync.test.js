@@ -171,7 +171,7 @@ test('market-entry orders (4H strategies, no entryLimit) sync as MARKET orders',
   const order = makeOrder({
     status: 'pending',
     notional: 500,
-    plan: { entryMin: 98, entryMax: 102, entryStyle: 'market' },
+    plan: { entryMin: 98, entryMax: 102, stopLoss: 90, takeProfit: 130, entryStyle: 'market' },
     exchangeSync: { demo: { status: 'not_submitted' }, live: { status: 'not_submitted' } }
   });
   const marketCalls = [];

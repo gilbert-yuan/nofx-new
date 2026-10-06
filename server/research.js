@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { recommendedLeverage, plannedMarginRiskPct } from './localAnalysis.js';
+import { isMarketEntryPlan } from '../shared/entryExecution.js';
 
 export const RESEARCH_VERSION = 'closed-candle-plan-v1';
 // Scenario assumptions, not exchange fee quotes. Frozen into every new record.
@@ -120,7 +121,8 @@ export function normalizePlan(raw, market, now, costs = PAPER_COSTS) {
       const { entryMin, entryMax, stopLoss, takeProfit, maxHoldBars } = plan;
       const long = action === 'OPEN_LONG';
       // entryLimit（限价挂单价）可选：有则按评分预测回调最优价挂单；无则回退旧区间逻辑。
-      const entryLimit = Number.isFinite(plan.entryLimit) ? plan.entryLimit : null;
+      const marketEntry = isMarketEntryPlan(plan);
+      const entryLimit = !marketEntry && Number.isFinite(plan.entryLimit) ? plan.entryLimit : null;
       if (entryMin > entryMax || (long ? !(stopLoss < entryMin && takeProfit > entryMax) : !(takeProfit < entryMin && stopLoss > entryMax))) issues.push('入场、止损、止盈价格关系无效');
 
       if (!Number.isInteger(maxHoldBars) || maxHoldBars > 120) issues.push('持有期限须为1～120根');
@@ -159,6 +161,8 @@ export function normalizePlan(raw, market, now, costs = PAPER_COSTS) {
         // 只挑已知字段透传，避免把分析对象里的临时字段带入持久化计划。
         normalized = { entryMin, entryMax, entryLimit, stopLoss, takeProfit, maxHoldBars, netRewardRisk,
           entryRule: entryLimit != null ? 'limit_pullback' : 'next_candle_open_in_range',
+          entryStyle: marketEntry ? 'market' : 'limit',
+          ...(optNum(plan.entryReference) > 0 ? { entryReference: plan.entryReference } : {}),
           ...(riskUnit !== undefined ? { riskUnit } : {}),
           ...(takeProfit1 !== undefined ? { takeProfit1 } : {}),
           ...(takeProfit2 !== undefined ? { takeProfit2 } : {}),

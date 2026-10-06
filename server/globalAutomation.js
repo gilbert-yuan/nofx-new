@@ -19,6 +19,10 @@ import { normalizeCloseReason, isStopReason } from '../shared/closeReasons.js';
 import { accountSummary, isTransientOrderError } from './simulatedAccount.js';
 import { buildOpportunityReport as createOpportunityReport, buildExecutionPlanFromOpportunity } from './opportunityReport.js';
 import { YAO_COIN_DEFAULTS, predictYaoCoins } from './yaoCoinPrediction.js';
+import { AUTO_TRADE } from '../shared/autoTradeDefaults.js';
+import { screenUniverse, checkBookLiquidity, tickerToSnapshot } from './shared/liquidityScreen.js';
+import { sizeSignal } from './shared/scoreSizing.js';
+import { shouldHaltNewEntries } from './shared/lossCircuit.js';
 
 /**
  * 对一轮扫描得到的机会做确定性排序。
@@ -100,6 +104,21 @@ const STOP_COOLDOWN_MIN = Math.max(0, Number(process.env.NOFX_STOP_COOLDOWN_MIN 
 // 均 1.5~2.5×/90d、MDD<6%、无爆仓；固定 100U/笔在 100U 账户下因手续费储备一单都开不出。
 const AUTO_MARGIN_PCT = Math.min(1, Math.max(0.01, Number(process.env.NOFX_AUTO_MARGIN_PCT ?? 0.05)));
 // 止损后的加长冷却（保持历史行为，默认 60 分钟）
+
+// ── 全市场 K 线拉取并发（2026-10-06）────────────────────────────────────────
+// 改前是串行 for...of + await，525 币单轮 ≈200s（线上日志实测 181~248s，失败 0）。
+// 改为共享游标 worker pool。并发值来自实测（scripts/_kline_fetch_bench.mjs，1m/limit82/走代理，
+// 每档 40 币、全部 0 失败）：
+//   并发 8 → 2.1x ｜ 并发 12 → 4.4x ｜ 并发 16 → 3.14x ｜ 并发 24 → 0.91x（比串行还慢）
+// ⇒ 拐点在 12；再往上恶化是本地代理（Clash 127.0.0.1:7890）排队，不是币安限频。
+// 硬上限 24：即使有人把 env 调成 100 也不会把代理打死。
+// 币安权重口径：/fapi/v1/klines 在 limit≤100 时权重 1，本链路 limit=windowLimit+2=82 → 权重 1，
+//   单轮 525 权重、单轮 30s 折算 ≈1050 权重/min，U 本位限速 2400/min，仍有 2 倍余量。
+//   回滚：删掉这个 env，代码自动回落串行（见 syncKlines 里 KLINE_SYNC_CONCURRENCY===1 的分支）。
+const KLINE_SYNC_CONCURRENCY = Math.min(
+  24,
+  Math.max(1, Number(process.env.NOFX_KLINE_SYNC_CONCURRENCY) || 12)
+);
 
 export function selectAnalysisEngine(config = {}) {
   const analysis = config.analysis || {};
@@ -289,12 +308,15 @@ export class GlobalAutomation {
     const roundStart = Date.now();
     const preparedMarkets = {};
     const scannableSymbols = [];
-    for (const symbol of symbols) {
-      if (!shouldContinue()) break;
-      progress.symbol = symbol;
+
+    // 并发拉取（2026-10-06）：原为串行 for...of + await，525 币单轮 ≈200s。
+    // 改共享游标 worker pool，并发由 NOFX_KLINE_SYNC_CONCURRENCY 控制（默认 12，实测拐点）。
+    // ⚠️ 并发后 progress.symbol 不再代表「正在处理的那个币」（多个 worker 同时在飞），
+    //    保留它只为调试观察，最后仍会置 null；前端进度条只依赖 completed/failed，不受影响。
+    const fetchOne = async (symbol) => {
       try {
         const market = await this.getFreshMarket(symbol, MAIN_INTERVAL, true);
-        if (!shouldContinue()) break;
+        if (!shouldContinue()) return;
         preparedMarkets[symbol] = market;
         scannableSymbols.push(symbol);
       } catch (error) {
@@ -302,7 +324,34 @@ export class GlobalAutomation {
         this.tasks.klineSync.error = `${symbol}: ${error.message}`;
       }
       progress.completed++;
+      // 保留原来的主动让出事件循环：单币 prepareMarket + saveKlines 是 CPU 侧工作，
+      // 不让出的话批量并发会饿死事件循环，把 /api/health 拖到秒级。
       await new Promise(resolve => setImmediate(resolve));
+    };
+
+    if (KLINE_SYNC_CONCURRENCY <= 1) {
+      // 串行回滚路径：env=1 时行为与改造前完全一致。
+      for (const symbol of symbols) {
+        if (!shouldContinue()) break;
+        progress.symbol = symbol;
+        await fetchOne(symbol);
+      }
+    } else {
+      // 共享游标：cursor 单调递增且上界为 symbols.length，故 completed 天然 ≤ total，
+      // 中止时无需修正计数（多个 worker 并发自增 completed 也不会溢出）。
+      let cursor = 0;
+      const workers = Array.from(
+        { length: Math.min(KLINE_SYNC_CONCURRENCY, symbols.length) },
+        async () => {
+          while (cursor < symbols.length) {
+            if (!shouldContinue()) return;
+            const index = cursor++;
+            progress.symbol = symbols[index];
+            await fetchOne(symbols[index]);
+          }
+        }
+      );
+      await Promise.all(workers);
     }
     if (shouldContinue() && scannableSymbols.length) {
       await this.refreshYaoCoins({ symbols: scannableSymbols, preparedMarkets });
@@ -386,6 +435,24 @@ export class GlobalAutomation {
     if (symbolFilter.filteredOut.length) {
       console.log(`[GlobalAutomation] 过滤 ${symbolFilter.filteredOut.length} 个负期望值币种: ${symbolFilter.filteredOut
         .map(f => `${f.symbol}(${Number(f.avgNet || 0).toFixed(2)}U/单, 样本${f.count})`).join(', ')}`);
+    }
+
+    if (AUTO_TRADE.screenEnabled && typeof this.market.ticker24hAll === 'function') {
+      try {
+        const tickers = await this.market.ticker24hAll();
+        if (!tickers || tickers.size === 0) throw new Error('24h ticker 为空');
+        const snapshots = symbols.map(symbol => tickerToSnapshot(symbol, tickers.get(symbol) || {}));
+        const liquidity = screenUniverse(snapshots, AUTO_TRADE);
+        if (liquidity.rejected.length) {
+          const reasonText = Object.entries(liquidity.reasons)
+            .map(([reason, count]) => `${reason}=${count}`)
+            .join('，');
+          console.log(`[GlobalAutomation] 流动性初筛剔除 ${liquidity.rejected.length} 个币: ${reasonText}`);
+        }
+        symbols = liquidity.filtered;
+      } catch (error) {
+        console.warn(`[GlobalAutomation] 流动性初筛失败，本轮跳过筛币: ${error.message}`);
+      }
     }
 
     const totals = { analyzed: 0, eligible: 0, submitted: 0, failed: 0 };
@@ -752,7 +819,9 @@ export class GlobalAutomation {
         const records = await this.archive?.list?.({ limit: 200 }) || [];
         this.opportunities = records.flatMap(record => (record.analyses || [])
           .map(signal => signal.opportunityReport)
-          .filter(Boolean)).slice(0, 50);
+          // Older market reports used a historical close as an ideal limit and may say BUY_NOW outside the entry band.
+          .filter(report => report && (report.levels?.entryMode !== 'MARKET_OR_NEXT_OPEN'
+            || report.levels?.signalReference != null))).slice(0, 50);
       } catch {
         // 机会展示不能阻塞自动化状态接口；下一次新机会仍会进入内存队列。
       }
@@ -792,10 +861,17 @@ export class GlobalAutomation {
     try {
       const simState = this.simulation.readLight ? await this.simulation.readLight()
         : this.simulation.read ? await this.simulation.read() : { orders: [] };
-      const sameSymbol = (simState.orders || []).filter(o => o.symbol === symbol);
+      if (simState.entriesPaused) return { symbol, success: true, action: 'SKIP_ENTRIES_PAUSED' };
+      const sameSymbol = (simState.orders || []).filter(o => o.symbol === symbol
+        && (!simState.fusedPoolStartedAt || (o.analysisContext?.strategyId || o.strategyId || null) === (signal.strategyId || null)));
       if (sameSymbol.some(o => o.status === 'pending' || o.status === 'open')) {
         console.log(`[GlobalAutomation] ${symbol} 已有未平仓订单，跳过重复开仓`);
         return { symbol, success: true, action: 'SKIP_DUPLICATE' };
+      }
+      const halt = shouldHaltNewEntries(simState.orders || [], AUTO_TRADE);
+      if (halt.halt) {
+        console.log(`[GlobalAutomation] ${halt.reason}，跳过开仓`);
+        return { symbol, success: true, action: 'SKIP_LOSS_CIRCUIT', reason: halt.reason };
       }
       // 止损类（含移动止损 / 保本止损）单独记一个更长的冷却。
       // 此前只认 `stop_loss` 字面量，细分后移动止损会被漏掉，导致冷却失效。
@@ -821,6 +897,10 @@ export class GlobalAutomation {
       }
 
       // 自动提交模拟订单（带 strategyId，订单从此知道自己属于哪个策略）。
+      if (signal.opportunityReport?.levels?.entryMode === 'MARKET_OR_NEXT_OPEN'
+        && !signal.opportunityReport.canProceed) {
+        return { symbol, success: true, action: 'SKIP_ENTRY_CONFIRMATION', reason: signal.opportunityReport.decision?.reason };
+      }
       // 模拟订单是否镜像到 Binance Demo 由 trader.syncPaperOrdersToDemo 控制，
       // 避免把本地回测/纸面订单误发到远端。
       // 正式策略已经按自己的 params 计算并固化了推荐杠杆。
@@ -830,9 +910,23 @@ export class GlobalAutomation {
       const leverageCap = Number.isFinite(configuredMaxLeverage) && configuredMaxLeverage >= 1
         ? Math.min(RISK_RULE.maxLeverage, Math.floor(configuredMaxLeverage))
         : RISK_RULE.maxLeverage;
-      const leverage = Number.isFinite(strategyLeverage) && strategyLeverage > 0
+      let leverage = Number.isFinite(strategyLeverage) && strategyLeverage > 0
         ? Math.max(1, Math.min(leverageCap, Math.floor(strategyLeverage)))
         : Math.max(1, Math.min(leverageCap, recommendedLeverage(signal.plan, signal.action === 'BUY' ? 'OPEN_LONG' : 'OPEN_SHORT')));
+      let scoreSizedMarginPct = null;
+      if (AUTO_TRADE.scoreSizingEnabled) {
+        const sized = sizeSignal(signal, {
+          params: AUTO_TRADE,
+          equity: Number(accountSummary(simState).equity ?? simState.initialBalance),
+          openCount: accountSummary(simState).openCount
+        });
+        if (!sized.ok) {
+          console.log(`[GlobalAutomation] ${symbol} ${sized.reason}，跳过开仓`);
+          return { symbol, success: true, action: sized.action || 'SKIP_SCORE_SIZE', reason: sized.reason };
+        }
+        leverage = Math.max(1, Math.min(leverageCap, sized.leverage));
+        scoreSizedMarginPct = sized.marginPct;
+      }
       // 策略级并发上限（09-17 平衡档上线）：多策略共用一个资金池，但按策略 id 各自限仓。
       // plan.maxPositions 缺省（旧策略/未配置）时不限制 —— 与既有行为完全一致。
       const strategyMaxPositions = Math.floor(Number(signal.plan?.maxPositions));
@@ -873,7 +967,9 @@ export class GlobalAutomation {
         }
       }
       if (!shouldContinue()) return { symbol, success: true, action: 'ABORTED' };
-      const strategyMarginPct = Number(signal.plan?.autoMarginPct);
+      const strategyMarginPct = Number.isFinite(scoreSizedMarginPct)
+        ? scoreSizedMarginPct
+        : Number(signal.plan?.autoMarginPct);
       const marginPct = Number.isFinite(strategyMarginPct) && strategyMarginPct > 0 && strategyMarginPct <= 1
         ? strategyMarginPct : AUTO_MARGIN_PCT;
       const summary = accountSummary(simState);
@@ -889,7 +985,7 @@ export class GlobalAutomation {
       const maxTotalNotionalPct = Number(config?.trader?.maxTotalNotionalPct);
       const hasPositionCap = Number.isFinite(maxPositionNotionalPct) && maxPositionNotionalPct > 0 && maxPositionNotionalPct <= 1;
       // 总名义敞口可以高于权益（由杠杆提供），但保留 2 倍硬上限；默认配置仍是 1 倍。
-      const hasTotalCap = Number.isFinite(maxTotalNotionalPct) && maxTotalNotionalPct > 0 && maxTotalNotionalPct <= 2;
+      const hasTotalCap = !simState.fusedPoolStartedAt && Number.isFinite(maxTotalNotionalPct) && maxTotalNotionalPct > 0 && maxTotalNotionalPct <= 2;
       let cappedMargin = explicitMargin;
       if (cappedMargin == null && Number.isFinite(equity) && equity > 0) {
         cappedMargin = Math.floor(Math.max(equity * marginPct, minOrderMargin) * 100) / 100;
@@ -913,9 +1009,32 @@ export class GlobalAutomation {
           return { symbol, success: true, action: 'SKIP_RISK_SIZE' };
         }
       }
+      if (simState.fusedPoolStartedAt) {
+        if (!summary.canOpen) return { symbol, success: true, action: 'SKIP_POOL_CAPITAL', reason: summary.warnings?.join(' ') };
+        cappedMargin = Math.floor(Math.min(cappedMargin ?? equity * marginPct, summary.available / (1 + leverage * 12 / 10000)) * 100) / 100;
+      }
       if (minOrderMargin > 0 && (!Number.isFinite(cappedMargin) || cappedMargin < minOrderMargin)) {
         console.log(`[GlobalAutomation] ${symbol} 受单仓/总敞口限制，无法满足 Binance 最低保证金 ${minOrderMargin} USDT，跳过开仓`);
         return { symbol, success: true, action: 'SKIP_MIN_MARGIN' };
+      }
+      if (AUTO_TRADE.screenEnabled && typeof this.market.bookTicker === 'function' && typeof this.market.depth === 'function') {
+        try {
+          const book = await this.market.bookTicker(symbol);
+          const depth = await this.market.depth({ symbol, limit: AUTO_TRADE.bookLevels });
+          const orderNotional = Number.isFinite(cappedMargin) ? cappedMargin * leverage : null;
+          const bookCheck = checkBookLiquidity({
+            bid: book?.bidPrice, ask: book?.askPrice,
+            bids: depth?.bids, asks: depth?.asks,
+            notional: orderNotional
+          }, AUTO_TRADE);
+          if (!bookCheck.ok) {
+            console.log(`[GlobalAutomation] ${symbol} 盘口不可成交：${bookCheck.reasons.join('；')}`);
+            return { symbol, success: true, action: 'SKIP_BOOK', reason: bookCheck.reasons.join('；') };
+          }
+        } catch (error) {
+          console.log(`[GlobalAutomation] ${symbol} 盘口校验失败，跳过开仓：${error.message}`);
+          return { symbol, success: true, action: 'SKIP_BOOK', reason: error.message };
+        }
       }
       const submitInput = {
         recordId,
@@ -928,7 +1047,7 @@ export class GlobalAutomation {
       // 买入金额：策略级 plan.autoMarginPct（如 4H 均值回归平衡档 0.015）优先 ——
       // 多策略共用一个资金池，各策略用各自回测验证过的仓位口径（按当前共享权益计）；
       // 缺省回落全局 NOFX_AUTO_MARGIN_PCT（enhanced-trend 等旧策略行为不变）。
-      if (cappedMargin != null && (hasPositionCap || hasTotalCap || explicitMargin != null || minOrderMargin > 0)) submitInput.margin = cappedMargin;
+      if (cappedMargin != null && (simState.fusedPoolStartedAt || hasPositionCap || hasTotalCap || explicitMargin != null || minOrderMargin > 0)) submitInput.margin = cappedMargin;
       else if (explicitMargin != null) submitInput.margin = explicitMargin;
       else if (Number.isFinite(strategyMarginPct) && strategyMarginPct > 0 && strategyMarginPct <= 1) {
         submitInput.autoMarginPct = strategyMarginPct;
@@ -953,7 +1072,7 @@ export class GlobalAutomation {
     const task = this.tasks.positionReview;
     const startedAt = Date.now();
     const state = this.simulation.readLight ? await this.simulation.readLight() : await this.simulation.read();
-    const openOrders = state.orders.filter(o => ['pending', 'open'].includes(o.status));
+    const openOrders = state.orders.filter(o => ['pending', 'open'].includes(o.status) && !o.manualCloseRequested && !o.manualEntryCancelled);
     const progress = task.progress = { total: openOrders.length, completed: 0, failed: 0, symbol: null, stage: null };
     const summary = {
       reviewed: 0,
@@ -1102,7 +1221,7 @@ export class GlobalAutomation {
           await this.simulation.mutateLight(state => {
             if (!shouldContinue()) return;
             const current = state.orders.find(o => o.id === order.id);
-            if (!current || current.status !== 'open') return;
+            if (!current || current.status !== 'open' || current.manualCloseRequested) return;
             current.reviewHistory = [...(current.reviewHistory || []), {
               at: new Date().toISOString(),
               engine: orderStrategy.engine,
@@ -1129,7 +1248,7 @@ export class GlobalAutomation {
         await this.simulation.mutateLight(state => {
           if (!shouldContinue()) return;
           const current = state.orders.find(o => o.id === order.id);
-          if (!current || current.status !== 'open') return;
+          if (!current || current.status !== 'open' || current.manualCloseRequested) return;
 
           const report = applyPaperProtectionReview(current, proposal, Date.now(), orderStrategy.engine);
           if (report.action === 'updated') {
@@ -1191,7 +1310,7 @@ export class GlobalAutomation {
     return this.simulation.mutateLight(state => {
       if (!shouldContinue()) return;
       const current = state.orders.find(o => o.id === order.id);
-      if (!current || current.status !== 'pending' || current.nextTime !== order.nextTime) return;
+      if (!current || current.status !== 'pending' || current.manualEntryCancelled || current.manualCloseRequested || current.nextTime !== order.nextTime) return;
       const report = applyPendingReview(current, signals?.[0]);
       const task = this.tasks.positionReview;
       if (report.action === 'cancelled') task.cancelled = (task.cancelled || 0) + 1;

@@ -23,6 +23,45 @@ function order(short = false, input = {}) {
 }
 const almost = (a, b) => assert.ok(Math.abs(a - b) < 1e-8, `${a} != ${b}`);
 
+test('partial exits update realized profit, release margin and allocate entry fees once', () => {
+  const partial = { id: 'partial', status: 'open', direction: 'OPEN_LONG', entry: 100, entryAt: new Date(0).toISOString(),
+    quantity: 6, realizedQty: 4, realizedNet: 20, margin: 100, notional: 1000, entryFee: 3, unrealized: 30,
+    costs: { feeBps: 2, slippageBps: 0, fundingBpsPer8h: 0 } };
+  const state = { initialBalance: 1000, orders: [partial, { status: 'closed', net: 5, margin: 10 },
+    { status: 'pending', margin: 10, notional: 50, costs: { feeBps: 10 } }] };
+  const before = accountSummary(state);
+  almost(before.realized, 25);
+  almost(before.entryFees, 1.8);
+  almost(before.usedMargin, 70);
+  almost(before.balance, 1023.2);
+  almost(before.available, 953.15);
+  almost(before.equity, 1053.2);
+  almost(before.net, 53.2);
+  settlePaperOrder(partial, 105, 'manual', 1000);
+  const after = accountSummary(state);
+  almost(after.usedMargin, 10);
+  almost(after.entryFees, 0);
+  almost(after.equity, before.equity - 105 * 6 * 2 / 10000);
+  almost(after.realized, partial.net + 5);
+  almost(after.available, after.balance - 10 - 0.05);
+  almost(after.equity, state.initialBalance + after.net);
+});
+
+test('partial take-profit marks the remaining quantity and funding in the same refresh', () => {
+  const { state, o } = order();
+  o.costs = { feeBps: 0, slippageBps: 0, fundingBpsPer8h: 100 };
+  o.plan.exitRules.partialTp = { enabled: true, tp1R: 1, tp2R: 2, tp1ClosePct: 0.4, tp2ClosePct: 0.4, moveStopToBreakEven: false };
+  advancePaperOrder(o, [candle(11 * bar)], 12 * bar);
+  advancePaperOrder(o, [candle(12 * bar, { open: 109, high: 116, low: 108, close: 115 })], 13 * bar);
+  assert.equal(o.status, 'open');
+  almost(o.realizedQty, 1.2);
+  almost(o.quantity, 1.8);
+  const funding = 300 * 0.6 * 100 / 10000 * (2 * bar) / 28800000;
+  almost(o.unrealized, (115 - o.entry) * o.quantity - funding);
+  almost(accountSummary(state).usedMargin, 60);
+  almost(accountSummary(state).realized, o.realizedNet);
+});
+
 test('paper reservation is funded, idempotent and refuses invalid plans without credentials', () => {
   const { state, o } = order();
   assert.equal(o.notional, 300);
@@ -313,7 +352,7 @@ test('PUT /api/paper/capital re-bases initial balance and persists it', { skip: 
     const url = `http://127.0.0.1:${server.address().port}/api/paper`;
     const put = async (path, body) => { const r = await fetch(url + path, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }); assert.equal(r.status, 200); return r.json(); };
     const bad = await fetch(url + '/capital', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ initialBalance: 0 }) });
-    assert.equal(bad.status, 400);
+    assert.equal(bad.status, 422);
     const result = await put('/capital', { initialBalance: 100 });
     assert.equal(result.initialBalance, 100);
     const status = await (await fetch(url + '/account')).json();

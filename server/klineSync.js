@@ -3,6 +3,16 @@ import { marketData } from './marketData.js';
 import { normalizeSymbols } from './tradeSync.js';
 import { fetchContinuousKlines } from './continuousKlines.js';
 
+// 手动/配置驱动的 K 线拉取并发（2026-10-06）。原为硬编码 5。
+// ⚠️ 生产定时链路不走这里：container.js 把 klineSync.automation 指向 globalAutomation，
+//    本类的 setInterval 分支被短路，全市场定时同步走 globalAutomation.syncKlines。
+//    这里唯一还能跑到的是 POST /api/history/fetch（symbols=ALL）。
+// 仍改成读同一个 env：两条拉取路径并发口径不一致时，排查会误判「线上为什么这么快/这么慢」。
+const KLINE_FETCH_CONCURRENCY = Math.min(
+  24,
+  Math.max(1, Number(process.env.NOFX_KLINE_SYNC_CONCURRENCY) || 12)
+);
+
 export class KlineSync {
   constructor({ store, marketDb, positionMonitor = null, client = marketData }) {
     this.store = store;
@@ -173,7 +183,9 @@ export class KlineSync {
         }
         this.progress.completed++;
       } };
-      const workers = await Promise.allSettled(Array.from({ length: Math.min(5, symbols.length) }, worker));
+      const workers = await Promise.allSettled(
+        Array.from({ length: Math.min(KLINE_FETCH_CONCURRENCY, symbols.length) }, worker)
+      );
       const failedWorker = workers.find(result => result.status === 'rejected');
       if (failedWorker) throw failedWorker.reason;
 

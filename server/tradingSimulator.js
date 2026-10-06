@@ -8,6 +8,7 @@
 import { nextOpenTime, validCandle, PAPER_COSTS } from './research.js';
 import { SMART_EXIT, partialTpLevels, netBreakEvenBps, exitRulesFor } from './shared/strategyGuards.js';
 import { normalizeCloseReason } from '../shared/closeReasons.js';
+import { isMarketEntryPlan } from '../shared/entryExecution.js';
 
 /**
  * 判定止损的细分来源（初始 / 移动 / 保本）——「平仓理由可统计」的关键。
@@ -260,7 +261,9 @@ export class TradingSimulator {
         // 更新标记价格和未实现盈亏
         order.markPrice = row.close;
         order.markAt = new Date(nextOpenTime(time, order.interval)).toISOString();
-        const funding = this._calcFunding(order.notional, order.costs, entryTime, nextOpenTime(time, order.interval));
+        const originalQty = realized.qty + order.quantity;
+        const remainingShare = originalQty > 0 ? order.quantity / originalQty : 1;
+        const funding = this._calcFunding(order.notional * remainingShare, order.costs, entryTime, nextOpenTime(time, order.interval));
         order.unrealized = direction * (row.close - entry) * order.quantity - funding;
 
         // 计算最大不利偏移
@@ -339,6 +342,12 @@ export class TradingSimulator {
             workingStop = long ? Math.max(workingStop, nextFloor) : Math.min(workingStop, nextFloor);
           }
         }
+
+        // Mark only the remaining position after partial take-profit fills in this candle.
+        const markedOriginalQty = realized.qty + order.quantity;
+        const markedShare = markedOriginalQty > 0 ? order.quantity / markedOriginalQty : 1;
+        order.unrealized = direction * (row.close - entry) * order.quantity
+          - this._calcFunding(order.notional * markedShare, order.costs, entryTime, nextOpenTime(time, order.interval));
 
         // 检查出场条件
         // 传 stopCtx 让 _checkExit 能细分「初始止损 / 移动止损 / 保本止损」与「整仓止盈 / 分批止盈」
@@ -537,7 +546,7 @@ export class TradingSimulator {
 
     // 限价挂单（entryLimit 存在）：等价格回调触达 entryLimit 才成交。
     // 多头：当根最低价触及 entryLimit；空头：当根最高价触及 entryLimit。
-    if (Number.isFinite(entryLimit)) {
+    if (!isMarketEntryPlan(protection) && Number.isFinite(entryLimit)) {
       const long = direction === 1;
       const reached = long ? row.low <= entryLimit : row.high >= entryLimit;
       if (!reached) return null;

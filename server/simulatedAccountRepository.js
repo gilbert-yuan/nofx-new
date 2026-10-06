@@ -303,9 +303,9 @@ export class SimulatedAccountRepository {
    */
   async readFrom(client, { summary = false, orderId, light = false, exchangeSync = false, automation = false } = {}) {
     const tables = {};
-    const summaryTables = new Set(['simulated_accounts', 'simulated_orders', 'simulated_order_costs', 'simulated_order_plans', 'simulated_automation_settings', 'simulated_automation_jobs', 'simulated_account_extensions']);
+    const summaryTables = new Set(['simulated_accounts', 'simulated_orders', 'simulated_order_costs', 'simulated_order_plans', 'simulated_order_extensions', 'simulated_automation_settings', 'simulated_automation_jobs', 'simulated_account_extensions']);
     let activeOrderIds = null;
-    if (light) {
+    if (light || summary) {
       const res = await client.query(
         `SELECT order_id FROM simulated_orders WHERE account_id=1 AND status IN ('pending','open')`
       );
@@ -321,6 +321,10 @@ export class SimulatedAccountRepository {
       if (filterOrder) {
         sql += ' AND order_id=$1';
         params.push(orderId);
+      } else if (summary && def.name === 'simulated_order_extensions') {
+        // Active bindings and partial exits are needed for activity and account totals.
+        sql += " AND ((order_id = ANY($1::text[]) AND path[1] IN ('exchangeSync', 'exchange', 'realizedNet', 'realizedQty')) OR path = ARRAY['analysisContext','strategyId']::text[] OR path = ARRAY['analysisContext','strategyName']::text[])";
+        params.push(activeOrderIds);
       } else if (light && childTable) {
         if (exchangeSync && def.name === 'simulated_order_extensions') {
           sql += " AND path[1] IN ('exchangeSync', 'exchange')";
@@ -328,7 +332,9 @@ export class SimulatedAccountRepository {
           sql += " AND (order_id = ANY($1::text[]) OR path = ARRAY['analysisContext', 'strategyModel']::text[])";
           params.push(activeOrderIds);
         } else {
-          sql += ' AND order_id = ANY($1::text[])';
+          sql += def.name === 'simulated_order_extensions'
+            ? " AND (order_id = ANY($1::text[]) OR path = ARRAY['analysisContext','strategyId']::text[] OR path = ARRAY['analysisContext','strategyName']::text[])"
+            : ' AND order_id = ANY($1::text[])';
           params.push(activeOrderIds);
         }
       }

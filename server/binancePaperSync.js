@@ -2,6 +2,7 @@ import { BinanceClient } from './binanceClient.js';
 import { binanceMarket } from './binanceMarket.js';
 // 环境判定/凭证解析的唯一实现在 shared/binanceEnvironment.js；这里 re-export 保持旧引用（含测试）兼容。
 import { isBinanceDemo, binanceEnvironmentConfig } from '../shared/binanceEnvironment.js';
+import { isMarketEntryPlan, marketEntryBlock } from '../shared/entryExecution.js';
 import {
   acquireBinanceExecutionLock,
   assertBinanceExecutionLock,
@@ -199,6 +200,7 @@ function applyOrderResult(target, result, now = new Date().toISOString()) {
   target.status = normalizeStatus(result.status, target.status || 'unknown');
   target.orderId = result.orderId ?? target.orderId ?? null;
   target.clientOrderId = result.clientOrderId || target.clientOrderId || null;
+  target.positionSide = result.positionSide || target.positionSide || 'BOTH';
   target.origQty = finiteNumber(result.origQty ?? result.origQuantity, target.origQty);
   target.executedQty = finiteNumber(result.executedQty, target.executedQty || 0);
   target.avgPrice = finiteNumber(result.avgPrice, target.avgPrice);
@@ -263,7 +265,7 @@ export async function paperLimitParams(order, client, environment = 'demo', leve
   //    只有 entryMin/entryMax sanity 区间、没有 entryLimit —— 此前一律被
   //    「缺少有效 entryLimit」判死且无限重试）。镜像语义：交易所发 MARKET 单，
   //    数量 = notional ÷ 标记价（纸面单成交在下一根 1m 开盘，市价镜像本身即近似）。
-  if (!(Number.isFinite(rawPrice) && rawPrice > 0)) {
+  if (isMarketEntryPlan(order.plan)) {
     const notional = Number(order.notional);
     if (!(notional > 0)) {
       throw new Error('模拟订单缺少有效 entryLimit 或数量，无法同步 Binance ' + environmentLabel(environment) + '。');
@@ -284,6 +286,8 @@ export async function paperLimitParams(order, client, environment = 'demo', leve
     if (!(refPrice > 0)) {
       throw new Error('无法获取 ' + order.symbol + ' 市价，本轮放弃同步 Binance ' + environmentLabel(environment) + '。');
     }
+    const blocked = marketEntryBlock(order.plan, refPrice, order.direction);
+    if (blocked) throw new Error(order.symbol + '：' + blocked);
     const quantity = floorStep(notional / refPrice, quantityStep);
     if (!(quantity > 0) || quantity < minQty || (minNotional > 0 && quantity * refPrice < minNotional)) {
       throw new Error('模拟订单 ' + order.symbol + ' 对齐 Binance ' + environmentLabel(environment) + ' 过滤器后低于最小下单要求。');
@@ -563,10 +567,22 @@ export class BinancePaperSync {
       const enabledEnvironments = BINANCE_SYNC_ENVIRONMENTS.filter(environment =>
         binanceSyncEnabled(config, environment) && binanceEnvironmentHasCredentials(config, environment));
       if (!enabledEnvironments.length) return;
-      const state = await this.simulation.exchangeSyncOrders();
+      const [state, accountState] = await Promise.all([
+        this.simulation.exchangeSyncOrders(), this.simulation.readLight ? this.simulation.readLight() : null
+      ]);
       for (const order of state.orders || []) {
         for (const environment of enabledEnvironments) {
           const link = ensureExchangeSync(order)[environment];
+          const snapshot = accountState?.exchangeAccounts?.[environment];
+          const metric = snapshot?.orderMetrics?.[order.id];
+          const terminal = ['closed', 'cancelled', 'expired'].includes(order.status);
+          const pendingCleanup = link.manualProtectionCleanup === 'pending';
+          const remoteEntry = snapshot?.orders?.some(row => String(row.orderId) === String(link.orderId) || row.clientOrderId === link.clientOrderId);
+          // Expired historical IDs otherwise generate endless GET/cancel requests,
+          // despite the fill journal and complete position snapshot confirming exit.
+          if (terminal && !pendingCleanup && !remoteEntry && metric?.remainingQty <= 1e-10 && metric.filledQty > 0) continue;
+          if (terminal && !pendingCleanup && !remoteEntry && snapshot?.syncedAt && metric?.filledQty === 0
+            && link.status === 'cancel_error' && Date.now() - Date.parse(order.createdAt) > 86400000) continue;
           if (order.status === 'pending' && (!linkHasRemoteOrder(link) || link.status === 'submit_error' || link.status === 'not_configured') && linkCanRetry(link)) {
             this.enqueue(order.id, { type: 'submit' });
           }
@@ -675,6 +691,21 @@ export class BinancePaperSync {
       }
       const link = ensureExchangeSync(order)[environment];
 
+      if (order.manualCloseRequested) {
+        await this.pullEntryIfNeeded(order, environment, client);
+        order = await this.simulation.getOrder(orderId);
+        await this.pullCloseOrders(order, environment, client);
+        const current = ensureExchangeSync(order)[environment];
+        if (current.manualProtectionCleanup === 'pending') {
+          const rows = await client.positions(order.symbol);
+          if (Array.isArray(rows) && !rows.some(row => (row.positionSide || 'BOTH') === lockPositionSide && Math.abs(Number(row.positionAmt)) > 0)
+            && await this.cancelNativeProtection(order, environment, client)) {
+            await this.updateLink(order.id, environment, link => { link.manualProtectionCleanup = 'clean'; });
+          }
+        }
+        continue;
+      }
+
       if (item.submit && ['pending', 'closed'].includes(order.status) && ['not_submitted', 'submit_error', 'not_configured', 'unknown'].includes(link.status) && linkCanRetry(link)) {
         await this.submitEntry(order, environment, client);
         order = await this.simulation.getOrder(orderId);
@@ -782,28 +813,56 @@ export class BinancePaperSync {
         return;
       }
     }
+    if (order.manualCloseRequested || order.manualEntryCancelled
+      || (this.simulation.capitalExecutionAllowed && !await this.simulation.capitalExecutionAllowed(order.id))) {
+      await this.updateLink(order.id, environment, current => {
+        current.blockedReason = '统一资金池已暂停开仓、同步未完成或资金占用超限，未发送新增订单。';
+        if (!current.lastError || !['submit_error', 'unknown'].includes(current.status)) current.lastError = current.blockedReason;
+        current.retryAt = new Date(Date.now() + 30000).toISOString();
+      });
+      return;
+    }
     await this.updateLink(order.id, environment, current => {
       current.clientOrderId = clientOrderId;
       current.status = 'submitting';
       current.submittedAt = current.submittedAt || new Date().toISOString();
       current.lastError = '';
+      current.blockedReason = '';
     });
     try {
-      const params = await paperLimitParams(order, client, environment, this.leverageCaches[environment]);
-      await safeSetLeverageForEnvironment(client, order.symbol, order.leverage, this.leverageCaches[environment], environment);
+      let params = await paperLimitParams(order, client, environment, this.leverageCaches[environment]);
+      const effectiveLeverage = await safeSetLeverageForEnvironment(client, order.symbol, order.leverage, this.leverageCaches[environment], environment);
+      if (effectiveLeverage !== order.leverage) {
+        params = await paperLimitParams({ ...order, leverage: effectiveLeverage, notional: order.margin * effectiveLeverage },
+          client, environment, this.leverageCaches[environment]);
+      }
+      await this.updateLink(order.id, environment, current => { current.actualLeverage = effectiveLeverage; });
       // 市价型策略（4H 均值回归/突破，plan 无 entryLimit）走 MARKET 单；限价策略走原 GTC 限价。
       const { market, ...orderParams } = params;
+      if (market) {
+        const quote = typeof client.price === 'function' ? await client.price(order.symbol) : await client.premiumIndex(order.symbol);
+        const blocked = marketEntryBlock(order.plan, Number(quote?.price ?? quote?.markPrice), order.direction);
+        if (blocked) throw new Error(order.symbol + '：' + blocked);
+      }
+      if (this.simulation.capitalExecutionAllowed && !await this.simulation.capitalExecutionAllowed(order.id)) {
+        await this.updateLink(order.id, environment, current => { current.status = 'not_submitted'; current.lastError = '资金池状态已变化，本次未发送新订单。'; });
+        return;
+      }
       const result = market
         ? await client.marketOrder({ ...orderParams, clientOrderId })
         : await client.limitOrder({ ...orderParams, timeInForce: 'GTC', clientOrderId });
       await this.updateLink(order.id, environment, current => applyOrderResult(current, result, new Date().toISOString()));
+      this.simulation.accountSync?.requestRefresh();
     } catch (error) {
+      console.warn('[paper-sync] ' + environmentLabel(environment) + ' ' + order.symbol + ' entry failed:', shortError(error));
       const resolved = isUnknownExecution(error) ? await this.findExistingOrder(client, order.symbol, clientOrderId) : null;
       if (resolved) {
         await this.updateLink(order.id, environment, current => applyOrderResult(current, resolved, new Date().toISOString()));
         return;
       }
       await this.updateLink(order.id, environment, current => {
+        current.lastSubmissionError = shortError(error);
+        current.lastSubmissionErrorAt = new Date().toISOString();
         if (isUnsupportedSymbolError(error)) {
           // 环境无此合约：确定性失败，置终态不再重试（否则每轮 backoff 重试、订单永久滞留 pending）。
           current.status = 'unsupported_symbol';
@@ -1113,6 +1172,7 @@ export class BinancePaperSync {
     try {
       const result = await client.order({ symbol: order.symbol, orderId: link.orderId, clientOrderId: link.orderId ? undefined : link.clientOrderId });
       await this.updateLink(order.id, environment, current => applyOrderResult(current, result, new Date().toISOString()));
+      this.simulation.accountSync?.requestRefresh();
     } catch (error) {
       await this.updateLink(order.id, environment, current => {
         current.lastError = shortError(error);
@@ -1132,6 +1192,7 @@ export class BinancePaperSync {
     try {
       const result = await client.cancelOrder({ symbol: order.symbol, orderId: link.orderId, clientOrderId: link.clientOrderId });
       await this.updateLink(order.id, environment, current => applyOrderResult(current, result, new Date().toISOString()));
+      this.simulation.accountSync?.requestRefresh();
     } catch (error) {
       await this.updateLink(order.id, environment, current => {
         current.status = 'cancel_error';

@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref, watch } from 'vue';
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { api } from '../api.js';
 import { binanceApi } from '../api/client.js';
 import { fmt, pct, statusLabel as status, reasonLabel as reason, reasonGroup } from '../utils/format.js';
@@ -9,6 +9,16 @@ import { isoDateTime } from '../utils/binance.js';
 const accountData = ref(null);
 const busy = ref(false);
 const error = ref('');
+const overview = computed(() => accountData.value || {});
+const actionMessage = ref('');
+const closedOrders = computed(() => accountData.value?.closedOrders || (accountData.value?.orders || []).filter(o => o.status === 'closed'));
+const selectedExchangeOrder = ref(null);
+let pollTimer = null;
+let disposed = false;
+let loadSequence = 0;
+const activeOrders = computed(() => accountData.value?.activeOrders || (accountData.value?.orders || []).filter(o => ['pending', 'open'].includes(o.status)));
+const activityCounts = computed(() => ({ positions: activeOrders.value.filter(o => o.status === 'open').length, pending: activeOrders.value.filter(o => o.status === 'pending').length }));
+const exchangeAccounts = computed(() => Object.values(accountData.value?.exchangeAccounts || {}).filter(account => account.enabled));
 
 // 币安绑定订单（exchangeSync.demo / exchangeSync.live）
 const remoteDetail = ref({});   // env -> 远端订单详情（点击「详情」时自动实时拉取）
@@ -72,13 +82,12 @@ function remoteActionLabel(env) {
   if (remoteLoading.value[env]) return '获取中…';
   return remoteDetail.value[env] ? '刷新' : '重试';
 }
-// 切换查看的订单时清空上一单的远端详情（安全网：其他入口改动 selectedOrder 也会重置）
-watch(() => selectedOrder.value?.id, () => resetRemoteOrder());
-
 // 模拟交易相关
 const orderInput = ref({ recordId: '', symbol: '', margin: 100, leverage: 2 });
 const showOrderForm = ref(false);
 const selectedOrder = ref(null);
+// Register after the ref exists: watch evaluates its getter during setup.
+watch(() => selectedOrder.value?.id, () => resetRemoteOrder());
 const orderPage = ref(1);
 const orderPageSize = ref(8); // 每页 8 条
 const orderScope = ref('active'); // active: 持仓 + 待入场 | closed: 已平仓
@@ -94,8 +103,8 @@ const filteredOrders = computed(() => {
   if (!accountData.value?.orders) return [];
 
   // 订单区分两段：① 持仓 + 待入场（在途）② 已平仓（历史成交）
-  const scopeStatus = orderScope.value === 'closed' ? ['closed'] : ['pending', 'open'];
-  let orders = accountData.value.orders.filter(o => scopeStatus.includes(o.status));
+  let orders = orderScope.value === 'closed'
+    ? closedOrders.value : activeOrders.value;
 
   // 状态筛选（仅「持仓 / 待入场」段有意义；已平仓段只有一种状态）
   if (orderScope.value === 'active') {
@@ -147,8 +156,8 @@ const totalOrderPages = computed(() => {
 const scopeCounts = computed(() => {
   const orders = accountData.value?.orders || [];
   return {
-    active: orders.filter(o => ['pending', 'open'].includes(o.status)).length,
-    closed: orders.filter(o => o.status === 'closed').length
+    active: activeOrders.value.length,
+    closed: closedOrders.value.length
   };
 });
 
@@ -157,7 +166,7 @@ const orderStats = computed(() => {
   if (!accountData.value?.orders) return null;
 
   const orders = accountData.value.orders;
-  const closed = orders.filter(o => o.status === 'closed');
+  const closed = closedOrders.value;
   const wins = closed.filter(o => o.net > 0);
   const losses = closed.filter(o => o.net < 0);
 
@@ -181,26 +190,30 @@ const orderStats = computed(() => {
 
 // 格式化函数
 // fmt / pct / statusLabel / reasonLabel 由 ../utils/format.js 提供
+const precise = value => value == null || !Number.isFinite(Number(value)) ? '—'
+  : Number(value).toLocaleString('zh-CN', { useGrouping: false, maximumSignificantDigits: 10 });
 
 // 加载模拟账户数据
-async function loadAccount() {
-  busy.value = true;
-  error.value = '';
+async function loadAccount({ silent = false } = {}) {
+  const sequence = ++loadSequence;
+  if (!silent) { busy.value = true; error.value = ''; }
   try {
-    accountData.value = await api('/paper/account?view=summary');
+    const data = await api('/paper/account?view=summary');
+    if (!disposed && sequence === loadSequence) accountData.value = data;
   } catch (err) {
-    error.value = err.message;
+    if (!disposed && sequence === loadSequence) error.value = err.message;
   } finally {
-    busy.value = false;
+    if (!silent && !disposed) busy.value = false;
   }
 }
 
 // 刷新模拟账户
 async function refreshAccount() {
+  ++loadSequence;
   busy.value = true;
   error.value = '';
   try {
-    accountData.value = await api('/paper/refresh', { method: 'POST' });
+    accountData.value = await api('/paper/exchange-refresh', { method: 'POST' });
   } catch (err) {
     error.value = err.message;
   } finally {
@@ -249,24 +262,49 @@ async function setCapital() {
   }
 }
 
-// 取消订单
-async function cancelOrder(orderId) {
-  if (!confirm('确定取消此订单？')) return;
-
+function describeAction(result) {
+  const items = result.results || [];
+  const issues = items.flatMap(item => item.results || [item]).filter(item => item.error || item.warning || item.complete === false);
+  actionMessage.value = issues.length ? issues.map(item => `${item.symbol || ''} ${item.error || item.warning || '已提交，等待币安持仓确认'}`).join('；') : '操作已完成，资金池和订单列表已更新。';
+  if (result.account) accountData.value = result.account;
+}
+async function closeOrder(order) {
+  const targets = order.executionTargets?.map(target => target.environment === 'live' ? '币安实盘' : '币安模拟盘') || [];
+  const operation = order.status === 'open' ? '平仓' : '撤单';
+  const detail = targets.length ? `，涉及 ${[...new Set(targets)].join('、')}，将处理该行对应的全部交易目标` : '';
+  if (!confirm(`确认${operation} ${order.symbol}${detail}？${order.status === 'open' ? '同方向合并持仓及其待入场余量将一起处理。' : '已成交部分继续保留。'}`)) return;
   busy.value = true;
-  error.value = '';
+  error.value = ''; actionMessage.value = ''; ++loadSequence;
   try {
-    await api(`/paper/orders/${orderId}`, { method: 'DELETE' });
-    await loadAccount();
+    describeAction(await api(`/paper/activity/${encodeURIComponent(order.id)}/close`, { method: 'POST', timeoutMs: 180000 }));
   } catch (err) {
     error.value = err.message;
+    await loadAccount({ silent: true });
   } finally {
     busy.value = false;
   }
 }
+async function closeAll() {
+  const live = activeOrders.value.some(order => order.executionTargets?.some(target => target.environment === 'live'));
+  if (!confirm(`确认平掉全部 ${activityCounts.value.positions} 个持仓，并撤销 ${activityCounts.value.pending} 个待入场订单？${live ? '包括币安实盘仓位。' : ''}完成后暂停新开仓，需手动恢复。`)) return;
+  busy.value = true; error.value = ''; actionMessage.value = ''; ++loadSequence;
+  try { describeAction(await api('/paper/close-all', { method: 'POST', timeoutMs: 600000 })); }
+  catch (err) { error.value = err.message; await loadAccount({ silent: true }); }
+  finally { busy.value = false; }
+}
+async function resumeEntries() {
+  busy.value = true; error.value = '';
+  try { await api('/paper/entries-paused', { method: 'PUT', body: { paused: false } }); await loadAccount(); }
+  catch (err) { error.value = err.message; }
+  finally { busy.value = false; }
+}
 
 // 查看订单详情：点击即加载完整明细，并自动实时拉取该订单已绑定的币安订单详情
 async function viewOrderDetail(order) {
+  if (order.kind === 'external_closed' || order.id.startsWith('fused:') || order.id.startsWith('reconciling:')) {
+    selectedExchangeOrder.value = order;
+    return;
+  }
   if (!order) return;
   const orderId = order.id;
   selectedOrder.value = order;   // 先渲染列表行已有字段，避免点击后空白等待
@@ -274,7 +312,7 @@ async function viewOrderDetail(order) {
   try {
     const detail = await api(`/paper/orders/${encodeURIComponent(orderId)}`);
     if (selectedOrder.value?.id !== orderId) return;   // 已切到别的订单，丢弃本次结果
-    selectedOrder.value = detail;
+    selectedOrder.value = { ...detail, ...order, exchangeSync: detail.exchangeSync, exchange: detail.exchange, analysisContext: detail.analysisContext };
     // 绑定关系只在完整明细里（accountSummary 不含 exchangeSync），拿到明细后立即并行拉币安详情
     await loadBoundRemoteOrders(detail);
   } catch (err) { error.value = err.message; }
@@ -301,11 +339,22 @@ function switchOrderScope(scope) {
 watch([statusFilter, directionFilter, sortBy, sortOrder], () => {
   orderPage.value = 1;
 });
+watch(totalOrderPages, pages => { orderPage.value = Math.min(orderPage.value, pages); });
+watch(activeOrders, orders => {
+  if (selectedExchangeOrder.value) selectedExchangeOrder.value = orders.find(o => o.id === selectedExchangeOrder.value.id) || null;
+});
 
 // 初始化
 onMounted(() => {
   loadAccount();
+  const poll = async () => {
+    if (disposed) return;
+    if (!busy.value && document.visibilityState !== 'hidden') await loadAccount({ silent: true });
+    if (!disposed) pollTimer = setTimeout(poll, 10000);
+  };
+  pollTimer = setTimeout(poll, 10000);
 });
+onUnmounted(() => { disposed = true; ++loadSequence; clearTimeout(pollTimer); });
 </script>
 
 <template>
@@ -314,37 +363,41 @@ onMounted(() => {
       <div>
         <span class="eyebrow">UNIFIED TRADING SIMULATION</span>
         <h2>交易模拟</h2>
-        <p>模拟账户与订单管理</p>
+        <p>多策略共享资金池 · 成交与持仓融合管理</p>
       </div>
     </div>
 
     <p v-if="error" class="signal-warning" role="alert">{{ error }}</p>
+    <p v-if="actionMessage" class="signal-warning" role="status">{{ actionMessage }}</p>
     <p v-if="busy" class="inline-loading" role="status">正在处理，请稍候…</p>
 
     <!-- 模拟账户视图 -->
     <template v-if="accountData">
       <!-- 账户概览 -->
+      <p class="muted pool-description">统一资金池（USDT） · 金额与收益依据：币安实盘 &gt; 币安模拟盘 &gt; 本地策略</p>
       <div class="summary-metrics performance-metrics">
         <article class="summary-metric">
           <span>已实现收益</span>
-          <strong :class="accountData.realized > 0 ? 'profit' : accountData.realized < 0 ? 'loss' : ''">
-            {{ fmt(accountData.realized) }}
+          <strong :class="overview.realized > 0 ? 'profit' : overview.realized < 0 ? 'loss' : ''">
+            {{ fmt(overview.realized) }}
           </strong>
-          <small>未实现 <span :class="accountData.unrealized > 0 ? 'profit' : accountData.unrealized < 0 ? 'loss' : ''">{{ fmt(accountData.unrealized) }}</span></small>
+          <small>未实现 <span :class="overview.unrealized > 0 ? 'profit' : overview.unrealized < 0 ? 'loss' : ''">{{ fmt(overview.unrealized) }}</span></small>
+          <small>成交净收益含手续费与资金费</small>
         </article>
         <article class="summary-metric">
-          <span>持仓数量</span>
-          <strong>{{ accountData.openCount }}</strong>
-          <small>已用保证金 {{ fmt(accountData.usedMargin) }}</small>
+          <span>持仓 / 待入场</span>
+          <strong>{{ overview.positions }} / {{ overview.pending }}</strong>
+          <small>已用保证金 {{ fmt(overview.usedMargin) }}</small>
+          <small>手续费预留 {{ fmt(overview.feeReserve) }} · 提交中占用 {{ fmt(overview.reservationMargin) }}</small>
         </article>
         <article class="summary-metric">
           <span>可用余额</span>
-          <strong>{{ fmt(accountData.available) }}</strong>
-          <small>净收益 <span :class="accountData.net > 0 ? 'profit' : accountData.net < 0 ? 'loss' : ''">{{ fmt(accountData.net) }}</span></small>
+          <strong>{{ fmt(overview.available) }}</strong>
+          <small>总收益 <span :class="overview.net > 0 ? 'profit' : overview.net < 0 ? 'loss' : ''">{{ fmt(overview.net) }}</span></small>
         </article>
         <article class="summary-metric">
           <span>总权益</span>
-          <strong>{{ fmt(accountData.equity) }}</strong>
+          <strong>{{ fmt(overview.equity) }}</strong>
           <small>初始金额 {{ fmt(accountData.initialBalance) }} · 自动仓位 {{ fmt(accountData.equity * (accountData.autoMarginPct ?? 0.05)) }}/笔</small>
         </article>
         <article v-if="orderStats" class="summary-metric">
@@ -355,13 +408,26 @@ onMounted(() => {
       </div>
 
       <div class="action-row">
-        <button class="primary" :disabled="busy" @click="refreshAccount">刷新行情与订单状态</button>
-        <button class="ghost" :disabled="busy" @click="showOrderForm = !showOrderForm">
+        <button class="primary" :disabled="busy" @click="refreshAccount">同步成交、持仓与挂单</button>
+        <button class="ghost" :disabled="busy || !overview.canOpen" @click="showOrderForm = !showOrderForm">
           {{ showOrderForm ? '取消下单' : '新建模拟订单' }}
         </button>
         <button class="ghost" :disabled="busy" @click="showCapitalForm = !showCapitalForm; capitalInput = accountData.initialBalance">
-          {{ showCapitalForm ? '取消设置' : '设置初始金额' }}
+          {{ showCapitalForm ? '取消设置' : '设置资金池初始金额' }}
         </button>
+        <button class="btn-small btn-danger" :disabled="busy || !activeOrders.length" @click="closeAll">全部平仓并撤单</button>
+        <button v-if="accountData.entriesPaused" class="ghost" :disabled="busy" @click="resumeEntries">恢复开仓</button>
+      </div>
+      <div class="exchange-sync-overview" aria-live="polite">
+        <p v-for="account in exchangeAccounts" :key="account.environment" :class="{ 'failed-text': account.error }">
+          <b>{{ account.environment === 'demo' ? '模拟盘数据' : '实盘数据' }}</b>
+          · {{ account.syncedAt ? '最近同步 ' + isoDateTime(account.syncedAt) : '尚未完成同步' }}
+          <template v-if="account.syncedAt"> · {{ account.positions?.length || 0 }} 个持仓 / {{ account.orders?.length || 0 }} 个入场挂单</template>
+          <template v-if="account.error"> · {{ account.error }}{{ account.syncedAt ? '（展示上次成功同步的数据）' : '' }}</template>
+        </p>
+        <p v-for="warning in overview.warnings || []" :key="warning" class="failed-text">{{ warning }}</p>
+        <small>总权益 = 本地设定初始金额 + 已实现收益 + 未实现收益；可用余额 = 总权益 − 持仓与挂单保证金 − 手续费预留 − 提交中占用。</small>
+        <p><small>持仓与挂单每 10 秒同步，成交收益通常每 30 秒同步。存量未绑定持仓从接入资金池时起记录已实现收益，当前浮盈亏计入权益；已绑定策略订单按实际成交历史核算。杠杆后的买入金额不作为资金池上限。</small></p>
       </div>
 
       <!-- 初始金额设置 -->
@@ -391,7 +457,7 @@ onMounted(() => {
           <select v-model="statusFilter">
             <option value="all">全部</option>
             <option value="pending">等待入场</option>
-            <option value="open">模拟持仓</option>
+            <option value="open">持仓</option>
           </select>
         </label>
 
@@ -434,9 +500,11 @@ onMounted(() => {
           <thead>
             <tr>
               <th>币种</th>
+              <th>数据依据</th>
               <th>方向</th>
               <th>状态</th>
               <th>杠杆</th>
+              <th>保证金（USDT）</th>
               <th>入场价</th>
               <th>标记价</th>
               <th>未实现</th>
@@ -449,23 +517,29 @@ onMounted(() => {
           <tbody>
             <tr v-for="order in paginatedOrders" :key="order.id">
               <td><strong>{{ order.symbol }}</strong></td>
+              <td>{{ order.sourceLabel || '本地模拟' }}<small v-if="order.stale" class="failed-text"> · 同步异常</small></td>
               <td>
                 <span :class="order.direction === 'OPEN_LONG' ? 'badge-long' : 'badge-short'">
                   {{ order.direction === 'OPEN_LONG' ? '多' : '空' }}
                 </span>
               </td>
-              <td>{{ status(order.status) }}</td>
+              <td>
+                {{ order.status === 'closed' ? '已平仓' : order.source && order.source !== 'paper' ? (order.status === 'open' ? '实际持仓' : order.remoteStatus === 'partially_filled' ? '部分成交 · 余量待入场' : '等待入场') : status(order.status) }}
+                <small v-for="local in order.localOrders || []" :key="local.id" class="local-order-note">本地模拟：{{ status(local.status) }}</small>
+              </td>
               <td>{{ order.leverage }}x</td>
-              <td>{{ order.entry ? fmt(order.entry) : '—' }}</td>
-              <td>{{ order.markPrice ? fmt(order.markPrice) : '—' }}</td>
+              <td :title="'买入金额 ' + fmt(order.buyAmount ?? order.notional) + ' USDT'">{{ order.margin != null ? fmt(order.margin) : '—' }}</td>
+              <td>{{ order.entry ? precise(order.entry) : '—' }}</td>
+              <td>{{ order.markPrice ? precise(order.markPrice) : '—' }}</td>
               <td :class="order.unrealized > 0 ? 'profit' : order.unrealized < 0 ? 'loss' : ''">
-                {{ order.unrealized ? fmt(order.unrealized) : '—' }}
+                {{ order.unrealized != null ? fmt(order.unrealized) : '—' }}
               </td>
               <td :class="order.net > 0 ? 'profit' : order.net < 0 ? 'loss' : ''">
-                {{ order.net ? fmt(order.net) : '—' }}
+                {{ order.net != null ? fmt(order.net) : '—' }}
+                <small v-if="order.accountingIncomplete" class="failed-text">历史明细待补齐</small>
               </td>
               <td :class="order.roi > 0 ? 'profit' : order.roi < 0 ? 'loss' : ''">
-                {{ order.roi ? pct(order.roi) : '—' }}
+                {{ order.roi != null ? pct(order.roi) : '—' }}
               </td>
               <td>
                 <span v-if="order.reason" class="close-reason" :data-group="reasonGroup(order.reason)">
@@ -478,14 +552,15 @@ onMounted(() => {
                 <button
                   v-if="['pending', 'open'].includes(order.status)"
                   class="btn-small btn-danger"
-                  @click="cancelOrder(order.id)"
+                  :disabled="busy"
+                  @click="closeOrder(order)"
                 >
-                  取消
+                  {{ order.status === 'open' ? '平仓' : '撤单' }}
                 </button>
               </td>
             </tr>
             <tr v-if="!paginatedOrders.length">
-              <td colspan="11" class="empty">
+              <td colspan="13" class="empty">
                 {{ orderScope === 'closed' ? '暂无已平仓订单' : '当前没有持仓或待入场单' }}
               </td>
             </tr>
@@ -543,6 +618,40 @@ onMounted(() => {
 
     </template>
 
+    <div v-if="selectedExchangeOrder" class="modal-backdrop" @click.self="selectedExchangeOrder = null">
+      <article class="modal modal-wide">
+        <button class="modal-close" @click="selectedExchangeOrder = null">×</button>
+        <h2>{{ selectedExchangeOrder.sourceLabel }} · {{ selectedExchangeOrder.symbol }}</h2>
+        <div class="detail-section">
+          <dl>
+            <dt>状态</dt><dd>{{ selectedExchangeOrder.status === 'closed' ? '已平仓' : selectedExchangeOrder.status === 'open' ? '实际持仓' : syncStatusLabel(selectedExchangeOrder.remoteStatus) }}</dd>
+            <dt>买入金额 / 保证金</dt><dd>{{ fmt(selectedExchangeOrder.buyAmount) }} / {{ fmt(selectedExchangeOrder.margin) }} USDT</dd>
+            <dt>净收益</dt><dd>{{ fmt(selectedExchangeOrder.net) }} USDT</dd>
+            <dt>执行目标</dt><dd>{{ selectedExchangeOrder.executionTargets?.map(target => target.environment === 'live' ? '币安实盘' : '币安模拟盘').join('、') || '已完成成交' }}</dd>
+            <dt>方向 / 持仓模式</dt><dd>{{ selectedExchangeOrder.direction === 'OPEN_LONG' ? '做多' : '做空' }} / {{ selectedExchangeOrder.positionSide }}</dd>
+            <dt>入场 / 委托价</dt><dd>{{ precise(selectedExchangeOrder.entry) }}</dd>
+            <dt>{{ selectedExchangeOrder.status === 'open' ? '持仓数量' : '剩余委托数量' }}</dt><dd>{{ precise(selectedExchangeOrder.quantity) }}</dd>
+            <template v-if="selectedExchangeOrder.orderId">
+              <dt>币安订单 ID</dt><dd>{{ selectedExchangeOrder.orderId }}</dd>
+              <dt>客户端订单 ID</dt><dd>{{ selectedExchangeOrder.clientOrderId || '—' }}</dd>
+              <dt>委托 / 成交数量</dt><dd>{{ precise(selectedExchangeOrder.origQty) }} / {{ precise(selectedExchangeOrder.executedQty) }}</dd>
+            </template>
+            <template v-if="selectedExchangeOrder.status === 'open'">
+              <dt>标记价</dt><dd>{{ precise(selectedExchangeOrder.markPrice) }}</dd>
+              <dt>未实现收益</dt><dd>{{ fmt(selectedExchangeOrder.unrealized) }} USDT</dd>
+            </template>
+            <dt>最近同步</dt><dd>{{ isoDateTime(selectedExchangeOrder.syncedAt) }}</dd>
+          </dl>
+          <p v-if="selectedExchangeOrder.syncError" class="failed-text">{{ selectedExchangeOrder.syncError }}</p>
+          <p v-if="!selectedExchangeOrder.localOrders?.length" class="muted">当前没有可确认的在途本地策略单绑定。币安实际持仓与挂单仍会正常展示。</p>
+          <div v-for="local in selectedExchangeOrder.localOrders || []" :key="local.id" class="binding-row">
+            本地策略单：{{ status(local.status) }}
+            <button class="btn-small" @click="selectedExchangeOrder = null; viewOrderDetail({ id: local.id })">查看模拟单详情</button>
+          </div>
+        </div>
+      </article>
+    </div>
+
     <!-- 订单详情模态框 -->
     <div v-if="selectedOrder" class="modal-backdrop" @click.self="selectedOrder = null">
       <article class="modal modal-wide">
@@ -560,6 +669,8 @@ onMounted(() => {
               <dd>{{ status(selectedOrder.status) }}</dd>
               <dt>保证金</dt>
               <dd>{{ fmt(selectedOrder.margin) }} USDT</dd>
+              <dt>收益核算</dt>
+              <dd>{{ selectedOrder.accountingIncomplete ? '部分历史平仓明细缺失，展示已取得成交的净额' : selectedOrder.allocationMethod === 'remaining_quantity' ? '交易所合并平仓及资金费按剩余数量分摊' : '订单成交记录' }}</dd>
               <dt>杠杆</dt>
               <dd>{{ selectedOrder.leverage }}x</dd>
               <dt>名义本金</dt>
@@ -571,9 +682,9 @@ onMounted(() => {
             <h3>交易详情</h3>
             <dl>
               <dt>入场价</dt>
-              <dd>{{ fmt(selectedOrder.entry) }}</dd>
+              <dd>{{ precise(selectedOrder.entry) }}</dd>
               <dt>数量</dt>
-              <dd>{{ fmt(selectedOrder.quantity) }}</dd>
+              <dd>{{ precise(selectedOrder.quantity) }}</dd>
               <dt>入场手续费</dt>
               <dd>{{ fmt(selectedOrder.entryFee) }} USDT</dd>
               <dt>持仓时间</dt>
@@ -585,7 +696,7 @@ onMounted(() => {
             <h3>平仓信息</h3>
             <dl>
               <dt>出场价</dt>
-              <dd>{{ fmt(selectedOrder.exit) }}</dd>
+              <dd>{{ precise(selectedOrder.exit) }}</dd>
               <dt>平仓原因</dt>
               <dd>{{ reason(selectedOrder.reason) }}</dd>
               <dt>毛收益</dt>
@@ -635,9 +746,9 @@ onMounted(() => {
             <dl v-if="remoteDetail[env]" class="binding-detail">
               <dt>币安状态</dt><dd><span class="binding-status" :data-status="remoteDetail[env].status">{{ syncStatusLabel(String(remoteDetail[env].status).toLowerCase()) }}</span></dd>
               <dt>订单类型</dt><dd>{{ remoteDetail[env].type || '—' }} · {{ remoteDetail[env].side || '—' }}</dd>
-              <dt>委托价</dt><dd>{{ remoteDetail[env].price ? fmt(remoteDetail[env].price) : '—' }}</dd>
-              <dt>成交均价</dt><dd>{{ remoteDetail[env].avgPrice ? fmt(remoteDetail[env].avgPrice) : '—' }}</dd>
-              <dt>委托 / 成交量</dt><dd>{{ fmt(remoteDetail[env].origQty) }} / {{ fmt(remoteDetail[env].executedQty) }}</dd>
+              <dt>委托价</dt><dd>{{ remoteDetail[env].price ? precise(remoteDetail[env].price) : '—' }}</dd>
+              <dt>成交均价</dt><dd>{{ remoteDetail[env].avgPrice ? precise(remoteDetail[env].avgPrice) : '—' }}</dd>
+              <dt>委托 / 成交量</dt><dd>{{ precise(remoteDetail[env].origQty) }} / {{ precise(remoteDetail[env].executedQty) }}</dd>
               <dt>最近更新</dt><dd>{{ remoteDetail[env].updateTime ? new Date(remoteDetail[env].updateTime).toLocaleString() : '—' }}</dd>
             </dl>
           </div>
@@ -684,6 +795,10 @@ onMounted(() => {
 </template>
 
 <style scoped>
+.exchange-sync-overview { margin: 12px 0 20px; color: var(--text-secondary); font-size: 12px; }
+.exchange-sync-overview p { margin: 6px 0; }
+.exchange-sync-overview small { color: var(--text-tertiary); }
+.local-order-note { display: block; color: var(--text-tertiary); font-size: 11px; }
 .capital-form {
   display: flex;
   gap: 10px;

@@ -119,6 +119,16 @@ export class BinanceMarket {
     return new Map(map);
   }
 
+  async bookTicker(symbol) {
+    if (typeof this.client.bookTicker !== 'function') return null;
+    return this.client.bookTicker(symbol);
+  }
+
+  async depth({ symbol, limit = 5 } = {}) {
+    if (typeof this.client.depth !== 'function') return null;
+    return this.client.depth({ symbol, limit });
+  }
+
   /**
    * Load the public derivatives context required by the supplied crypto SKILLs.
    * Individual endpoints are allowed to fail so the strategy can fail closed

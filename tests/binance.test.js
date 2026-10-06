@@ -180,6 +180,7 @@ test('manual order route forwards reduceOnly and positions expose the account mo
   const { createBinanceRouter } = await import('../server/routes/binance.js');
   const storeStub = { getConfig: async () => ({ binance: { apiKey: 'k', secretKey: 's', demo: true } }) };
   let submitted;
+  let accountRefreshes = 0;
   const clientStub = {
     hasCredentials: () => true,
     marketOrder: async args => { submitted = args; return { orderId: 21, status: 'FILLED' }; },
@@ -187,7 +188,8 @@ test('manual order route forwards reduceOnly and positions expose the account mo
     positionMode: async () => ({ dualSidePosition: false }),
     dualSidePosition: async () => false
   };
-  const router = createBinanceRouter({ store: storeStub, positionMonitor: {}, clientFactory: () => clientStub });
+  const router = createBinanceRouter({ store: storeStub, positionMonitor: {}, clientFactory: () => clientStub,
+    researchInstances: { simulation: { accountSync: { requestRefresh: () => { accountRefreshes++; } } } } });
   const invoke = (path, req) => new Promise((resolve, reject) => {
     const handler = router.stack.find(layer => layer.route?.path === path).route.stack[0].handle;
     const response = { statusCode: 200, body: null, json(body) { this.body = body; resolve(this); return body; }, status(code) { this.statusCode = code; return this; } };
@@ -197,6 +199,7 @@ test('manual order route forwards reduceOnly and positions expose the account mo
   const orderResponse = await invoke('/api/binance/order', { body: { symbol: 'BTCUSDT', side: 'SELL', type: 'MARKET', quantity: 0.001, reduceOnly: true } });
   assert.equal(orderResponse.body.order.orderId, 21);
   assert.equal(submitted.reduceOnly, true);
+  assert.equal(accountRefreshes, 1, 'successful manual order should immediately schedule account reconciliation');
   const positionsResponse = await invoke('/api/binance/positions', { query: { symbol: 'BTCUSDT' } });
   assert.equal(positionsResponse.body.positionMode, 'one-way');
   assert.equal(positionsResponse.body.positions.length, 1);
