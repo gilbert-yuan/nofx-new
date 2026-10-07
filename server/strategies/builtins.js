@@ -158,7 +158,7 @@ defineStrategy({
   planInterval: '1m',
   paramSchema: YAO_AMBUSH_PARAM_SCHEMA,
   prefilter: (symbols, ctx = {}) => prefilterYaoCoinSymbols(symbols, ctx),
-  analyze: (market, ctx = {}) => yaoCoinAmbushAnalysis(market, ctx),
+  analyze: (market, ctx = {}) => yaoCoinAmbushAnalysis(market, ctx, ctx.costs),
   review: (order, market) => yaoCoinAmbushReview(order, market)
 });
 
@@ -190,7 +190,7 @@ defineStrategy({
   marketWindows: { '4h': 300 },
   planInterval: '4h',
   paramSchema: H4_BREAKOUT_PARAM_SCHEMA,
-  analyze: (market, ctx = {}) => h4BreakoutAnalysis(market, ctx),
+  analyze: (market, ctx = {}) => h4BreakoutAnalysis(market, ctx, ctx.costs),
   // 订单自带的 exitRules 快照决定移动止损阶梯；复核直接复用跨引擎单一事实源
   review: (order, market) => h4BreakoutReview(order, market)
 });
@@ -218,7 +218,7 @@ defineStrategy({
   marketWindows: { '4h': 300 },
   planInterval: '4h',
   paramSchema: H4_REVERSION_PARAM_SCHEMA,
-  analyze: (market, ctx = {}) => h4ReversionAnalysis(market, ctx),
+  analyze: (market, ctx = {}) => h4ReversionAnalysis(market, ctx, ctx.costs),
   review: (order, market) => h4ReversionReview(order, market)
 });
 
@@ -243,7 +243,7 @@ defineStrategy({
   marketWindows: { '4h': 300 },
   planInterval: '4h',
   paramSchema: H4_CHANDELIER_PARAM_SCHEMA,
-  analyze: (market, ctx = {}) => h4ChandelierBreakoutAnalysis(market, ctx),
+  analyze: (market, ctx = {}) => h4ChandelierBreakoutAnalysis(market, ctx, ctx.costs),
   review: (order, market) => h4ChandelierReview(order, market)
 });
 

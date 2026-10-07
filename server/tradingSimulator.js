@@ -62,6 +62,9 @@ export class SimulatorConfig {
 
     // 成本参数
     this.costs = options.costs || { ...PAPER_COSTS };
+    // Explicit offline scenarios may change pending TTL; account defaults remain 24 hours.
+    this.pendingOrderTtlMs = Number.isFinite(options.pendingOrderTtlMs) && options.pendingOrderTtlMs > 0
+      ? options.pendingOrderTtlMs : 24 * 60 * 60 * 1000;
   }
 }
 
@@ -199,7 +202,7 @@ export class TradingSimulator {
       const ordered = rows.slice().sort((a, b) => Number(a.openTime) - Number(b.openTime));
       const seq = ordered.map(r => r.close);
       const maPeriod = Number.isInteger(smartExit.maPeriod) && smartExit.maPeriod > 1 ? smartExit.maPeriod : 20;
-      const atrPeriod = 14;
+      const atrPeriod = Number.isInteger(smartExit.atrPeriod) && smartExit.atrPeriod > 1 ? smartExit.atrPeriod : 14;
       for (let i = 0; i < ordered.length; i++) {
         const t = Number(ordered[i].openTime);
         if (i + 1 >= maPeriod) {
@@ -452,7 +455,7 @@ export class TradingSimulator {
         margin: this.config.costs.notional ?? PAPER_COSTS.notional,
         costs: { ...this.config.costs },
         protectionRevisions: [],
-        pendingExpiresAt: Number.isFinite(Date.parse(input.createdAt)) ? Date.parse(input.createdAt) + 24 * 60 * 60 * 1000 : null
+        pendingExpiresAt: Number.isFinite(Date.parse(input.createdAt)) ? Date.parse(input.createdAt) + this.config.pendingOrderTtlMs : null
       };
     }
 
@@ -470,7 +473,7 @@ export class TradingSimulator {
       margin: input.margin,
       costs: input.costs || { ...PAPER_COSTS },
       protectionRevisions: input.protectionRevisions || [],
-      pendingExpiresAt: Number.isFinite(Date.parse(input.createdAt)) ? Date.parse(input.createdAt) + 24 * 60 * 60 * 1000 : null,
+      pendingExpiresAt: Number.isFinite(Date.parse(input.createdAt)) ? Date.parse(input.createdAt) + this.config.pendingOrderTtlMs : null,
       entry: input.entry,
       entryTime: input.entryAt ? Date.parse(input.entryAt) : null,
       heldBars: input.heldBars || 0,

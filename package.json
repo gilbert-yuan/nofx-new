@@ -4,6 +4,12 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "backtest:campaign": "node --max-old-space-size=4096 scripts/backtest-campaign.mjs run",
+    "backtest:deploy": "node scripts/backtest-deploy.mjs",
+    "backtest:system": "node --max-old-space-size=4096 scripts/backtest-system.mjs",
+    "backtest:smoke": "node scripts/backtest-smoke.mjs",
+    "backtest:year": "node --max-old-space-size=4096 scripts/backtest-system.mjs all",
+    "backtest:strategies": "node --max-old-space-size=4096 scripts/backtest-system.mjs optimize",
     "migrate:simulated-account": "node scripts/migrate-simulated-account.js",
     "orders:cancel": "node scripts/cancel-pending-orders.mjs",
     "test": "node --env-file=tests/test.env --test tests/*.test.js",

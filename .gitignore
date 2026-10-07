@@ -16,6 +16,13 @@ scripts/*
 !scripts/backtest-flow-analysis.mjs
 !scripts/backtest-auto-trade.mjs
 !scripts/optimize-h4-rounds.mjs
+!scripts/backtest-system.mjs
+!scripts/backtest-smoke.mjs
+!scripts/backtest-campaign.mjs
+!scripts/backtest-deploy.mjs
+!scripts/backtest-*-v1.mjs
+!scripts/backtest/
+!scripts/backtest/**
 output/
 .claude/
 .codegraph/

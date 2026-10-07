@@ -331,6 +331,7 @@ function legacyStructureLongAnalysis(market, ctx = {}, costs = PAPER_COSTS) {
 export function structureLongAnalysis(market, ctx = {}) {
   return analyzeSkillStructure(market, ctx, {
     long: true,
+    costs: ctx.costs || {},
     params: resolveStructureLongParams(ctx?.params)
   });
 }

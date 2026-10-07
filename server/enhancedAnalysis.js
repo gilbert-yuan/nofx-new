@@ -243,6 +243,13 @@ const TRAIL_TP_ATR = TRAILING_RULE.extendTpAtr;
 // 于是「订单按自己策略的规则出场」—— 复核与逐根结算都从订单读，而非读全局常量。
 
 const ENHANCED_DEFAULTS_RAW = {
+  maFastPeriod: 20, maSlowPeriod: 50, atrPeriod: 14, rsiPeriod: 14,
+  macdFastPeriod: 12, macdSlowPeriod: 26, macdSignalPeriod: 9,
+  bollingerPeriod: 20, bollingerStdDev: 2,
+  volumeRecentPeriod: 5, volumeLookbackPeriod: 20,
+  supportRecentPeriod: 20, supportLookbackPeriod: 50,
+  ichimokuTenkanPeriod: 9, ichimokuKijunPeriod: 26, ichimokuSpanPeriod: 52,
+  dmiPeriod: 14, supertrendPeriod: 10, supertrendMultiplier: 3, obvPeriod: 20,
   // 信号过滤
   minTrendScore: MIN_TREND_SCORE,
   minAtrPct: MIN_ATR_PCT,
@@ -297,6 +304,7 @@ const ENHANCED_DEFAULTS_RAW = {
   trailingL2LockR: TRAILING_RULE.ladder[2].lockR,
   // 智能退出
   smartExitEnabled: SMART_EXIT.enabled,
+  smartExitMaPeriod: 20, smartExitAtrPeriod: 14,
   // 根级均线失守独立开关（方案A）：默认跟随总开关，确保既有配置零变化；
   // 可单独设为 true（配合 smartExitEnabled=false）只开根级均线失守、关复核层 CLOSE。
   smartExitBarLevelEnabled: SMART_EXIT.enabled,
@@ -316,8 +324,16 @@ const ENHANCED_DEFAULTS_RAW = {
 
 export const ENHANCED_DEFAULTS = Object.freeze(ENHANCED_DEFAULTS_RAW);
 
+export function enhancedWindowBars(parameters = {}) {
+  const p = { ...ENHANCED_DEFAULTS_RAW, ...parameters };
+  return Math.max(50, p.maSlowPeriod, p.maFastPeriod, p.atrPeriod + 1, p.rsiPeriod + 1,
+    p.macdSlowPeriod + p.macdSignalPeriod - 1, p.bollingerPeriod, p.volumeLookbackPeriod, p.supportLookbackPeriod,
+    p.ichimokuTenkanPeriod, p.ichimokuKijunPeriod, p.ichimokuSpanPeriod, p.dmiPeriod + 1, p.supertrendPeriod + 1, p.obvPeriod);
+}
+
 /** 参数分组（前端按此渲染分区） */
 export const PARAM_GROUP_LABELS = Object.freeze({
+  indicator: '指标周期',
   filter: '信号过滤',
   entry: '入场与挂单',
   protection: '止盈止损',
@@ -336,6 +352,12 @@ const boolSpec = (key, label, group, description) =>
  * 新增可调参数只需在此追加一项 —— 注册表校验、API、前端编辑器自动生效。
  */
 export const ENHANCED_PARAM_SCHEMA = Object.freeze([
+  ...['maFastPeriod', 'maSlowPeriod', 'atrPeriod', 'rsiPeriod', 'macdFastPeriod', 'macdSlowPeriod',
+    'macdSignalPeriod', 'bollingerPeriod', 'volumeRecentPeriod', 'volumeLookbackPeriod',
+    'supportRecentPeriod', 'supportLookbackPeriod', 'ichimokuTenkanPeriod', 'ichimokuKijunPeriod', 'ichimokuSpanPeriod',
+    'dmiPeriod', 'supertrendPeriod', 'obvPeriod'].map(key => numSpec(key, key, 'indicator', 2, 78, 1, '主周期已收盘 K 线上的指标周期；窗口不足时不生成信号。')),
+  numSpec('bollingerStdDev', '布林带标准差倍数', 'indicator', 0.5, 5, 0.1, '布林带宽度倍数。'),
+  numSpec('supertrendMultiplier', 'Supertrend ATR 倍数', 'indicator', 0.5, 10, 0.1, '超级趋势带的 ATR 倍数。'),
   numSpec('minTrendScore', '最低趋势评分', 'filter', 0, 100, 1, '综合信号强度门槛，低于该分数不出手。提高=降频提质。'),
   numSpec('minAtrPct', '波动率下限', 'filter', 0, 0.05, 0.0005, 'ATR/价格 下限；死水震荡市不做趋势单。0.007 = 0.7%。'),
   numSpec('maxAtrPct', '波动率上限', 'filter', 0.001, 0.5, 0.001, 'ATR/价格 上限；极端波动直接回避。0.012 = 1.2%。'),
@@ -384,6 +406,8 @@ export const ENHANCED_PARAM_SCHEMA = Object.freeze([
   numSpec('trailingBreakEvenFloorAtr', '保本落点（ATR）', 'exit', 0, 3, 0.05, '仅在启用保本落点时生效。'),
   numSpec('trailingBreakEvenCostBufferBps', '保本线成本缓冲（bps）', 'exit', 0, 200, 1, '净保本线的额外缓冲。'),
   boolSpec('smartExitEnabled', '启用智能退出', 'exit', '均线失守 / RSI 极值 / MACD 背离三条主动离场规则的总开关。'),
+  numSpec('smartExitMaPeriod', '智能退出均线周期', 'exit', 2, 78, 1, '逐根均线失守与持仓复核使用的均线周期。'),
+  numSpec('smartExitAtrPeriod', '智能退出 ATR 周期', 'exit', 2, 78, 1, '逐根均线失守偏离使用的 ATR 周期。'),
   boolSpec('smartExitBarLevelEnabled', '根级均线失守（独立开关）', 'exit', '把均线失守下沉到每根已收盘 K 线判定；独立于总开关，未设置时跟随「启用智能退出」。'),
   boolSpec('smartExitBarLevel', '逐根判定均线失守', 'exit', '把均线失守下沉到每根已收盘 K 线，降低离场延迟。'),
   numSpec('smartExitMaAtr', '均线失守偏离（ATR）', 'exit', 0.2, 5, 0.1, '均线失守需要偏离 MA20 超过该 ATR 倍数才生效。'),
@@ -457,7 +481,8 @@ export function buildExitRules(params) {
         ? p.smartExitBarLevelEnabled
         : p.smartExitEnabled,
       barLevel: p.smartExitBarLevel,
-      maPeriod: 20,
+      maPeriod: p.smartExitMaPeriod ?? 20,
+      atrPeriod: p.smartExitAtrPeriod ?? 14,
       maBreakAtr: p.smartExitMaAtr,
       maExitMaxProfitR: p.smartExitMaExitMaxR,
       tpMinR: p.smartExitTpMinR,
@@ -491,29 +516,29 @@ function ema(data, period) {
 // 修复 P2-3：原代码用 closes.slice(-9) 只取最近 9 根 K 线算 MACD 子序列再 EMA(9)，与标准全序列 EMA 偏差大，
 // signal 偏低、histogram 偏高，金叉/死叉判错。改为增量维护 EMA12/EMA26、构造完整 MACD 序列、再对 MACD 做 EMA(9)。
 // 数据需求：closes.length >= 26 才能算第一根 MACD，< 35 时 EMA9 信号线样本不足返回 null（避免半截信号污染趋势评分）。
-function calculateMACD(closes) {
-  if (closes.length < 26) return null;
+function calculateMACD(closes, fast = 12, slow = 26, signalPeriod = 9) {
+  if (fast >= slow || closes.length < slow) return null;
 
-  const k12 = 2 / (12 + 1);
-  const k26 = 2 / (26 + 1);
-  const k9  = 2 / (9  + 1);
+  const k12 = 2 / (fast + 1);
+  const k26 = 2 / (slow + 1);
+  const k9  = 2 / (signalPeriod + 1);
 
   // 用 SMA 初始化 EMA12 / EMA26（与既有 ema() 助手口径一致）
   let e12 = 0, e26 = 0;
-  for (let i = 0; i < 26; i++) {
-    if (i < 12) e12 += closes[i];
+  for (let i = 0; i < slow; i++) {
+    if (i < fast) e12 += closes[i];
     e26 += closes[i];
   }
-  e12 /= 12;
-  e26 /= 26;
+  e12 /= fast;
+  e26 /= slow;
 
   // 推进 EMA12/EMA26，记录每个 i>=25 时刻的 MACD(i) = EMA12(i) - EMA26(i)
   const macdSeries = [];
-  for (let i = 25; i < closes.length; i++) {
+  for (let i = slow - 1; i < closes.length; i++) {
     // EMA12 从 i=12 开始增量更新；到达 i=25 时已包含 closes[0..25]
-    if (i >= 12) e12 = closes[i] * k12 + e12 * (1 - k12);
+    if (i >= fast) e12 = closes[i] * k12 + e12 * (1 - k12);
     // EMA26 从 i=26 开始增量更新；i=25 时为 SMA 种子
-    if (i >= 26) e26 = closes[i] * k26 + e26 * (1 - k26);
+    if (i >= slow) e26 = closes[i] * k26 + e26 * (1 - k26);
     macdSeries.push(e12 - e26);
   }
 
@@ -522,14 +547,14 @@ function calculateMACD(closes) {
   const macdLine = macdSeries[macdSeries.length - 1];
 
   // 信号线至少需要 9 个 MACD 样本才能给出稳定的 EMA(9) 值
-  if (macdSeries.length < 9) {
+  if (macdSeries.length < signalPeriod) {
     return { macdLine, signalLine: null, histogram: null };
   }
 
   let signal = 0;
-  for (let i = 0; i < 9; i++) signal += macdSeries[i];
-  signal /= 9;
-  for (let i = 9; i < macdSeries.length; i++) {
+  for (let i = 0; i < signalPeriod; i++) signal += macdSeries[i];
+  signal /= signalPeriod;
+  for (let i = signalPeriod; i < macdSeries.length; i++) {
     signal = macdSeries[i] * k9 + signal * (1 - k9);
   }
 
@@ -574,11 +599,11 @@ function calculateBollinger(closes, period = 20, stdDev = 2) {
 }
 
 // 成交量分析
-function analyzeVolume(volumes) {
-  if (volumes.length < 20) return null;
+function analyzeVolume(volumes, recentPeriod = 5, lookbackPeriod = 20) {
+  if (recentPeriod >= lookbackPeriod || volumes.length < lookbackPeriod) return null;
 
-  const recent = volumes.slice(-5);
-  const baseline = volumes.slice(-20, -5);
+  const recent = volumes.slice(-recentPeriod);
+  const baseline = volumes.slice(-lookbackPeriod, -recentPeriod);
 
   const recentAvg = recent.reduce((sum, v) => sum + v, 0) / recent.length;
   const baselineAvg = baseline.reduce((sum, v) => sum + v, 0) / baseline.length;
@@ -590,21 +615,21 @@ function analyzeVolume(volumes) {
 }
 
 // 寻找支撑阻力位
-function findSupportResistance(klines) {
-  if (klines.length < 50) return null;
+function findSupportResistance(klines, recentPeriod = 20, lookbackPeriod = 50) {
+  if (klines.length < lookbackPeriod) return null;
 
   const highs = klines.map(k => k.high);
   const lows = klines.map(k => k.low);
 
   // 最近的高点和低点
-  const recentHigh = Math.max(...highs.slice(-20));
-  const recentLow = Math.min(...lows.slice(-20));
+  const recentHigh = Math.max(...highs.slice(-recentPeriod));
+  const recentLow = Math.min(...lows.slice(-recentPeriod));
 
   // 历史关键位（出现频率高的价格区域）
   const priceRanges = {};
   const binSize = (recentHigh - recentLow) / 20;
 
-  klines.slice(-50).forEach(k => {
+  klines.slice(-lookbackPeriod).forEach(k => {
     const bin = Math.floor((k.high - recentLow) / binSize);
     priceRanges[bin] = (priceRanges[bin] || 0) + 1;
   });
@@ -625,7 +650,7 @@ function findSupportResistance(klines) {
 }
 
 // 趋势强度评分
-function calculateTrendStrength(market) {
+function calculateTrendStrength(market, p = ENHANCED_DEFAULTS_RAW) {
   let score = 0;
   const reasons = [];
 
@@ -640,8 +665,8 @@ function calculateTrendStrength(market) {
   // 总分：100分
 
   // 1. 均线排列 (20分)
-  const ma20 = closes.slice(-20).reduce((sum, c) => sum + c, 0) / 20;
-  const ma50 = closes.slice(-50).reduce((sum, c) => sum + c, 0) / 50;
+  const ma20 = closes.slice(-p.maFastPeriod).reduce((sum, c) => sum + c, 0) / p.maFastPeriod;
+  const ma50 = closes.slice(-p.maSlowPeriod).reduce((sum, c) => sum + c, 0) / p.maSlowPeriod;
   const close = rows.at(-1).close;
 
   if (ma20 > ma50 && close > ma20) {
@@ -658,7 +683,7 @@ function calculateTrendStrength(market) {
   }
 
   // 2. MACD (15分)
-  const macd = calculateMACD(closes);
+  const macd = calculateMACD(closes, p.macdFastPeriod, p.macdSlowPeriod, p.macdSignalPeriod);
   if (macd) {
     if (Math.abs(macd.histogram) > Math.abs(closes[closes.length - 10] - closes[closes.length - 1]) * 0.002) {
       if (macd.histogram > 0 && macd.macdLine > macd.signalLine) {
@@ -678,7 +703,7 @@ function calculateTrendStrength(market) {
   }
 
   // 3. RSI (12分)
-  const rsi = calculateRSI(closes);
+  const rsi = calculateRSI(closes, p.rsiPeriod);
   if (rsi !== null) {
     if (rsi > 50 && rsi < 70) {
       score += 12;
@@ -699,7 +724,7 @@ function calculateTrendStrength(market) {
   }
 
   // 4. 布林带 (10分)
-  const bb = calculateBollinger(closes);
+  const bb = calculateBollinger(closes, p.bollingerPeriod, p.bollingerStdDev);
   if (bb) {
     const position = (close - bb.lower) / (bb.upper - bb.lower);
     if (position > 0.3 && position < 0.7) {
@@ -718,7 +743,7 @@ function calculateTrendStrength(market) {
   }
 
   // 5. 成交量 (13分)
-  const volumeAnalysis = analyzeVolume(volumes);
+  const volumeAnalysis = analyzeVolume(volumes, p.volumeRecentPeriod, p.volumeLookbackPeriod);
   if (volumeAnalysis) {
     if (volumeAnalysis.strong) {
       score += 13;
@@ -739,7 +764,8 @@ function calculateTrendStrength(market) {
 
   // 6. Ichimoku一目均衡表 (10分)
   try {
-    const ichimoku = calculateIchimoku(highs, lows, closes);
+    const ichimoku = calculateIchimoku(highs, lows, closes, { tenkanPeriod: p.ichimokuTenkanPeriod,
+      kijunPeriod: p.ichimokuKijunPeriod, senkouBPeriod: p.ichimokuSpanPeriod });
     if (ichimoku) {
       const ichimokuScore = ichimoku.strength / 7; // 转换为10分制
       score += ichimokuScore;
@@ -751,7 +777,7 @@ function calculateTrendStrength(market) {
 
   // 7. DMI/ADX趋势强度 (8分)
   try {
-    const dmi = calculateDMI(highs, lows, closes);
+    const dmi = calculateDMI(highs, lows, closes, p.dmiPeriod);
     if (dmi) {
       if (dmi.trendStrength === 'STRONG') {
         score += 8;
@@ -770,7 +796,7 @@ function calculateTrendStrength(market) {
 
   // 8. Supertrend超级趋势 (7分)
   try {
-    const supertrend = calculateSupertrend(highs, lows, closes);
+    const supertrend = calculateSupertrend(highs, lows, closes, p.supertrendPeriod, p.supertrendMultiplier);
     if (supertrend) {
       if (supertrend.trend === 'BULLISH' || supertrend.trend === 'BEARISH') {
         score += 7;
@@ -786,7 +812,7 @@ function calculateTrendStrength(market) {
 
   // 9. OBV能量潮 (5分)
   try {
-    const obv = calculateOBV(closes, volumes);
+    const obv = calculateOBV(closes, volumes, p.obvPeriod);
     if (obv) {
       if (obv.signal === 'BULLISH' || obv.signal === 'BEARISH') {
         score += 5;
@@ -841,7 +867,7 @@ export function enhancedAnalysis(market, overrides, ctx = {}) {
   });
 
   // 最低数据要求
-  if (rows.length < 50) {
+  if (rows.length < enhancedWindowBars(P)) {
     return wait('需要至少50根K线数据，当前数据不足。', ['数据不足，无法可靠分析。']);
   }
 
@@ -853,19 +879,19 @@ export function enhancedAnalysis(market, overrides, ctx = {}) {
   const close = rows.at(-1).close;
 
   // 计算所有指标
-  const ma20 = closes.slice(-20).reduce((sum, c) => sum + c, 0) / 20;
-  const ma50 = closes.slice(-50).reduce((sum, c) => sum + c, 0) / 50;
-  const atr = rows.slice(-14).reduce((sum, r, i) => {
-    const previous = rows[rows.length - 15 + i].close;
+  const ma20 = closes.slice(-P.maFastPeriod).reduce((sum, c) => sum + c, 0) / P.maFastPeriod;
+  const ma50 = closes.slice(-P.maSlowPeriod).reduce((sum, c) => sum + c, 0) / P.maSlowPeriod;
+  const atr = rows.slice(-P.atrPeriod).reduce((sum, r, i) => {
+    const previous = rows[rows.length - P.atrPeriod - 1 + i].close;
     return sum + Math.max(r.high - r.low, Math.abs(r.high - previous), Math.abs(r.low - previous));
-  }, 0) / 14;
+  }, 0) / P.atrPeriod;
 
-  const macd = calculateMACD(closes);
-  const rsi = calculateRSI(closes);
-  const bb = calculateBollinger(closes);
-  const volumeAnalysis = analyzeVolume(volumes);
-  const srLevels = findSupportResistance(rows);
-  const trendStrength = calculateTrendStrength(market);
+  const macd = calculateMACD(closes, P.macdFastPeriod, P.macdSlowPeriod, P.macdSignalPeriod);
+  const rsi = calculateRSI(closes, P.rsiPeriod);
+  const bb = calculateBollinger(closes, P.bollingerPeriod, P.bollingerStdDev);
+  const volumeAnalysis = analyzeVolume(volumes, P.volumeRecentPeriod, P.volumeLookbackPeriod);
+  const srLevels = findSupportResistance(rows, P.supportRecentPeriod, P.supportLookbackPeriod);
+  const trendStrength = calculateTrendStrength(market, P);
 
   // 波动率过滤（上下限均为策略参数；上限：极端行情回避，下限：死水/震荡不做趋势单）
   const volatility = atr / close;
@@ -1184,6 +1210,7 @@ export function enhancedAnalysis(market, overrides, ctx = {}) {
       trendStrengthScore: trendStrength.score,
       trend15Filter: trend15FilterResult,
       indicators: {
+        periods: Object.fromEntries(ENHANCED_PARAM_SCHEMA.filter(s => s.group === 'indicator').map(s => [s.key, P[s.key]])),
         ma20,
         ma50,
         atr,
@@ -1202,6 +1229,7 @@ export function enhancedAnalysis(market, overrides, ctx = {}) {
  * 增强版持仓复核
  */
 export function enhancedProtectionReview(order, market) {
+  const P = { ...ENHANCED_DEFAULTS_RAW, ...(order.plan?.indicators?.periods || {}) };
   // 该订单**所属策略**的出场规则：下单时快照在 order.plan.exitRules，
   // 旧订单（无该字段）自动回退全局默认值 —— 因此多策略并存时每单按自己的规则出场。
   const rules = exitRulesFor(order.plan);
@@ -1217,15 +1245,17 @@ export function enhancedProtectionReview(order, market) {
 
   // 重新计算技术指标
   const closes = rows.map(r => r.close);
-  const ma20 = closes.slice(-20).reduce((sum, c) => sum + c, 0) / 20;
-  const atr = rows.slice(-14).reduce((sum, r, i) => {
-    const previous = rows[rows.length - 15 + i].close;
+  const maPeriod = smartRule.maPeriod || 20, atrPeriod = smartRule.atrPeriod || 14;
+  if (rows.length < Math.max(maPeriod, atrPeriod + 1)) return { action: 'HOLD', reason: '指标周期所需数据不足。' };
+  const ma20 = closes.slice(-maPeriod).reduce((sum, c) => sum + c, 0) / maPeriod;
+  const atr = rows.slice(-atrPeriod).reduce((sum, r, i) => {
+    const previous = rows[rows.length - atrPeriod - 1 + i].close;
     return sum + Math.max(r.high - r.low, Math.abs(r.high - previous), Math.abs(r.low - previous));
-  }, 0) / 14;
+  }, 0) / atrPeriod;
 
-  const rsi = calculateRSI(closes);
-  const macd = calculateMACD(closes);
-  const trendStrength = calculateTrendStrength(market);
+  const rsi = calculateRSI(closes, P.rsiPeriod);
+  const macd = calculateMACD(closes, P.macdFastPeriod, P.macdSlowPeriod, P.macdSignalPeriod);
+  const trendStrength = calculateTrendStrength(market, P);
 
   // 评估当前趋势
   const trendValid = long ? (close > ma20) : (close < ma20);

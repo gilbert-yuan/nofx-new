@@ -22,12 +22,12 @@
  * Ichimoku Cloud (一目均衡表)
  * 最强大的趋势判断系统之一
  */
-export function calculateIchimoku(highs, lows, closes) {
-  if (highs.length < 52) return null;
-
-  const tenkanPeriod = 9;   // 转换线
-  const kijunPeriod = 26;   // 基准线
-  const senkouBPeriod = 52; // 先行带B
+export function calculateIchimoku(highs, lows, closes, options = {}) {
+  const tenkanPeriod = options.tenkanPeriod ?? 9;
+  const kijunPeriod = options.kijunPeriod ?? 26;
+  const senkouBPeriod = options.senkouBPeriod ?? 52;
+  if (![tenkanPeriod, kijunPeriod, senkouBPeriod].every(p => Number.isInteger(p) && p > 1)
+    || highs.length < Math.max(tenkanPeriod, kijunPeriod, senkouBPeriod)) return null;
 
   // 转换线 = (9日最高 + 9日最低) / 2
   const tenkanSen = (
@@ -51,7 +51,7 @@ export function calculateIchimoku(highs, lows, closes) {
   ) / 2;
 
   // 滞后线 = 收盘价，向后移26期
-  const chikouSpan = closes[closes.length - 26];
+  const chikouSpan = closes[closes.length - kijunPeriod];
 
   const currentPrice = closes[closes.length - 1];
 
@@ -68,7 +68,7 @@ export function calculateIchimoku(highs, lows, closes) {
     if (tenkanSen > kijunSen) strength += 20;
 
     // 滞后线 > 价格 = 更强
-    if (chikouSpan && chikouSpan > closes[closes.length - 26]) strength += 20;
+    if (chikouSpan && chikouSpan > closes[closes.length - kijunPeriod]) strength += 20;
   }
   // 价格在云下方 = 看跌
   else if (currentPrice < Math.min(senkouSpanA, senkouSpanB)) {
@@ -76,7 +76,7 @@ export function calculateIchimoku(highs, lows, closes) {
     strength += 30;
 
     if (tenkanSen < kijunSen) strength += 20;
-    if (chikouSpan && chikouSpan < closes[closes.length - 26]) strength += 20;
+    if (chikouSpan && chikouSpan < closes[closes.length - kijunPeriod]) strength += 20;
   }
 
   return {
@@ -246,7 +246,7 @@ export function calculateSupertrend(highs, lows, closes, period = 10, multiplier
  * OBV (能量潮指标)
  * 通过成交量变化判断趋势
  */
-export function calculateOBV(closes, volumes) {
+export function calculateOBV(closes, volumes, period = 20) {
   if (closes.length < 2) return null;
 
   let obv = 0;
@@ -261,8 +261,8 @@ export function calculateOBV(closes, volumes) {
   // 计算OBV的趋势
   const obvs = [];
   let tempObv = 0;
-  for (let i = 1; i < Math.min(closes.length, 20); i++) {
-    const idx = closes.length - 20 + i;
+  for (let i = 1; i < Math.min(closes.length, period); i++) {
+    const idx = closes.length - period + i;
     if (idx < 1) continue;
 
     if (closes[idx] > closes[idx - 1]) {

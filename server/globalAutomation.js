@@ -23,6 +23,9 @@ import { AUTO_TRADE } from '../shared/autoTradeDefaults.js';
 import { screenUniverse, checkBookLiquidity, tickerToSnapshot } from './shared/liquidityScreen.js';
 import { sizeSignal } from './shared/scoreSizing.js';
 import { shouldHaltNewEntries } from './shared/lossCircuit.js';
+import { backtestEntryFilter } from './shared/backtestFeatureFilters.js';
+import { enhancedWindowBars } from './enhancedAnalysis.js';
+import { klineFeatures, matchFeatureRules } from '../shared/strategyFeatureFilter.js';
 
 /**
  * 对一轮扫描得到的机会做确定性排序。
@@ -710,6 +713,10 @@ export class GlobalAutomation {
    */
   async runStrategyAnalysis({ strategy, symbol, market, submit, interval, config, strategyPrompt,
     state, adaptiveConfig, adaptiveOverrides, localHistory }) {
+    if (strategy.engine === 'enhanced') {
+      const required = enhancedWindowBars(strategy.params);
+      if (market.klines.length < required) market = await this.getFreshMarket(symbol, interval, false, required);
+    }
     const ctx = {
       params: strategy.params,
       config,
@@ -758,6 +765,29 @@ export class GlobalAutomation {
       // btcMarket: null,   // 已关闭，不再向分析器注入
       requireFiveMinute: Boolean(strategy.marketContext?.requireFiveMinute)
     };
+
+    if (submit) {
+      let filter;
+      try {
+        filter = backtestEntryFilter(config, strategy.id, strategy.params);
+        if (filter?.rules.length) {
+          const tf = filter.featureConfig.interval, count = filter.featureConfig.lookbackBars;
+          const existing = tf === market.interval ? market : ctx.auxMarkets?.[tf];
+          const featureMarket = existing?.klines?.length >= count ? existing
+            : await this.getFreshMarket(symbol, tf, false, count);
+          const features = featureMarket && !featureMarket.partial
+            ? klineFeatures(featureMarket.klines, filter.featureConfig) : null;
+          const verdict = matchFeatureRules(features, filter.rules, filter.missing);
+          if (!verdict.passed) return { analysis: { action: 'WAIT', positionRecommendation: 'WAIT',
+            confidence: 1, plan: null, reason: `回测特征筛选未通过：${verdict.failures.join('；')}`,
+            risk: '特征过滤来自历史数据，不能保证未来盈利。', featureFilter: { features, ...verdict } },
+            auxMarkets: ctx.auxMarkets || {} };
+        }
+      } catch (error) {
+        return { analysis: { action: 'WAIT', positionRecommendation: 'WAIT', confidence: 1, plan: null,
+          reason: `回测特征筛选不可用：${error.message}`, risk: '筛选数据不足，等待数据恢复。' }, auxMarkets: ctx.auxMarkets || {} };
+      }
+    }
 
     if (strategy.engine === 'local') {
       const defaults = {

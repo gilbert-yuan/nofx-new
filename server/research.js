@@ -91,7 +91,7 @@ export function prepareMarket({ symbol, interval, rows, limit, now = Date.now(),
   return { symbol, exchange: 'binance', marketProvider, interval, dataAsOf: new Date(end).toISOString(), klines: closed };
 }
 
-export function normalizePlan(raw, market, now, costs = PAPER_COSTS) {
+export function normalizePlan(raw, market, now, costs = PAPER_COSTS, options = {}) {
   const issues = [];
   if (Date.parse(market.dataAsOf) !== candleOpenAt(now, market.interval)) issues.push('分析完成时行情已跨周期，请重新分析');
   const requestedAction = String(raw?.positionRecommendation || raw?.action || 'WAIT').toUpperCase();
@@ -125,7 +125,9 @@ export function normalizePlan(raw, market, now, costs = PAPER_COSTS) {
       const entryLimit = !marketEntry && Number.isFinite(plan.entryLimit) ? plan.entryLimit : null;
       if (entryMin > entryMax || (long ? !(stopLoss < entryMin && takeProfit > entryMax) : !(takeProfit < entryMin && stopLoss > entryMax))) issues.push('入场、止损、止盈价格关系无效');
 
-      if (!Number.isInteger(maxHoldBars) || maxHoldBars > 120) issues.push('持有期限须为1～120根');
+      const holdLimit = Number.isInteger(options.maxHoldBarsLimit) && options.maxHoldBarsLimit >= 120
+        ? options.maxHoldBarsLimit : 120;
+      if (!Number.isInteger(maxHoldBars) || maxHoldBars > holdLimit) issues.push(`持有期限须为1～${holdLimit}根`);
       if (!issues.length) {
         // 入场基准价：优先限价 entryLimit（实际成交价），否则用区间边沿（最不利价）。
         const entry = entryLimit != null ? entryLimit : (long ? entryMax : entryMin);
@@ -178,6 +180,9 @@ export function normalizePlan(raw, market, now, costs = PAPER_COSTS) {
           ...(liquidationSafety !== undefined ? { liquidationSafety } : {}),
           ...(plan.exitRules && typeof plan.exitRules === 'object' ? { exitRules: plan.exitRules } : {}),
           ...(plan.smartExit && typeof plan.smartExit === 'object' ? { smartExit: plan.smartExit } : {}),
+          ...(plan.indicators?.periods && typeof plan.indicators.periods === 'object'
+            ? { indicators: { periods: Object.fromEntries(Object.entries(plan.indicators.periods)
+              .filter(([, value]) => Number.isFinite(value) && value > 0 && value <= 156)) } } : {}),
           ...(marginRiskPct !== undefined ? { marginRiskPct } : {}) };
       }
     }

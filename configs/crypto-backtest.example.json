@@ -1,0 +1,79 @@
+{
+  "version": 1,
+  "period": { "days": 365, "from": null, "to": null, "warmupDays": 90 },
+  "data": {
+    "directory": "data/backtest/crypto-year",
+    "legacyDirectories": ["data/backtest/bf365-1m"],
+    "symbols": "all",
+    "market": "binance-usdm-perpetual",
+    "quoteAsset": "USDT",
+    "downloadWorkers": 2,
+    "verifyChecksums": true,
+    "restFallback": true,
+    "restLookbackDays": 7,
+    "minCoverage": 0.95,
+    "minObservedDays": 1,
+    "allowPartialHistory": true,
+    "historicalProfiles": null
+  },
+  "parameterSource": "schema",
+  "execution": {
+    "initialBalance": 1000,
+    "marginPct": 0.05,
+    "fixedMargin": null,
+    "riskPct": 0.01,
+    "maxLeverage": 5,
+    "leverage": null,
+    "respectStrategySizing": true,
+    "pendingMinutes": 1440,
+    "cooldownMinutes": 0,
+    "stopCooldownMinutes": 60,
+    "dailyLossPct": 0.03,
+    "consecutiveLossLimit": 5,
+    "decisionEveryBars": 1,
+    "reviewEveryBars": 1
+  },
+  "costs": { "feeBps": 6, "slippageBps": 5, "fundingBpsPer8h": 3 },
+  "features": {
+    "enabled": true,
+    "interval": "1h",
+    "lookbackBars": 72,
+    "trendBars": 24,
+    "atrPeriod": 14,
+    "volumePeriod": 20,
+    "minCoinsPerGroup": 5,
+    "minTradesPerCoin": 5,
+    "maxRules": 2,
+    "manualRules": []
+  },
+  "optimization": {
+    "trainFraction": 0.6,
+    "validationFraction": 0.2,
+    "method": "adaptive-random",
+    "objective": "return",
+    "autoSpace": true,
+    "seed": 20261007,
+    "maxRounds": 5,
+    "trialsPerRound": 8,
+    "patience": 2,
+    "minTrades": 10,
+    "minTradesPerCoin": 3,
+    "maxDrawdown": 0.6,
+    "drawdownPenalty": 0.5,
+    "instabilityPenalty": 0.1,
+    "runtimeSpace": {},
+    "costSpace": {}
+  },
+  "strategies": {
+    "h4-mean-reversion-v1": {
+      "params": {},
+      "searchSpace": {
+        "entryExtAtr": [1.5, 2, 2.5],
+        "stopAtr": [1.2, 1.5, 1.8],
+        "tpR": [1.2, 1.5, 2],
+        "maxHoldBars": [12, 17, 24]
+      }
+    }
+  },
+  "output": { "directory": "output/crypto-backtest", "workers": 2, "resume": true, "saveTrades": true }
+}

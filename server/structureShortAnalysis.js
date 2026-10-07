@@ -342,6 +342,7 @@ function legacyStructureShortAnalysis(market, ctx = {}, costs = PAPER_COSTS) {
 export function structureShortAnalysis(market, ctx = {}) {
   return analyzeSkillStructure(market, ctx, {
     long: false,
+    costs: ctx.costs || {},
     params: resolveStructureShortParams(ctx?.params)
   });
 }

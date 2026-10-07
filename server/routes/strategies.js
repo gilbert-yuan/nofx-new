@@ -31,6 +31,17 @@ export function createStrategiesRouter({ strategies, store, globalAutomation = n
 
   router.put('/api/strategies/:id', asyncHandler(async (req, res) => {
     const body = req.body || {};
+    if (body.expectedParams) {
+      if (typeof body.expectedParams !== 'object' || Array.isArray(body.expectedParams))
+        return res.status(400).json({ error: 'expectedParams 需为参数对象。' });
+      const current = await strategies.describe(req.params.id, await config());
+      if (!current) return res.status(404).json({ error: '策略不存在。' });
+      const expected = body.expectedParams;
+      if (Object.keys(current.params).length !== Object.keys(expected).length
+        || Object.keys(current.params).some(key => current.params[key] !== expected[key])) {
+        return res.status(409).json({ error: '策略参数已变更，回测基线不再匹配；重新回测后再应用。' });
+      }
+    }
     const patch = {};
     if (typeof body.enabled === 'boolean') patch.enabled = body.enabled;
     if (body.params && typeof body.params === 'object') patch.params = body.params;

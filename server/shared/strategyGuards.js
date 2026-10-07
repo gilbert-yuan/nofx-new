@@ -300,6 +300,7 @@ export function resolveSmartExitRule(smartExit) {
       : smartExit.enabled !== false,
     barLevel: smartExit.barLevel !== false,
     maPeriod: Number.isInteger(smartExit.maPeriod) && smartExit.maPeriod > 1 ? smartExit.maPeriod : 20,
+    atrPeriod: Number.isInteger(smartExit.atrPeriod) && smartExit.atrPeriod > 1 ? smartExit.atrPeriod : 14,
     maBreakAtr: pick(smartExit.maBreakAtr, SMART_EXIT.maBreakAtr),
     maExitMaxProfitR: pick(smartExit.maExitMaxProfitR, SMART_EXIT.maExitMaxProfitR),
     tpMinR: pick(smartExit.tpMinR, SMART_EXIT.tpMinR),
