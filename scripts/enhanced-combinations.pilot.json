@@ -1,0 +1,17 @@
+{
+  "backtest": {
+    "period": { "from": "2026-09-06T00:00:00Z", "to": "2026-10-06T00:00:00Z", "warmupDays": 90 },
+    "parameterSource": "configured",
+    "data": { "directory": "data/backtest/crypto-year", "legacyDirectories": [], "symbols": "all", "minCoverage": 0.95, "allowPartialHistory": false },
+    "execution": { "initialBalance": 1000, "marginPct": 0.05, "riskPct": 0.01, "maxLeverage": 12, "decisionEveryBars": 1, "reviewEveryBars": 1 },
+    "optimization": { "minTrades": 5, "maxDrawdown": 0.5, "objective": "risk-adjusted-return", "trainFraction": 0.6, "validationFraction": 0.2 },
+    "features": { "enabled": false },
+    "output": { "directory": "output/enhanced-combinations-pilot", "workers": 2, "resume": true }
+  },
+  "search": {
+    "seed": 20261007, "mainTrials": 6, "singleTrials": 3, "pairTrials": 3,
+    "topMain": 2, "topSingles": 2, "maxSymbols": 12, "strategyIds": "disabled",
+    "modes": ["all", "any"], "lookbackBars": [0, 1, 3], "minScores": [0, 60, 70],
+    "yaoKlineOnly": true
+  }
+}

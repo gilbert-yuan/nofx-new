@@ -1,0 +1,41 @@
+{
+  "backtest": {
+    "period": { "from": "2025-10-06T00:00:00Z", "to": "2026-10-06T00:00:00Z", "warmupDays": 55 },
+    "parameterSource": "configured",
+    "data": { "directory": "data/backtest/crypto-year", "legacyDirectories": [], "symbols": "all", "minCoverage": 0.95, "minObservedDays": 1, "allowPartialHistory": true },
+    "execution": { "initialBalance": 100, "marginPct": 0.05, "riskPct": 0.01, "leverage": 10, "maxLeverage": 10, "respectStrategySizing": false, "pendingMinutes": 30, "cooldownMinutes": 5, "stopCooldownMinutes": 60, "dailyLossPct": 0.1, "consecutiveLossLimit": 8, "decisionEveryBars": 1, "reviewEveryBars": 1 },
+    "costs": { "feeBps": 6, "slippageBps": 5, "fundingBpsPer8h": 3 },
+    "features": { "enabled": false },
+    "optimization": { "minTrades": 15, "maxDrawdown": 0.5, "objective": "return", "trainFraction": 0.6, "validationFraction": 0.2 },
+    "output": { "directory": "output/yao-h4-100u-10x", "workers": 3, "resume": true }
+  },
+  "capital": { "maxPositions": 5, "maxMarginPct": 0.5, "minMargin": 0.5, "minNotional": 5, "pendingCooldownMinutes": 5 },
+  "search": {
+    "seed": 20261008, "sampleSymbols": 32, "trials": 32, "refinementTrials": 24,
+    "refinementSpace": {
+      "entryPullbackAtr": [1, 2], "entryBandAtr": [0.1, 0.3, 0.5],
+      "require15mTrend": [true, false], "stopAtr": [0.5, 1],
+      "minStopPct": [0.003, 0.005, 0.008, 0.015],
+      "tp1R": [0.5, 1, 1.5], "tp2R": [1, 2, 3], "tp3R": [2, 3, 5],
+      "maxHoldBars": [5, 15, 30, 60, 120], "trailingTriggerR": [0.5, 1, 1.5]
+    },
+    "filterModes": ["trend", "signal"], "lookbackBars": [0, 1],
+    "mainSpace": {
+      "minProbabilityPct": [40], "minRawProbabilityPct": [75, 80, 85, 90, 95],
+      "minCurrentAmplitudePct": [6, 8, 12, 16], "maxCurrentAmplitudePct": [35, 42, 48],
+      "minRecentReturnPct": [1, 1.5, 2, 3], "minVolumeRatio": [1.5, 2, 2.5, 3],
+      "minRangeRatio": [1.2, 1.5, 2], "minTrendConsistencyPct": [50, 60, 70, 80],
+      "entryPullbackAtr": [0.5, 1, 1.5, 2], "entryBandAtr": [0.3, 0.5],
+      "require15mTrend": [true, false], "minTrend15SepAtr": [0, 0.3, 0.6],
+      "stopAtr": [0.5, 1, 2], "minStopPct": [0.005, 0.008, 0.01, 0.015],
+      "tp1R": [1, 1.5, 2], "tp2R": [2, 2.5, 3], "tp3R": [3, 3.5, 5, 7],
+      "maxHoldBars": [30, 60, 90, 120], "trailingTriggerR": [0.5, 1, 1.5],
+      "trailingProfitTriggerPct": [0.02, 0.04, 0.08]
+    },
+    "h4Space": {
+      "emaFast": [8, 12, 20], "emaSlow": [26, 50], "trendSepAtr": [0, 0.3, 0.6],
+      "adxMin": [0, 15, 20], "channelPeriod": [10, 20], "breakoutBufAtr": [0, 0.05],
+      "volumeMult": [0, 1], "rsiLongMin": [45, 50], "rsiShortMax": [50, 55]
+    }
+  }
+}

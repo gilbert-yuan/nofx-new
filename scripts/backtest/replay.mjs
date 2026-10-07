@@ -9,6 +9,7 @@ import { klineFeatures, matchFeatureRules } from '../../shared/strategyFeatureFi
 import { abs, DAY, MINUTE, duration, validateParams, validateExecution } from './config.mjs';
 import { readCandles, resample, closedWindow, coverage } from './data.mjs';
 import { tradeMetrics } from './stats.mjs';
+import { createConfirmationGate } from './confirmation.mjs';
 
 let cached = null;
 export async function dataset(file, config) {
@@ -42,7 +43,7 @@ function readProfiles(config) {
   return out;
 }
 export async function replay({ config, strategyId, symbol, file, params, execution, costs,
-  from, to, rules = [], keepTrades = true }) {
+  from, to, rules = [], keepTrades = true, confirmation = null }) {
   const def = getStrategy(strategyId);
   if (!def) throw new Error(`未知策略 ${strategyId}`);
   params = validateParams(def, params); execution ||= config.execution; costs ||= config.costs;
@@ -61,13 +62,16 @@ export async function replay({ config, strategyId, symbol, file, params, executi
   const primaryWindow = def.engine === 'enhanced' ? Math.max(def.marketWindow, enhancedWindowBars(params)) : def.marketWindow;
   const neededTFs = new Set(['1m', interval, ...def.needsAux, config.features.interval]);
   for (const tf of neededTFs) if (!loaded.intervals.has(tf)) loaded.intervals.set(tf, resample(base, tf));
+  const confirm = createConfirmationGate({ confirmation, loaded, symbol, costs, execution,
+    profileAt: time => profilesAt(profiles, symbol, time, config.data.profileMaxAgeDays * DAY) });
   const simulator = new TradingSimulator({ mode: 'account', unlimitedCapital: false, initialBalance: execution.initialBalance,
     enableLiquidation: execution.enableLiquidation, enableIsolatedMargin: execution.enableIsolatedMargin,
     enableDynamicProtection: execution.enableDynamicProtection, pendingOrderTtlMs: execution.pendingMinutes * MINUTE, costs });
   const start = base.lowerBound(from), end = base.lowerBound(to), trades = [], monthly = {};
   if (end <= start) return { ...result, status: 'excluded', reason: 'no_data_in_segment' };
   const funnel = { decisions: 0, insufficient: 0, analyzed: 0, signals: 0, featureRejected: 0,
-    profileRejected: 0, profileMissing: 0, orders: 0, expired: 0, riskRejected: 0, cancelledAtEnd: 0 };
+    profileRejected: 0, profileMissing: 0, orders: 0, expired: 0, riskRejected: 0, cancelledAtEnd: 0,
+    confirmationRejected: 0, confirmationUnavailable: 0 };
   let order = null, realized = 0, peak = execution.initialBalance, drawdown = 0, cooldownUntil = -Infinity;
   let day = -1, dailyOpening = execution.initialBalance, dailyRealized = 0, losses = 0, activeMinutes = 0;
   let firstEquity = execution.initialBalance, analysisErrors = 0, firstError = null;
@@ -104,7 +108,7 @@ export async function replay({ config, strategyId, symbol, file, params, executi
       gross: order.gross, fees: order.fees ?? order.fee, funding: order.funding, reason: order.reason,
       periodEnd: order.periodEnd || false, ambiguousBar: order.ambiguousBar || false,
       partialFills: order.partialFills ?? order.tpStage ?? 0, features: order.features,
-      featureAsOf: order.featureAsOf, entryPlan: order.initialPlan });
+      featureAsOf: order.featureAsOf, entryPlan: order.initialPlan, ...(confirm ? { confirmation: order.confirmation } : {}) });
     order = null;
   };
   for (let i = start; i < end; i++) {
@@ -192,6 +196,9 @@ export async function replay({ config, strategyId, symbol, file, params, executi
       { maxHoldBarsLimit: Math.max(120, def.paramSchema.find(p => p.key === 'maxHoldBars')?.max || 120) });
     if (!signal.eligible) continue;
     funnel.signals++;
+    const confirmationResult = confirm ? await confirm(time, signal.positionRecommendation) : null;
+    if (confirmationResult?.members.some(m => m.unavailable)) funnel.confirmationUnavailable++;
+    if (confirmationResult && !confirmationResult.passed) { funnel.confirmationRejected++; continue; }
     const plan = { ...raw.plan, ...signal.plan }, long = signal.positionRecommendation === 'OPEN_LONG';
     const price = plan.entryLimit || (long ? plan.entryMax : plan.entryMin);
     const leverage = Math.max(1, Math.min(execution.maxLeverage, params.maxLeverage ?? execution.maxLeverage,
@@ -208,7 +215,7 @@ export async function replay({ config, strategyId, symbol, file, params, executi
       interval: '1m', status: 'pending', plan, initialPlan: structuredClone(plan), costs: { ...costs },
       createdAt: new Date(time).toISOString(), nextTime: time, margin, leverage, notional: margin * leverage,
       pendingDeadline: time + execution.pendingMinutes * MINUTE, protectionRevisions: [], reviewHistory: [],
-      features, featureAsOf: featureMarket?.dataAsOf || null };
+      features, featureAsOf: featureMarket?.dataAsOf || null, ...(confirm ? { confirmation: confirmationResult } : {}) };
     funnel.orders++;
   }
   if (order?.entry) { const lastTime = base.time(end - 1) + MINUTE; settlePaperOrder(order, base.at(end - 1).close, 'backtest_period_end', lastTime); order.periodEnd = true; order.reason = 'backtest_period_end'; close(lastTime); recordEquity(lastTime, base.at(end - 1).close); }
