@@ -67,6 +67,7 @@ fn automation_summary(status: &Value) -> Value {
     json!({
         "active":status["active"],"uptime":status["uptime"],"tasks":tasks,
         "analysis":select(&status["analysisMeta"],&["phase","asOf","readOnly","symbols","marketReady","processedSymbols","enabledStrategies","analyzed","opportunityCount","failed","error","marketWarning"]),
+        "execution":select(&status["executionStatus"],&["readOnly","enabled","ready","mode","reason"]),
         "stats":select(&status["stats"],&["totalAnalyzed","totalOrders","totalReviews"]),
         "account":select(&status["account"],&["equity","available","entriesPaused","syncReady","canOpen","accountingComplete","activityCounts","warnings"])
     })

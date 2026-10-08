@@ -66,6 +66,36 @@ async fn public_request_retries_truncated_body() {
 }
 
 #[tokio::test]
+async fn depth_uses_integer_supported_limits_and_keeps_book_guard() {
+    use axum::{Json, Router, extract::Query, routing::get};
+    use std::collections::HashMap;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let exchange = Exchange::test_endpoint(&format!("http://{}", listener.local_addr().unwrap()));
+    let app = Router::new().route(
+        "/fapi/v1/depth",
+        get(|Query(query): Query<HashMap<String, String>>| async move {
+            assert_eq!(query["symbol"], "BTCUSDT");
+            let limit: usize = query["limit"].parse().expect("limit must be an integer");
+            assert!([5, 10, 20, 50, 100, 500, 1000].contains(&limit));
+            Json(json!({"limit":limit,"bids":[["100","10"]],"asks":[["100.01","10"]]}))
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    for (levels, limit) in [(1, 5), (5, 5), (7, 10), (15, 20), (30, 50), (50, 50)] {
+        let depth = exchange.depth("BTCUSDT", levels).await.unwrap();
+        assert_eq!(depth["limit"], limit);
+        crate::automation_guards::book_check(
+            &json!({"bidPrice":"100","askPrice":"100.01"}),
+            &depth,
+            10.,
+        )
+        .unwrap();
+    }
+    assert!(exchange.depth("BTCUSDT", 1001).await.is_err());
+    server.abort();
+}
+
+#[tokio::test]
 async fn public_request_reports_body_failure_after_three_attempts() {
     let mock = mock(vec![response(200, "{}", true)]).await;
     let error = mock
@@ -184,6 +214,80 @@ async fn signed_mutation_does_not_retry_truncated_body() {
     );
     // One server-time GET and one mutation POST; the failed POST is never replayed.
     assert_eq!(mock.requests.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn signed_request_recalibrates_only_an_explicit_timestamp_rejection() {
+    let mock = mock(vec![
+        response(
+            200,
+            &json!({"serverTime":crate::now_ms()}).to_string(),
+            false,
+        ),
+        response(400, "{\"code\":-1021,\"msg\":\"Timestamp ahead\"}", false),
+        response(
+            200,
+            &json!({"serverTime":crate::now_ms()}).to_string(),
+            false,
+        ),
+        response(200, "{\"orderId\":123}", false),
+    ])
+    .await;
+    let order = mock
+        .exchange
+        .signed("POST", "/fapi/v1/order", &json!({"symbol":"BTCUSDT"}))
+        .await
+        .unwrap();
+    assert_eq!(order["orderId"], 123);
+    assert_eq!(mock.requests.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
+async fn delayed_clock_response_does_not_make_signed_timestamp_ahead() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let exchange = Exchange::test_endpoint(&format!("http://{}", listener.local_addr().unwrap()));
+    let server = tokio::spawn(async move {
+        for step in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 4096];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let count = socket.read(&mut chunk).await.unwrap();
+                request.extend_from_slice(&chunk[..count]);
+            }
+            let body = if step == 0 {
+                tokio::time::sleep(Duration::from_millis(2200)).await;
+                json!({"serverTime":crate::now_ms()})
+            } else {
+                let request = String::from_utf8(request).unwrap();
+                let timestamp = request
+                    .split("timestamp=")
+                    .nth(1)
+                    .unwrap()
+                    .split(['&', ' '])
+                    .next()
+                    .unwrap()
+                    .parse::<i64>()
+                    .unwrap();
+                let age = crate::now_ms() - timestamp;
+                assert!(
+                    (400..5000).contains(&age),
+                    "signed timestamp must stay behind: {age}ms"
+                );
+                json!({"orderId":123})
+            };
+            socket
+                .write_all(response(200, &body.to_string(), false).as_bytes())
+                .await
+                .unwrap();
+        }
+    });
+    let order = exchange
+        .signed("POST", "/fapi/v1/order", &json!({"symbol":"BTCUSDT"}))
+        .await
+        .unwrap();
+    server.await.unwrap();
+    assert_eq!(order["orderId"], 123);
 }
 
 #[test]

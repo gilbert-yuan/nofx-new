@@ -615,4 +615,18 @@ mod tests {
             "WAIT_REANALYSIS"
         );
     }
+    #[test]
+    fn oi_notional_inflation_does_not_create_a_false_crowding_block() {
+        let signal = json!({"symbol":"TESTUSDT","action":"BUY","plan":{"entryStyle":"market","entryMin":99.,"entryMax":101.,"stopLoss":95.,"takeProfit":110.}});
+        let market = json!({"symbol":"TESTUSDT","interval":"1m","klines":[{"close":100.}]});
+        let mut context = json!({"ticker24h":{"lastPrice":100.,"priceChangePercent":15.},"premium":{"lastFundingRate":0.0001},"oi":[{"sumOpenInterest":100.,"sumOpenInterestValue":10000.},{"sumOpenInterest":100.,"sumOpenInterestValue":13000.}]});
+        let report = opportunity_report(&signal, &market, &context, &json!({}), 0);
+        assert_eq!(report["current"]["oiChangePct"], 0.);
+        assert_eq!(report["canProceed"], true);
+        context["oi"][1]["sumOpenInterest"] = json!(130.);
+        assert_eq!(
+            opportunity_report(&signal, &market, &context, &json!({}), 0)["canProceed"],
+            false
+        );
+    }
 }

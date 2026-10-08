@@ -269,6 +269,40 @@ async fn run(options: &PgConnectOptions) -> Result<()> {
     let now = now_ms();
     let record = json!({"id":"rust-http-record","at":iso(now),"marketProvider":"binance","strategyId":"enhanced-trend-v1","strategyVersion":"test-native","analysisEngine":"local","scope":{"interval":"1m"},"snapshot":{"costs":{"feeBps":6,"slippageBps":5,"fundingBpsPer8h":3}},"analyses":[{"symbol":"BTCUSDT","interval":"1m","marketProvider":"binance","strategyId":"enhanced-trend-v1","positionRecommendation":"OPEN_LONG","eligible":true,"firstEntryAt":iso((now.div_euclid(60000)+1)*60000),"expiresAt":iso(now+86400000),"confidence":0.8,"plan":{"entryMin":99,"entryMax":100,"entryLimit":99.5,"stopLoss":90,"takeProfit":110,"maxHoldBars":30}}]});
     db.save_record(&record).await?;
+    let original_persisted = db.record("rust-http-record").await?.unwrap();
+    let mut enriched = record["analyses"][0].clone();
+    enriched["opportunityReport"] = json!({"indicators":{"mode":"advisory","source":"binance"}});
+    let market_context =
+        json!({"symbol":"BTCUSDT","collectedAt":iso(now),"premium":{"time":now},"errors":{}});
+    db.record_market_context("rust-http-record", &enriched, &market_context)
+        .await?;
+    let persisted = db.record("rust-http-record").await?.unwrap();
+    assert_eq!(persisted["at"], record["at"]);
+    assert_eq!(persisted["snapshot"], original_persisted["snapshot"]);
+    assert_eq!(persisted["analyses"][0]["eligible"], true);
+    assert_eq!(persisted["marketContext"], market_context);
+    assert_eq!(
+        persisted["analyses"][0]["opportunityReport"]["indicators"]["mode"],
+        "advisory"
+    );
+    request(
+        &client,
+        &base,
+        "GET",
+        "/api/market/indicators?symbol=INVALID",
+        None,
+        400,
+    )
+    .await?;
+    request(
+        &client,
+        &base,
+        "GET",
+        "/api/market/indicators?symbol=BTCUSDT&interval=bad",
+        None,
+        400,
+    )
+    .await?;
     let order=request(&client,&base,"POST","/api/paper/orders",Some(json!({"recordId":"rust-http-record","symbol":"BTCUSDT","strategyId":"enhanced-trend-v1","margin":10,"leverage":2})),200).await?;
     assert_eq!(order["status"], "pending");
     let same=request(&client,&base,"POST","/api/paper/orders",Some(json!({"recordId":"rust-http-record","symbol":"BTCUSDT","strategyId":"enhanced-trend-v1","margin":10,"leverage":2})),200).await?;

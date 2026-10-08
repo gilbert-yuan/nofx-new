@@ -1155,12 +1155,9 @@ fn formatted(value: f64) -> String {
         .trim_end_matches('.')
         .to_owned()
 }
-pub fn aligned_quantity(info: &Value, amount: f64, market: bool) -> Result<f64> {
-    if !amount.is_finite() || amount <= 0. {
-        bail!("下单数量无效。");
-    }
+fn quantity_filter(info: &Value, market: bool) -> Result<&Value> {
     let filters = info["filters"].as_array().context("币种数量过滤器未就绪")?;
-    let filter = filters
+    filters
         .iter()
         .find(|f| {
             f["filterType"]
@@ -1172,7 +1169,36 @@ pub fn aligned_quantity(info: &Value, amount: f64, market: bool) -> Result<f64> 
                 && n(f, "stepSize", 0.) > 0.
         })
         .or_else(|| filters.iter().find(|f| f["filterType"] == "LOT_SIZE"))
-        .context("缺少数量过滤器")?;
+        .context("缺少数量过滤器")
+}
+/// Reserve one quantity step above the exchange minimum before allocating capital.
+pub fn minimum_entry_notional(info: &Value, price: f64, market: bool) -> Result<f64> {
+    if !price.is_finite() || price <= 0. {
+        bail!("计算最小下单规模需要有效价格。");
+    }
+    let filter = quantity_filter(info, market)?;
+    let step = n(filter, "stepSize", 0.);
+    if step <= 0. {
+        bail!("币种数量步长无效。");
+    }
+    let minimum = arr(&info["filters"])
+        .iter()
+        .filter(|f| matches!(f["filterType"].as_str(), Some("MIN_NOTIONAL" | "NOTIONAL")))
+        .map(|f| n(f, "notional", n(f, "minNotional", 0.)))
+        .fold(0_f64, f64::max);
+    let quantity = ((minimum / price).max(n(filter, "minQty", 0.)) / step).ceil() * step;
+    let quantity = aligned_quantity(info, quantity + step, market)?;
+    let notional = quantity * price;
+    if notional < minimum {
+        bail!("交易所数量上限不足以满足最小成交额。");
+    }
+    Ok(notional)
+}
+pub fn aligned_quantity(info: &Value, amount: f64, market: bool) -> Result<f64> {
+    if !amount.is_finite() || amount <= 0. {
+        bail!("下单数量无效。");
+    }
+    let filter = quantity_filter(info, market)?;
     let step = n(filter, "stepSize", 0.);
     if step <= 0. {
         bail!("币种数量步长无效。");

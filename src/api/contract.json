@@ -34,7 +34,8 @@
     "refresh": "/api/market/symbols/refresh",
     "status": "/api/market/symbols/status",
     "klines": "/api/market/klines",
-    "flowAnalysis": "/api/market/flow-analysis"
+    "flowAnalysis": "/api/market/flow-analysis",
+    "indicators": "/api/market/indicators"
   },
   "history": {
     "fetch": "/api/history/fetch",

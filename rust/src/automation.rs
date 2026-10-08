@@ -158,6 +158,11 @@ impl Automation {
         let mut state = self.state.lock().await.clone();
         state["active"] = json!(self.active());
         state["account"] = crate::paper::status(&self.db).await?;
+        state["executionStatus"] = execution_status(
+            &self.store.read("config").await?,
+            &state["account"],
+            self.active(),
+        );
         state["uptime"] = json!(self.started.elapsed().as_secs_f64());
         state["yaoCoinMeta"] = json!({"targetAmplitudePct":50,"asOf":state["yaoCoinsAt"],"total":state["yaoCoins"].as_array().map(Vec::len).unwrap_or(0),"evaluated":state["analysisMeta"]["marketReady"],"error":state["yaoCoinError"]});
         Ok(state)
@@ -528,14 +533,19 @@ impl Automation {
                 &json!({}),
             );
             for prediction in predictions.as_array_mut().into_iter().flatten() {
-                let symbol = prediction["symbol"].as_str().unwrap_or("");
-                let market = &prepared[symbol];
+                let symbol = prediction["symbol"].as_str().unwrap_or("").to_owned();
+                let market = &prepared[&symbol];
                 prediction["dataAsOf"] = market["dataAsOf"].clone();
                 prediction["cacheOnly"] = json!(
                     market["cacheOnly"] == true
                         || !ticker_available
                         || timestamp(&market["dataAsOf"])
                             != Some(research::candle_open(now_ms(), "1m")?)
+                );
+                prediction["indicators"] = crate::market_indicators::summarize(
+                    &json!({"symbol":symbol}),
+                    market,
+                    now_ms(),
                 );
             }
             let mut status = self.state.lock().await;
@@ -567,6 +577,7 @@ impl Automation {
                 continue;
             }
             let mut aux = BTreeMap::new();
+            let mut shared_confirmation = None;
             for strategy in &enabled {
                 let id = strategy["id"].as_str().unwrap();
                 let config = self.store.read("config").await?;
@@ -706,11 +717,17 @@ impl Automation {
                     continue;
                 }
                 if !data_only {
-                    let opportunity_context = self.market.opportunity_context(&symbol).await;
+                    if shared_confirmation.is_none() {
+                        shared_confirmation = Some(
+                            self.market
+                                .confirmation_context(&symbol, &ticker_map[&symbol])
+                                .await,
+                        );
+                    }
                     signal["opportunityReport"] = strategies::opportunity_report(
                         &signal,
                         &plan_market,
-                        &opportunity_context,
+                        shared_confirmation.as_ref().unwrap(),
                         strategy,
                         now,
                     );
@@ -775,6 +792,73 @@ impl Automation {
                 candidate["signal"]["opportunityReport"] = report;
             }
         }
+        // Collect extended metrics for a bounded union of opportunity and prediction candidates.
+        // Baseline confirmation and execution guards continue to cover every eligible candidate.
+        let predictions = self.state.lock().await["yaoCoins"].clone();
+        let indicator_limit =
+            env_num("NOFX_INDICATOR_SYMBOLS_PER_CYCLE", 30.).clamp(0., 50.) as usize;
+        let targets = indicator_symbols(&selected, &predictions, indicator_limit);
+        {
+            let mut status = self.state.lock().await;
+            status["analysisMeta"]["phase"] = json!("enriching");
+            status["tasks"]["klineSync"]["progress"]["stage"] =
+                json!("补齐免费持仓、资金费与成交指标");
+        }
+        let jobs = futures::stream::iter(targets.iter().cloned().map(|symbol| {
+            let ticker = &ticker_map[&symbol];
+            async move {
+                (
+                    symbol.clone(),
+                    self.market.indicator_context(&symbol, ticker).await,
+                )
+            }
+        }));
+        let mut jobs = jobs.buffer_unordered(3);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut contexts = BTreeMap::new();
+        while let Ok(Some((symbol, context))) = tokio::time::timeout_at(deadline, jobs.next()).await
+        {
+            contexts.insert(symbol, context);
+        }
+        drop(jobs);
+        if self.generation.load(Ordering::SeqCst) != token {
+            return Ok(json!({"cancelled":true,"sync":sync}));
+        }
+        for candidate in &mut selected {
+            let symbol = candidate["symbol"].as_str().unwrap_or("");
+            if let Some(raw) = contexts.get(symbol) {
+                let indicators =
+                    crate::market_indicators::summarize(raw, &prepared[symbol], now_ms());
+                let long = candidate["signal"]["action"] == "BUY";
+                let evidence = crate::market_indicators::evidence(&indicators, long);
+                let report = &mut candidate["signal"]["opportunityReport"];
+                if report.is_object() {
+                    report["indicators"] = indicators;
+                    report["evidence"] = json!(evidence);
+                }
+                if !data_only && let Some(id) = candidate["record"]["id"].as_str() {
+                    self.db
+                        .record_market_context(id, &candidate["signal"], raw)
+                        .await?;
+                }
+            }
+        }
+        {
+            let mut status = self.state.lock().await;
+            for prediction in status["yaoCoins"].as_array_mut().into_iter().flatten() {
+                let symbol = prediction["symbol"].as_str().unwrap_or("").to_owned();
+                if let Some(raw) = contexts.get(&symbol) {
+                    let indicators =
+                        crate::market_indicators::summarize(raw, &prepared[&symbol], now_ms());
+                    prediction["evidence"] = json!(crate::market_indicators::evidence(
+                        &indicators,
+                        prediction["direction"] == "UP"
+                    ));
+                    prediction["indicators"] = indicators;
+                }
+            }
+            status["analysisMeta"]["indicators"] = json!({"requested":targets.len(),"collected":contexts.len(),"symbolLimit":indicator_limit,"timeLimitSeconds":15,"mode":"advisory","asOf":iso(now_ms())});
+        }
         let opportunities: Vec<Value> = selected
             .iter()
             .filter_map(opportunity_card)
@@ -797,13 +881,22 @@ impl Automation {
             );
         }
         let mut submitted = 0;
+        let mut created = 0;
+        let maximum_entries =
+            number(&config["trader"]["maxNewEntriesPerCycle"], 1.).max(0.) as usize;
+        let mut execution = vec![];
         // Circuit, cooldown, available equity and symbol conflicts are rechecked per submission.
         for c in &selected {
             if self.generation.load(Ordering::SeqCst) != token {
                 break;
             }
             let current = self.db.account(true, None).await?;
-            if entry_guard(&current, c, &config).is_some() {
+            if let Some(reason) = entry_guard(&current, c, &config) {
+                execution.push(execution_skip(c, &reason));
+                continue;
+            }
+            if created >= maximum_entries {
+                execution.push(execution_skip(c, "达到每轮新增订单上限"));
                 continue;
             }
             let signal = &c["signal"];
@@ -811,14 +904,28 @@ impl Automation {
             use chrono::Timelike;
             let hour = chrono::Utc::now().hour();
             let history = crate::analytics::closed_orders(&current);
-            if crate::analytics::should_open_position(
+            let adaptive_check = crate::analytics::should_open_position(
                 c["symbol"].as_str().unwrap_or(""),
                 Some(hour),
                 &history,
                 &adaptive,
-            )["shouldOpen"]
-                != true
-            {
+            );
+            if adaptive_check["shouldOpen"] != true {
+                let reason = adaptive_check["reasons"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join("；");
+                execution.push(execution_skip(
+                    c,
+                    if reason.is_empty() {
+                        "自适应历史表现或时段规则暂不允许开仓"
+                    } else {
+                        &reason
+                    },
+                ));
                 continue;
             }
             let mut margin_pct = number(
@@ -842,6 +949,7 @@ impl Automation {
                     signal,
                     number(&funds["openCount"], 0.) as usize,
                 ) else {
+                    execution.push(execution_skip(c, "评分仓位规则暂不允许开仓"));
                     continue;
                 };
                 leverage = sized_lev.clamp(1., cap);
@@ -852,30 +960,71 @@ impl Automation {
             } else {
                 0.
             };
-            let mut margin = (equity * margin_pct).max(min_margin);
-            let cap = number(&config["trader"]["maxPositionNotionalPct"], 0.);
-            if cap > 0. && cap <= 1. {
-                margin = margin.min(equity * cap / leverage);
-            }
-            if !current["fusedPoolStartedAt"].is_null() {
+            let available = if !current["fusedPoolStartedAt"].is_null() {
                 if funds["canOpen"] != true {
+                    let reason = funds["warnings"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join("；");
+                    execution.push(execution_skip(
+                        c,
+                        if reason.is_empty() {
+                            "资金池暂不允许开仓"
+                        } else {
+                            &reason
+                        },
+                    ));
                     continue;
                 }
-                margin =
-                    margin.min(number(&funds["available"], 0.) / (1. + leverage * 12. / 10000.));
-            }
-            margin = (margin * 100.).floor() / 100.;
-            if margin < min_margin.max(1.) {
+                Some(number(&funds["available"], 0.))
+            } else {
+                None
+            };
+            let symbol = c["symbol"].as_str().unwrap_or("");
+            let market_entry = signal["plan"]["entryStyle"] == "market";
+            let price = if market_entry {
+                number(&signal["opportunityReport"]["current"]["price"], 0.)
+            } else {
+                number(&signal["plan"]["entryLimit"], 0.)
+            };
+            let minimum_notional = match contracts.iter().find(|info| info["symbol"] == symbol) {
+                Some(info) => crate::paper::minimum_entry_notional(info, price, market_entry),
+                None => Err(anyhow::anyhow!("合约数量过滤器未就绪")),
+            };
+            let minimum_notional = match minimum_notional {
+                Ok(value) => value,
+                Err(error) => {
+                    execution.push(execution_skip(c, &format!("最小下单规模：{error}")));
+                    continue;
+                }
+            };
+            let Some((leverage, margin)) = crate::automation_guards::entry_size(
+                equity,
+                margin_pct,
+                leverage,
+                min_margin,
+                number(&config["trader"]["maxPositionNotionalPct"], 0.),
+                available,
+                minimum_notional,
+            ) else {
+                execution.push(execution_skip(
+                    c,
+                    "资金或名义仓位上限不足以满足最小下单规模",
+                ));
                 continue;
-            }
+            };
             if crate::automation_guards::enabled("NOFX_LIQUIDITY_SCREEN", true) {
                 let symbol = c["symbol"].as_str().unwrap_or("");
                 let params = json!({"symbol":symbol});
-                let depth_params = json!({"symbol":symbol,"limit":crate::automation_guards::env_num("NOFX_BOOK_LEVELS",5.,1.,50.)});
+                let levels =
+                    crate::automation_guards::env_num("NOFX_BOOK_LEVELS", 5., 1., 50.) as usize;
                 let (book, depth) = tokio::join!(
                     self.market
                         .public_request("/fapi/v1/ticker/bookTicker", &params),
-                    self.market.public_request("/fapi/v1/depth", &depth_params)
+                    self.market.depth(symbol, levels)
                 );
                 match (book, depth) {
                     (Ok(book), Ok(depth)) => {
@@ -883,26 +1032,58 @@ impl Automation {
                             crate::automation_guards::book_check(&book, &depth, margin * leverage)
                         {
                             errors.push(format!("{symbol} 盘口：{error}"));
+                            execution.push(execution_skip(c, &format!("盘口风控：{error}")));
                             continue;
                         }
                     }
-                    _ => {
-                        errors.push(format!("{symbol} 盘口数据不可用，跳过开仓"));
+                    (book, depth) => {
+                        let detail = [("买卖报价", book), ("盘口深度", depth)]
+                            .into_iter()
+                            .filter_map(|(name, result)| {
+                                result.err().map(|error| format!("{name}：{error:#}"))
+                            })
+                            .collect::<Vec<_>>()
+                            .join("；");
+                        let reason = format!("盘口数据不可用，跳过开仓：{detail}");
+                        errors.push(format!("{symbol} {reason}"));
+                        execution.push(execution_skip(c, &reason));
                         continue;
                     }
                 }
             }
             let input = json!({"recordId":c["record"]["id"],"symbol":c["symbol"],"strategyId":c["strategy"]["id"],"automatic":true,"margin":margin,"autoMarginPct":margin_pct,"leverage":leverage,"executionPlan":strategies::execution_plan(signal)});
             match crate::paper::submit(&self.db, &self.store, &input).await {
-                Ok(_) => submitted += 1,
-                Err(e) => errors.push(format!("{}: {e}", c["symbol"])),
+                Ok(order) => {
+                    created += 1;
+                    let mut result = execution_outcome(&order, &config);
+                    result["strategyId"] = c["strategy"]["id"].clone();
+                    if result["status"] == "submitted" || result["status"] == "paper_created" {
+                        submitted += 1;
+                    } else if result["status"] == "execution_failed" {
+                        errors.push(format!(
+                            "{}: {}",
+                            c["symbol"].as_str().unwrap_or(""),
+                            result["reason"].as_str().unwrap_or("交易所执行失败")
+                        ));
+                    }
+                    execution.push(result);
+                }
+                Err(e) => {
+                    errors.push(format!("{}: {e}", c["symbol"]));
+                    execution.push(execution_skip(c, &e.to_string()));
+                }
             }
         }
         let mut s = self.state.lock().await;
+        for card in s["opportunities"].as_array_mut().into_iter().flatten() {
+            if let Some(result) = execution.iter().find(|r| r["symbol"] == card["symbol"]) {
+                card["execution"] = result.clone();
+            }
+        }
         s["stats"]["totalOrders"] =
             json!(number(&s["stats"]["totalOrders"], 0.) + submitted as f64);
         Ok(
-            json!({"analyzed":analyzed,"eligible":selected.len(),"submitted":submitted,"failed":errors.len(),"errors":errors,"runId":run_id,"sync":sync}),
+            json!({"analyzed":analyzed,"eligible":selected.len(),"created":created,"submitted":submitted,"execution":execution,"failed":errors.len(),"errors":errors,"runId":run_id,"sync":sync}),
         )
     }
     async fn review(&self) -> Result<Value> {
@@ -1015,6 +1196,103 @@ impl Automation {
         Ok(json!({"reviewed":reviewed,"failed":errors.len(),"errors":errors}))
     }
 }
+fn trading_mode_block(config: &Value) -> Option<&'static str> {
+    if config["marketSync"]["dataOnly"] == true {
+        return Some("采集与分析展示模式，自动下单关闭");
+    }
+    if config["trader"]["enabled"] != true {
+        return Some("自动交易未开启");
+    }
+    if config["trader"]["dryRun"] == true {
+        return Some("试运行模式，不提交订单");
+    }
+    if config["trader"]["allowEntryOrders"] != true {
+        return Some("新增订单开关未开启");
+    }
+    None
+}
+fn execution_status(config: &Value, account: &Value, active: bool) -> Value {
+    let block = trading_mode_block(config);
+    let targets = ["demo", "live"]
+        .into_iter()
+        .filter(|env| {
+            config["trader"][if *env == "demo" {
+                "syncPaperOrdersToDemo"
+            } else {
+                "syncPaperOrdersToLive"
+            }] == true
+        })
+        .collect::<Vec<_>>();
+    let reason = if let Some(reason) = block {
+        reason.to_owned()
+    } else if !active {
+        "自动任务已停止".into()
+    } else if account["canOpen"] == false {
+        let warnings = account["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join("；");
+        if warnings.is_empty() {
+            "资金池暂不允许开仓".into()
+        } else {
+            warnings
+        }
+    } else {
+        String::new()
+    };
+    json!({"readOnly":config["marketSync"]["dataOnly"]==true,"enabled":block.is_none(),"ready":reason.is_empty(),"mode":if targets.is_empty(){"paper".to_owned()}else{targets.join("+")},"reason":reason})
+}
+fn execution_skip(candidate: &Value, reason: &str) -> Value {
+    json!({"symbol":candidate["symbol"],"strategyId":candidate["strategy"]["id"],"status":"skipped","reason":reason})
+}
+fn execution_outcome(order: &Value, config: &Value) -> Value {
+    let targets: Vec<Value> = ["demo", "live"].into_iter()
+        .filter(|env| config["trader"][if *env == "demo" { "syncPaperOrdersToDemo" } else { "syncPaperOrdersToLive" }] == true)
+        .map(|env| { let link = &order["exchangeSync"][env]; json!({"environment":env,"status":link["status"],"orderId":link["orderId"],"lastError":link["lastError"]}) }).collect();
+    let accepted = targets.iter().any(|t| {
+        !t["orderId"].is_null()
+            && matches!(
+                t["status"].as_str(),
+                Some("new" | "partially_filled" | "filled" | "submitted")
+            )
+    });
+    let status = if targets.is_empty() {
+        "paper_created"
+    } else if accepted {
+        "submitted"
+    } else if targets
+        .iter()
+        .any(|t| t["status"] == "unknown" || t["status"] == "submitting")
+    {
+        "reconciling"
+    } else {
+        "execution_failed"
+    };
+    let reason = match status {
+        "paper_created" => "模拟订单已创建".to_owned(),
+        "submitted" => "交易所已确认接收订单".to_owned(),
+        "reconciling" => "订单执行结果待对账，不重复发送".to_owned(),
+        _ => targets
+            .iter()
+            .map(|t| {
+                format!(
+                    "{}：{}",
+                    t["environment"].as_str().unwrap_or(""),
+                    t["lastError"]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .or(t["status"].as_str())
+                        .unwrap_or("交易所未确认订单")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("；"),
+    };
+    json!({"symbol":order["symbol"],"orderId":order["id"],"status":status,"reason":reason,"targets":targets})
+}
 fn mark_display_report(report: &mut Value, cache_only: bool, context_missing: bool) {
     report["readOnly"] = json!(true);
     report["cacheOnly"] = json!(cache_only);
@@ -1107,7 +1385,55 @@ fn select_candidates(candidates: &[Value]) -> Vec<Value> {
     }
     selected.into_values().collect()
 }
-fn entry_guard(state: &Value, c: &Value, _config: &Value) -> Option<String> {
+fn indicator_symbols(selected: &[Value], predictions: &Value, limit: usize) -> Vec<String> {
+    if limit == 0 {
+        return vec![];
+    }
+    let mut symbols = vec![];
+    for candidate in selected
+        .iter()
+        .filter(|c| c["signal"]["cacheOnly"] != true)
+        .take((limit * 2 / 3).max(1))
+    {
+        if let Some(symbol) = candidate["symbol"].as_str() {
+            symbols.push(symbol.to_owned());
+        }
+    }
+    for prediction in predictions
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|p| p["cacheOnly"] != true)
+    {
+        if symbols.len() >= limit {
+            break;
+        }
+        if let Some(symbol) = prediction["symbol"].as_str()
+            && !symbols.iter().any(|s| s == symbol)
+        {
+            symbols.push(symbol.to_owned());
+        }
+    }
+    symbols
+}
+fn entry_guard(state: &Value, c: &Value, config: &Value) -> Option<String> {
+    if let Some(reason) = trading_mode_block(config) {
+        return Some(reason.into());
+    }
+    if number(&c["signal"]["confidence"], 0.) < number(&config["trader"]["minConfidence"], 0.65) {
+        return Some("信号置信度低于开仓门槛".into());
+    }
+    if (c["signal"]["plan"]["entryStyle"] == "market"
+        || number(&c["signal"]["plan"]["entryLimit"], 0.) <= 0.)
+        && c["signal"]["opportunityReport"]["canProceed"] != true
+    {
+        return Some(
+            c["signal"]["opportunityReport"]["decision"]["reason"]
+                .as_str()
+                .unwrap_or("市价入场尚未通过确认")
+                .into(),
+        );
+    }
     if state["entriesPaused"] == true {
         return Some("开仓已暂停".into());
     }
@@ -1265,6 +1591,48 @@ mod sync_tests;
 mod tests {
     use super::*;
     #[test]
+    fn execution_requires_trading_mode_and_keeps_limit_waiting_separate() {
+        let mut config = json!({"marketSync":{"dataOnly":true},"trader":{"enabled":true,"dryRun":false,"allowEntryOrders":true,"minConfidence":0.65,"syncPaperOrdersToDemo":true}});
+        let account = json!({"orders":[],"canOpen":true});
+        let mut candidate = json!({"symbol":"TESTUSDT","strategy":{"id":"test"},"signal":{"confidence":0.9,"plan":{"entryLimit":100},"opportunityReport":{"canProceed":false}}});
+        assert!(
+            entry_guard(&account, &candidate, &config)
+                .unwrap()
+                .contains("自动下单关闭")
+        );
+        assert_eq!(execution_status(&config, &account, true)["ready"], false);
+        config["marketSync"]["dataOnly"] = json!(false);
+        assert!(entry_guard(&account, &candidate, &config).is_none());
+        candidate["signal"]["plan"]["entryLimit"] = json!(0);
+        assert!(entry_guard(&account, &candidate, &config).is_some());
+        candidate["signal"]["opportunityReport"]["canProceed"] = json!(true);
+        assert!(entry_guard(&account, &candidate, &config).is_none());
+        config["trader"]["dryRun"] = json!(true);
+        assert!(
+            entry_guard(&account, &candidate, &config)
+                .unwrap()
+                .contains("试运行")
+        );
+    }
+    #[test]
+    fn saved_local_order_does_not_count_as_confirmed_exchange_submission() {
+        let config = json!({"trader":{"syncPaperOrdersToDemo":true}});
+        let mut order = json!({"id":"local-1","symbol":"TESTUSDT","exchangeSync":{"demo":{"status":"rejected","orderId":null,"lastError":"计划价格已被穿越"}}});
+        let failed = execution_outcome(&order, &config);
+        assert_eq!(failed["status"], "execution_failed");
+        assert!(
+            failed["reason"]
+                .as_str()
+                .unwrap()
+                .contains("计划价格已被穿越")
+        );
+        order["exchangeSync"]["demo"]["status"] = json!("unknown");
+        assert_eq!(execution_outcome(&order, &config)["status"], "reconciling");
+        order["exchangeSync"]["demo"]["status"] = json!("new");
+        order["exchangeSync"]["demo"]["orderId"] = json!(123);
+        assert_eq!(execution_outcome(&order, &config)["status"], "submitted");
+    }
+    #[test]
     fn opportunity_cards_expose_confirmation_fields_to_the_frontend() {
         let now = now_ms();
         let strategy = json!({"id":"enhanced-trend-v1","name":"增强趋势 v1"});
@@ -1280,6 +1648,21 @@ mod tests {
         assert_eq!(card["recordId"], "record-1");
         assert!(card["generatedAt"].is_string());
         assert!(opportunity_card(&json!({"signal":{"opportunityReport":null}})).is_none());
+    }
+    #[test]
+    fn auxiliary_collection_is_bounded_deduplicated_and_skips_cached_signals() {
+        let selected = vec![
+            json!({"symbol":"AUSDT"}),
+            json!({"symbol":"BUSDT"}),
+            json!({"symbol":"CUSDT","signal":{"cacheOnly":true}}),
+        ];
+        let predictions = json!([{"symbol":"AUSDT"},{"symbol":"DUSDT","cacheOnly":true},{"symbol":"EUSDT"},{"symbol":"FUSDT"}]);
+        assert_eq!(
+            indicator_symbols(&selected, &predictions, 3),
+            vec!["AUSDT", "BUSDT", "EUSDT"]
+        );
+        assert!(indicator_symbols(&selected, &predictions, 0).is_empty());
+        assert_eq!(indicator_symbols(&selected, &predictions, 1), vec!["AUSDT"]);
     }
     #[test]
     fn sync_covers_standard_intervals_without_enabled_strategies() {

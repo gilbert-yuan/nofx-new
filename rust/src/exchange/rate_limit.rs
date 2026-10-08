@@ -13,6 +13,8 @@ pub(super) struct Budget {
     used: u32,
     funding_window: i64,
     funding_used: u32,
+    statistics_window: i64,
+    statistics_used: u32,
     cooldown_until: i64,
 }
 
@@ -46,9 +48,13 @@ pub(super) fn weight(path: &str, params: &Value) -> u32 {
         | "/fapi/v1/time"
         | "/fapi/v1/ticker/24hr"
         | "/fapi/v1/premiumIndex"
-        | "/fapi/v1/openInterest"
-        | "/fapi/v1/fundingRate"
-        | "/futures/data/openInterestHist" => 1,
+        | "/fapi/v1/openInterest" => 1,
+        "/fapi/v1/fundingRate" | "/fapi/v1/fundingInfo" => 0,
+        "/futures/data/openInterestHist"
+        | "/futures/data/globalLongShortAccountRatio"
+        | "/futures/data/topLongShortPositionRatio"
+        | "/futures/data/topLongShortAccountRatio"
+        | "/futures/data/takerlongshortRatio" => 0,
         _ => 5,
     }
 }
@@ -65,6 +71,10 @@ impl Budget {
             self.funding_window = funding_window;
             self.funding_used = 0;
         }
+        if funding_window != self.statistics_window {
+            self.statistics_window = funding_window;
+            self.statistics_used = 0;
+        }
     }
 
     // Return the delay without reserving while full, so concurrent waiters recheck capacity.
@@ -80,12 +90,17 @@ impl Budget {
         if self.used.saturating_add(cost) > WEIGHT_PER_MINUTE {
             return Ok((self.minute + 1) * 60_000 - now + 100);
         }
-        if path == "/fapi/v1/fundingRate" && self.funding_used >= 400 {
+        let funding = matches!(path, "/fapi/v1/fundingRate" | "/fapi/v1/fundingInfo");
+        let statistics = path.starts_with("/futures/data/");
+        if (funding && self.funding_used >= 400) || (statistics && self.statistics_used >= 800) {
             return Ok(((self.funding_window + 1) * 300_000 - now + 100).min(60_000));
         }
         self.used += cost;
-        if path == "/fapi/v1/fundingRate" {
+        if funding {
             self.funding_used += 1;
+        }
+        if statistics {
+            self.statistics_used += 1;
         }
         Ok(0)
     }
@@ -200,6 +215,59 @@ mod tests {
         assert_eq!(
             budget
                 .reserve("/fapi/v1/time", &json!({}), 590_000)
+                .unwrap(),
+            0
+        );
+    }
+    #[test]
+    fn zero_weight_statistics_and_funding_info_have_separate_request_limits() {
+        let mut budget = Budget::default();
+        for _ in 0..800 {
+            assert_eq!(
+                budget
+                    .reserve("/futures/data/openInterestHist", &json!({}), 61_000)
+                    .unwrap(),
+                0
+            );
+        }
+        assert!(
+            budget
+                .reserve(
+                    "/futures/data/globalLongShortAccountRatio",
+                    &json!({}),
+                    61_000
+                )
+                .unwrap()
+                > 0
+        );
+        assert_eq!(budget.used, 0);
+        assert_eq!(
+            budget.reserve("/fapi/v1/time", &json!({}), 61_000).unwrap(),
+            0
+        );
+        for _ in 0..400 {
+            assert_eq!(
+                budget
+                    .reserve("/fapi/v1/fundingInfo", &json!({}), 61_000)
+                    .unwrap(),
+                0
+            );
+        }
+        assert!(
+            budget
+                .reserve("/fapi/v1/fundingRate", &json!({}), 61_000)
+                .unwrap()
+                > 0
+        );
+        assert_eq!(
+            budget
+                .reserve("/futures/data/openInterestHist", &json!({}), 300_100)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            budget
+                .reserve("/fapi/v1/fundingRate", &json!({}), 300_100)
                 .unwrap(),
             0
         );

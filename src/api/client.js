@@ -67,6 +67,7 @@ export const marketApi = {
   status: () => api(API.market.status),
   klines: (params) => api(`${API.market.klines}${qs(params)}`),
   flowAnalysis: (params) => api(`${API.market.flowAnalysis}${qs(params)}`),
+  indicators: (params) => api(`${API.market.indicators}${qs(params)}`),
   analyzeFlowData: (body) => api(API.market.flowAnalysis, { method: 'POST', body })
 };
 

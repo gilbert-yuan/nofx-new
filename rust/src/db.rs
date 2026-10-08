@@ -465,6 +465,17 @@ impl Db {
                 .await?,
         )
     }
+    /// Enrich a selected signal with data collected at its own recorded timestamps.
+    pub async fn record_market_context(
+        &self,
+        id: &str,
+        signal: &Value,
+        context: &Value,
+    ) -> Result<()> {
+        sqlx::query("UPDATE research_records SET record=jsonb_set(record,'{analyses,0}',$2) || jsonb_build_object('marketContext',$3::jsonb) WHERE id=$1")
+            .bind(id).bind(signal).bind(context).execute(&self.pool).await?;
+        Ok(())
+    }
     pub async fn records(
         &self,
         date: &str,

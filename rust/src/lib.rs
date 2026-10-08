@@ -6,6 +6,7 @@ pub mod db;
 pub mod exchange;
 pub mod flow;
 pub mod ledger;
+pub mod market_indicators;
 pub mod paper;
 pub mod research;
 pub mod simulator;

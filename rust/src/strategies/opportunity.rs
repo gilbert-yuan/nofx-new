@@ -36,7 +36,15 @@ fn nullable(v: &Value) -> Option<f64> {
 fn positive(v: &Value) -> Option<f64> {
     nullable(v).filter(|x| *x > 0.)
 }
-fn context(raw: &Value) -> Value {
+fn source_fresh(raw: &Value, key: &str, at: &Value, now: i64, maximum_age: i64) -> bool {
+    // Timeless imported fixtures remain compatible; live collection always carries metadata.
+    if !raw["meta"].is_object() {
+        return true;
+    }
+    let at = crate::timestamp(at).or_else(|| crate::timestamp(&raw["meta"][key]["fetchedAt"]));
+    at.is_some_and(|at| at > 0 && at <= now + 5_000 && now - at <= maximum_age)
+}
+fn context(raw: &Value, now: i64) -> Value {
     let funding = raw["funding"]
         .as_array()
         .and_then(|r| r.last())
@@ -54,15 +62,36 @@ fn context(raw: &Value) -> Value {
             }
         })
         .unwrap_or(&Value::Null);
-    let current =
-        nullable(&latest["sumOpenInterestValue"]).or_else(|| nullable(&latest["sumOpenInterest"]));
-    let prior = nullable(&previous["sumOpenInterestValue"])
-        .or_else(|| nullable(&previous["sumOpenInterest"]));
+    // Price appreciation can inflate OI notional without any increase in contracts.
+    let current = nullable(&latest["sumOpenInterest"]);
+    let prior = nullable(&previous["sumOpenInterest"]);
     let change = current
         .zip(prior)
         .filter(|(_, p)| *p > 0.)
         .map(|(c, p)| (c / p - 1.) * 100.);
-    json!({"lastPrice":positive(&raw["ticker24h"]["lastPrice"]),"change24hPct":nullable(&raw["ticker24h"]["priceChangePercent"]),"oiChangePct":change,"fundingRate":nullable(&raw["premium"]["lastFundingRate"]).or_else(||nullable(&funding["fundingRate"])),"markPrice":positive(&raw["premium"]["markPrice"]),"errors":if raw["errors"].is_object(){raw["errors"].clone()}else{json!({})}})
+    let ticker_fresh = source_fresh(
+        raw,
+        "ticker24h",
+        &raw["ticker24h"]["closeTime"],
+        now,
+        90_000,
+    );
+    let premium_fresh = source_fresh(raw, "premium", &raw["premium"]["time"], now, 90_000);
+    let oi_fresh = source_fresh(raw, "oi", &latest["timestamp"], now, 1_860_000)
+        && (!raw["meta"].is_object()
+            || crate::timestamp(&latest["timestamp"])
+                .zip(crate::timestamp(&previous["timestamp"]))
+                .is_some_and(|(a, b)| a - b == 900_000));
+    let funding_fresh = source_fresh(raw, "funding", &funding["fundingTime"], now, 129_600_000);
+    let rate = premium_fresh
+        .then(|| nullable(&raw["premium"]["lastFundingRate"]))
+        .flatten()
+        .or_else(|| {
+            funding_fresh
+                .then(|| nullable(&funding["fundingRate"]))
+                .flatten()
+        });
+    json!({"lastPrice":if ticker_fresh{positive(&raw["ticker24h"]["lastPrice"])}else{None},"change24hPct":if ticker_fresh{nullable(&raw["ticker24h"]["priceChangePercent"])}else{None},"oiChangePct":if oi_fresh{change}else{None},"fundingRate":rate,"markPrice":if premium_fresh{positive(&raw["premium"]["markPrice"])}else{None},"errors":if raw["errors"].is_object(){raw["errors"].clone()}else{json!({})}})
 }
 fn collect_targets(plan: &Value, long: bool) -> Vec<f64> {
     let mut targets: Vec<f64> = ["takeProfit1", "takeProfit2", "takeProfit3", "takeProfit"]
@@ -110,7 +139,7 @@ pub fn opportunity_report(
     let limit = positive(&p["entryLimit"]);
     let market_entry = is_market_plan(p);
     let reference = positive(&p["entryReference"]).unwrap_or((e0 + e1) / 2.);
-    let ctx = context(market_context);
+    let ctx = context(market_context, now);
     let current = positive(&ctx["lastPrice"])
         .or_else(|| positive(&ctx["markPrice"]))
         .unwrap_or(price);
@@ -194,7 +223,9 @@ pub fn opportunity_report(
         .as_str()
         .or_else(|| market["symbol"].as_str())
         .unwrap_or("");
-    json!({"generatedAt":iso(now),"dataAsOf":if !signal["dataAsOf"].is_null(){&signal["dataAsOf"]}else{&market["dataAsOf"]},"symbol":symbol,"exchange":signal["exchange"].as_str().or_else(||market["exchange"].as_str()).unwrap_or("binance"),"marketProvider":signal["marketProvider"].as_str().or_else(||market["marketProvider"].as_str()).unwrap_or("binance"),"interval":signal["interval"].as_str().or_else(||market["interval"].as_str()),"strategyId":signal["strategyId"].as_str().or_else(||strategy["id"].as_str()),"strategyName":strategy["name"].as_str().or_else(||signal["strategyName"].as_str()),"action":action,"trend":if long{"LONG"}else{"SHORT"},"confidence":number(&signal["confidence"],0.),"recommendation":if proceed{action}else{"HOLD"},"canProceed":proceed,"decision":{"code":code,"label":label,"canProceed":proceed,"reason":reason},"current":{"price":current,"change24hPct":change,"oiChangePct":oi,"fundingRate":funding,"markPrice":ctx["markPrice"]},"levels":{"entryRange":{"min":e0,"max":e1},"optimalEntry":optimal,"entryMode":if market_entry{"MARKET_OR_NEXT_OPEN"}else{"LIMIT_PULLBACK"},"signalReference":reference,"stopLoss":positive(&p["stopLoss"]),"takeProfits":targets,"riskUnit":positive(&p["riskUnit"])},"warnings":warnings,"strategyReason":signal["reason"].as_str().unwrap_or(""),"risk":signal["risk"].as_str().unwrap_or(""),"summary":format!("{symbol} 初步判断{}；当前价 {current}；理想入场 {e0}～{e1}；止损 {}；止盈 {}；结论：{label}。",if long{"做多"}else{"做空"},n(p,"stopLoss"),targets.iter().map(|x|x.to_string()).collect::<Vec<_>>().join(" / ")),"contextErrors":ctx["errors"]})
+    let indicators = crate::market_indicators::summarize(market_context, market, now);
+    let evidence = crate::market_indicators::evidence(&indicators, long);
+    json!({"generatedAt":iso(now),"dataAsOf":if !signal["dataAsOf"].is_null(){&signal["dataAsOf"]}else{&market["dataAsOf"]},"symbol":symbol,"exchange":signal["exchange"].as_str().or_else(||market["exchange"].as_str()).unwrap_or("binance"),"marketProvider":signal["marketProvider"].as_str().or_else(||market["marketProvider"].as_str()).unwrap_or("binance"),"interval":signal["interval"].as_str().or_else(||market["interval"].as_str()),"strategyId":signal["strategyId"].as_str().or_else(||strategy["id"].as_str()),"strategyName":strategy["name"].as_str().or_else(||signal["strategyName"].as_str()),"action":action,"trend":if long{"LONG"}else{"SHORT"},"confidence":number(&signal["confidence"],0.),"recommendation":if proceed{action}else{"HOLD"},"canProceed":proceed,"decision":{"code":code,"label":label,"canProceed":proceed,"reason":reason},"current":{"price":current,"change24hPct":change,"oiChangePct":oi,"fundingRate":funding,"markPrice":ctx["markPrice"]},"levels":{"entryRange":{"min":e0,"max":e1},"optimalEntry":optimal,"entryMode":if market_entry{"MARKET_OR_NEXT_OPEN"}else{"LIMIT_PULLBACK"},"signalReference":reference,"stopLoss":positive(&p["stopLoss"]),"takeProfits":targets,"riskUnit":positive(&p["riskUnit"])},"warnings":warnings,"strategyReason":signal["reason"].as_str().unwrap_or(""),"risk":signal["risk"].as_str().unwrap_or(""),"summary":format!("{symbol} 初步判断{}；当前价 {current}；理想入场 {e0}～{e1}；止损 {}；止盈 {}；结论：{label}。",if long{"做多"}else{"做空"},n(p,"stopLoss"),targets.iter().map(|x|x.to_string()).collect::<Vec<_>>().join(" / ")),"contextErrors":ctx["errors"],"indicators":indicators,"evidence":evidence})
 }
 pub fn execution_plan(signal: &Value) -> Value {
     let p = &signal["plan"];

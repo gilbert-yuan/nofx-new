@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Mutex;
+mod market_context;
 mod rate_limit;
 
 #[derive(Clone)]
@@ -16,6 +17,7 @@ pub struct Exchange {
     secret: String,
     pub demo: bool,
     offset: Arc<Mutex<Option<i64>>>,
+    market_cache: market_context::Cache,
 }
 impl Exchange {
     #[cfg(test)]
@@ -33,6 +35,7 @@ impl Exchange {
             secret: "test-secret".into(),
             demo: false,
             offset: Arc::new(Mutex::new(None)),
+            market_cache: Default::default(),
         }
     }
     pub fn public() -> Result<Self> {
@@ -68,10 +71,20 @@ impl Exchange {
             secret: credential("secretKey"),
             demo,
             offset: Arc::new(Mutex::new(None)),
+            market_cache: Default::default(),
         })
     }
     pub fn credentials(&self) -> bool {
         !self.key.is_empty() && !self.secret.is_empty()
+    }
+    pub async fn depth(&self, symbol: &str, levels: usize) -> Result<Value> {
+        valid_symbol(symbol)?;
+        let limit = [5_usize, 10, 20, 50, 100, 500, 1000]
+            .into_iter()
+            .find(|limit| *limit >= levels)
+            .context("Binance 盘口最多支持 1000 档")?;
+        self.public_request("/fapi/v1/depth", &json!({"symbol":symbol,"limit":limit}))
+            .await
     }
     pub fn account_key(&self) -> String {
         hex::encode(Sha256::digest(self.key.as_bytes()))
@@ -175,31 +188,54 @@ impl Exchange {
         if !self.credentials() {
             bail!("请先配置该环境的 Binance API Key / Secret Key。");
         }
-        let mut offset = self.offset.lock().await;
-        if offset.is_none() {
-            let start = crate::now_ms();
-            let time = self.public_request("/fapi/v1/time", &json!({})).await?;
-            *offset =
-                Some(crate::number(&time["serverTime"], 0.) as i64 - (start + crate::now_ms()) / 2);
+        for attempt in 0..2 {
+            let skew = self.server_offset(attempt > 0).await?;
+            let mut fields = params.clone();
+            fields["timestamp"] = json!(crate::now_ms() + skew);
+            fields["recvWindow"] = json!(5000);
+            let query = query_string(&fields);
+            let signature = sign(&self.secret, &query);
+            let url = format!("{}{}?{}&signature={}", self.base, path, query, signature);
+            // Transport failures remain ambiguous: never replay them, even for invalid JSON.
+            let response = self
+                .client
+                .request(reqwest::Method::from_bytes(method.as_bytes())?, url)
+                .header("X-MBX-APIKEY", &self.key)
+                .send()
+                .await?;
+            let status = response.status().as_u16();
+            let text = response.text().await?;
+            // -1021 is an explicit rejection before execution, so one corrected send is safe.
+            if attempt == 0
+                && status == 400
+                && serde_json::from_str::<Value>(&text)
+                    .ok()
+                    .is_some_and(|v| v["code"] == -1021)
+            {
+                tracing::warn!(
+                    method,
+                    path,
+                    "Binance rejected timestamp; recalibrating server clock"
+                );
+                continue;
+            }
+            return parse_response(status, &text);
         }
-        let skew = offset.unwrap_or(0);
-        drop(offset);
-        let mut fields = params.clone();
-        fields["timestamp"] = json!(crate::now_ms() + skew);
-        fields["recvWindow"] = json!(5000);
-        let query = query_string(&fields);
-        let signature = sign(&self.secret, &query);
-        let url = format!("{}{}?{}&signature={}", self.base, path, query, signature);
-        // Signed mutations are sent once. A transport failure must be reconciled by client ID.
-        let response = self
-            .client
-            .request(reqwest::Method::from_bytes(method.as_bytes())?, url)
-            .header("X-MBX-APIKEY", &self.key)
-            .send()
-            .await?;
-        let status = response.status().as_u16();
-        let text = response.text().await?;
-        parse_response(status, &text)
+        unreachable!()
+    }
+    async fn server_offset(&self, refresh: bool) -> Result<i64> {
+        let mut offset = self.offset.lock().await;
+        if refresh || offset.is_none() {
+            let time = self.public_request("/fapi/v1/time", &json!({})).await?;
+            let server = time["serverTime"]
+                .as_i64()
+                .filter(|t| *t > 0)
+                .context("Binance 未返回有效服务器时间")?;
+            // Queueing, retries and proxy latency must not push timestamps ahead of the server.
+            // Anchor to receipt rather than the midpoint of the entire public request.
+            *offset = Some(server - crate::now_ms() - 500);
+        }
+        Ok(offset.unwrap_or(0))
     }
     pub async fn spot_signed(&self, path: &str, params: &Value) -> Result<Value> {
         if !self.demo {
@@ -253,37 +289,7 @@ impl Exchange {
         Ok(rows)
     }
     pub async fn opportunity_context(&self, symbol: &str) -> Value {
-        let calls = [
-            (
-                "ticker24h",
-                "/fapi/v1/ticker/24hr",
-                json!({"symbol":symbol}),
-            ),
-            ("premium", "/fapi/v1/premiumIndex", json!({"symbol":symbol})),
-            (
-                "funding",
-                "/fapi/v1/fundingRate",
-                json!({"symbol":symbol,"limit":1}),
-            ),
-            (
-                "oi",
-                "/futures/data/openInterestHist",
-                json!({"symbol":symbol,"period":"15m","limit":2}),
-            ),
-        ];
-        let results =
-            futures::future::join_all(calls.iter().map(|(key, path, params)| async move {
-                (*key, self.public_request(path, params).await)
-            }))
-            .await;
-        let mut context = json!({"symbol":symbol,"ticker24h":null,"premium":null,"funding":[],"oi":[],"errors":{}});
-        for (key, result) in results {
-            match result {
-                Ok(data) => context[key] = data,
-                Err(error) => context["errors"][key] = json!(error.to_string()),
-            }
-        }
-        context
+        self.market_context(symbol, &Value::Null, false).await
     }
 }
 fn http_client(reuse_idle_connections: bool) -> Result<reqwest::Client> {

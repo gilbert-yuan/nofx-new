@@ -137,6 +137,52 @@ pub fn score_size(signal: &Value, open_count: usize) -> Option<(f64, f64)> {
     }
     Some((leverage, margin))
 }
+/// Fit the minimum margin by reducing leverage, without increasing capped exposure.
+pub fn entry_size(
+    equity: f64,
+    margin_pct: f64,
+    leverage: f64,
+    min_margin: f64,
+    notional_pct: f64,
+    available: Option<f64>,
+    minimum_notional: f64,
+) -> Option<(f64, f64)> {
+    if ![equity, margin_pct, leverage, min_margin, minimum_notional]
+        .into_iter()
+        .all(f64::is_finite)
+        || equity <= 0.
+        || margin_pct <= 0.
+        || leverage < 1.
+        || min_margin < 0.
+        || minimum_notional < 0.
+        || available.is_some_and(|v| !v.is_finite() || v <= 0.)
+    {
+        return None;
+    }
+    let mut leverage = leverage.floor();
+    let required_margin = (minimum_notional / leverage * 100.).ceil() / 100.;
+    let mut notional = (equity * margin_pct).max(min_margin).max(required_margin) * leverage;
+    if notional_pct > 0. && notional_pct <= 1. {
+        notional = notional.min(equity * notional_pct);
+    }
+    if !notional.is_finite() || notional < minimum_notional {
+        return None;
+    }
+    loop {
+        let mut margin = notional / leverage;
+        if let Some(available) = available {
+            margin = margin.min(available / (1. + leverage * 12. / 10000.));
+        }
+        margin = (margin * 100.).floor() / 100.;
+        if margin >= min_margin.max(1.) && margin * leverage >= minimum_notional {
+            return Some((leverage, margin));
+        }
+        if leverage <= 1. {
+            return None;
+        }
+        leverage -= 1.;
+    }
+}
 pub fn screen(ticker: &Value, market: Option<&Value>) -> bool {
     let volume = optional(&ticker["quoteVolume"]);
     if volume.is_none_or(|v| v < env_num("NOFX_MIN_QUOTE_VOL_24H", 5_000_000., 0., 1e12)) {
@@ -220,6 +266,51 @@ pub fn book_check(book: &Value, order_book: &Value, notional: f64) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn minimum_margin_reduces_leverage_without_raising_exposure() {
+        for requested in [3., 5.] {
+            let (leverage, margin) = entry_size(53.77, 0.06, requested, 5., 0.25, Some(50.), 0.)
+                .expect("lower leverage fits the same notional cap");
+            assert_eq!(leverage, 2.);
+            assert!(margin >= 5.);
+            assert!(margin * leverage <= 53.77 * 0.25);
+            assert!(margin * (1. + leverage * 12. / 10000.) <= 50.);
+        }
+        assert_eq!(
+            entry_size(100., 0.06, 3., 5., 0.25, Some(50.), 0.),
+            Some((3., 6.))
+        );
+    }
+    #[test]
+    fn minimum_margin_still_rejects_insufficient_equity_or_cash() {
+        assert_eq!(entry_size(18., 0.06, 5., 5., 0.25, Some(50.), 0.), None);
+        assert_eq!(entry_size(53.77, 0.06, 5., 5., 0.25, Some(4.99), 0.), None);
+        let (leverage, margin) = entry_size(53.77, 0.06, 5., 5., 0.25, Some(5.01), 0.).unwrap();
+        assert_eq!((leverage, margin), (1., 5.));
+        assert!(margin * (1. + leverage * 12. / 10000.) <= 5.01);
+        assert_eq!(
+            entry_size(f64::NAN, 0.06, 5., 5., 0.25, Some(50.), 0.),
+            None
+        );
+    }
+    #[test]
+    fn sizing_covers_exchange_rounding_and_rejects_minimum_above_risk_cap() {
+        let info = json!({"filters":[
+            {"filterType":"LOT_SIZE","stepSize":"1","minQty":"1","maxQty":"100000"},
+            {"filterType":"MIN_NOTIONAL","notional":"5"}
+        ]});
+        let price = 0.1234;
+        let too_small = crate::paper::aligned_quantity(&info, 5. / price, true).unwrap();
+        assert!(too_small * price < 5.);
+        let minimum = crate::paper::minimum_entry_notional(&info, price, true).unwrap();
+        let (leverage, margin) = entry_size(53.77, 0.06, 1., 5., 0.25, Some(50.), minimum).unwrap();
+        let quantity =
+            crate::paper::aligned_quantity(&info, margin * leverage / price, true).unwrap();
+        assert!(quantity * price >= 5.);
+        assert!(margin * leverage <= 53.77 * 0.25);
+        assert_eq!(entry_size(53.77, 0.06, 5., 5., 0.25, Some(50.), 20.), None);
+        assert!(crate::paper::minimum_entry_notional(&info, f64::NAN, true).is_err());
+    }
     #[test]
     fn missing_book_and_excessive_size_fail_closed() {
         let book = json!({"bidPrice":100,"askPrice":100.01});

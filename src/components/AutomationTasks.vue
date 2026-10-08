@@ -1,6 +1,7 @@
 <script setup>
 import { computed, ref, onMounted, onBeforeUnmount } from 'vue';
 import { api } from '../api.js';
+import MarketIndicators from './MarketIndicators.vue';
 
 const state = ref(null), error = ref(''), busy = ref(false);
 let timer, disposed = false, loading = false;
@@ -17,7 +18,8 @@ const yaoDirectionClass = direction => direction === 'UP' ? 'yao-up' : direction
 const yaoEntryLabel = direction => direction === 'UP' ? '最佳买入' : direction === 'DOWN' ? '最佳做空' : '最佳入场';
 const yaoReasons = reasons => Array.isArray(reasons) && reasons.length ? reasons.join('；') : '—';
 const analysis = computed(() => state.value?.analysisMeta || {});
-const analysisBusy = computed(() => ['syncing', 'analyzing'].includes(analysis.value.phase));
+const readOnly = computed(() => state.value?.executionStatus?.readOnly ?? analysis.value.readOnly);
+const analysisBusy = computed(() => ['syncing', 'analyzing', 'enriching'].includes(analysis.value.phase));
 const opportunityEmpty = computed(() => {
   if (analysis.value.phase === 'error') return `机会分析失败：${analysis.value.error || '请查看任务错误'}`;
   if (analysisBusy.value) return '正在同步行情并生成机会分析，请等待本轮完成。';
@@ -58,19 +60,22 @@ onBeforeUnmount(() => { disposed = true; clearInterval(timer); });
         {{ state.active ? '停止自动任务' : '启动自动任务' }}
       </button>
     </div>
-    <p v-if="analysis.readOnly" class="muted">当前为采集与分析展示模式。行情同步后生成策略机会和妖币预测，自动下单与持仓管理关闭。</p>
+    <p v-if="readOnly" class="muted">当前为采集与分析展示模式。行情同步后生成策略机会和妖币预测，自动下单与持仓管理关闭。</p>
     <p v-else class="muted">沿用当前策略配置。全市场按币种逐个拉取并立即分析；订单管理独立更新活跃订单行情。停止后，本轮在安全检查点退出，自动撮合与盈亏刷新也会停止。</p>
     <p v-if="error" class="signal-warning" role="alert">{{ error }}</p>
     <p v-if="analysis.marketWarning" class="signal-warning">{{ analysis.marketWarning }}</p>
+    <p v-if="state?.executionStatus?.reason" class="signal-warning">自动下单状态：{{ state.executionStatus.reason }}</p>
+    <p v-else-if="state?.executionStatus?.ready" class="muted">自动下单已就绪 · {{ state.executionStatus.mode === 'demo' ? '币安 Demo' : state.executionStatus.mode === 'live' ? '币安实盘' : state.executionStatus.mode }} · 按策略、确认结果与资金池风控执行。</p>
     <div v-if="state" class="task-grid">
       <article v-for="(task, key) in state.tasks" :key="key">
-        <h4>{{ analysis.readOnly && key === 'klineSync' ? '全市场行情同步 → 机会与预测' : names[key] || key }}</h4>
+        <h4>{{ readOnly && key === 'klineSync' ? '全市场行情同步 → 机会与预测' : names[key] || key }}</h4>
         <p>{{ task.running ? '执行中' : !task.enabled ? '已暂停' : state.active ? '等待下一轮' : '已停止' }}</p>
         <p>每轮完成后等待 {{ task.interval / 1000 }} 秒</p>
         <p>进度 {{ task.progress?.completed || 0 }} / {{ task.progress?.total || 0 }} · 失败 {{ task.progress?.failed || 0 }}</p>
         <p v-if="task.progress?.symbol">当前币种：{{ task.progress.symbol }}</p>
         <p v-if="task.progress?.stage">当前阶段：{{ task.progress.stage }}</p>
         <p v-if="task.lastSummary" class="task-summary">{{ task.lastSummary }}</p>
+        <p v-if="key === 'klineSync' && task.summary && !task.summary.reportsOnly" class="task-summary">上轮机会 {{ task.summary.eligible || 0 }} · 创建订单 {{ task.summary.created || 0 }} · 确认提交 {{ task.summary.submitted || 0 }} · 跳过 {{ task.summary.execution?.filter(item => item.status === 'skipped').length || 0 }}</p>
         <small>最近完成：{{ time(task.lastRun) }}</small>
         <small v-if="task.lastSummaryAt">摘要时间：{{ time(task.lastSummaryAt) }}</small>
         <small>下一轮：{{ state.active && task.enabled ? time(task.nextRunAt) : '—' }}</small>
@@ -87,7 +92,7 @@ onBeforeUnmount(() => { disposed = true; clearInterval(timer); });
         <div><h3>策略机会 · 超级确认</h3><p class="muted">先由现有策略选币和定方向，再由独立确认层判断是否追入或等待更好价格。</p></div>
         <small v-if="analysis.asOf">分析时间：{{ time(analysis.asOf) }}</small>
       </div>
-      <p v-if="analysisBusy" class="muted">{{ analysis.phase === 'syncing' ? '同步行情中' : `分析 ${analysis.processedSymbols || 0} / ${analysis.symbols || 0} 个币种 · 已完成 ${analysis.analyzed || 0} 次策略分析` }}</p>
+      <p v-if="analysisBusy" class="muted">{{ analysis.phase === 'syncing' ? '同步行情中' : analysis.phase === 'enriching' ? '正在更新候选的行情辅助指标' : `分析 ${analysis.processedSymbols || 0} / ${analysis.symbols || 0} 个币种 · 已完成 ${analysis.analyzed || 0} 次策略分析` }}</p>
       <p v-if="!state?.opportunities?.length" class="muted">{{ opportunityEmpty }}</p>
       <div v-else class="opportunity-grid">
         <article v-for="item in state.opportunities" :key="item.symbol + '-' + item.generatedAt" class="opportunity-card">
@@ -98,7 +103,7 @@ onBeforeUnmount(() => { disposed = true; clearInterval(timer); });
           <div class="opportunity-stats">
             <div><span>{{ item.cacheOnly ? '缓存参考价' : '当前价' }}</span><strong>{{ price(item.current?.price) }}</strong></div>
             <div><span>24h</span><strong>{{ pct(item.current?.change24hPct) }}</strong></div>
-            <div><span>OI</span><strong>{{ pct(item.current?.oiChangePct) }}</strong></div>
+            <div><span>持仓数量 15m</span><strong>{{ pct(item.current?.oiChangePct) }}</strong></div>
             <div><span>资金费率</span><strong>{{ funding(item.current?.fundingRate) }}</strong></div>
           </div>
           <dl class="opportunity-levels">
@@ -112,7 +117,9 @@ onBeforeUnmount(() => { disposed = true; clearInterval(timer); });
             <div><dt>止盈</dt><dd>{{ item.levels?.takeProfits?.length ? item.levels.takeProfits.map(price).join(' / ') : '—' }}</dd></div>
           </dl>
           <p class="opportunity-summary">{{ item.summary }}</p>
-          <small>生成时间：{{ time(item.generatedAt) }} · {{ analysis.readOnly ? '只读分析，不自动执行' : item.canProceed ? '当前可按计划继续' : '当前等待确认，不追价' }}</small>
+          <MarketIndicators :data="item.indicators" :evidence="item.evidence" />
+          <small>生成时间：{{ time(item.generatedAt) }} · {{ readOnly ? '只读分析，不自动执行' : item.canProceed ? '当前可按计划继续' : '当前等待确认，不追价' }}</small>
+          <small v-if="item.execution">执行结果：{{ item.execution.reason }}</small>
           <small v-if="item.cacheOnly">缓存数据时间：{{ time(item.dataAsOf) }} · 等待实时行情恢复</small>
         </article>
       </div>
@@ -152,6 +159,7 @@ onBeforeUnmount(() => { disposed = true; clearInterval(timer); });
             <span>数据 {{ item.features?.dataSource === 'ticker24h+klines' ? '24h+K线' : 'K线降级' }}</span>
           </div>
           <p class="yao-reasons">{{ yaoReasons(item.reasons) }}</p>
+          <MarketIndicators :data="item.indicators" :evidence="item.evidence" />
           <small class="yao-warning">{{ item.warnings?.[0] }} · 仅观察，不自动下单</small>
           <small v-if="item.cacheOnly" class="yao-warning">缓存数据时间：{{ time(item.dataAsOf) }} · 等待实时行情恢复</small>
         </article>

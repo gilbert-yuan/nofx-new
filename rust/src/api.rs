@@ -294,6 +294,27 @@ async fn dispatch(
             return ok(app.automation.sync_status().await?);
         }
         ("GET", "/api/market/flow-analysis") => return ok(flow_live(app, query).await?),
+        ("GET", "/api/market/indicators") => {
+            let symbol = strip_symbol(q(query, "symbol", "BTCUSDT")).to_uppercase();
+            crate::exchange::valid_symbol(&symbol).map_err(|e| anyhow::anyhow!("400: {e}"))?;
+            let interval = q(query, "interval", "1m");
+            interval_ms(interval).context("400: 不支持的指标周期")?;
+            let (context, market) = tokio::join!(
+                app.market.indicator_context(&symbol, &Value::Null),
+                research::display_market(&app.db, &app.market, &symbol, interval, 80, true),
+            );
+            let mut context = context;
+            let market = match market {
+                Ok(market) => market,
+                Err(error) => {
+                    context["errors"]["klines"] = json!(format!("{error:#}"));
+                    json!({"symbol":symbol,"interval":interval,"klines":[]})
+                }
+            };
+            return ok(
+                json!({"symbol":symbol,"indicators":crate::market_indicators::summarize(&context,&market,now_ms())}),
+            );
+        }
         ("POST", "/api/market/flow-analysis") => {
             let mut flow = input.clone();
             if !flow["datasets"].is_object() {
