@@ -219,7 +219,13 @@ pub async fn sync_candles(
         return Ok(cached);
     }
     let rows = client
-        .klines(symbol, interval, limit.saturating_add(2), None, None)
+        .klines(
+            symbol,
+            interval,
+            sync_fetch_limit(symbol, interval, &cached, limit, now_ms()),
+            None,
+            None,
+        )
         .await?;
     let closed: Vec<Value> = rows
         .into_iter()
@@ -229,7 +235,63 @@ pub async fn sync_candles(
         bail!("{symbol}/{interval}：没有已收盘K线");
     }
     db.save_klines(&key, interval, &closed).await?;
-    Ok(closed)
+    // Incremental responses must be merged with the persisted history.
+    db.candles(&key, interval, limit as i64, None, None).await
+}
+fn sync_fetch_limit(
+    symbol: &str,
+    interval: &str,
+    cached: &[Value],
+    limit: usize,
+    now: i64,
+) -> usize {
+    let full = limit.saturating_add(2).min(1000);
+    let Some(duration) = interval_ms(interval) else {
+        return full;
+    };
+    let Some(end) = cached
+        .last()
+        .and_then(|r| r["openTime"].as_i64())
+        .map(|t| t + duration)
+    else {
+        return full;
+    };
+    let Ok(current) = candle_open(now, interval) else {
+        return full;
+    };
+    if end > current || prepare_market(symbol, interval, cached, limit, end).is_err() {
+        return full;
+    }
+    let missing = ((current - end) / duration) as usize;
+    full.min(missing.saturating_add(2))
+}
+
+// Historical cache is only a display fallback; execution keeps using fresh_market.
+pub async fn display_market(
+    db: &Db,
+    client: &Exchange,
+    symbol: &str,
+    interval: &str,
+    limit: usize,
+    read_only: bool,
+) -> Result<Value> {
+    match fresh_market(db, client, symbol, interval, limit).await {
+        Ok(market) => Ok(market),
+        Err(error) if read_only => {
+            let key = storage_symbol(symbol, "binance")?;
+            let rows = db.candles(&key, interval, limit as i64, None, None).await?;
+            let end = rows
+                .last()
+                .and_then(|r| r["openTime"].as_i64())
+                .context("没有可用于只读展示的缓存行情")?
+                + interval_ms(interval).context("不支持的周期")?;
+            let mut market = prepare_market(symbol, interval, &rows, limit, end)?;
+            market["cacheOnly"] = json!(true);
+            market["marketWarning"] = json!(format!("实时行情不可用，使用缓存：{error:#}"));
+            Ok(market)
+        }
+        Err(error) => Err(error),
+    }
 }
 pub async fn fresh_market(
     db: &Db,
@@ -445,6 +507,32 @@ pub fn symbols(input: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn incremental_fetch_keeps_full_refill_for_broken_history() {
+        let rows: Vec<Value> = (920..1000).map(|i| json!({"openTime":i * 60_000,"open":100,"high":101,"low":99,"close":100,"volume":10})).collect();
+        assert_eq!(
+            sync_fetch_limit("BTCUSDT", "1m", &rows, 80, 1001 * 60_000),
+            3
+        );
+        assert_eq!(
+            sync_fetch_limit("BTCUSDT", "1m", &rows, 80, 1020 * 60_000),
+            22
+        );
+        assert_eq!(
+            sync_fetch_limit("BTCUSDT", "1m", &rows, 80, 1100 * 60_000),
+            82
+        );
+        assert_eq!(
+            sync_fetch_limit("BTCUSDT", "1m", &rows[..75], 80, 1001 * 60_000),
+            82
+        );
+        let mut gapped = rows;
+        gapped.remove(40);
+        assert_eq!(
+            sync_fetch_limit("BTCUSDT", "1m", &gapped, 80, 1001 * 60_000),
+            82
+        );
+    }
     #[test]
     fn stale_and_invalid_plan_never_eligible() {
         let now = 1_800_000;

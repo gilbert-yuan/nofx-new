@@ -4,10 +4,13 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Mutex;
+mod rate_limit;
 
 #[derive(Clone)]
 pub struct Exchange {
     client: reqwest::Client,
+    retry_client: reqwest::Client,
+    budget: Arc<Mutex<rate_limit::Budget>>,
     base: String,
     key: String,
     secret: String,
@@ -19,7 +22,13 @@ impl Exchange {
     pub(crate) fn test_endpoint(base: &str) -> Self {
         Self {
             client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            retry_client: reqwest::Client::builder()
+                .no_proxy()
+                .pool_max_idle_per_host(0)
+                .build()
+                .unwrap(),
             base: base.into(),
+            budget: Arc::new(Mutex::new(rate_limit::Budget::default())),
             key: "test-key".into(),
             secret: "test-secret".into(),
             demo: false,
@@ -50,25 +59,11 @@ impl Exchange {
                 .trim()
                 .to_owned()
         };
-        let mut builder = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .connect_timeout(Duration::from_secs(8))
-            .user_agent("NOFX-Rust/0.1");
-        if let Some(proxy) = std::env::var("HTTPS_PROXY")
-            .ok()
-            .or_else(|| std::env::var("HTTP_PROXY").ok())
-            .filter(|s| !s.is_empty())
-        {
-            builder = builder.proxy(reqwest::Proxy::all(proxy)?);
-        }
         Ok(Self {
-            client: builder.build()?,
-            base: if demo {
-                "https://demo-fapi.binance.com".to_owned()
-            } else {
-                std::env::var("BINANCE_FUTURES_BASE")
-                    .unwrap_or("https://www.binance.com".to_owned())
-            },
+            client: http_client(true)?,
+            retry_client: http_client(false)?,
+            budget: rate_limit::shared(demo),
+            base: futures_base(demo, std::env::var("BINANCE_FUTURES_BASE").ok().as_deref()),
             key: credential("apiKey"),
             secret: credential("secretKey"),
             demo,
@@ -91,22 +86,87 @@ impl Exchange {
             query
         );
         for attempt in 0..3 {
-            let result = self.client.get(&url).send().await;
-            match result {
+            loop {
+                let delay = self
+                    .budget
+                    .lock()
+                    .await
+                    .reserve(path, params, crate::now_ms())?;
+                if delay == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(delay as u64)).await;
+            }
+            let sent = crate::now_ms();
+            // Retry with a separate pool that cannot reuse an interrupted or stale connection.
+            let request = if attempt == 0 {
+                self.client.get(&url)
+            } else {
+                self.retry_client
+                    .get(&url)
+                    .header(reqwest::header::CONNECTION, "close")
+            };
+            let (result, retryable) = match request.send().await {
                 Ok(response) => {
                     let status = response.status();
-                    let body = response.text().await?;
-                    if (status.as_u16() == 429 || status.is_server_error()) && attempt < 2 {
-                        tokio::time::sleep(Duration::from_millis(350_u64 << attempt)).await;
-                        continue;
+                    let headers = response.headers().clone();
+                    self.budget
+                        .lock()
+                        .await
+                        .observe_headers(&headers, sent, crate::now_ms());
+                    match response.text().await {
+                        Ok(body) => {
+                            self.budget.lock().await.observe_rejection(
+                                status.as_u16(),
+                                &headers,
+                                &body,
+                                crate::now_ms(),
+                            );
+                            let result = parse_response(status.as_u16(), &body);
+                            let retryable = status.as_u16() == 429
+                                || status.is_server_error()
+                                || (status.is_success()
+                                    && result.as_ref().is_err_and(|error| {
+                                        error.downcast_ref::<serde_json::Error>().is_some()
+                                    }));
+                            (result, retryable)
+                        }
+                        Err(error) => {
+                            self.budget.lock().await.observe_rejection(
+                                status.as_u16(),
+                                &headers,
+                                "",
+                                crate::now_ms(),
+                            );
+                            (
+                                Err(anyhow::Error::new(error)
+                                    .context(format!("读取 Binance 响应体失败 (HTTP {status})"))),
+                                status.is_success()
+                                    || status.as_u16() == 429
+                                    || status.is_server_error(),
+                            )
+                        }
                     }
-                    return parse_response(status.as_u16(), &body);
                 }
-                Err(error) if attempt < 2 => {
-                    tracing::warn!(%error,"Retrying public market request");
+                Err(error) => (Err(error.into()), true),
+            };
+            match result {
+                Ok(data) => {
+                    if attempt > 0 {
+                        tracing::info!(%url, attempts = attempt + 1, "Public market request recovered after retry");
+                    }
+                    return Ok(data);
+                }
+                Err(error) if retryable && attempt < 2 => {
+                    tracing::warn!(error = %format!("{error:#}"), %url, attempt = attempt + 1, "Retrying public market request");
                     tokio::time::sleep(Duration::from_millis(350_u64 << attempt)).await;
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    bail!(
+                        "Binance public GET {url} failed after {} attempt(s): {error:#}",
+                        attempt + 1
+                    );
+                }
             }
         }
         unreachable!()
@@ -226,6 +286,36 @@ impl Exchange {
         context
     }
 }
+fn http_client(reuse_idle_connections: bool) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(8))
+        .pool_idle_timeout(Duration::from_secs(15))
+        .user_agent("NOFX-Rust/0.1");
+    if !reuse_idle_connections {
+        builder = builder.pool_max_idle_per_host(0);
+    }
+    if let Some(proxy) = std::env::var("HTTPS_PROXY")
+        .ok()
+        .or_else(|| std::env::var("HTTP_PROXY").ok())
+        .filter(|s| !s.is_empty())
+    {
+        builder = builder.proxy(reqwest::Proxy::all(proxy)?);
+    }
+    Ok(builder.build()?)
+}
+fn futures_base(demo: bool, live_override: Option<&str>) -> String {
+    if demo {
+        "https://demo-fapi.binance.com".to_owned()
+    } else {
+        live_override
+            .map(str::trim)
+            .filter(|base| !base.is_empty())
+            .unwrap_or("https://fapi.binance.com")
+            .trim_end_matches('/')
+            .to_owned()
+    }
+}
 pub fn is_demo(b: &Value) -> bool {
     b.get("demo")
         .map(|v| v == true)
@@ -311,6 +401,10 @@ fn parse_response(status: u16, text: &str) -> Result<Value> {
     }
     Ok(data)
 }
+#[cfg(test)]
+#[path = "exchange/request_tests.rs"]
+mod request_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

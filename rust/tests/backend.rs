@@ -97,6 +97,51 @@ async fn isolated_database_and_http_contract() -> Result<()> {
         Err(panic) => std::panic::resume_unwind(panic),
     }
 }
+fn spawn_server(root: &std::path::Path, options: &PgConnectOptions, port: u16) -> Result<Server> {
+    let log = std::fs::File::create(root.join("server.log"))?;
+    Ok(Server(
+        Command::new(env!("CARGO_BIN_EXE_nofx-server"))
+            .arg("--root")
+            .arg(root)
+            .arg("--host")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .env("DATABASE_URL", options.to_url_lossy().as_str())
+            .env("DATA_DIR", root.join("data"))
+            .env("NOFX_AUTOSTART", "0")
+            .env("NOFX_LONG_ONLY", "false")
+            .env("RUST_LOG", "warn")
+            .stdout(Stdio::from(log.try_clone()?))
+            .stderr(Stdio::from(log))
+            .spawn()?,
+    ))
+}
+async fn wait_ready(
+    server: &mut Server,
+    client: &Client,
+    base: &str,
+    root: &std::path::Path,
+) -> Result<()> {
+    for _ in 0..120 {
+        if client
+            .get(format!("{base}/api/health"))
+            .send()
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+        if server.0.try_wait()?.is_some() {
+            bail!(
+                "isolated server exited: {}",
+                std::fs::read_to_string(root.join("server.log"))?
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    bail!("isolated Rust API did not become ready")
+}
 async fn run(options: &PgConnectOptions) -> Result<()> {
     let root = tempfile::tempdir()?;
     std::fs::create_dir(root.path().join("dist"))?;
@@ -107,52 +152,23 @@ async fn run(options: &PgConnectOptions) -> Result<()> {
     let socket = std::net::TcpListener::bind("127.0.0.1:0")?;
     let port = socket.local_addr()?.port();
     drop(socket);
-    let log = std::fs::File::create(root.path().join("server.log"))?;
-    let mut server = Server(
-        Command::new(env!("CARGO_BIN_EXE_nofx-server"))
-            .arg("--root")
-            .arg(root.path())
-            .arg("--host")
-            .arg("127.0.0.1")
-            .arg("--port")
-            .arg(port.to_string())
-            .env("DATABASE_URL", options.to_url_lossy().as_str())
-            .env("DATA_DIR", root.path().join("data"))
-            .env("NOFX_AUTOSTART", "0")
-            .env("NOFX_LONG_ONLY", "false")
-            .env("RUST_LOG", "warn")
-            .stdout(Stdio::from(log.try_clone()?))
-            .stderr(Stdio::from(log))
-            .spawn()?,
-    );
+    let mut server = spawn_server(root.path(), options, port)?;
     let client = Client::builder()
         .timeout(Duration::from_secs(8))
         .no_proxy()
         .build()?;
     let base = format!("http://127.0.0.1:{port}");
-    let mut ready = false;
-    for _ in 0..120 {
-        if client
-            .get(format!("{base}/api/health"))
-            .send()
-            .await
-            .is_ok()
-        {
-            ready = true;
-            break;
-        }
-        if server.0.try_wait()?.is_some() {
-            bail!(
-                "isolated server exited: {}",
-                std::fs::read_to_string(root.path().join("server.log"))?
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-    if !ready {
-        bail!("isolated Rust API did not become ready");
-    }
-    let health = request(&client, &base, "GET", "/api/health", None, 200).await?;
+    wait_ready(&mut server, &client, &base, root.path()).await?;
+    let api: Value = serde_json::from_str(include_str!("../../src/api/contract.json"))?;
+    let health = request(
+        &client,
+        &base,
+        "GET",
+        api["health"].as_str().unwrap(),
+        None,
+        200,
+    )
+    .await?;
     assert_eq!(health["runtime"], "rust");
     let db = Db {
         pool: sqlx::PgPool::connect_with(options.clone()).await?,
@@ -160,19 +176,54 @@ async fn run(options: &PgConnectOptions) -> Result<()> {
     let initial = db.account(false, None).await?;
     assert!(!initial["fusedPoolStartedAt"].is_null());
     assert_eq!(initial["unlimitedCapital"], false);
-    let config=request(&client,&base,"PUT","/api/config",Some(json!({"model":{"apiKey":"test-secret"},"trader":{"syncPaperOrdersToDemo":false,"syncPaperOrdersToLive":false}})),200).await?;
+    let config=request(&client,&base,"PUT",api["config"]["put"].as_str().unwrap(),Some(json!({"model":{"apiKey":"test-secret"},"trader":{"syncPaperOrdersToDemo":false,"syncPaperOrdersToLive":false}})),200).await?;
     assert!(!config.to_string().contains("test-secret"));
-    let strategies = request(&client, &base, "GET", "/api/strategies", None, 200).await?;
+    let strategies = request(
+        &client,
+        &base,
+        "GET",
+        api["strategies"]["base"].as_str().unwrap(),
+        None,
+        200,
+    )
+    .await?;
     assert_eq!(strategies["strategies"].as_array().unwrap().len(), 7);
+    let opportunities = request(
+        &client,
+        &base,
+        "GET",
+        "/api/automation/opportunities",
+        None,
+        200,
+    )
+    .await?;
+    assert!(opportunities["asOf"].is_null());
+    assert_eq!(opportunities["analysis"]["phase"], "idle");
+    let predictions = request(
+        &client,
+        &base,
+        "GET",
+        "/api/automation/yao-coins",
+        None,
+        200,
+    )
+    .await?;
+    assert!(predictions["asOf"].is_null());
+    assert_eq!(predictions["analysis"]["phase"], "idle");
     for path in [
         "/api/paper/account",
         "/api/paper/statistics",
-        "/api/paper/daily-trend",
-        "/api/strategy-stats",
+        api["paper"]["dailyTrend"].as_str().unwrap(),
+        api["stats"]["base"].as_str().unwrap(),
+        api["binance"]["status"].as_str().unwrap(),
+        api["config"]["get"].as_str().unwrap(),
+        api["strategy"]["get"].as_str().unwrap(),
+        api["market"]["status"].as_str().unwrap(),
         "/api/automation/status",
         "/api/automation/opportunities",
         "/api/automation/yao-coins",
-        "/api/history/summary",
+        api["history"]["summary"].as_str().unwrap(),
+        api["history"]["syncStatus"].as_str().unwrap(),
         "/api/analyses",
         "/api/adaptive/config",
     ] {
@@ -192,7 +243,7 @@ async fn run(options: &PgConnectOptions) -> Result<()> {
         &client,
         &base,
         "POST",
-        "/api/market/flow-analysis",
+        api["market"]["flowAnalysis"].as_str().unwrap(),
         Some(json!({"datasets":{"1h":"bad"}})),
         400,
     )
@@ -201,7 +252,7 @@ async fn run(options: &PgConnectOptions) -> Result<()> {
         &client,
         &base,
         "POST",
-        "/api/market/flow-analysis",
+        api["market"]["flowAnalysis"].as_str().unwrap(),
         Some(json!({"symbol":"TEST","datasets":{"1h":[]}})),
         200,
     )
@@ -229,15 +280,21 @@ async fn run(options: &PgConnectOptions) -> Result<()> {
             .iter_mut()
             .find(|o| o["id"] == order["id"])
             .unwrap();
-        o["nativeTestExtension"] = json!({"array":[1,null,true,{"value":"nested"}],"unknown":null});
+        o["nativeTestExtension"] = json!({"array":[1,null,true,{"value":"nested"}],"emptyArray":[],"emptyObject":{},"indices":(0..12).map(|i|json!({"value":i})).collect::<Vec<_>>(),"unknown":null});
         Ok(Value::Null)
     })
     .await?;
     let stored = db.account(false, None).await?;
+    let extension = &stored["orders"][0]["nativeTestExtension"];
     assert_eq!(
-        stored["orders"][0]["nativeTestExtension"],
-        json!({"array":[1,null,true,{"value":"nested"}],"unknown":null})
+        extension["array"],
+        json!([1, null, true, {"value":"nested"}])
     );
+    assert_eq!(extension["emptyArray"], json!([]));
+    assert_eq!(extension["emptyObject"], json!({}));
+    for i in 0..12 {
+        assert_eq!(extension["indices"][i]["value"], json!(i));
+    }
     request(
         &client,
         &base,
@@ -282,6 +339,30 @@ async fn run(options: &PgConnectOptions) -> Result<()> {
             .await?
             .contains("Rust isolation test")
     );
+    // Restart initialization must preserve historical orders and the existing pool timestamp.
+    db.mutate_account_light(|state| {
+        state["unlimitedCapital"] = json!(true);
+        Ok(Value::Null)
+    })
+    .await?;
+    let mut expected = db.account(false, None).await?;
+    expected["unlimitedCapital"] = json!(false);
+    drop(server);
+    server = spawn_server(root.path(), options, port)?;
+    wait_ready(&mut server, &client, &base, root.path()).await?;
+    assert_eq!(db.account(false, None).await?, expected);
+
+    // A legacy null timestamp is filled once without changing nested order extensions.
+    sqlx::query("UPDATE simulated_account_extensions SET value_kind='null',text_value=NULL WHERE account_id=1 AND path=ARRAY['fusedPoolStartedAt']::text[]")
+        .execute(&db.pool)
+        .await?;
+    drop(server);
+    server = spawn_server(root.path(), options, port)?;
+    wait_ready(&mut server, &client, &base, root.path()).await?;
+    let initialized = db.account(false, None).await?;
+    assert!(initialized["fusedPoolStartedAt"].is_string());
+    expected["fusedPoolStartedAt"] = initialized["fusedPoolStartedAt"].clone();
+    assert_eq!(initialized, expected);
     db.pool.close().await;
     drop(server);
     Ok(())

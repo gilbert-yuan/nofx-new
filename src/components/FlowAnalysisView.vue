@@ -1,10 +1,10 @@
 <script setup>
 import { computed, reactive, ref } from 'vue';
 import { marketApi } from '../api/client.js';
-import { DEFAULT_FLOW_ANALYSIS_PARAMS, FLOW_ANALYSIS_INTERVALS } from '../../shared/flowAnalysis.js';
+import flowConfig from '../../rust/src/flow_defaults.json';
 
-const INTERVALS = FLOW_ANALYSIS_INTERVALS;
-const DEFAULTS = structuredClone(DEFAULT_FLOW_ANALYSIS_PARAMS);
+const INTERVALS = Object.keys(flowConfig.defaults.lookaheadBarsByInterval);
+const DEFAULTS = structuredClone(flowConfig.defaults);
 
 const mode = ref('live');
 const symbol = ref('BTCUSDT');

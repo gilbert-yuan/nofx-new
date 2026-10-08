@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use futures::StreamExt;
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -14,6 +14,37 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{Mutex, Semaphore};
+
+const SYNC_INTERVALS: [&str; 6] = ["1m", "5m", "15m", "1h", "4h", "1d"];
+
+fn sync_windows(config: &Value, enabled: &[Value]) -> Result<BTreeMap<String, usize>> {
+    let limit = number(&config["marketSync"]["limit"], 80.).clamp(80., 1000.) as usize;
+    let mut windows: BTreeMap<String, usize> = SYNC_INTERVALS
+        .iter()
+        .map(|interval| ((*interval).to_owned(), limit))
+        .collect();
+    let configured = config["marketSync"]["interval"].as_str().unwrap_or("15m");
+    interval_ms(configured).context("不支持的同步周期")?;
+    windows.insert(configured.to_owned(), limit);
+    for strategy in enabled {
+        for interval in strategy["needsAux"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .chain(strategy["planInterval"].as_str())
+        {
+            interval_ms(interval).context("不支持的策略周期")?;
+            let window =
+                number(&strategy["marketWindows"][interval], 80.).clamp(30., 1000.) as usize;
+            windows
+                .entry(interval.to_owned())
+                .and_modify(|current| *current = (*current).max(window))
+                .or_insert(window);
+        }
+    }
+    Ok(windows)
+}
 
 pub struct Automation {
     pub db: Db,
@@ -35,7 +66,7 @@ impl Automation {
             active: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             state: Mutex::new(
-                json!({"tasks":{"klineSync":{"enabled":true,"interval":6000,"lastRun":null,"running":false},"positionReview":{"enabled":true,"interval":1000,"lastRun":null,"running":false}},"stats":{"totalAnalyzed":0,"totalOrders":0,"totalReviews":0,"errors":[]},"opportunities":[],"yaoCoins":[],"yaoCoinsAt":null,"yaoCoinError":""}),
+                json!({"tasks":{"klineSync":{"enabled":true,"interval":6000,"lastRun":null,"running":false},"positionReview":{"enabled":true,"interval":1000,"lastRun":null,"running":false}},"stats":{"totalAnalyzed":0,"totalOrders":0,"totalReviews":0,"errors":[]},"opportunities":[],"opportunitiesAt":null,"analysisMeta":{"phase":"idle","asOf":null,"analyzed":0},"yaoCoins":[],"yaoCoinsAt":null,"yaoCoinError":""}),
             ),
             sync_gate: Semaphore::new(1),
             review_gate: Semaphore::new(1),
@@ -46,11 +77,16 @@ impl Automation {
         self.active.load(Ordering::SeqCst)
     }
     pub async fn start(self: &Arc<Self>) -> Result<()> {
+        let data_only = self.store.read("config").await?["marketSync"]["dataOnly"] == true;
         if self.active.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
         let token = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         for kind in ["klineSync", "positionReview"] {
+            if data_only && kind == "positionReview" {
+                self.state.lock().await["tasks"][kind]["enabled"] = json!(false);
+                continue;
+            }
             let this = self.clone();
             tokio::spawn(async move {
                 while this.active() && this.generation.load(Ordering::SeqCst) == token {
@@ -68,15 +104,18 @@ impl Automation {
                 }
             });
         }
-        let this = self.clone();
-        tokio::spawn(async move {
-            while this.active() && this.generation.load(Ordering::SeqCst) == token {
-                if let Err(error) = crate::paper::exchange_refresh(&this.db, &this.store).await {
-                    tracing::warn!(%error,"Exchange account synchronization deferred");
+        if !data_only {
+            let this = self.clone();
+            tokio::spawn(async move {
+                while this.active() && this.generation.load(Ordering::SeqCst) == token {
+                    if let Err(error) = crate::paper::exchange_refresh(&this.db, &this.store).await
+                    {
+                        tracing::warn!(%error,"Exchange account synchronization deferred");
+                    }
+                    tokio::time::sleep(Duration::from_secs(15)).await;
                 }
-                tokio::time::sleep(Duration::from_secs(15)).await;
-            }
-        });
+            });
+        }
         Ok(())
     }
     pub fn stop(&self) {
@@ -120,14 +159,14 @@ impl Automation {
         state["active"] = json!(self.active());
         state["account"] = crate::paper::status(&self.db).await?;
         state["uptime"] = json!(self.started.elapsed().as_secs_f64());
-        state["yaoCoinMeta"] = json!({"targetAmplitudePct":50,"asOf":state["yaoCoinsAt"],"total":state["yaoCoins"].as_array().map(Vec::len).unwrap_or(0),"error":state["yaoCoinError"]});
+        state["yaoCoinMeta"] = json!({"targetAmplitudePct":50,"asOf":state["yaoCoinsAt"],"total":state["yaoCoins"].as_array().map(Vec::len).unwrap_or(0),"evaluated":state["analysisMeta"]["marketReady"],"error":state["yaoCoinError"]});
         Ok(state)
     }
     pub async fn sync_status(&self) -> Result<Value> {
-        let state = self.state.lock().await;
+        let state = self.state.lock().await.clone();
         let task = &state["tasks"]["klineSync"];
         Ok(
-            json!({"running":self.active()&&task["enabled"]!=false,"busy":task["running"],"lastRunAt":task["lastRun"],"nextRunAt":task["nextRunAt"],"lastError":task["error"].as_str().unwrap_or(""),"progress":task["progress"],"interval":"1m","intervalSeconds":number(&task["interval"],6000.)/1000.,"provider":"binance","states":[],"managedBy":"globalAutomation"}),
+            json!({"running":self.active()&&task["enabled"]!=false,"busy":task["running"],"lastRunAt":task["lastRun"],"nextRunAt":task["nextRunAt"],"lastError":task["error"].as_str().unwrap_or(""),"progress":task["progress"],"interval":"1m","intervals":SYNC_INTERVALS,"intervalSeconds":number(&task["interval"],6000.)/1000.,"provider":"binance","states":self.db.sync_states().await?,"managedBy":"globalAutomation"}),
         )
     }
     pub async fn execute(&self, kind: &str) -> Result<Value> {
@@ -160,6 +199,14 @@ impl Automation {
                     .map(|e| e.to_string())
                     .unwrap_or_default()
             );
+            if kind == "klineSync" {
+                state["analysisMeta"]["phase"] = json!(match &result {
+                    Ok(summary) if summary["cancelled"] == true => "cancelled",
+                    Ok(_) => "ready",
+                    Err(_) => "error",
+                });
+                state["analysisMeta"]["error"] = state["tasks"][kind]["error"].clone();
+            }
             if let Ok(summary) = &result {
                 state["tasks"][kind]["summary"] = summary.clone();
             } else if let Err(e) = &result {
@@ -190,7 +237,29 @@ impl Automation {
                 .filter_map(|s| s["symbol"].as_str().map(str::to_owned))
                 .collect();
         }
-        self.fetch_symbols(&symbols, interval, limit).await
+        {
+            let mut state = self.state.lock().await;
+            state["tasks"]["klineSync"]["running"] = json!(true);
+            state["tasks"]["klineSync"]["startedAt"] = json!(iso(now_ms()));
+            state["tasks"]["klineSync"]["progress"] =
+                json!({"total":symbols.len(),"completed":0,"failed":0,"intervals":[interval]});
+        }
+        let result = self.fetch_symbols(&symbols, interval, limit).await;
+        let mut state = self.state.lock().await;
+        let task = &mut state["tasks"]["klineSync"];
+        task["running"] = json!(false);
+        task["lastRun"] = json!(iso(now_ms()));
+        task["error"] = json!(
+            result
+                .as_ref()
+                .err()
+                .map(ToString::to_string)
+                .unwrap_or_default()
+        );
+        if let Ok(summary) = &result {
+            task["summary"] = summary.clone();
+        }
+        result
     }
     async fn fetch_symbols(
         &self,
@@ -211,10 +280,14 @@ impl Automation {
                         .into_iter()
                         .filter(|r| r["confirmed"] != false)
                         .collect();
-                    self.db
-                        .save_klines(&key, interval, &closed)
-                        .await
-                        .map(|n| (n, closed.last().and_then(|r| r["openTime"].as_i64())))
+                    if closed.is_empty() {
+                        Err(anyhow::anyhow!("没有已收盘K线"))
+                    } else {
+                        self.db
+                            .save_klines(&key, interval, &closed)
+                            .await
+                            .map(|n| (n, closed.last().and_then(|r| r["openTime"].as_i64())))
+                    }
                 }
                 Err(e) => Err(e),
             };
@@ -232,23 +305,100 @@ impl Automation {
                         .unwrap_or_default(),
                 )
                 .await;
+            let mut state = self.state.lock().await;
+            let progress = &mut state["tasks"]["klineSync"]["progress"];
+            let field = if result.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            };
+            progress[field] = json!(progress[field].as_u64().unwrap_or(0) + 1);
             (symbol.clone(), result)
         }));
         let results = jobs.buffer_unordered(concurrency).collect::<Vec<_>>().await;
         let mut saved = 0;
         let mut errors = vec![];
+        let mut datasets = vec![];
         for (symbol, r) in results {
             match r {
-                Ok((n, _)) => saved += n,
-                Err(e) => errors.push(format!("{symbol}: {e}")),
+                Ok((n, last)) => {
+                    saved += n;
+                    datasets.push(
+                        json!({"symbol":symbol,"interval":interval,"saved":n,"lastOpenTime":last}),
+                    );
+                }
+                Err(e) => {
+                    datasets
+                        .push(json!({"symbol":symbol,"interval":interval,"error":e.to_string()}));
+                    errors.push(format!("{symbol}: {e}"));
+                }
             }
         }
         Ok(
-            json!({"source":"binance","total":symbols.len(),"completed":symbols.len()-errors.len(),"failed":errors.len(),"saved":saved,"errors":errors,"at":iso(now_ms())}),
+            json!({"source":"binance","symbols":symbols,"interval":interval,"datasets":datasets,"total":symbols.len(),"completed":symbols.len()-errors.len(),"failed":errors.len(),"saved":saved,"errors":errors,"at":iso(now_ms())}),
         )
+    }
+    async fn sync_universe(
+        &self,
+        symbols: &[String],
+        windows: &BTreeMap<String, usize>,
+        token: u64,
+    ) -> Value {
+        self.state.lock().await["tasks"]["klineSync"]["progress"] = json!({"total":symbols.len(),"completed":0,"failed":0,"intervals":windows.keys().collect::<Vec<_>>()});
+        let concurrency = env_num("NOFX_KLINE_SYNC_CONCURRENCY", 12.).clamp(1., 24.) as usize;
+        let jobs = futures::stream::iter(symbols.iter().cloned().map(|symbol| async move {
+            let mut errors = vec![];
+            for (interval, limit) in windows {
+                if self.generation.load(Ordering::SeqCst) != token {
+                    return errors;
+                }
+                let result =
+                    research::sync_candles(&self.db, &self.market, &symbol, interval, *limit).await;
+                let error = result
+                    .as_ref()
+                    .err()
+                    .map(ToString::to_string)
+                    .unwrap_or_default();
+                let last = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|rows| rows.last())
+                    .and_then(|r| r["openTime"].as_i64());
+                if let Err(e) = self
+                    .db
+                    .sync_state(
+                        &format!("BINANCE_{symbol}"),
+                        interval,
+                        last,
+                        if result.is_ok() { "ok" } else { "error" },
+                        &error,
+                    )
+                    .await
+                {
+                    errors.push(format!("{symbol}/{interval} 同步状态：{e}"));
+                }
+                if let Err(e) = result {
+                    errors.push(format!("{symbol}/{interval}: {e}"));
+                }
+            }
+            let mut state = self.state.lock().await;
+            let progress = &mut state["tasks"]["klineSync"]["progress"];
+            let field = if errors.is_empty() {
+                "completed"
+            } else {
+                "failed"
+            };
+            progress[field] = json!(progress[field].as_u64().unwrap_or(0) + 1);
+            errors
+        }));
+        let results = jobs.buffer_unordered(concurrency).collect::<Vec<_>>().await;
+        let progress = self.state.lock().await["tasks"]["klineSync"]["progress"].clone();
+        let errors: Vec<String> = results.into_iter().flatten().collect();
+        json!({"total":symbols.len(),"completed":progress["completed"],"failed":progress["failed"],"intervals":progress["intervals"],"errors":errors})
     }
     async fn scan(&self, token: u64) -> Result<Value> {
         let config = self.store.read("config").await?;
+        let data_only = config["marketSync"]["dataOnly"] == true;
         let registry = strategies::list(&config, &self.store.read("strategies").await?);
         let enabled: Vec<Value> = registry["strategies"]
             .as_array()
@@ -257,7 +407,33 @@ impl Automation {
             .filter(|s| s["enabled"] == true)
             .cloned()
             .collect();
-        let contracts = self.market.contracts().await?;
+        {
+            let mut status = self.state.lock().await;
+            status["analysisMeta"] = json!({"phase":"syncing","startedAt":iso(now_ms()),"asOf":status["opportunitiesAt"],"readOnly":data_only,"enabledStrategies":enabled.len(),"analyzed":0,"processedSymbols":0,"marketReady":0,"error":""});
+        }
+        let contracts = match self.market.contracts().await {
+            Ok(contracts) => contracts,
+            Err(error) if data_only => {
+                self.state.lock().await["analysisMeta"]["marketWarning"] = json!(format!(
+                    "合约列表不可用，按本地已同步币种生成只读分析：{error:#}"
+                ));
+                self.db
+                    .sync_states()
+                    .await?
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|s| s["symbol"].as_str())
+                    .filter_map(|s| s.strip_prefix("BINANCE_"))
+                    .filter(|s| s.ends_with("USDT"))
+                    .map(str::to_owned)
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .map(|s| json!({"symbol":s}))
+                    .collect()
+            }
+            Err(error) => return Err(error),
+        };
         let mut symbols: Vec<String> = contracts
             .iter()
             .filter_map(|s| s["symbol"].as_str().map(str::to_owned))
@@ -266,6 +442,13 @@ impl Automation {
             research::symbols(&json!({"symbolsText":config["marketSync"]["symbolsText"]}));
         if !universe.is_empty() && !universe.iter().any(|s| s == "ALL") {
             symbols.retain(|s| universe.contains(s));
+        }
+        // Persist every selected contract and timeframe before applying trading screens.
+        let sync = self
+            .sync_universe(&symbols, &sync_windows(&config, &enabled)?, token)
+            .await;
+        if self.generation.load(Ordering::SeqCst) != token {
+            return Ok(json!({"cancelled":true,"sync":sync}));
         }
         let state = self.db.account(true, None).await?;
         let mut query = HashMap::new();
@@ -277,11 +460,22 @@ impl Automation {
             let keep: Vec<&str> = filtered.iter().filter_map(Value::as_str).collect();
             symbols.retain(|s| keep.contains(&s.as_str()));
         }
-        let tickers = self
+        let tickers = match self
             .market
             .public_request("/fapi/v1/ticker/24hr", &json!({}))
-            .await?;
-        if env_bool("NOFX_LIQUIDITY_SCREEN", true) {
+            .await
+        {
+            Ok(tickers) => tickers,
+            Err(error) if data_only => {
+                self.state.lock().await["analysisMeta"]["marketWarning"] = json!(format!(
+                    "24h 行情不可用，仅按缓存 K 线展示，等待实时数据恢复：{error:#}"
+                ));
+                json!([])
+            }
+            Err(error) => return Err(error),
+        };
+        let ticker_available = tickers.as_array().is_some_and(|t| !t.is_empty());
+        if env_bool("NOFX_LIQUIDITY_SCREEN", true) && (!data_only || ticker_available) {
             let minimum = env_num("NOFX_MIN_QUOTE_VOL_24H", 5_000_000.);
             symbols.retain(|s| {
                 tickers
@@ -291,16 +485,25 @@ impl Automation {
             });
         }
         {
-            self.state.lock().await["tasks"]["klineSync"]["progress"] =
-                json!({"total":symbols.len(),"completed":0,"failed":0});
+            let mut status = self.state.lock().await;
+            status["analysisMeta"]["phase"] = json!("analyzing");
+            status["analysisMeta"]["symbols"] = json!(symbols.len());
+            status["tasks"]["klineSync"]["progress"]["stage"] = json!("生成机会分析与妖币预测");
         }
         let run_id = uuid::Uuid::new_v4().to_string();
         let mut candidates = vec![];
-        let mut errors = vec![];
+        let mut errors: Vec<String> = sync["errors"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect();
         let mut analyzed = 0;
         let concurrency = env_num("NOFX_KLINE_SYNC_CONCURRENCY", 12.).clamp(1., 24.) as usize;
         let jobs = futures::stream::iter(symbols.iter().cloned().map(|symbol| async move {
-            let result = research::fresh_market(&self.db, &self.market, &symbol, "1m", 80).await;
+            let result =
+                research::display_market(&self.db, &self.market, &symbol, "1m", 80, data_only)
+                    .await;
             (symbol.clone(), result)
         }));
         let markets = jobs.buffer_unordered(concurrency).collect::<Vec<_>>().await;
@@ -317,21 +520,38 @@ impl Automation {
             }
         }
         {
-            let predictions = strategies::yao_predictions(
+            let mut predictions = strategies::yao_predictions(
                 &symbols.iter().map(|s| json!(s)).collect::<Vec<_>>(),
                 &prepared,
                 &ticker_map,
                 now_ms(),
                 &json!({}),
             );
+            for prediction in predictions.as_array_mut().into_iter().flatten() {
+                let symbol = prediction["symbol"].as_str().unwrap_or("");
+                let market = &prepared[symbol];
+                prediction["dataAsOf"] = market["dataAsOf"].clone();
+                prediction["cacheOnly"] = json!(
+                    market["cacheOnly"] == true
+                        || !ticker_available
+                        || timestamp(&market["dataAsOf"])
+                            != Some(research::candle_open(now_ms(), "1m")?)
+                );
+            }
             let mut status = self.state.lock().await;
             status["yaoCoins"] = predictions;
             status["yaoCoinsAt"] = json!(iso(now_ms()));
             status["yaoCoinError"] = json!("");
+            status["analysisMeta"]["marketReady"] = json!(prepared.as_object().unwrap().len());
         }
-        for (symbol, main) in markets {
+        for (index, (symbol, main)) in markets.into_iter().enumerate() {
             if self.generation.load(Ordering::SeqCst) != token {
                 break;
+            }
+            {
+                let mut status = self.state.lock().await;
+                status["analysisMeta"]["processedSymbols"] = json!(index + 1);
+                status["analysisMeta"]["symbol"] = json!(symbol);
             }
             let market = match main {
                 Ok(m) => m,
@@ -340,7 +560,8 @@ impl Automation {
                     continue;
                 }
             };
-            if crate::automation_guards::enabled("NOFX_LIQUIDITY_SCREEN", true)
+            if (!data_only || ticker_available)
+                && crate::automation_guards::enabled("NOFX_LIQUIDITY_SCREEN", true)
                 && !crate::automation_guards::screen(&ticker_map[&symbol], Some(&market))
             {
                 continue;
@@ -364,12 +585,13 @@ impl Automation {
                             .as_array()
                             .is_none_or(|rows| rows.len() < window)
                     }) {
-                        match research::fresh_market(
+                        match research::display_market(
                             &self.db,
                             &self.market,
                             &symbol,
                             interval,
                             window,
+                            data_only,
                         )
                         .await
                         {
@@ -403,8 +625,15 @@ impl Automation {
                         }) {
                             cached.unwrap().clone()
                         } else {
-                            match research::fresh_market(&self.db, &self.market, &symbol, tf, count)
-                                .await
+                            match research::display_market(
+                                &self.db,
+                                &self.market,
+                                &symbol,
+                                tf,
+                                count,
+                                data_only,
+                            )
+                            .await
                             {
                                 Ok(m) => m,
                                 Err(error) => {
@@ -445,6 +674,7 @@ impl Automation {
                     }
                 };
                 analyzed += 1;
+                self.state.lock().await["analysisMeta"]["analyzed"] = json!(analyzed);
                 raw["maxHoldBarsLimit"] = strategy["params"]["maxHoldBars"].clone();
                 let plan_interval = strategy["planInterval"].as_str().unwrap_or("1m");
                 let mut plan_market = market.clone();
@@ -457,58 +687,115 @@ impl Automation {
                     }
                 }
                 let now = now_ms();
-                let mut signal = research::normalize_plan(&raw, &plan_market, now);
+                // Display historical observations at their actual data time; execution still requires now.
+                let plan_time = if data_only {
+                    timestamp(&plan_market["dataAsOf"]).unwrap_or(now)
+                } else {
+                    now
+                };
+                let cache_only = market["cacheOnly"] == true
+                    || !ticker_available
+                    || aux.values().any(|m| m["cacheOnly"] == true)
+                    || timestamp(&market["dataAsOf"]) != Some(research::candle_open(now, "1m")?);
+                let mut signal = research::normalize_plan(&raw, &plan_market, plan_time);
+                signal["cacheOnly"] = json!(data_only && cache_only);
                 signal["strategyId"] = json!(id);
                 signal["analysisEngine"] = strategy["engine"].clone();
                 signal["confidenceType"] = json!("rule_strength");
                 if signal["eligible"] != true {
                     continue;
                 }
-                let opportunity_context = self.market.opportunity_context(&symbol).await;
-                signal["opportunityReport"] = strategies::opportunity_report(
-                    &signal,
-                    &plan_market,
-                    &opportunity_context,
-                    strategy,
-                    now,
-                );
-                let scope =
-                    json!({"interval":plan_interval,"limit":80,"engine":strategy["engine"]});
-                let mut legacy = self.store.read("strategy").await?;
-                legacy["interval"] = json!(plan_interval);
-                let mut record = research::create_record(
-                    &config,
-                    &legacy,
-                    &[plan_market.clone()],
-                    &[signal.clone()],
-                    &scope,
-                    "automation",
-                    now,
-                    Some(strategy),
-                    &[],
-                );
-                record["automationRunId"] = json!(run_id);
-                record["analysisEngine"] = strategy["engine"].clone();
-                self.db.save_record(&record).await?;
+                if !data_only {
+                    let opportunity_context = self.market.opportunity_context(&symbol).await;
+                    signal["opportunityReport"] = strategies::opportunity_report(
+                        &signal,
+                        &plan_market,
+                        &opportunity_context,
+                        strategy,
+                        now,
+                    );
+                }
+                let record = if data_only {
+                    json!({"id":null,"at":iso(now)})
+                } else {
+                    let scope =
+                        json!({"interval":plan_interval,"limit":80,"engine":strategy["engine"]});
+                    let mut legacy = self.store.read("strategy").await?;
+                    legacy["interval"] = json!(plan_interval);
+                    let mut record = research::create_record(
+                        &config,
+                        &legacy,
+                        &[plan_market.clone()],
+                        &[signal.clone()],
+                        &scope,
+                        "automation",
+                        now,
+                        Some(strategy),
+                        &[],
+                    );
+                    record["automationRunId"] = json!(run_id);
+                    record["analysisEngine"] = strategy["engine"].clone();
+                    self.db.save_record(&record).await?;
+                    record
+                };
                 candidates.push(json!({"symbol":symbol,"signal":signal,"record":record,"strategy":strategy,"market":plan_market}));
             }
-            let mut s = self.state.lock().await;
-            let progress = &mut s["tasks"]["klineSync"]["progress"];
-            progress["completed"] = json!(number(&progress["completed"], 0.) + 1.);
+        }
+        if self.generation.load(Ordering::SeqCst) != token {
+            return Ok(json!({"cancelled":true,"sync":sync}));
         }
         let mut selected = select_candidates(&candidates);
         selected.sort_by(compare_candidates);
+        // Only the selected display cards need the extra confirmation requests.
+        if data_only {
+            for candidate in selected.iter_mut().take(50) {
+                if self.generation.load(Ordering::SeqCst) != token {
+                    return Ok(json!({"cancelled":true,"sync":sync}));
+                }
+                let symbol = candidate["symbol"].as_str().unwrap_or("");
+                let context = if candidate["signal"]["cacheOnly"] == true {
+                    json!({"errors":{"market":"缓存行情，仅供观察，等待实时数据恢复"}})
+                } else {
+                    self.market.opportunity_context(symbol).await
+                };
+                let mut report = strategies::opportunity_report(
+                    &candidate["signal"],
+                    &candidate["market"],
+                    &context,
+                    &candidate["strategy"],
+                    now_ms(),
+                );
+                if report.is_object() {
+                    mark_display_report(
+                        &mut report,
+                        candidate["signal"]["cacheOnly"] == true,
+                        context["errors"].as_object().is_some_and(|e| !e.is_empty()),
+                    );
+                }
+                candidate["signal"]["opportunityReport"] = report;
+            }
+        }
         let opportunities: Vec<Value> = selected
             .iter()
-            .map(|c| {
-                let mut s = c["signal"].clone();
-                s["recordId"] = c["record"]["id"].clone();
-                s["strategyName"] = c["strategy"]["name"].clone();
-                s["at"] = c["record"]["at"].clone();
-                s
-            })
+            .filter_map(opportunity_card)
             .take(50)
             .collect();
+        {
+            let mut status = self.state.lock().await;
+            status["opportunities"] = json!(opportunities);
+            status["opportunitiesAt"] = json!(iso(now_ms()));
+            status["analysisMeta"]["asOf"] = status["opportunitiesAt"].clone();
+            status["analysisMeta"]["opportunityCount"] = json!(opportunities.len());
+            status["analysisMeta"]["failed"] = json!(errors.len());
+            status["stats"]["totalAnalyzed"] =
+                json!(number(&status["stats"]["totalAnalyzed"], 0.) + analyzed as f64);
+        }
+        // Read-only market reports end here, before any order submission or exchange mutation.
+        if data_only {
+            return Ok(
+                json!({"dataOnly":true,"reportsOnly":true,"analyzed":analyzed,"eligible":selected.len(),"submitted":0,"failed":errors.len(),"errors":errors,"runId":run_id,"sync":sync}),
+            );
+        }
         let mut submitted = 0;
         // Circuit, cooldown, available equity and symbol conflicts are rechecked per submission.
         for c in &selected {
@@ -612,13 +899,10 @@ impl Automation {
             }
         }
         let mut s = self.state.lock().await;
-        s["opportunities"] = json!(opportunities);
-        s["stats"]["totalAnalyzed"] =
-            json!(number(&s["stats"]["totalAnalyzed"], 0.) + analyzed as f64);
         s["stats"]["totalOrders"] =
             json!(number(&s["stats"]["totalOrders"], 0.) + submitted as f64);
         Ok(
-            json!({"analyzed":analyzed,"eligible":selected.len(),"submitted":submitted,"failed":errors.len(),"errors":errors,"runId":run_id}),
+            json!({"analyzed":analyzed,"eligible":selected.len(),"submitted":submitted,"failed":errors.len(),"errors":errors,"runId":run_id,"sync":sync}),
         )
     }
     async fn review(&self) -> Result<Value> {
@@ -730,6 +1014,39 @@ impl Automation {
             json!(number(&s["stats"]["totalReviews"], 0.) + reviewed as f64);
         Ok(json!({"reviewed":reviewed,"failed":errors.len(),"errors":errors}))
     }
+}
+fn mark_display_report(report: &mut Value, cache_only: bool, context_missing: bool) {
+    report["readOnly"] = json!(true);
+    report["cacheOnly"] = json!(cache_only);
+    if cache_only || context_missing {
+        let reason = if cache_only {
+            "缓存行情仅供观察，请核对数据时间并等待实时行情恢复。"
+        } else {
+            "确认数据暂时不完整，等待实时确认数据恢复。"
+        };
+        report["canProceed"] = json!(false);
+        report["recommendation"] = json!("HOLD");
+        report["decision"] = json!({"code":"WAIT_FRESH_DATA","label":"等待实时数据确认","canProceed":false,"reason":reason});
+        report["summary"] = json!(format!(
+            "{}；数据时间 {}。{}",
+            report["symbol"].as_str().unwrap_or(""),
+            report["dataAsOf"].as_str().unwrap_or("未知"),
+            reason
+        ));
+        if let Some(warnings) = report["warnings"].as_array_mut() {
+            warnings.insert(0, json!(reason));
+        }
+    }
+}
+
+fn opportunity_card(candidate: &Value) -> Option<Value> {
+    let mut report = candidate["signal"]["opportunityReport"].clone();
+    if !report.is_object() {
+        return None;
+    }
+    report["recordId"] = candidate["record"]["id"].clone();
+    report["at"] = candidate["record"]["at"].clone();
+    Some(report)
 }
 fn env_num(name: &str, fallback: f64) -> f64 {
     std::env::var(name)
@@ -941,8 +1258,50 @@ pub fn apply_protection(
 }
 
 #[cfg(test)]
+#[path = "automation/sync_tests.rs"]
+mod sync_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn opportunity_cards_expose_confirmation_fields_to_the_frontend() {
+        let now = now_ms();
+        let strategy = json!({"id":"enhanced-trend-v1","name":"增强趋势 v1"});
+        let market = json!({"symbol":"TESTUSDT","interval":"1m","klines":[{"close":100.}],"dataAsOf":iso(now)});
+        let signal = json!({"symbol":"TESTUSDT","action":"BUY","strategyId":"enhanced-trend-v1","confidence":0.8,"plan":{"entryMin":99.,"entryMax":101.,"entryLimit":100.,"stopLoss":95.,"takeProfit":110.}});
+        let report = strategies::opportunity_report(&signal, &market, &json!({}), &strategy, now);
+        let card = opportunity_card(&json!({"signal":{"opportunityReport":report},"record":{"id":"record-1","at":iso(now)}})).unwrap();
+        assert_eq!(card["symbol"], "TESTUSDT");
+        assert_eq!(card["current"]["price"], 100.);
+        assert_eq!(card["levels"]["entryRange"]["min"], 99.);
+        assert_eq!(card["levels"]["stopLoss"], 95.);
+        assert_eq!(card["decision"]["code"], "BUY_NOW");
+        assert_eq!(card["recordId"], "record-1");
+        assert!(card["generatedAt"].is_string());
+        assert!(opportunity_card(&json!({"signal":{"opportunityReport":null}})).is_none());
+    }
+    #[test]
+    fn sync_covers_standard_intervals_without_enabled_strategies() {
+        let windows =
+            sync_windows(&json!({"marketSync":{"interval":"1w","limit":100}}), &[]).unwrap();
+        for interval in SYNC_INTERVALS.into_iter().chain(["1w"]) {
+            assert_eq!(windows[interval], 100);
+        }
+        assert!(sync_windows(&json!({"marketSync":{"interval":"invalid"}}), &[]).is_err());
+    }
+    #[test]
+    fn sync_uses_largest_strategy_window_for_every_contract() {
+        let strategies = vec![
+            json!({"needsAux":["15m","4h"],"marketWindows":{"15m":200,"4h":300}}),
+            json!({"needsAux":["15m","1h"],"marketWindows":{"15m":500,"1h":500},"planInterval":"4h"}),
+        ];
+        let windows = sync_windows(&json!({}), &strategies).unwrap();
+        assert_eq!(windows["15m"], 500);
+        assert_eq!(windows["1h"], 500);
+        assert_eq!(windows["4h"], 300);
+        assert_eq!(windows["5m"], 80);
+    }
     #[test]
     fn priority_wins_within_symbol() {
         let a = json!({"symbol":"BTCUSDT","strategy":{"priority":1},"signal":{"score":30}});
@@ -961,4 +1320,20 @@ mod tests {
         .unwrap();
         assert_eq!(order["plan"]["stopLoss"], 99);
     }
+}
+#[test]
+fn cached_display_reports_cannot_recommend_execution() {
+    let mut report = json!({"symbol":"BTCUSDT","dataAsOf":"2026-10-08T01:00:00Z","canProceed":true,"recommendation":"BUY","decision":{"code":"BUY_NOW"},"warnings":[]});
+    mark_display_report(&mut report, true, false);
+    assert_eq!(report["readOnly"], true);
+    assert_eq!(report["cacheOnly"], true);
+    assert_eq!(report["canProceed"], false);
+    assert_eq!(report["recommendation"], "HOLD");
+    assert_eq!(report["decision"]["code"], "WAIT_FRESH_DATA");
+    assert!(
+        report["summary"]
+            .as_str()
+            .unwrap()
+            .contains("2026-10-08T01:00:00Z")
+    );
 }

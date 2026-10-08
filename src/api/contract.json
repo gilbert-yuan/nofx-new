@@ -1,0 +1,47 @@
+{
+  "health": "/api/health",
+  "config": {
+    "get": "/api/config",
+    "put": "/api/config"
+  },
+  "binance": {
+    "status": "/api/binance/status",
+    "test": "/api/binance/test",
+    "review": "/api/binance/review",
+    "trades": "/api/binance/trades",
+    "spotDemoOrders": "/api/binance/spot-demo/orders",
+    "order": "/api/binance/order",
+    "orderDetail": "/api/binance/orderDetail",
+    "openOrders": "/api/binance/openOrders",
+    "positions": "/api/binance/positions",
+    "smoke": "/api/binance/smoke"
+  },
+  "strategy": {
+    "get": "/api/strategy",
+    "put": "/api/strategy"
+  },
+  "strategies": {
+    "base": "/api/strategies"
+  },
+  "paper": {
+    "dailyTrend": "/api/paper/daily-trend"
+  },
+  "stats": {
+    "base": "/api/strategy-stats"
+  },
+  "market": {
+    "symbols": "/api/market/symbols",
+    "refresh": "/api/market/symbols/refresh",
+    "status": "/api/market/symbols/status",
+    "klines": "/api/market/klines",
+    "flowAnalysis": "/api/market/flow-analysis"
+  },
+  "history": {
+    "fetch": "/api/history/fetch",
+    "klines": "/api/history/klines",
+    "summary": "/api/history/summary",
+    "syncStatus": "/api/history/sync/status",
+    "syncStart": "/api/history/sync/start",
+    "syncStop": "/api/history/sync/stop"
+  }
+}

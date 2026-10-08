@@ -3,8 +3,7 @@
  * DailyTrendView · 每日趋势
  *
  * 数据源：GET/POST /api/paper/daily-trend → byDay（按 exitAt UTC+8 日期分桶）
- *   —— 服务端用**单条 SQL** 一次聚合出日级 14 项 + 汇总 8 项指标（server/dailyTrend.js），
- *      不再把全部已平仓订单拉进 Node 内存跑多遍 O(N) 统计。
+ *   —— Rust API 使用 rust/sql/daily_trend.sql 聚合日级指标与汇总。
  * 闭环：老板在「交易模拟」+ 历史分析里看出"今天某币种大亏"时，可以跳到本页
  *      倒查到当日是哪些信号源（symbol / engine / strategy）拖低了全天净收益。
  *
@@ -23,7 +22,7 @@
  */
 import { ref, computed, onMounted, watch } from 'vue';
 import { paperApi } from '../api/client.js';
-import { closeReasonLabel, closeReasonGroup } from '../../shared/closeReasons.js';
+import { closeReasonLabel, closeReasonGroup } from '../utils/closeReasons.js';
 
 const busy = ref(false);
 const error = ref('');
@@ -144,7 +143,7 @@ const axisTicks = computed(() => {
 
 function fmt(v) { return v === null || v === undefined ? '—' : Number(v).toFixed(2); }
 function pct(v) { return v === null || v === undefined ? '—' : (v * 100).toFixed(1) + '%'; }
-// 平仓理由标签与后端同一份字典（shared/closeReasons.js）
+// 将 Rust API 返回的理由代码转换为界面标签。
 function reason(s) { return closeReasonLabel(s) || s || '—'; }
 
 // 某理由占总平仓单数的比例

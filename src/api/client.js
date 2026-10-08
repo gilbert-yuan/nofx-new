@@ -1,10 +1,10 @@
 /**
  * 契约驱动的类型化 API 客户端（前端单一出口）
- * - 路径全部来自 shared/api-contract.js，杜绝字符串硬编码漂移
+ * - 路径来自 JSON 接口契约，连接 Rust API
  * - 底层复用既有 api() 传输层（超时/取消/错误规范化）
  * - 研究类接口（/analyses、/market/analyze-*）暂未纳入契约，仍走 api() 原路径
  */
-import { API } from '../../shared/api-contract.js';
+import API from './contract.json';
 import { api } from '../api.js';
 
 /** 剔除 undefined/null 的查询参数 */

@@ -1,0 +1,37 @@
+{
+  "apps": [
+    {
+      "name": "nofx-api",
+      "cwd": ".",
+      "script": "target/release/nofx-server.exe",
+      "interpreter": "none",
+      "autorestart": true,
+      "watch": false,
+      "log_date_format": "YYYY-MM-DD HH:mm:ss",
+      "max_restarts": 10,
+      "min_uptime": "10s",
+      "exp_backoff_restart_delay": 2000,
+      "env": {
+        "NODE_ENV": "production",
+        "PORT": 3100,
+        "HTTP_PROXY": "http://127.0.0.1:7890",
+        "HTTPS_PROXY": "http://127.0.0.1:7890",
+        "NOFX_MIN_TREND_SCORE": "73",
+        "NOFX_LONG_ONLY": "true",
+        "NOFX_SMART_MA_ATR": "2.0",
+        "NOFX_SMART_MIN_HOLD": "15",
+        "NOFX_PULLBACK_ATR_SHALLOW": "1.9",
+        "NOFX_PULLBACK_ATR_DEEP": "2.2",
+        "NOFX_MAX_ATR_PCT": "0.012",
+        "NOFX_MIN_ATR_PCT": "0.007",
+        "NOFX_STOP_ATR": "2.0",
+        "NOFX_SMART_EXIT": "false",
+        "NOFX_MAX_LEVERAGE": "12",
+        "NOFX_RISK_BUDGET_PCT": "0.18",
+        "NOFX_AUTO_MARGIN_PCT": "0.06",
+        "NOFX_PENDING_GRACE_MIN": "60",
+        "NOFX_KLINE_SYNC_CONCURRENCY": "12"
+      }
+    }
+  ]
+}

@@ -12,6 +12,10 @@ path = "rust/src/lib.rs"
 name = "nofx-server"
 path = "rust/src/main.rs"
 
+[[bin]]
+name = "nofx-diagnostics"
+path = "rust/src/bin/nofx-diagnostics.rs"
+
 [[test]]
 name = "backend-integration"
 path = "rust/tests/backend.rs"

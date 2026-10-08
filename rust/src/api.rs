@@ -42,6 +42,8 @@ pub async fn serve(root: PathBuf, host: String, port: u16) -> Result<()> {
     let db = Db::connect().await?;
     let market = Exchange::public()?;
     let automation = Automation::new(db.clone(), store.clone(), market.clone());
+    let config = store.read("config").await?;
+    automation.configure("klineSync", &json!({"enabled":config["marketSync"]["enabled"]!=false,"interval":number(&config["marketSync"]["intervalSeconds"],60.).max(1.)*1000.})).await?;
     let app = Arc::new(App {
         db,
         store,
@@ -352,13 +354,13 @@ async fn dispatch(
         ("GET", "/api/automation/opportunities") => {
             let state = app.automation.state.lock().await;
             return ok(
-                json!({"asOf":iso(now_ms()),"opportunities":state["opportunities"].as_array().unwrap().iter().take(qn(query,"limit",20.,1.,50.)as usize).collect::<Vec<_>>()}),
+                json!({"asOf":state["opportunitiesAt"],"analysis":state["analysisMeta"],"opportunities":state["opportunities"].as_array().unwrap().iter().take(qn(query,"limit",20.,1.,50.)as usize).collect::<Vec<_>>()}),
             );
         }
         ("GET", "/api/automation/yao-coins") => {
             let state = app.automation.state.lock().await;
             return ok(
-                json!({"asOf":state["yaoCoinsAt"],"targetAmplitudePct":50,"candidates":state["yaoCoins"].as_array().unwrap().iter().take(qn(query,"limit",20.,1.,50.)as usize).collect::<Vec<_>>(),"error":state["yaoCoinError"]}),
+                json!({"asOf":state["yaoCoinsAt"],"analysis":state["analysisMeta"],"targetAmplitudePct":50,"candidates":state["yaoCoins"].as_array().unwrap().iter().take(qn(query,"limit",20.,1.,50.)as usize).collect::<Vec<_>>(),"error":state["yaoCoinError"]}),
             );
         }
         ("POST", "/api/automation/start") => {

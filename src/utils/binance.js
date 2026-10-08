@@ -2,9 +2,10 @@
  * 币安相关展示工具 —— BinanceSettings / BinanceOrdersView 等共用，
  * 消除两个视图各自维护一份 fmt / orderStatus / 盈亏配色的重复。
  */
-import { isBinanceDemo } from '../../shared/binanceEnvironment.js';
-
-export { isBinanceDemo };
+/** 配置表单中的环境显示；凭证选择和交易执行由 Rust API 处理。 */
+export const isBinanceDemo = source => source?.demo !== undefined
+  ? source.demo === true
+  : source?.testnet !== false;
 
 /** 金额/数量格式化：至少 2 位、最多 6 位小数，非法值显示占位符 */
 export const fmt = value => Number.isFinite(Number(value))

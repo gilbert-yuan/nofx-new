@@ -382,15 +382,20 @@ impl Db {
             };
             sqlx::query(&format!("CREATE TABLE IF NOT EXISTS {name}(account_id INTEGER NOT NULL,{ordercol}path TEXT[] NOT NULL,value_kind TEXT NOT NULL,text_value TEXT,number_value DOUBLE PRECISION,boolean_value BOOLEAN,PRIMARY KEY({pk}),{fk})")).execute(&self.pool).await?;
         }
-        sqlx::query("INSERT INTO simulated_accounts(account_id,initial_balance)VALUES(1,10000)ON CONFLICT DO NOTHING").execute(&self.pool).await?;
-        self.mutate_account(|state| {
-            if state["fusedPoolStartedAt"].is_null() {
-                state["fusedPoolStartedAt"] = json!(crate::iso(crate::now_ms()));
-            }
-            state["unlimitedCapital"] = json!(false);
-            Ok(Value::Null)
-        })
-        .await?;
+        // Startup changes only account fields; historical orders need not be hydrated.
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(790217)")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT INTO simulated_accounts(account_id,initial_balance)VALUES(1,10000)ON CONFLICT DO NOTHING").execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO simulated_account_extensions(account_id,path,value_kind,text_value)VALUES(1,ARRAY['fusedPoolStartedAt']::text[],'string',$1)ON CONFLICT(account_id,path)DO UPDATE SET value_kind='string',text_value=EXCLUDED.text_value,number_value=NULL,boolean_value=NULL WHERE simulated_account_extensions.value_kind='null'")
+            .bind(crate::iso(crate::now_ms()))
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE simulated_accounts SET unlimited_capital=false WHERE account_id=1 AND unlimited_capital IS DISTINCT FROM false")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
     pub async fn save_klines(&self, symbol: &str, interval: &str, rows: &[Value]) -> Result<usize> {
@@ -604,8 +609,11 @@ async fn read_account(
         } else {
             ""
         };
+        // Array prefixes precede their children, preserving hydration order while
+        // allowing the (account_id, order_id, path) / (account_id, path) primary keys.
+        let ordering = if order { "t.order_id,t.path" } else { "t.path" };
         let query = format!(
-            "SELECT to_jsonb(t)FROM {name} t WHERE t.account_id=1{filter} ORDER BY array_length(path,1)"
+            "SELECT to_jsonb(t)FROM {name} t WHERE t.account_id=1{filter} ORDER BY {ordering}"
         );
         let rows = if order && order_id.is_some() {
             sqlx::query_scalar::<_, Value>(&query)

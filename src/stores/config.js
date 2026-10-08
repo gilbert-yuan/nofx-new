@@ -6,8 +6,7 @@
 import { defineStore } from 'pinia';
 import { reactive, ref } from 'vue';
 import { configApi, strategyApi, binanceApi, marketApi, historyApi } from '../api/client.js';
-// demo/testnet 环境判定与后端共用同一实现（shared/），避免前后端口径漂移
-import { isBinanceDemo } from '../../shared/binanceEnvironment.js';
+import { isBinanceDemo } from '../utils/binance.js';
 
 export const useConfigStore = defineStore('config', () => {
   const config = reactive({

@@ -1,20 +1,37 @@
 <script setup>
-import { ref, onMounted, onBeforeUnmount } from 'vue';
+import { computed, ref, onMounted, onBeforeUnmount } from 'vue';
 import { api } from '../api.js';
 
 const state = ref(null), error = ref(''), busy = ref(false);
 let timer, disposed = false, loading = false;
 const names = { klineSync: '全市场拉取 → 分析 → 挂单', positionReview: '挂单与持仓管理 → 盈亏更新' };
 const time = value => value ? new Date(value).toLocaleString() : '—';
-const price = value => Number.isFinite(Number(value)) ? Number(value).toPrecision(8).replace(/\.?(0+)(e|$)/, '$2') : '—';
+const numeric = value => value != null && value !== '' && Number.isFinite(Number(value));
+const price = value => numeric(value) ? Number(value).toPrecision(8).replace(/\.?(0+)(e|$)/, '$2') : '—';
 const range = value => value ? `${price(value.min)}～${price(value.max)}` : '—';
-const pct = value => Number.isFinite(Number(value)) ? `${Number(value) >= 0 ? '+' : ''}${Number(value).toFixed(2)}%` : '—';
-const funding = value => Number.isFinite(Number(value)) ? `${(Number(value) * 100).toFixed(4)}%` : '—';
+const pct = value => numeric(value) ? `${Number(value) >= 0 ? '+' : ''}${Number(value).toFixed(2)}%` : '—';
+const funding = value => numeric(value) ? `${(Number(value) * 100).toFixed(4)}%` : '—';
 const decisionClass = code => code === 'BUY_NOW' || code === 'SELL_NOW' ? 'opportunity-go' : 'opportunity-wait';
 const marketEntry = item => item.levels?.entryMode === 'MARKET_OR_NEXT_OPEN';
 const yaoDirectionClass = direction => direction === 'UP' ? 'yao-up' : direction === 'DOWN' ? 'yao-down' : 'yao-neutral';
 const yaoEntryLabel = direction => direction === 'UP' ? '最佳买入' : direction === 'DOWN' ? '最佳做空' : '最佳入场';
 const yaoReasons = reasons => Array.isArray(reasons) && reasons.length ? reasons.join('；') : '—';
+const analysis = computed(() => state.value?.analysisMeta || {});
+const analysisBusy = computed(() => ['syncing', 'analyzing'].includes(analysis.value.phase));
+const opportunityEmpty = computed(() => {
+  if (analysis.value.phase === 'error') return `机会分析失败：${analysis.value.error || '请查看任务错误'}`;
+  if (analysisBusy.value) return '正在同步行情并生成机会分析，请等待本轮完成。';
+  if (!analysis.value.asOf) return '尚未完成机会分析。启动自动任务后，面板会在行情同步完成后更新。';
+  if (!analysis.value.enabledStrategies) return '当前没有启用策略，请在策略配置中启用需要分析的策略。';
+  if (!analysis.value.marketReady) return '本轮没有足够且连续的最新已收盘 K 线，请查看同步状态与分析错误。';
+  return `本轮完成 ${analysis.value.analyzed || 0} 次策略分析，尚未发现满足策略与有效风险计划的机会。`;
+});
+const yaoEmpty = computed(() => {
+  if (analysis.value.phase === 'error') return `预测分析失败：${analysis.value.error || '请查看任务错误'}`;
+  if (!state.value?.yaoCoinMeta?.asOf) return analysisBusy.value ? '正在同步行情并生成妖币预测，请等待本轮完成。' : '尚未完成妖币预测，启动自动任务后更新。';
+  if (!state.value?.yaoCoinMeta?.evaluated) return '本轮没有可用于预测的最新行情，请查看同步状态与分析错误。';
+  return `已评估 ${state.value?.yaoCoinMeta?.evaluated || 0} 个币种，本轮没有达到观察门槛的候选。`;
+});
 async function load() {
   if (loading || disposed) return;
   loading = true;
@@ -41,11 +58,13 @@ onBeforeUnmount(() => { disposed = true; clearInterval(timer); });
         {{ state.active ? '停止自动任务' : '启动自动任务' }}
       </button>
     </div>
-    <p class="muted">沿用当前策略配置。全市场按币种逐个拉取并立即分析；订单管理独立更新活跃订单行情。停止后，本轮在安全检查点退出，自动撮合与盈亏刷新也会停止。</p>
+    <p v-if="analysis.readOnly" class="muted">当前为采集与分析展示模式。行情同步后生成策略机会和妖币预测，自动下单与持仓管理关闭。</p>
+    <p v-else class="muted">沿用当前策略配置。全市场按币种逐个拉取并立即分析；订单管理独立更新活跃订单行情。停止后，本轮在安全检查点退出，自动撮合与盈亏刷新也会停止。</p>
     <p v-if="error" class="signal-warning" role="alert">{{ error }}</p>
+    <p v-if="analysis.marketWarning" class="signal-warning">{{ analysis.marketWarning }}</p>
     <div v-if="state" class="task-grid">
       <article v-for="(task, key) in state.tasks" :key="key">
-        <h4>{{ names[key] || key }}</h4>
+        <h4>{{ analysis.readOnly && key === 'klineSync' ? '全市场行情同步 → 机会与预测' : names[key] || key }}</h4>
         <p>{{ task.running ? '执行中' : !task.enabled ? '已暂停' : state.active ? '等待下一轮' : '已停止' }}</p>
         <p>每轮完成后等待 {{ task.interval / 1000 }} 秒</p>
         <p>进度 {{ task.progress?.completed || 0 }} / {{ task.progress?.total || 0 }} · 失败 {{ task.progress?.failed || 0 }}</p>
@@ -66,8 +85,10 @@ onBeforeUnmount(() => { disposed = true; clearInterval(timer); });
     <section class="opportunity-panel">
       <div class="section-head">
         <div><h3>策略机会 · 超级确认</h3><p class="muted">先由现有策略选币和定方向，再由独立确认层判断是否追入或等待更好价格。</p></div>
+        <small v-if="analysis.asOf">分析时间：{{ time(analysis.asOf) }}</small>
       </div>
-      <p v-if="!state?.opportunities?.length" class="muted">暂未发现有效机会。策略观望、数据不足或风险计划不合格的币种不会显示在这里。</p>
+      <p v-if="analysisBusy" class="muted">{{ analysis.phase === 'syncing' ? '同步行情中' : `分析 ${analysis.processedSymbols || 0} / ${analysis.symbols || 0} 个币种 · 已完成 ${analysis.analyzed || 0} 次策略分析` }}</p>
+      <p v-if="!state?.opportunities?.length" class="muted">{{ opportunityEmpty }}</p>
       <div v-else class="opportunity-grid">
         <article v-for="item in state.opportunities" :key="item.symbol + '-' + item.generatedAt" class="opportunity-card">
           <div class="opportunity-head">
@@ -75,7 +96,7 @@ onBeforeUnmount(() => { disposed = true; clearInterval(timer); });
             <span :class="decisionClass(item.decision?.code)">{{ item.decision?.label || item.recommendation }}</span>
           </div>
           <div class="opportunity-stats">
-            <div><span>当前价</span><strong>{{ price(item.current?.price) }}</strong></div>
+            <div><span>{{ item.cacheOnly ? '缓存参考价' : '当前价' }}</span><strong>{{ price(item.current?.price) }}</strong></div>
             <div><span>24h</span><strong>{{ pct(item.current?.change24hPct) }}</strong></div>
             <div><span>OI</span><strong>{{ pct(item.current?.oiChangePct) }}</strong></div>
             <div><span>资金费率</span><strong>{{ funding(item.current?.fundingRate) }}</strong></div>
@@ -91,7 +112,8 @@ onBeforeUnmount(() => { disposed = true; clearInterval(timer); });
             <div><dt>止盈</dt><dd>{{ item.levels?.takeProfits?.length ? item.levels.takeProfits.map(price).join(' / ') : '—' }}</dd></div>
           </dl>
           <p class="opportunity-summary">{{ item.summary }}</p>
-          <small>生成时间：{{ time(item.generatedAt) }} · {{ item.canProceed ? '当前可按计划继续' : '当前等待确认，不追价' }}</small>
+          <small>生成时间：{{ time(item.generatedAt) }} · {{ analysis.readOnly ? '只读分析，不自动执行' : item.canProceed ? '当前可按计划继续' : '当前等待确认，不追价' }}</small>
+          <small v-if="item.cacheOnly">缓存数据时间：{{ time(item.dataAsOf) }} · 等待实时行情恢复</small>
         </article>
       </div>
     </section>
@@ -104,7 +126,7 @@ onBeforeUnmount(() => { disposed = true; clearInterval(timer); });
         <small v-if="state?.yaoCoinMeta?.asOf">行情时间：{{ time(state.yaoCoinMeta.asOf) }}</small>
       </div>
       <p v-if="state?.yaoCoinMeta?.error" class="signal-warning">妖币 24h 快照暂时失败：{{ state.yaoCoinMeta.error }}。当前候选仍按已缓存 K 线展示。</p>
-      <p v-if="!state?.yaoCoins?.length" class="muted">本轮没有达到观察门槛的候选。候选会在全市场行情同步完成后更新，不代表没有普通策略机会。</p>
+      <p v-if="!state?.yaoCoins?.length" class="muted">{{ yaoEmpty }}</p>
       <div v-else class="yao-grid">
         <article v-for="item in state.yaoCoins" :key="item.symbol + '-' + item.generatedAt" class="yao-card">
           <div class="yao-head">
@@ -112,7 +134,7 @@ onBeforeUnmount(() => { disposed = true; clearInterval(timer); });
             <span :class="yaoDirectionClass(item.direction)">{{ item.directionLabel }}</span>
           </div>
           <div class="yao-stats">
-            <div><span>当前价</span><strong>{{ price(item.current?.price) }}</strong></div>
+            <div><span>{{ item.cacheOnly ? '缓存参考价' : '当前价' }}</span><strong>{{ price(item.current?.price) }}</strong></div>
             <div><span>当前24h</span><strong>{{ pct(item.current?.change24hPct) }}</strong></div>
             <div><span>当前振幅</span><strong>{{ pct(item.current?.amplitude24hPct) }}</strong></div>
             <div><span>预测涨跌幅</span><strong :class="yaoDirectionClass(item.direction)">{{ pct(item.predictedMovePct) }}</strong></div>
@@ -131,6 +153,7 @@ onBeforeUnmount(() => { disposed = true; clearInterval(timer); });
           </div>
           <p class="yao-reasons">{{ yaoReasons(item.reasons) }}</p>
           <small class="yao-warning">{{ item.warnings?.[0] }} · 仅观察，不自动下单</small>
+          <small v-if="item.cacheOnly" class="yao-warning">缓存数据时间：{{ time(item.dataAsOf) }} · 等待实时行情恢复</small>
         </article>
       </div>
     </section>
