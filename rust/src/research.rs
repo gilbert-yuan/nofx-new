@@ -205,6 +205,32 @@ pub fn create_record(
     }
     record
 }
+/// Keep candle storage independent of the minimum history required by analysis.
+pub async fn sync_candles(
+    db: &Db,
+    client: &Exchange,
+    symbol: &str,
+    interval: &str,
+    limit: usize,
+) -> Result<Vec<Value>> {
+    let key = storage_symbol(symbol, "binance")?;
+    let cached = db.candles(&key, interval, limit as i64, None, None).await?;
+    if prepare_market(symbol, interval, &cached, limit, now_ms()).is_ok() {
+        return Ok(cached);
+    }
+    let rows = client
+        .klines(symbol, interval, limit.saturating_add(2), None, None)
+        .await?;
+    let closed: Vec<Value> = rows
+        .into_iter()
+        .filter(|r| r["confirmed"] != false)
+        .collect();
+    if closed.is_empty() {
+        bail!("{symbol}/{interval}：没有已收盘K线");
+    }
+    db.save_klines(&key, interval, &closed).await?;
+    Ok(closed)
+}
 pub async fn fresh_market(
     db: &Db,
     client: &Exchange,
@@ -212,17 +238,8 @@ pub async fn fresh_market(
     interval: &str,
     limit: usize,
 ) -> Result<Value> {
-    let rows = client
-        .klines(symbol, interval, limit.saturating_add(2), None, None)
-        .await?;
-    let market = prepare_market(symbol, interval, &rows, limit, now_ms())?;
-    db.save_klines(
-        &storage_symbol(symbol, "binance")?,
-        interval,
-        market["klines"].as_array().unwrap(),
-    )
-    .await?;
-    Ok(market)
+    let rows = sync_candles(db, client, symbol, interval, limit).await?;
+    prepare_market(symbol, interval, &rows, limit, now_ms())
 }
 pub async fn ai_analyze(config: &Value, strategy: &Value, markets: &[Value]) -> Result<Vec<Value>> {
     if config["model"]["enabled"] != true
