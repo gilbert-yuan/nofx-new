@@ -1,0 +1,20 @@
+{
+  "days": 30,
+  "symbolCount": 12,
+  "symbols": "representative",
+  "initialBalance": 10000,
+  "maxTrials": 64,
+  "seed": 20261008,
+  "minimumCoverage": 0.99,
+  "optimization": {
+    "trainFraction": 0.6,
+    "validationFraction": 0.2,
+    "minTrades": 10,
+    "minValidationTrades": 5,
+    "minTradingSymbols": 3,
+    "objective": "risk-adjusted",
+    "maxDrawdown": 0.3,
+    "drawdownPenalty": 1,
+    "instabilityPenalty": 0.25
+  }
+}

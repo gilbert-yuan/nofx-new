@@ -16,6 +16,14 @@ path = "rust/src/main.rs"
 name = "nofx-diagnostics"
 path = "rust/src/bin/nofx-diagnostics.rs"
 
+[[bin]]
+name = "nofx-optimize"
+path = "rust/src/bin/nofx-optimize.rs"
+
+[[bin]]
+name = "nofx-campaign"
+path = "rust/src/bin/nofx-campaign.rs"
+
 [[test]]
 name = "backend-integration"
 path = "rust/tests/backend.rs"
@@ -46,6 +54,7 @@ tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
-lto = "thin"
-codegen-units = 1
+# Keep Windows release builds within the memory budget; strategy/replay code remains optimized.
+lto = false
+codegen-units = 16
 

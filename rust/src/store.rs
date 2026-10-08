@@ -79,7 +79,7 @@ pub fn default_config() -> Value {
         "binance":{"apiKey":"","secretKey":"","demoApiKey":"","demoSecretKey":"","liveApiKey":"","liveSecretKey":"","demo":true,"testnet":true},
         "okx":{"apiKey":"","secretKey":"","passphrase":"","demo":true,"tdMode":"isolated"},
         "model":{"enabled":false,"apiKey":"","baseUrl":"https://api.openai.com/v1","model":"gpt-4o-mini","maxConcurrentRequests":5},
-        "trader":{"exchange":"binance","enabled":false,"dryRun":true,"scanIntervalSeconds":900,"quoteAsset":"USDT","maxLeverage":5,"maxPositionNotionalPct":0.25,"maxTotalNotionalPct":1.25,"minOrderMargin":5,"minConfidence":0.65,"allowEntryOrders":false,"allowCloseOrders":false,"allowProtectionUpdates":true,"syncPaperOrdersToDemo":false,"syncPaperOrdersToLive":false,"entrySymbolsText":"","maxNewEntriesPerCycle":1,"maxPositionsToReview":10,"minProtectionMoveBps":25},
+        "trader":{"exchange":"binance","enabled":false,"dryRun":true,"scanIntervalSeconds":900,"quoteAsset":"USDT","maxLeverage":5,"maxPositionNotionalPct":0.25,"maxTotalNotionalPct":1.25,"minOrderMargin":5,"minConfidence":0.45,"allowEntryOrders":false,"allowCloseOrders":false,"allowProtectionUpdates":true,"syncPaperOrdersToDemo":false,"syncPaperOrdersToLive":false,"entrySymbolsText":"","maxNewEntriesPerCycle":1,"maxPositionsToReview":10,"minProtectionMoveBps":25},
         "marketSync":{"enabled":true,"symbolsText":"ALL","interval":"15m","intervalSeconds":60,"limit":80},
         "tradeSync":{"enabled":false,"symbolsText":"BTCUSDT, ETHUSDT","intervalSeconds":300,"limit":500,"initialLookbackDays":30},"analysis":{"engine":"local"}
     })

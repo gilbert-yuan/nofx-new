@@ -9,6 +9,7 @@ use std::{
     str::FromStr,
     time::Duration,
 };
+mod indicators;
 
 #[derive(Clone)]
 pub struct Db {
@@ -323,6 +324,7 @@ impl Db {
         Ok(db)
     }
     pub(crate) async fn init(&self) -> Result<()> {
+        sqlx::raw_sql("CREATE TABLE IF NOT EXISTS market_indicator_history(symbol TEXT NOT NULL,kind TEXT NOT NULL,observed_at BIGINT NOT NULL,available_at BIGINT NOT NULL,origin TEXT NOT NULL,data JSONB NOT NULL,PRIMARY KEY(symbol,kind,observed_at,origin)); CREATE INDEX IF NOT EXISTS market_indicator_history_range ON market_indicator_history(symbol,observed_at);").execute(&self.pool).await?;
         sqlx::raw_sql("CREATE TABLE IF NOT EXISTS market_klines(symbol TEXT NOT NULL,interval TEXT NOT NULL,open_time BIGINT NOT NULL,open DOUBLE PRECISION NOT NULL,high DOUBLE PRECISION NOT NULL,low DOUBLE PRECISION NOT NULL,close DOUBLE PRECISION NOT NULL,volume DOUBLE PRECISION NOT NULL,close_time BIGINT NOT NULL,quote_volume DOUBLE PRECISION NOT NULL,trade_count INTEGER NOT NULL,taker_buy_volume DOUBLE PRECISION,taker_buy_quote_volume DOUBLE PRECISION,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),PRIMARY KEY(symbol,interval,open_time)); ALTER TABLE market_klines ADD COLUMN IF NOT EXISTS taker_buy_volume DOUBLE PRECISION; ALTER TABLE market_klines ADD COLUMN IF NOT EXISTS taker_buy_quote_volume DOUBLE PRECISION; CREATE TABLE IF NOT EXISTS research_records(id TEXT PRIMARY KEY,created_at TIMESTAMPTZ NOT NULL,record JSONB NOT NULL);CREATE INDEX IF NOT EXISTS research_records_time ON research_records(created_at DESC);CREATE TABLE IF NOT EXISTS kline_sync_state(symbol TEXT NOT NULL,interval TEXT NOT NULL,last_open_time BIGINT,last_sync_at TIMESTAMPTZ,last_status TEXT NOT NULL DEFAULT 'idle',last_error TEXT NOT NULL DEFAULT '',PRIMARY KEY(symbol,interval));CREATE TABLE IF NOT EXISTS trade_sync_state(symbol TEXT PRIMARY KEY,last_trade_id BIGINT,last_trade_time BIGINT,last_sync_at TIMESTAMPTZ,last_status TEXT NOT NULL DEFAULT 'idle',last_error TEXT NOT NULL DEFAULT '');").execute(&self.pool).await?;
         let legacy:bool=sqlx::query_scalar("SELECT to_regclass('simulated_accounts') IS NULL AND to_regclass('simulated_account') IS NOT NULL").fetch_one(&self.pool).await?;
         if legacy {

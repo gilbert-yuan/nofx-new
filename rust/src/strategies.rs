@@ -62,7 +62,14 @@ fn registry() -> &'static Value {
     })
 }
 pub fn definitions() -> Vec<Value> {
-    registry()["strategies"].as_array().unwrap().clone()
+    let mut definitions = registry()["strategies"].as_array().unwrap().clone();
+    for definition in &mut definitions {
+        definition["paramSchema"]
+            .as_array_mut()
+            .unwrap()
+            .extend(crate::market_filters::schema());
+    }
+    definitions
 }
 pub fn definition(id: &str) -> Option<Value> {
     definitions().into_iter().find(|d| d["id"] == id)
@@ -121,6 +128,7 @@ pub fn resolve_params(id: &str, overrides: &Value) -> Result<Value> {
             }
         }
     }
+    crate::market_filters::validate(&params)?;
     Ok(json!({"params":params,"rejected":rejected}))
 }
 pub fn list(config: &Value, state: &Value) -> Value {
@@ -175,7 +183,9 @@ pub fn list(config: &Value, state: &Value) -> Value {
             d
         })
         .collect();
-    json!({"enabled":enabled,"strategies":all,"updatedAt":state["updatedAt"],"groupLabels":registry()["groupLabels"]})
+    let mut labels = registry()["groupLabels"].clone();
+    labels["marketContext"] = json!("免费行情指标 · 历史回放过滤");
+    json!({"enabled":enabled,"strategies":all,"updatedAt":state["updatedAt"],"groupLabels":labels})
 }
 pub fn analyze(id: &str, market: &Value, context: &Value) -> Result<Value> {
     let p = resolve_params(id, &context["params"])?["params"].clone();
@@ -184,7 +194,7 @@ pub fn analyze(id: &str, market: &Value, context: &Value) -> Result<Value> {
         ctx = json!({});
     }
     ctx["params"] = p;
-    Ok(match id {
+    let mut signal = match id {
         "h4-trend-breakout-v1" | "h4-mean-reversion-v1" | "h4-chandelier-breakout-v1" => {
             h4::analyze(id, market, &ctx)
         }
@@ -193,7 +203,11 @@ pub fn analyze(id: &str, market: &Value, context: &Value) -> Result<Value> {
         "enhanced-trend-v1" => enhanced::analyze(market, &ctx),
         "yao-coin-ambush-v1" => yao::analyze(market, &ctx),
         _ => bail!("未知策略：{id}"),
-    })
+    };
+    if ctx["deferMarketFilters"] != true {
+        crate::market_filters::apply(&mut signal, market, &ctx);
+    }
+    Ok(signal)
 }
 pub fn review(id: &str, order: &Value, market: &Value, context: &Value) -> Result<Value> {
     if definition(id).is_none() {

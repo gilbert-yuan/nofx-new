@@ -204,6 +204,24 @@ async fn dispatch(
                 &app.store.read("strategies").await?,
             ));
         }
+        ("POST", "/api/research/indicator-history/fetch") => {
+            let _permit = app
+                .performance_gate
+                .try_acquire()
+                .map_err(|_| anyhow::anyhow!("409: 历史研究任务正在运行，请稍后重试"))?;
+            return ok(crate::indicator_history::fetch(&app.db, &app.market, input).await?);
+        }
+        ("POST", "/api/research/backtest") => {
+            let _permit = app
+                .performance_gate
+                .try_acquire()
+                .map_err(|_| anyhow::anyhow!("409: 历史研究任务正在运行，请稍后重试"))?;
+            let config = app.store.read("config").await?;
+            let account = app.db.account(false, None).await?;
+            return ok(
+                crate::backtest::run(&app.db, input, &config, &account["adaptiveConfig"]).await?,
+            );
+        }
         ("GET", "/api/market/symbols") => {
             let contracts = contracts(app, false).await?;
             let search = q(query, "search", "").trim().to_uppercase();

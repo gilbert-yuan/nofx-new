@@ -27,7 +27,11 @@
     "build:server": "cargo build --release --locked --bin nofx-server",
     "setup:rust": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/setup-rust.ps1",
     "server": "cargo run --locked --bin nofx-server",
-    "diagnose": "cargo run --locked --bin nofx-diagnostics --"
+    "diagnose": "cargo run --locked --bin nofx-diagnostics --",
+    "optimize": "cargo run --release --locked --bin nofx-optimize --",
+    "backtest:month": "cargo run --release --locked --bin nofx-campaign -- --root .",
+    "backtest:status": "target/native-build/release/nofx-campaign.exe --root . --status",
+    "backtest:stop": "set \"PM2_HOME=%CD%\\.pm2\" && pm2 stop nofx-monthly-research"
   },
   "dependencies": {
     "@vitejs/plugin-vue": "^5.2.4",

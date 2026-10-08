@@ -1,0 +1,16 @@
+{
+  "apps": [{
+    "name": "nofx-monthly-research",
+    "cwd": ".",
+    "script": "target/native-build/release/nofx-campaign.exe",
+    "args": "--root . --campaign configs/monthly-enabled.campaign.json --output output/monthly-enabled --watch",
+    "interpreter": "none",
+    "autorestart": true,
+    "stop_exit_codes": [0],
+    "watch": false,
+    "min_uptime": "10s",
+    "max_restarts": 10,
+    "exp_backoff_restart_delay": 10000,
+    "log_date_format": "YYYY-MM-DD HH:mm:ss"
+  }]
+}

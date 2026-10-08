@@ -174,6 +174,47 @@ async fn run(options: &PgConnectOptions) -> Result<()> {
         pool: sqlx::PgPool::connect_with(options.clone()).await?,
     };
     let initial = db.account(false, None).await?;
+    // Historical research must never modify the real simulated account.
+    let time = (now_ms() - 5 * 86_400_000).div_euclid(60_000) * 60_000;
+    let history_samples = vec![nofx_core::indicator_history::Sample {
+        kind: "oi5m".into(),
+        observed_at: time,
+        available_at: time + 300_000,
+        origin: "historical-rest".into(),
+        data: json!({"timestamp":time,"sumOpenInterest":"100","sumOpenInterestValue":"10000"}),
+    }];
+    assert_eq!(
+        db.save_indicator_samples("BTCUSDT", &history_samples)
+            .await?,
+        1
+    );
+    assert_eq!(
+        db.save_indicator_samples("BTCUSDT", &history_samples)
+            .await?,
+        0
+    );
+    let loaded = db
+        .indicator_samples("BTCUSDT", time - 1, time + 600_000)
+        .await?;
+    assert_eq!(loaded.len(), 1);
+    assert!(
+        nofx_core::indicator_history::context("BTCUSDT", &loaded, time + 60_000)["oi5m"].is_null()
+    );
+    let empty=request(&client,&base,"POST",api["research"]["backtest"].as_str().unwrap(),Some(json!({"symbol":"BTCUSDT","strategyId":"enhanced-trend-v1","startTime":time,"endTime":time+3_600_000})),400).await?;
+    assert!(empty["error"].as_str().unwrap().contains("历史"));
+    for tf in ["1m", "15m"] {
+        let dt = if tf == "1m" { 60_000 } else { 900_000 };
+        let start = time.div_euclid(dt) * dt;
+        let rows:Vec<_>=(-1600..120).map(|i|json!({"openTime":start+i*dt,"open":100.,"high":101.,"low":99.,"close":100.,"volume":1000.,"quoteVolume":100000.,"tradeCount":100,"takerBuyQuoteVolume":60000.,"closeTime":start+(i+1)*dt-1})).collect();
+        db.save_klines("BINANCE_BTCUSDT", tf, &rows).await?;
+    }
+    let replay=request(&client,&base,"POST",api["research"]["backtest"].as_str().unwrap(),Some(json!({"symbol":"BTCUSDT","strategyId":"enhanced-trend-v1","startTime":time,"endTime":time+3_600_000,"grid":{"marketFlowEnabled":[false,true]}})),200).await?;
+    assert_eq!(replay["researchOnly"], true);
+    assert_eq!(replay["combinations"].as_array().unwrap().len(), 2);
+    assert!(replay["baseline"]["training"]["analyzed"].as_u64().unwrap() > 0);
+    assert_eq!(initial, db.account(false, None).await?);
+    verify_campaign_resume(options, &db, time).await?;
+    assert_eq!(initial, db.account(false, None).await?);
     assert!(!initial["fusedPoolStartedAt"].is_null());
     assert_eq!(initial["unlimitedCapital"], false);
     let config=request(&client,&base,"PUT",api["config"]["put"].as_str().unwrap(),Some(json!({"model":{"apiKey":"test-secret"},"trader":{"syncPaperOrdersToDemo":false,"syncPaperOrdersToLive":false}})),200).await?;
@@ -399,5 +440,71 @@ async fn run(options: &PgConnectOptions) -> Result<()> {
     assert_eq!(initialized, expected);
     db.pool.close().await;
     drop(server);
+    Ok(())
+}
+
+async fn verify_campaign_resume(options: &PgConnectOptions, db: &Db, start: i64) -> Result<()> {
+    use nofx_core::{backtest, campaign, strategies};
+    let root = tempfile::tempdir()?;
+    let directory = root.path().join("research");
+    let id = "enhanced-trend-v1";
+    let base = strategies::defaults(id);
+    let settings = json!({"maxTrials":2,"seed":7,"initialBalance":1000,
+        "optimization":{"minTrades":10,"minValidationTrades":5,"minTradingSymbols":1}});
+    campaign::write_json(&root.path().join("settings.json"), &settings)?;
+    campaign::write_json(
+        &root.path().join("ecosystem.config.json"),
+        &json!({"apps":[{"env":{}}]}),
+    )?;
+    let manifest = json!({"startTime":start,"endTime":start+3_600_000,
+        "engineVersion":campaign::engine_version(),"environment":campaign::environment_snapshot(),
+        "strategies":{id:{"params":base,"space":campaign::search_space(id,&base)?}},
+        "symbols":["BTCUSDT"],"config":{"trader":{"minConfidence":0.65,"maxLeverage":5}},
+        "adaptive":{},"settings":settings});
+    campaign::write_json(&directory.join("manifest.json"), &manifest)?;
+    let history = backtest::load_history(db, "BTCUSDT", id, start, start + 3_600_000).await?;
+    campaign::write_json(
+        &directory.join("data/BTCUSDT.json"),
+        &serde_json::to_value(history)?,
+    )?;
+    let command = || -> Result<()> {
+        let result = Command::new(env!("CARGO_BIN_EXE_nofx-campaign"))
+            .args([
+                "--root",
+                root.path().to_str().unwrap(),
+                "--campaign",
+                "settings.json",
+                "--output",
+                "research",
+                "--max-units",
+                "1",
+            ])
+            .env("DATABASE_URL", options.to_url_lossy().as_str())
+            .output()?;
+        if !result.status.success() {
+            bail!(
+                "campaign CLI failed: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        Ok(())
+    };
+    command()?;
+    let first = directory.join("trials/0000-enhanced-trend-v1-BTCUSDT.json");
+    let before = std::fs::read(&first)?;
+    assert_eq!(
+        campaign::read_json(&directory.join("summary.json"))?["completedUnits"],
+        1
+    );
+    command()?;
+    assert_eq!(
+        std::fs::read(&first)?,
+        before,
+        "resume must never replace completed trials"
+    );
+    assert_eq!(
+        campaign::read_json(&directory.join("summary.json"))?["completedUnits"],
+        2
+    );
     Ok(())
 }

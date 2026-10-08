@@ -578,6 +578,7 @@ impl Automation {
             }
             let mut aux = BTreeMap::new();
             let mut shared_confirmation = None;
+            let mut shared_indicators = None;
             for strategy in &enabled {
                 let id = strategy["id"].as_str().unwrap();
                 let config = self.store.read("config").await?;
@@ -677,6 +678,7 @@ impl Automation {
                         continue;
                     }
                 }
+                context["deferMarketFilters"] = json!(true);
                 let mut raw = match strategies::analyze(id, &market, &context) {
                     Ok(r) => r,
                     Err(e) => {
@@ -684,6 +686,28 @@ impl Automation {
                         continue;
                     }
                 };
+                if matches!(raw["action"].as_str(), Some("BUY" | "SELL"))
+                    && crate::market_filters::enabled(&strategy["params"])
+                {
+                    if crate::market_filters::needs_remote(&strategy["params"])
+                        && shared_indicators.is_none()
+                    {
+                        let collected = self
+                            .market
+                            .indicator_context(&symbol, &ticker_map[&symbol])
+                            .await;
+                        self.db
+                            .save_indicator_samples(
+                                &symbol,
+                                &crate::indicator_history::samples(&collected),
+                            )
+                            .await?;
+                        shared_indicators = Some(collected);
+                    }
+                    context["marketContext"] = shared_indicators.clone().unwrap_or(json!({}));
+                    context["evaluationAt"] = json!(iso(now_ms()));
+                    crate::market_filters::apply(&mut raw, &market, &context);
+                }
                 analyzed += 1;
                 self.state.lock().await["analysisMeta"]["analyzed"] = json!(analyzed);
                 raw["maxHoldBarsLimit"] = strategy["params"]["maxHoldBars"].clone();
@@ -827,6 +851,9 @@ impl Automation {
         for candidate in &mut selected {
             let symbol = candidate["symbol"].as_str().unwrap_or("");
             if let Some(raw) = contexts.get(symbol) {
+                self.db
+                    .save_indicator_samples(symbol, &crate::indicator_history::samples(raw))
+                    .await?;
                 let indicators =
                     crate::market_indicators::summarize(raw, &prepared[symbol], now_ms());
                 let long = candidate["signal"]["action"] == "BUY";
@@ -859,6 +886,12 @@ impl Automation {
             }
             status["analysisMeta"]["indicators"] = json!({"requested":targets.len(),"collected":contexts.len(),"symbolLimit":indicator_limit,"timeLimitSeconds":15,"mode":"advisory","asOf":iso(now_ms())});
         }
+        // Also retain prediction-only samples, with their actual availability times.
+        for (symbol, raw) in &contexts {
+            self.db
+                .save_indicator_samples(symbol, &crate::indicator_history::samples(raw))
+                .await?;
+        }
         let opportunities: Vec<Value> = selected
             .iter()
             .filter_map(opportunity_card)
@@ -885,7 +918,7 @@ impl Automation {
         let maximum_entries =
             number(&config["trader"]["maxNewEntriesPerCycle"], 1.).max(0.) as usize;
         let mut execution = vec![];
-        // Circuit, cooldown, available equity and symbol conflicts are rechecked per submission.
+        // Cooldown, available equity and symbol conflicts are rechecked per submission.
         for c in &selected {
             if self.generation.load(Ordering::SeqCst) != token {
                 break;
@@ -1146,6 +1179,12 @@ impl Automation {
                 continue;
             }
             let now = now_ms();
+            if order["status"] == "pending"
+                && crate::market_filters::needs_remote(&context["params"])
+            {
+                context["marketContext"] = self.market.indicator_context(symbol, &json!({})).await;
+                context["evaluationAt"] = json!(iso(now));
+            }
             let proposal = if order["status"] == "pending" {
                 match strategies::analyze(strategy_id, &market, &context) {
                     Ok(raw) => research::normalize_plan(&raw, &market, now),
@@ -1417,10 +1456,13 @@ fn indicator_symbols(selected: &[Value], predictions: &Value, limit: usize) -> V
     symbols
 }
 fn entry_guard(state: &Value, c: &Value, config: &Value) -> Option<String> {
+    entry_guard_at(state, c, config, now_ms())
+}
+pub fn entry_guard_at(state: &Value, c: &Value, config: &Value, now: i64) -> Option<String> {
     if let Some(reason) = trading_mode_block(config) {
         return Some(reason.into());
     }
-    if number(&c["signal"]["confidence"], 0.) < number(&config["trader"]["minConfidence"], 0.65) {
+    if number(&c["signal"]["confidence"], 0.) < number(&config["trader"]["minConfidence"], 0.45) {
         return Some("信号置信度低于开仓门槛".into());
     }
     if (c["signal"]["plan"]["entryStyle"] == "market"
@@ -1459,21 +1501,13 @@ fn entry_guard(state: &Value, c: &Value, config: &Value) -> Option<String> {
     }
     let mut closed: Vec<&Value> = orders.iter().filter(|o| o["status"] == "closed").collect();
     closed.sort_by_key(|o| std::cmp::Reverse(timestamp(&o["exitAt"]).unwrap_or(0)));
-    let loss_streak = closed
-        .iter()
-        .take(env_num("NOFX_CONSECUTIVE_LOSS_LOOKBACK", 20.) as usize)
-        .take_while(|o| number(&o["net"], 0.) <= 0.)
-        .count();
-    if loss_streak as f64 >= env_num("NOFX_CONSECUTIVE_LOSS_HALT", 4.) {
-        return Some("连续亏损熔断".into());
-    }
     if let Some(previous) = closed.iter().find(|o| o["symbol"] == c["symbol"]) {
         let minutes = if previous["reason"].as_str().unwrap_or("").contains("stop") {
             env_num("NOFX_STOP_COOLDOWN_MIN", 60.)
         } else {
             env_num("NOFX_SYMBOL_COOLDOWN_MIN", 30.)
         };
-        if now_ms() - timestamp(&previous["exitAt"]).unwrap_or(0) < (minutes * 60000.) as i64 {
+        if now - timestamp(&previous["exitAt"]).unwrap_or(0) < (minutes * 60000.) as i64 {
             return Some("币种平仓冷却".into());
         }
     }
@@ -1590,6 +1624,51 @@ mod sync_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn entry_confidence_uses_the_lower_default_threshold() {
+        let mut config = crate::store::default_config();
+        config["trader"]["enabled"] = json!(true);
+        config["trader"]["dryRun"] = json!(false);
+        config["trader"]["allowEntryOrders"] = json!(true);
+        assert_eq!(config["trader"]["minConfidence"], 0.45);
+        let account = json!({"orders":[]});
+        let mut candidate = json!({"symbol":"TESTUSDT","strategy":{"id":"test"},"signal":{"confidence":0.45,"plan":{"entryLimit":100}}});
+        assert_eq!(entry_guard_at(&account, &candidate, &config, 0), None);
+        config["trader"]
+            .as_object_mut()
+            .unwrap()
+            .remove("minConfidence");
+        assert_eq!(entry_guard_at(&account, &candidate, &config, 0), None);
+        candidate["signal"]["confidence"] = json!(0.449);
+        assert_eq!(
+            entry_guard_at(&account, &candidate, &config, 0).as_deref(),
+            Some("信号置信度低于开仓门槛")
+        );
+        config["trader"]["minConfidence"] = json!(0.6);
+        candidate["signal"]["confidence"] = json!(0.5);
+        assert_eq!(
+            entry_guard_at(&account, &candidate, &config, 0).as_deref(),
+            Some("信号置信度低于开仓门槛")
+        );
+    }
+    #[test]
+    fn losing_history_allows_entries_and_keeps_symbol_cooldowns() {
+        let config = json!({"trader":{"enabled":true,"dryRun":false,"allowEntryOrders":true,"minConfidence":0.45}});
+        let now = 1_800_000_000_000_i64;
+        let mut account = json!({"orders":(0..5).map(|i|json!({"symbol":format!("LOSS{i}USDT"),"status":"closed","net":-1,"exitAt":iso(now-60_000*(i+1)),"reason":"stop_loss"})).collect::<Vec<_>>()});
+        let mut candidate = json!({"symbol":"TESTUSDT","strategy":{"id":"test"},"signal":{"confidence":0.45,"plan":{"entryLimit":100}}});
+        assert_eq!(entry_guard_at(&account, &candidate, &config, now), None);
+        candidate["symbol"] = json!("LOSS0USDT");
+        assert_eq!(
+            entry_guard_at(&account, &candidate, &config, now).as_deref(),
+            Some("币种平仓冷却")
+        );
+        account["orders"][0]["status"] = json!("open");
+        assert_eq!(
+            entry_guard_at(&account, &candidate, &config, now).as_deref(),
+            Some("币种已有活动订单")
+        );
+    }
     #[test]
     fn execution_requires_trading_mode_and_keeps_limit_waiting_separate() {
         let mut config = json!({"marketSync":{"dataOnly":true},"trader":{"enabled":true,"dryRun":false,"allowEntryOrders":true,"minConfidence":0.65,"syncPaperOrdersToDemo":true}});

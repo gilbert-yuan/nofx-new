@@ -276,6 +276,20 @@ pub fn summarize(raw: &Value, market: &Value, now: i64) -> Value {
         "orderBook",
         "flow",
     ];
+    let settled = raw["funding"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|r| time(&r["fundingTime"]).is_some_and(|t| t <= now))
+        .max_by_key(|r| time(&r["fundingTime"]));
+    let at = settled.and_then(|r| time(&r["fundingTime"]));
+    let rate = settled.and_then(|r| finite(&r["fundingRate"]));
+    let state = status(at, rate.is_some(), now, 36 * 3_600_000);
+    result["settledFunding"] = stamped(
+        json!({"rate":if state=="fresh"{rate}else{None},"kind":"last_settled","source":"binance"}),
+        at,
+        state,
+    );
     let available = groups
         .iter()
         .filter(|key| result[**key]["status"] == "fresh")

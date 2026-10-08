@@ -16,7 +16,9 @@ cargo run --locked --bin nofx-server
 $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
 ```
 
-完整启动、测试、PM2 部署与迁移说明见 [Rust 后端说明](docs/RUST_BACKEND.md)。新增后端测试和回测使用 Rust，复用 `nofx_core`。旧回测脚本已经删除，本次没有新增离线回测命令。
+新增后端测试和回测使用 Rust，复用 `nofx_core`。策略管理已提供历史指标补齐与参数组合回测入口，使用共享策略、模拟成交及成本模型；操作与限制见 [历史指标回测说明](docs/indicator-backtest.md)。
+
+月度全部启用策略的持续研究使用 `nofx-campaign`，自动补齐 12 个代表币种的数据，逐项保存结果并支持断点续跑；后台启动、状态与扩展方式见 [月度研究说明](docs/monthly-campaign.md)。
 
 自动 K 线采集覆盖 `marketSync.symbolsText` 指定的币种（`ALL` 表示全部 Binance USDT 永续合约），同步 `1m / 5m / 15m / 1h / 4h / 1d`、配置周期及启用策略所需的辅助周期。成交额和策略黑名单只影响交易分析；新币的已有历史也会保存，分析仍要求足够且连续的已收盘 K 线。
 
@@ -33,6 +35,8 @@ $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
 运行 `npm run diagnose` 检查 Rust 服务的同步、分析和下单状态；`npm run diagnose -- --pm2` 同时读取保存的 PM2 快照。诊断工具不会发送交易指令，也不会输出 API 密钥。
 
 首次使用 PM2 运行服务时执行 `npm run pm2:start`。更新已运行的服务时执行 `npm run pm2:restart`，该命令先构建前端，再停止 `nofx-api`、编译 Rust 并重新启动。Windows 会锁定正在运行的 `.exe` 文件，因此 Rust 编译必须在服务停止后进行；编译期间 API 暂时不可用。
+
+发布配置保留常规优化，关闭 LTO 并使用 16 个代码生成单元，降低 Windows 编译的峰值内存。内存紧张时可先设置 `$env:CARGO_BUILD_JOBS='1'`；测试可另外设置 `$env:CARGO_PROFILE_TEST_DEBUG='0'` 与 `$env:CARGO_PROFILE_DEV_DEBUG='0'` 降低调试信息占用。
 
 币安实盘与公开合约行情默认使用官方 `https://fapi.binance.com`，Demo 使用 `https://demo-fapi.binance.com`。可用 `BINANCE_FUTURES_BASE` 覆盖实盘地址。公有 GET 请求在连接中断或响应体读取失败时最多尝试三次，重试使用新连接，成功后记录 `Public market request recovered after retry`；最终同步结果查看 `/api/history/sync/status` 的失败数和错误明细。
 

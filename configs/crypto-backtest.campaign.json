@@ -170,25 +170,45 @@
         "partialTpMoveStopToBreakeven": false
       },
       "searchSpace": {
-        "minTrendScore": [
-          70,
-          73,
-          76
+        "maFastPeriod": [
+          12,
+          20,
+          30
         ],
-        "stopAtr": [
-          1.5,
-          2,
-          2.5
+        "maSlowPeriod": [
+          40,
+          50,
+          60
         ],
-        "mainTpR": [
-          2.5,
-          3,
-          4
+        "atrPeriod": [
+          10,
+          14,
+          20
         ],
-        "maxHoldBars": [
-          90,
-          120,
-          180
+        "rsiPeriod": [
+          10,
+          14,
+          21
+        ],
+        "macdFastPeriod": [
+          8,
+          12,
+          16
+        ],
+        "macdSlowPeriod": [
+          20,
+          26,
+          32
+        ],
+        "macdSignalPeriod": [
+          7,
+          9,
+          12
+        ],
+        "bollingerPeriod": [
+          14,
+          20,
+          26
         ]
       }
     },

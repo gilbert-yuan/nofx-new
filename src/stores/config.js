@@ -18,7 +18,7 @@ export const useConfigStore = defineStore('config', () => {
     trader: {
       exchange: 'binance', enabled: false, dryRun: true, allowEntryOrders: false,
       allowCloseOrders: false, allowProtectionUpdates: true, entrySymbolsText: '',
-      maxNewEntriesPerCycle: 1, minConfidence: 0.65, maxLeverage: 5, maxPositionNotionalPct: 0.25,
+      maxNewEntriesPerCycle: 1, minConfidence: 0.45, maxLeverage: 5, maxPositionNotionalPct: 0.25,
       maxTotalNotionalPct: 1.25, minProtectionMoveBps: 25,
       syncPaperOrdersToDemo: false, syncPaperOrdersToLive: false
     }

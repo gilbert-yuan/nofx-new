@@ -23,6 +23,10 @@
   "strategies": {
     "base": "/api/strategies"
   },
+  "research": {
+    "indicatorHistoryFetch": "/api/research/indicator-history/fetch",
+    "backtest": "/api/research/backtest"
+  },
   "paper": {
     "dailyTrend": "/api/paper/daily-trend"
   },

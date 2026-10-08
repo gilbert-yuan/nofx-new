@@ -13,6 +13,7 @@
  */
 import { ref, onMounted, computed } from 'vue';
 import { strategiesApi } from '../api/client.js';
+import IndicatorBacktest from './IndicatorBacktest.vue';
 
 const data = ref(null);
 const drafts = ref({});
@@ -232,6 +233,7 @@ onMounted(() => { load().catch((e) => { error.value = e.message; }); });
             </div>
           </fieldset>
         </div>
+        <IndicatorBacktest v-if="expanded[item.id]" :strategy="item" :params="draft(item)" />
       </article>
 
       <p class="muted strategies-foot">

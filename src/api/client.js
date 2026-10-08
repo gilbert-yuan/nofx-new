@@ -35,6 +35,11 @@ export const strategiesApi = {
   reset: (id) => api(`${API.strategies.base}/${encodeURIComponent(id)}/reset`, { method: 'POST' })
 };
 
+export const researchApi = {
+  fetchIndicators: (body) => api(API.research.indicatorHistoryFetch, { method: 'POST', body, timeoutMs: 1800000 }),
+  backtest: (body) => api(API.research.backtest, { method: 'POST', body, timeoutMs: 1800000 })
+};
+
 /** 模拟账户：每日趋势（服务端单条 SQL 聚合；refresh=true 走 POST 强制刷新） */
 export const paperApi = {
   dailyTrend: (refresh = false) => api(API.paper.dailyTrend, refresh ? { method: 'POST' } : {})
