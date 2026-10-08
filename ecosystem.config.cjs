@@ -1,6 +1,6 @@
 /**
  * 生产部署（PM2 单进程）
- * 后端 express 已直接托管前端 dist 静态资源与 SPA fallback，
+ * Rust 后端直接托管前端 dist 静态资源与 SPA fallback，
  * 不再需要独立的 vite/web 进程；构建后只需启动 nofx-api。
  *
  * 启动：npm run build && npm run pm2:start
@@ -10,8 +10,8 @@ module.exports = {
     {
       name: 'nofx-api',
       cwd: __dirname,
-      script: 'server/index.js',
-      interpreter: 'node',
+      script: process.platform === 'win32' ? 'target/release/nofx-server.exe' : 'target/release/nofx-server',
+      interpreter: 'none',
       autorestart: true,
       watch: false,
       // 日志带时间戳：便于区分历史错误与当前错误（此前无时间戳，排障只能盲猜）。

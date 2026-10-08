@@ -1,0 +1,34 @@
+{
+  "symbolFilter": {
+    "enabled": true,
+    "minSampleSize": 5,
+    "minSampleSizeToExclude": 10,
+    "minWinRate": 0.35,
+    "minOrdersToActivate": 20
+  },
+  "hourFilter": {
+    "enabled": true,
+    "minSampleSize": 5,
+    "minWinRate": 0.55,
+    "minOrdersToActivate": 50
+  },
+  "holdingPeriodOptimization": {
+    "enabled": true,
+    "minSampleSize": 20,
+    "autoApplyThreshold": 0.3,
+    "triggerInterval": 50
+  },
+  "symbolLevelParams": {
+    "enabled": true,
+    "minSampleSize": 10
+  },
+  "volatilityAdaptive": {
+    "enabled": false,
+    "lookbackPeriod": 100
+  },
+  "logging": {
+    "verbose": true,
+    "logFilters": true,
+    "logOptimizations": true
+  }
+}
