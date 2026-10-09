@@ -143,27 +143,13 @@ pub fn macd(v: &[f64], fast: usize, slow: usize, signal: usize) -> (Vec<f64>, Ve
         .collect();
     (line, aligned, hist)
 }
-// Preserve the enhanced engine's historical SMA initialization/update order.
+// Use the same SMA-seeded EMA history as the shared MACD implementation.
 pub fn enhanced_macd(v: &[f64], fast: usize, slow: usize, signal: usize) -> (f64, f64, f64) {
-    if fast >= slow || v.len() < slow {
+    if fast == 0 || signal == 0 || fast >= slow || v.len() < slow {
         return (f64::NAN, f64::NAN, f64::NAN);
     }
-    let mut ef = mean(&v[..fast]);
-    let mut es = mean(&v[..slow]);
-    let kf = 2. / (fast + 1) as f64;
-    let ks = 2. / (slow + 1) as f64;
-    let mut line = vec![];
-    for (i, &x) in v.iter().enumerate().skip(slow - 1) {
-        if i >= fast {
-            ef = x * kf + ef * (1. - kf);
-        }
-        if i >= slow {
-            es = x * ks + es * (1. - ks);
-        }
-        line.push(ef - es);
-    }
-    let sig = last(&ema(&line, signal));
-    (last(&line), sig, last(&line) - sig)
+    let (line, signal, histogram) = macd(v, fast, slow, signal);
+    (last(&line), last(&signal), last(&histogram))
 }
 pub fn adx(r: &[Value], p: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     let tr = true_ranges(r);
@@ -292,4 +278,34 @@ pub fn skill_structure(r: &[Value]) -> Value {
     let bear = support.map(|x| close < x).unwrap_or(false);
     let recent = &r[r.len().saturating_sub(8)..];
     json!({"trend":if hp=="LH"&&lp=="LL"{"BEARISH"}else if hp=="HH"&&lp=="HL"{"BULLISH"}else{"NEUTRAL"},"highPattern":hp,"lowPattern":lp,"bosBullish":bull,"bosBearish":bear,"chochBullish":bull&&lp=="HL","chochBearish":bear&&hp=="LH","failedBreakout":h.len()>=2&&recent.iter().any(|x|n(x,"high")>n(&h[h.len()-2],"price")&&n(x,"close")<n(&h[h.len()-2],"price")),"failedBreakdown":l.len()>=2&&recent.iter().any(|x|n(x,"low")<n(&l[l.len()-2],"price")&&n(x,"close")>n(&l[l.len()-2],"price")),"resistance":resistance,"support":support,"highs":h,"lows":l})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enhanced_macd_uses_every_fast_ema_update() {
+        // On a linear series SMA-seeded EMA(2) - EMA(5) is exactly +/-1.5.
+        // Skipping the fast EMA updates between the two seeds creates false momentum.
+        for direction in [1., -1.] {
+            let values: Vec<f64> = (0..8).map(|i| 100. + direction * i as f64).collect();
+            let (line, signal, histogram) = enhanced_macd(&values, 2, 5, 2);
+            assert!((line - direction * 1.5).abs() < 1e-12, "{line}");
+            assert!((signal - direction * 1.5).abs() < 1e-12, "{signal}");
+            assert!(histogram.abs() < 1e-12, "{histogram}");
+        }
+    }
+
+    #[test]
+    fn enhanced_macd_rejects_invalid_periods_and_waits_for_signal_seed() {
+        let values = [100.; 8];
+        for (fast, slow, signal) in [(0, 5, 2), (2, 0, 2), (5, 2, 2), (2, 5, 0)] {
+            let result = enhanced_macd(&values, fast, slow, signal);
+            assert!(result.0.is_nan() && result.1.is_nan() && result.2.is_nan());
+        }
+        let result = enhanced_macd(&values[..5], 2, 5, 2);
+        assert_eq!(result.0, 0.);
+        assert!(result.1.is_nan() && result.2.is_nan());
+    }
 }

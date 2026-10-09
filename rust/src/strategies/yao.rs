@@ -360,7 +360,7 @@ pub fn analyze(m: &Value, ctx: &Value) -> Value {
         json!({"enabled":true,"ok":aligned&&separated,"fast":fast,"slow":slow,"atr":a,"sepAtr":sep,"aligned":aligned,"separated":separated,"minSepAtr":p["minTrend15SepAtr"]})
     };
     trend["trend15"] = trend15.clone();
-    if !b(&trend15, "ok") {
+    if b(p, "require15mTrend") && !b(&trend15, "ok") {
         return hold(
             "15m 趋势未与预测一致或间距不足，观望。".into(),
             json!({"trend":trend}),

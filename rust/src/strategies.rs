@@ -540,7 +540,103 @@ mod tests {
             let ctx = json!({"auxMarkets":{"15m":market(dataset,"15m"),"1h":market(dataset,"1h"),"4h":market(dataset,"4h"),"5m":market(dataset,"15m")},"params":case["params"],"account":{"equity":10000},"costs":{"feeBps":6,"slippageBps":5,"fundingBpsPer8h":3}});
             let id = case["id"].as_str().unwrap();
             let got = analyze(id, &m, &ctx).unwrap();
-            compatible(&case["expected"], &got, &format!("{id}:{index}"));
+            let mut expected = case["expected"].clone();
+            // The migration snapshot captured the bug: breakout plans stored zero
+            // even though the same snapshot's signal had a nonzero score.
+            // Retain the immutable fixture and compare every other field as before.
+            if matches!(id, "h4-trend-breakout-v1" | "h4-chandelier-breakout-v1")
+                && expected["plan"].is_object()
+            {
+                expected["plan"]["signalScore"] = expected["score"].clone();
+            }
+            compatible(&expected, &got, &format!("{id}:{index}"));
+        }
+    }
+    #[test]
+    fn h4_breakout_carries_its_score_into_position_sizing() {
+        let dataset = json!({"count":260,"drift":0.035,"mode":"break"});
+        for id in ["h4-trend-breakout-v1", "h4-chandelier-breakout-v1"] {
+            for drift in [0.035, -0.035] {
+                let m = market(&merge(dataset.clone(), json!({"drift":drift})), "4h");
+                let signal = analyze(
+                    id,
+                    &m,
+                    &json!({"params":{"longOnly":false,"rsiLongMax":100,"rsiShortMin":0}}),
+                )
+                .unwrap();
+                assert!(
+                    matches!(signal["action"].as_str(), Some("BUY" | "SELL")),
+                    "{signal}"
+                );
+                assert!(n(&signal, "score") > 0.);
+                assert_eq!(signal["plan"]["signalScore"], signal["score"]);
+            }
+        }
+    }
+    #[test]
+    fn h4_reversion_requires_ready_adx_when_filter_is_enabled() {
+        let m = market(&json!({"count":80,"drift":0.035,"mode":"dip"}), "4h");
+        let mut ctx = json!({"params":{"adxPeriod":60,"adxMax":50,"entryExtAtr":0.2,"rsiOversold":60,"rsiOverbought":90,"minNetRr":0.1,"minAtrPct":0,"maxAtrPct":0.2}});
+        let signal = analyze("h4-mean-reversion-v1", &m, &ctx).unwrap();
+        assert_eq!(signal["action"], "WAIT", "{signal}");
+        assert_eq!(signal["dataGap"], true);
+        ctx["params"]["adxMax"] = json!(0);
+        assert_eq!(
+            analyze("h4-mean-reversion-v1", &m, &ctx).unwrap()["action"],
+            "BUY"
+        );
+    }
+    #[test]
+    fn enhanced_conflicting_periods_never_bypass_momentum_confirmation() {
+        let m = market(&json!({"count":80,"drift":0.035,"mode":"normal"}), "1m");
+        for params in [
+            json!({"macdFastPeriod":26,"macdSlowPeriod":12}),
+            json!({"maFastPeriod":50,"maSlowPeriod":20}),
+            json!({"volumeRecentPeriod":20,"volumeLookbackPeriod":20}),
+            json!({"trend15Enabled":true,"trend15EmaFast":50,"trend15EmaSlow":20}),
+        ] {
+            let result = analyze("enhanced-trend-v1", &m, &json!({"params":params})).unwrap();
+            assert_eq!(result["action"], "WAIT");
+            assert!(
+                result["reason"].as_str().unwrap().starts_with("参数冲突"),
+                "{result}"
+            );
+        }
+    }
+    #[test]
+    fn yao_optional_trend_gate_can_be_disabled_without_disabling_entries() {
+        let dataset = json!({"count":260,"drift":0.035,"mode":"surge"});
+        let m = market(&dataset, "1m");
+        let mut ctx = json!({"params":{"require15mTrend":false,"minProbabilityPct":40,"minRawProbabilityPct":50,"minCurrentAmplitudePct":0,"minVolumeRatio":0,"minRangeRatio":0,"minTrendConsistencyPct":0,"minRecentReturnPct":0,"minNetRr":0.1},"auxMarkets":{"15m":market(&dataset,"15m")}});
+        let result = analyze("yao-coin-ambush-v1", &m, &ctx).unwrap();
+        assert_eq!(result["action"], "BUY", "{result}");
+        assert_eq!(result["trend"]["trend15"]["enabled"], false);
+        ctx["params"]["require15mTrend"] = json!(true);
+        ctx["params"]["trend15EmaFast"] = json!(50);
+        ctx["params"]["trend15EmaSlow"] = json!(20);
+        assert_eq!(
+            analyze("yao-coin-ambush-v1", &m, &ctx).unwrap()["action"],
+            "WAIT"
+        );
+    }
+    #[test]
+    fn enhanced_volume_upper_bound_is_configurable_and_conflicts_are_explicit() {
+        let mut m = market(&json!({"count":260,"drift":0.035,"mode":"normal"}), "1m");
+        for row in m["klines"].as_array_mut().unwrap().iter_mut().rev().take(5) {
+            row["volume"] = json!(n(row, "volume") * 1.6);
+        }
+        let id = "enhanced-trend-v1";
+        assert_eq!(analyze(id, &m, &json!({})).unwrap()["action"], "WAIT");
+        let conflict = analyze(id, &m, &json!({"params":{"minVolumeRatio":1.3}})).unwrap();
+        assert!(conflict["reason"].as_str().unwrap().starts_with("参数冲突"));
+        for upper in [1.8, 0.] {
+            let signal = analyze(
+                id,
+                &m,
+                &json!({"params":{"minVolumeRatio":1.3,"maxVolumeRatio":upper}}),
+            )
+            .unwrap();
+            assert_eq!(signal["action"], "BUY", "{signal}");
         }
     }
     #[test]

@@ -152,8 +152,10 @@ pub fn normalize_plan(raw: &Value, market: &Value, now: i64) -> Value {
                     "next_candle_open_in_range"
                 });
                 let distance = (entry - sl).abs() / entry;
-                leverage = raw["recommendedLeverage"]
-                    .as_f64()
+                leverage = [&raw["recommendedLeverage"], &p["recommendedLeverage"]]
+                    .into_iter()
+                    .filter_map(Value::as_f64)
+                    .find(|v| v.is_finite() && *v >= 1.)
                     .unwrap_or_else(|| (0.10 / distance).floor())
                     .clamp(1., 12.);
                 margin_risk = leverage * distance;
@@ -507,6 +509,34 @@ pub fn symbols(input: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn normalization_respects_strategy_leverage_and_risk_budget() {
+        let now = 1_800_000;
+        let market = json!({"symbol":"BTCUSDT","interval":"1m","dataAsOf":iso(now)});
+        let mut raw = json!({"action":"BUY","confidence":0.9,"plan":{"entryMin":99.,"entryMax":101.,"entryLimit":100.,"stopLoss":98.,"takeProfit":108.,"maxHoldBars":20,"recommendedLeverage":2.}});
+        let signal = normalize_plan(&raw, &market, now);
+        assert_eq!(signal["eligible"], true);
+        assert_eq!(signal["recommendedLeverage"], 2.);
+        assert_eq!(signal["marginRiskPct"], 0.04);
+        raw["recommendedLeverage"] = json!(1.);
+        assert_eq!(
+            normalize_plan(&raw, &market, now)["recommendedLeverage"],
+            1.
+        );
+        raw["recommendedLeverage"] = json!(0.);
+        assert_eq!(
+            normalize_plan(&raw, &market, now)["recommendedLeverage"],
+            2.
+        );
+        raw["plan"]
+            .as_object_mut()
+            .unwrap()
+            .remove("recommendedLeverage");
+        assert_eq!(
+            normalize_plan(&raw, &market, now)["recommendedLeverage"],
+            5.
+        );
+    }
     #[test]
     fn incremental_fetch_keeps_full_refill_for_broken_history() {
         let rows: Vec<Value> = (920..1000).map(|i| json!({"openTime":i * 60_000,"open":100,"high":101,"low":99,"close":100,"volume":10})).collect();

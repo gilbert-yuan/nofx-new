@@ -298,6 +298,20 @@ pub fn analyze(m: &Value, ctx: &Value) -> Value {
     let r = rows(m);
     let symbol = &m["symbol"];
     let hold = |reason: String, trend: Value| json!({"symbol":symbol,"action":"WAIT","confidence":0,"reason":reason,"risk":"市场条件不满足开仓要求。","plan":null,"trendScore":trend});
+    for (fast, slow, enabled) in [
+        ("maFastPeriod", "maSlowPeriod", true),
+        ("macdFastPeriod", "macdSlowPeriod", true),
+        ("volumeRecentPeriod", "volumeLookbackPeriod", true),
+        ("trend15EmaFast", "trend15EmaSlow", b(p, "trend15Enabled")),
+    ] {
+        if enabled && period(p, fast) >= period(p, slow) {
+            return hold(format!("参数冲突：{fast} 必须小于 {slow}。"), Value::Null);
+        }
+    }
+    let max_volume = n(p, "maxVolumeRatio");
+    if b(p, "requireVolumeConfirm") && max_volume > 0. && n(p, "minVolumeRatio") >= max_volume {
+        return hold("参数冲突：最低量比必须低于最高量比。".into(), Value::Null);
+    }
     let mut need = 50;
     for key in [
         "maSlowPeriod",
@@ -317,7 +331,10 @@ pub fn analyze(m: &Value, ctx: &Value) -> Value {
     }
     need = need.max(period(p, "macdSlowPeriod") + period(p, "macdSignalPeriod") - 1);
     if r.len() < need {
-        return hold("需要至少50根K线数据，当前数据不足。".into(), Value::Null);
+        return hold(
+            format!("需要至少 {need} 根K线数据，当前只有 {} 根。", r.len()),
+            Value::Null,
+        );
     }
     let c = closes(&r);
     let close = *c.last().unwrap();
@@ -381,7 +398,7 @@ pub fn analyze(m: &Value, ctx: &Value) -> Value {
             strength,
         );
     }
-    if vr >= 1.2 {
+    if max_volume > 0. && vr >= max_volume {
         return hold(
             format!("近期成交量放大至基线{vr:.2}倍，避免放量追势。"),
             strength,

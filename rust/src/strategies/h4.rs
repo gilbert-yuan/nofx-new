@@ -27,7 +27,7 @@ fn plan(
     a: f64,
     target: f64,
     p: &Value,
-    score: Option<f64>,
+    score: f64,
     target_source: String,
     extra: Value,
 ) -> Value {
@@ -39,14 +39,14 @@ fn plan(
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(5.);
     let mut cap = n(p, "maxLeverage").floor().clamp(1., hard);
-    if b(p, "scoreLeverageEnabled") && score.unwrap_or(-1.) >= n(p, "scoreLeverageThreshold") {
+    if b(p, "scoreLeverageEnabled") && score >= n(p, "scoreLeverageThreshold") {
         cap = cap.max(n(p, "scoreLeverageMax").floor().min(hard));
     }
     let lev = (n(p, "riskBudgetPct") / pct).floor().clamp(1., cap);
     let margin = n(p, "autoMarginPct");
     let pos = n(p, "maxPositions").floor();
     merge(
-        json!({"entryMin":price-band,"entryMax":price+band,"entryReference":price,"stopLoss":price-direction*risk,"takeProfit":target,"riskUnit":risk,"stopDistancePct":pct,"maxHoldBars":n(p,"maxHoldBars").round(),"recommendedLeverage":lev,"marginRiskPct":lev*pct,"signalScore":score.unwrap_or(0.),"autoMarginPct":if margin>0.&&margin<=1.{Some(margin)}else{None},"maxPositions":if pos>=1.{Some(pos)}else{None},"targetSource":target_source,"entryStyle":"market","exitRules":exit_rules(p)}),
+        json!({"entryMin":price-band,"entryMax":price+band,"entryReference":price,"stopLoss":price-direction*risk,"takeProfit":target,"riskUnit":risk,"stopDistancePct":pct,"maxHoldBars":n(p,"maxHoldBars").round(),"recommendedLeverage":lev,"marginRiskPct":lev*pct,"signalScore":score,"autoMarginPct":if margin>0.&&margin<=1.{Some(margin)}else{None},"maxPositions":if pos>=1.{Some(pos)}else{None},"targetSource":target_source,"entryStyle":"market","exitRules":exit_rules(p)}),
         extra,
     )
 }
@@ -160,6 +160,17 @@ pub fn analyze(id: &str, m: &Value, ctx: &Value) -> Value {
         return hold(
             "4H 指标未就绪（ATR 无效），本轮观望。".into(),
             json!({"dataGap":true}),
+        );
+    }
+    let adx_required = if reversion {
+        n(p, "adxMax") > 0.
+    } else {
+        n(p, "adxMin") > 0.
+    };
+    if !rs.is_finite() || adx_required && !ax.is_finite() {
+        return hold(
+            "4H 指标未就绪（RSI/ADX），本轮观望。".into(),
+            json!({"dataGap":true,"trend":merge(trend.clone(),json!({"dataGap":true}))}),
         );
     }
     let (direction, metrics, score, target, target_source, extra) = if reversion {
@@ -371,16 +382,7 @@ pub fn analyze(id: &str, m: &Value, ctx: &Value) -> Value {
             json!({"metrics":metrics}),
         );
     }
-    let plan = plan(
-        direction,
-        price,
-        a,
-        target,
-        p,
-        if reversion { Some(score) } else { None },
-        target_source,
-        extra,
-    );
+    let plan = plan(direction, price, a, target, p, score, target_source, extra);
     if !sane(&plan, direction) {
         return hold(
             "计划几何非法，本轮观望。".into(),

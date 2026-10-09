@@ -312,6 +312,17 @@
           "description": "近 5 根均量 ÷ 前 15 根均量的下限。"
         },
         {
+          "key": "maxVolumeRatio",
+          "label": "最高量比",
+          "group": "filter",
+          "type": "number",
+          "default": 1.2,
+          "min": 0,
+          "max": 10,
+          "step": 0.1,
+          "description": "量比达到该值时避免放量追势；0 关闭上限。启用最低量比确认时，上限必须高于下限。"
+        },
+        {
           "key": "requireVolumeConfirm",
           "label": "强制量能确认",
           "group": "filter",

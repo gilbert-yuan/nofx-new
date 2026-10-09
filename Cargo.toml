@@ -24,6 +24,10 @@ path = "rust/src/bin/nofx-optimize.rs"
 name = "nofx-campaign"
 path = "rust/src/bin/nofx-campaign.rs"
 
+[[bin]]
+name = "nofx-replay"
+path = "rust/src/bin/nofx-replay.rs"
+
 [[test]]
 name = "backend-integration"
 path = "rust/tests/backend.rs"
