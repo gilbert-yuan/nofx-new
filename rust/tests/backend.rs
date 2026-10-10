@@ -460,7 +460,7 @@ async fn verify_campaign_resume(options: &PgConnectOptions, db: &Db, start: i64)
         "engineVersion":campaign::engine_version(),"environment":campaign::environment_snapshot(),
         "strategies":{id:{"params":base,"space":campaign::search_space(id,&base)?}},
         "symbols":["BTCUSDT"],"config":{"trader":{"minConfidence":0.65,"maxLeverage":5}},
-        "adaptive":{},"settings":settings});
+        "adaptive":{},"settings":settings,"costs":nofx_core::research::costs()});
     campaign::write_json(&directory.join("manifest.json"), &manifest)?;
     let history = backtest::load_history(db, "BTCUSDT", id, start, start + 3_600_000).await?;
     campaign::write_json(
@@ -506,5 +506,58 @@ async fn verify_campaign_resume(options: &PgConnectOptions, db: &Db, start: i64)
         campaign::read_json(&directory.join("summary.json"))?["completedUnits"],
         2
     );
+    // A new focused study reuses raw data, freezes current config, and resumes
+    // independently without reading or creating final-test results.
+    let store = nofx_core::store::Store::new(root.path().join("data")).await?;
+    store
+        .write(
+            "strategies",
+            &json!({"initialized":true,"strategies":{
+        id:{"enabled":true,"params":base}}}),
+        )
+        .await?;
+    let focused_settings = json!({"sourceResearch":"research","strategyIds":[id],
+        "symbols":["BTCUSDT"],"maxTrials":2,"holdoutMode":"deferred",
+        "candidates":{id:[{"minTrendScore":73}]},"optimization":settings["optimization"]});
+    campaign::write_json(&root.path().join("focused.json"), &focused_settings)?;
+    let account_before = db.account(true, None).await?;
+    let focused = root.path().join("focused");
+    let focused_command = || -> Result<()> {
+        let result = Command::new(env!("CARGO_BIN_EXE_nofx-campaign"))
+            .args([
+                "--root",
+                root.path().to_str().unwrap(),
+                "--campaign",
+                "focused.json",
+                "--output",
+                "focused",
+                "--max-units",
+                "1",
+            ])
+            .env("DATABASE_URL", options.to_url_lossy().as_str())
+            .output()?;
+        if !result.status.success() {
+            bail!(
+                "focused campaign failed: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        Ok(())
+    };
+    focused_command()?;
+    let first = focused.join("trials/0000-enhanced-trend-v1-BTCUSDT.json");
+    let before = std::fs::read(&first)?;
+    focused_command()?;
+    assert_eq!(std::fs::read(&first)?, before);
+    assert_eq!(
+        campaign::read_json(&focused.join("summary.json"))?["completedUnits"],
+        2
+    );
+    assert!(!focused.join(format!("holdout-{id}.json")).exists());
+    assert_eq!(
+        campaign::read_json(&focused.join("downloads/BTCUSDT.json"))?["marketRequests"],
+        0
+    );
+    assert_eq!(db.account(true, None).await?, account_before);
     Ok(())
 }

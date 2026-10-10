@@ -240,12 +240,20 @@ pub async fn create_manifest(
     db: &Db,
     exchange: &Exchange,
 ) -> Result<Value> {
-    let end = now_ms().div_euclid(60_000) * 60_000;
+    let source = frozen_source(root, settings)?;
+    let end = source.as_ref().map_or_else(
+        || now_ms().div_euclid(60_000) * 60_000,
+        |(_, manifest)| timestamp(&manifest["endTime"]).unwrap(),
+    );
     let days = number(&settings["days"], 30.) as i64;
     if !(1..=31).contains(&days) {
         bail!("days 需要在 1～31");
     }
-    let start = end - days * 86_400_000;
+    let start = source
+        .as_ref()
+        .map_or(end - days * 86_400_000, |(_, manifest)| {
+            timestamp(&manifest["startTime"]).unwrap()
+        });
     let store =
         Store::new(root.join(std::env::var("DATA_DIR").unwrap_or_else(|_| "data".into()))).await?;
     let config = store.read("config").await?;
@@ -267,6 +275,21 @@ pub async fn create_manifest(
     if selected.is_empty() {
         bail!("当前没有启用的策略");
     }
+    if let Some(requested) = settings.get("strategyIds") {
+        let requested = requested
+            .as_array()
+            .filter(|ids| !ids.is_empty())
+            .context("strategyIds 必须是非空策略数组")?;
+        for id in requested {
+            if !id.as_str().is_some_and(|id| selected.contains_key(id)) {
+                bail!("指定策略未启用或不存在：{id}");
+            }
+        }
+        selected.retain(|id, _| requested.contains(&json!(id)));
+    }
+    for (id, strategy) in &mut selected {
+        strategy["candidates"] = fixed_candidates(id, &strategy["params"], settings)?;
+    }
     let symbols: Vec<String> = if let Some(values) = settings["symbols"].as_array() {
         values
             .iter()
@@ -276,6 +299,8 @@ pub async fn create_manifest(
                     .map(str::to_uppercase)
             })
             .collect::<Result<_>>()?
+    } else if let Some((_, manifest)) = &source {
+        symbols(manifest)
     } else {
         let contracts = exchange
             .public_request("/fapi/v1/exchangeInfo", &json!({}))
@@ -297,9 +322,22 @@ pub async fn create_manifest(
     }
     for symbol in &symbols {
         valid_symbol(symbol)?;
+        if source.as_ref().is_some_and(|(_, manifest)| {
+            !manifest["symbols"]
+                .as_array()
+                .is_some_and(|list| list.contains(&json!(symbol)))
+        }) {
+            bail!("{symbol} 不在冻结行情源中");
+        }
+    }
+    if symbols.iter().collect::<BTreeSet<_>>().len() != symbols.len() {
+        bail!("symbols 不能重复，否则会重复加权");
     }
     let account = db.account(true, None).await?;
     let manifest = json!({"version":1,"createdAt":iso(now_ms()),"startTime":start,"endTime":end,
+        "frozenSource":source.as_ref().map(|(path, manifest)| json!({"directory":path,
+            "engineVersion":manifest["engineVersion"],
+            "manifestSha256":hex::encode(Sha256::digest(serde_json::to_vec(manifest).unwrap()))})),
         "engineVersion":engine_version(),"environment":environment_snapshot(),"strategies":selected,
         "symbols":symbols,"config":research_config(&config),"adaptive":account["adaptiveConfig"],"settings":settings,
         "costs":crate::research::costs(),"researchOnly":true,
@@ -309,6 +347,92 @@ pub async fn create_manifest(
             "保留生产风控与固定成本模型；盘口、历史最小数量和网络成交延迟不重建"]});
     optimizer::split_range(start, end, &settings["optimization"])?;
     Ok(manifest)
+}
+
+fn frozen_source(root: &Path, settings: &Value) -> Result<Option<(PathBuf, Value)>> {
+    let Some(source) = settings.get("sourceResearch") else {
+        return Ok(None);
+    };
+    let path = root
+        .join(source.as_str().context("sourceResearch 必须是目录路径")?)
+        .canonicalize()?;
+    let manifest = read_json(&path.join("manifest.json"))?;
+    if manifest["costs"] != crate::research::costs() {
+        bail!("冻结源的共享成本模型不同，不能混用");
+    }
+    let start = timestamp(&manifest["startTime"]).context("冻结源缺少开始时间")?;
+    let end = timestamp(&manifest["endTime"]).context("冻结源缺少结束时间")?;
+    let old = optimizer::split_range(start, end, &manifest["settings"]["optimization"])?;
+    let new = optimizer::split_range(start, end, &settings["optimization"])?;
+    if old.train_end != new.train_end || old.validation_end != new.validation_end {
+        bail!("复用冻结行情必须保持原训练/验证边界，不能把最终测试用于选参");
+    }
+    Ok(Some((path, manifest)))
+}
+
+fn fixed_candidates(id: &str, base: &Value, settings: &Value) -> Result<Value> {
+    let Some(patches) = settings.get("candidates") else {
+        return Ok(Value::Null);
+    };
+    let patches = patches[id]
+        .as_array()
+        .context("每个指定策略都需要 candidates 数组")?;
+    if patches.len() + 1 != number(&settings["maxTrials"], 64.) as usize {
+        bail!("maxTrials 必须等于固定候选数加一个基线");
+    }
+    let definition = strategies::definition(id).context("未知策略")?;
+    // Normalize both sides before deduplication: JSON integers and floats can
+    // describe identical parameters but compare unequal as serde_json::Value.
+    let resolved_base = strategies::resolve_params(id, base)?;
+    if !resolved_base["rejected"].as_array().unwrap().is_empty() {
+        bail!("固定候选基线参数无效：{}", resolved_base["rejected"]);
+    }
+    let base = &resolved_base["params"];
+    let mut candidates = vec![base.clone()];
+    for patch in patches {
+        let patch = patch.as_object().context("固定候选必须是参数补丁对象")?;
+        let mut params = base.clone();
+        for (key, value) in patch {
+            let schema = definition["paramSchema"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|schema| schema["key"] == key.as_str())
+                .with_context(|| format!("未知固定候选参数：{id}.{key}"))?;
+            if ![
+                "indicator",
+                "filter",
+                "entry",
+                "protection",
+                "exit",
+                "marketContext",
+            ]
+            .contains(&schema["group"].as_str().unwrap_or(""))
+                || [
+                    "longOnly",
+                    "shortOnly",
+                    "marketBookEnabled",
+                    "marketRequireData",
+                ]
+                .contains(&key.as_str())
+            {
+                bail!("固定候选不能更改风险预算、杠杆或数据约束：{key}");
+            }
+            if value.is_null() || value == "" {
+                bail!("固定候选值不能为空：{key}");
+            }
+            params[key] = value.clone();
+        }
+        let resolved = strategies::resolve_params(id, &params)?;
+        if !resolved["rejected"].as_array().unwrap().is_empty() {
+            bail!("固定候选参数无效：{}", resolved["rejected"]);
+        }
+        if candidates.contains(&resolved["params"]) {
+            bail!("固定候选与基线或之前候选重复");
+        }
+        candidates.push(resolved["params"].clone());
+    }
+    Ok(json!(candidates))
 }
 
 fn ids(manifest: &Value) -> Vec<String> {
@@ -400,8 +524,13 @@ fn trial_complete(
             >= number(&opt["minValidationTrades"], 5.)
         && number(&trial["training"]["tradingSymbols"], 0.)
             >= number(&opt["minTradingSymbols"], 3.)
+        && number(&trial["validation"]["tradingSymbols"], 0.)
+            >= number(&opt["minValidationTradingSymbols"], 1.)
         && trial["training"]["marketGaps"] == 0.
-        && trial["validation"]["marketGaps"] == 0.;
+        && trial["validation"]["marketGaps"] == 0.
+        && (opt["requireCompleteIndicators"] != true
+            || (trial["training"]["missingChecks"] == 0.
+                && trial["validation"]["missingChecks"] == 0.));
     trial["sufficient"] = json!(sufficient);
     trial["score"] = if sufficient {
         json!(optimizer::score_trial(&trial, opt))
@@ -410,6 +539,36 @@ fn trial_complete(
     };
     Ok(Some(trial))
 }
+
+fn validation_gate(best: &Value, baseline: &Value, opt: &Value) -> Vec<&'static str> {
+    let mut reasons = vec![];
+    if best["sufficient"] != true || !number(&best["score"], f64::NAN).is_finite() {
+        reasons.push("候选样本或数据不合格");
+    }
+    if baseline["sufficient"] != true {
+        reasons.push("缺少完整且样本充分的基线");
+    }
+    if number(&best["training"]["returnPct"], f64::NEG_INFINITY) <= 0. {
+        reasons.push("训练净收益未转正");
+    }
+    if number(&best["validation"]["returnPct"], f64::NEG_INFINITY) <= 0. {
+        reasons.push("验证净收益未转正");
+    }
+    if number(&best["validation"]["returnPct"], f64::NEG_INFINITY)
+        <= number(&baseline["validation"]["returnPct"], f64::INFINITY)
+    {
+        reasons.push("验证净收益未超过基线");
+    }
+    let max_dd = number(&opt["maxDrawdown"], 0.3) * 100.;
+    if number(&best["training"]["maxDrawdownPct"], f64::INFINITY) > max_dd {
+        reasons.push("训练回撤超过上限");
+    }
+    if number(&best["validation"]["maxDrawdownPct"], f64::INFINITY) > max_dd {
+        reasons.push("验证回撤超过上限");
+    }
+    reasons
+}
+
 pub fn summary(directory: &Path, manifest: &Value) -> Result<Value> {
     let mut reports = serde_json::Map::new();
     let mut completed = 0;
@@ -438,20 +597,25 @@ pub fn summary(directory: &Path, manifest: &Value) -> Result<Value> {
         });
         let best = trials
             .iter()
-            .find(|t| t["sufficient"] == true)
+            .find(|t| {
+                validation_gate(t, &baseline, &manifest["settings"]["optimization"]).is_empty()
+            })
+            .or_else(|| {
+                trials
+                    .iter()
+                    .find(|t| t["sufficient"] == true && number(&t["score"], f64::NAN).is_finite())
+            })
             .cloned()
             .unwrap_or(Value::Null);
-        let improves_baseline = !best.is_null()
-            && number(&best["validation"]["returnPct"], 0.)
-                > number(&baseline["validation"]["returnPct"], 0.)
-            && number(&best["validation"]["returnPct"], 0.) > 0.
-            && number(&best["training"]["maxDrawdownPct"], 100.)
-                <= number(&manifest["settings"]["optimization"]["maxDrawdown"], 0.3) * 100.;
+        let reasons = validation_gate(&best, &baseline, &manifest["settings"]["optimization"]);
+        let improves_baseline = reasons.is_empty();
         reports.insert(
             id.clone(),
             json!({"name":manifest["strategies"][&id]["name"],"baseline":baseline,
             "best":best,"completedCandidates":trials.len(),"ranking":trials,
             "improvesBaselineOnValidation":improves_baseline,
+            "validationGateReasons":reasons,
+            "holdoutDeferred":manifest["settings"]["holdoutMode"] == "deferred",
             "holdout":directory.join(format!("holdout-{id}.json")).exists()}),
         );
     }
@@ -474,7 +638,9 @@ fn candidate(directory: &Path, manifest: &Value, index: usize, id: &str) -> Resu
         return read_json(&path);
     }
     let spec = spec(manifest, id);
-    let params = if index == 0 {
+    let params = if let Some(fixed) = manifest["strategies"][id]["candidates"].as_array() {
+        fixed.get(index).context("固定候选索引越界")?.clone()
+    } else if index == 0 {
         spec.base.clone()
     } else {
         let ranking = summary(directory, manifest)?;
@@ -516,6 +682,9 @@ async fn history(
     }
     let start = timestamp(&manifest["startTime"]).unwrap();
     let end = timestamp(&manifest["endTime"]).unwrap();
+    if let Some(source) = manifest["frozenSource"]["directory"].as_str() {
+        return import_frozen_history(directory, manifest, symbol, Path::new(source));
+    }
     let mut covered = BTreeMap::<String, usize>::new();
     let mut all_ids = ids(manifest);
     all_ids.sort_by_key(|id| {
@@ -598,6 +767,37 @@ async fn history(
     write_json(&path, &serde_json::to_value(&history)?)?;
     Ok(history)
 }
+
+fn import_frozen_history(
+    directory: &Path,
+    manifest: &Value,
+    symbol: &str,
+    source: &Path,
+) -> Result<History> {
+    let source_manifest = read_json(&source.join("manifest.json"))?;
+    let digest = hex::encode(Sha256::digest(serde_json::to_vec(&source_manifest)?));
+    if manifest["frozenSource"]["manifestSha256"] != digest {
+        bail!("冻结行情源 manifest 已变化，停止导入");
+    }
+    let bytes = fs::read(source.join("data").join(format!("{symbol}.json")))?;
+    let history: History = serde_json::from_slice(&bytes)?;
+    let start = timestamp(&manifest["startTime"]).context("缺少开始时间")?;
+    let end = timestamp(&manifest["endTime"]).context("缺少结束时间")?;
+    if coverage(&history, start, end) < number(&manifest["settings"]["minimumCoverage"], 0.99) {
+        bail!("{symbol} 冻结行情覆盖不足");
+    }
+    // Copy raw inputs only. Old trials, candidates, and holdout results are never imported.
+    write_json(
+        &directory.join("downloads").join(format!("{symbol}.json")),
+        &json!({"sourceResearch":source,"sourceSha256":hex::encode(Sha256::digest(&bytes)),
+            "copiedAt":iso(now_ms()),"marketRequests":0}),
+    )?;
+    write_json(
+        &directory.join("data").join(format!("{symbol}.json")),
+        &serde_json::to_value(&history)?,
+    )?;
+    Ok(history)
+}
 pub fn status(directory: &Path, phase: &str, unit: Value) -> Result<()> {
     write_json(
         &directory.join("status.json"),
@@ -624,6 +824,9 @@ pub async fn run(
     };
     if manifest["engineVersion"] != engine_version() {
         bail!("回放代码已变化，请为新版本使用新的输出目录，旧结果保持可查");
+    }
+    if manifest["settings"] != *settings {
+        bail!("研究设置已变化，请恢复冻结设置或使用新输出目录");
     }
     if manifest["environment"] != serde_json::to_value(environment_snapshot())? {
         bail!("风控环境参数已变化，不能混合旧结果；请恢复原环境或用新目录");
@@ -747,21 +950,30 @@ pub async fn run(
         for id in ids(&manifest) {
             let heldout_path = directory.join(format!("holdout-{id}.json"));
             let row = &report["strategies"][&id];
-            if heldout_path.exists()
+            if manifest["settings"]["holdoutMode"] == "deferred"
+                || heldout_path.exists()
                 || number(&row["completedCandidates"], 0.)
                     < number(&manifest["settings"]["maxTrials"], 64.)
             {
                 continue;
             }
-            if row["best"].is_null() {
+            if row["improvesBaselineOnValidation"] != true {
                 write_json(
                     &heldout_path,
-                    &json!({"skipped":true,"reason":"训练/验证成交数或币种覆盖不足，没有可靠候选"}),
+                    &json!({"skipped":true,"reason":"候选未通过训练/验证盈利与风险门槛", "reasons":row["validationGateReasons"]}),
                 )?;
                 continue;
             }
             let mut results = vec![];
             for symbol in symbols(&manifest) {
+                if directory.join("STOP").exists() {
+                    status(
+                        directory,
+                        "paused",
+                        json!({"strategy":id,"phase":"holdout"}),
+                    )?;
+                    return Ok(());
+                }
                 let hist = history(directory, &manifest, &symbol, &db, &exchange).await?;
                 status(directory, "holdout", json!({"strategy":id,"symbol":symbol}))?;
                 let result = optimizer::holdout(
@@ -807,6 +1019,140 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fixed_experiments_validate_patches_and_keep_baseline() {
+        let id = "enhanced-trend-v1";
+        let base = strategies::defaults(id);
+        let mut settings = json!({"maxTrials":2,"candidates":{id:[{"marketFlowEnabled":true,"marketFlowMinFraction":0.6}]}});
+        let candidates = fixed_candidates(id, &base, &settings).unwrap();
+        assert_eq!(
+            candidates[0],
+            strategies::resolve_params(id, &base).unwrap()["params"]
+        );
+        assert_eq!(candidates[1]["marketFlowEnabled"], true);
+        assert_eq!(
+            candidates[1]["riskBudgetPct"],
+            candidates[0]["riskBudgetPct"]
+        );
+        for patch in [
+            json!({"typo":1}),
+            json!({"maxLeverage":10}),
+            json!({"marketRequireData":false}),
+            json!({"minTrendScore":101}),
+            json!({"minTrendScore":null}),
+            json!({}),
+        ] {
+            settings["candidates"][id][0] = patch;
+            assert!(fixed_candidates(id, &base, &settings).is_err());
+        }
+        settings["candidates"][id][0] = json!({"minTrendScore":73});
+        settings["maxTrials"] = json!(3);
+        assert!(fixed_candidates(id, &base, &settings).is_err());
+    }
+
+    #[test]
+    fn profitability_gate_rejects_validation_risk_and_unreliable_comparisons() {
+        let base = json!({"sufficient":true,"validation":{"returnPct":0.5}});
+        let good = json!({"sufficient":true,"score":0.01,
+            "training":{"returnPct":3,"maxDrawdownPct":2},
+            "validation":{"returnPct":2,"maxDrawdownPct":2}});
+        let opt = json!({"maxDrawdown":0.05});
+        assert!(validation_gate(&good, &base, &opt).is_empty());
+        let mut bad = good.clone();
+        bad["validation"]["maxDrawdownPct"] = json!(6);
+        assert!(validation_gate(&bad, &base, &opt).contains(&"验证回撤超过上限"));
+        bad = good.clone();
+        bad["training"]["returnPct"] = json!(-1);
+        assert!(validation_gate(&bad, &base, &opt).contains(&"训练净收益未转正"));
+        assert!(!validation_gate(&good, &Value::Null, &opt).is_empty());
+        bad = good.clone();
+        bad["validation"]["returnPct"] = json!(0.4);
+        assert!(!validation_gate(&bad, &base, &opt).is_empty());
+    }
+
+    #[test]
+    fn frozen_import_preserves_splits_and_never_copies_results() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let output = root.path().join("output");
+        let start = 1_700_000_040_000_i64;
+        let settings = json!({"sourceResearch":"source","optimization":{"trainFraction":0.6,"validationFraction":0.2}});
+        let manifest = json!({"startTime":start,"endTime":start+600_000,
+            "costs":crate::research::costs(),"settings":settings,"symbols":["BTCUSDT"]});
+        write_json(&source.join("manifest.json"), &manifest).unwrap();
+        assert!(frozen_source(root.path(), &settings).is_ok());
+        let mut bad = settings.clone();
+        bad["optimization"]["trainFraction"] = json!(0.8);
+        bad["optimization"]["validationFraction"] = json!(0.1);
+        assert!(frozen_source(root.path(), &bad).is_err());
+        let history = History {
+            datasets: BTreeMap::from([(
+                "1m".into(),
+                (0..10)
+                    .map(|i| json!({"openTime":start+i*60_000}))
+                    .collect(),
+            )]),
+            samples: vec![],
+        };
+        write_json(
+            &source.join("data/BTCUSDT.json"),
+            &serde_json::to_value(history).unwrap(),
+        )
+        .unwrap();
+        write_json(
+            &source.join("holdout-enhanced-trend-v1.json"),
+            &json!({"neverRead":true}),
+        )
+        .unwrap();
+        let before = fs::read(source.join("data/BTCUSDT.json")).unwrap();
+        let mut destination = manifest.clone();
+        destination["frozenSource"] = json!({"manifestSha256":hex::encode(Sha256::digest(serde_json::to_vec(&manifest).unwrap()))});
+        import_frozen_history(&output, &destination, "BTCUSDT", &source).unwrap();
+        assert_eq!(fs::read(source.join("data/BTCUSDT.json")).unwrap(), before);
+        assert!(output.join("data/BTCUSDT.json").exists());
+        assert!(!output.join("holdout-enhanced-trend-v1.json").exists());
+        assert!(!output.join("trials").exists());
+        destination["frozenSource"]["manifestSha256"] = json!("changed");
+        assert!(import_frozen_history(&output, &destination, "BTCUSDT", &source).is_err());
+    }
+
+    #[test]
+    fn focused_research_requires_validation_breadth_and_indicator_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "enhanced-trend-v1";
+        let mut manifest = json!({"symbols":["BTCUSDT","ETHUSDT"],"settings":{"optimization":{
+            "minTrades":10,"minValidationTrades":5,"minTradingSymbols":2,
+            "minValidationTradingSymbols":2,"requireCompleteIndicators":true}}});
+        let row = json!({"params":{},"training":{"closedTrades":10,"marketGaps":0},
+            "validation":{"closedTrades":5,"marketGaps":0}});
+        write_json(&result_path(dir.path(), 0, id, "BTCUSDT"), &row).unwrap();
+        let mut other = row.clone();
+        other["validation"]["closedTrades"] = json!(0);
+        write_json(&result_path(dir.path(), 0, id, "ETHUSDT"), &other).unwrap();
+        assert_eq!(
+            trial_complete(dir.path(), &manifest, 0, id)
+                .unwrap()
+                .unwrap()["sufficient"],
+            false
+        );
+        other = row.clone();
+        other["training"]["missing"] = json!({"oi":1});
+        write_json(&result_path(dir.path(), 0, id, "ETHUSDT"), &other).unwrap();
+        assert_eq!(
+            trial_complete(dir.path(), &manifest, 0, id)
+                .unwrap()
+                .unwrap()["sufficient"],
+            false
+        );
+        manifest["settings"]["optimization"]["requireCompleteIndicators"] = json!(false);
+        assert_eq!(
+            trial_complete(dir.path(), &manifest, 0, id)
+                .unwrap()
+                .unwrap()["sufficient"],
+            true
+        );
+    }
+
     #[test]
     fn atomic_results_and_process_lock_survive_resume() {
         let dir = tempfile::tempdir().unwrap();

@@ -46,7 +46,30 @@ K 线下载会复用数据库中连续、字段完整且在收盘后更新过的
 
 所有币种的候选参数保持相同。每币种从相同初始权益独立回放，收益等权汇总；报告中的 `maxDrawdownPct` 为最差币种回撤，不是合并资金池的回撤。训练至少 10 笔、验证至少 5 笔、训练至少 3 个币种有成交且没有 K 线断档，候选才参与可靠排名。目标为训练收益减回撤，并惩罚验证不稳定；最终测试不参与选参。没有足够成交时保留“样本不足”，不会把零成交当成获胜。
 
-`improvesBaselineOnValidation` 仅表示验证收益优于基线且为正、训练回撤未超配置门槛，仍需检查最终测试。程序不会保存候选到在线策略，也不会触发交易所下单。
+`improvesBaselineOnValidation` 表示候选通过下文的训练/验证盈利、样本与回撤门槛，仍需检查独立最终测试。程序不会保存候选到在线策略，也不会触发交易所下单。
+
+## 固定候选与冻结行情研究
+
+`configs/profit-improvement-20261009.json` 定义增强趋势的 8 个候选（含基线）和 8 个币种，共 64 个训练/验证单位。候选逐项改变主动成交过滤、趋势评分、15m 确认或出场规则，保持杠杆和风险预算。具体设置：
+
+- `strategyIds`：只研究当前已启用的指定策略；省略时沿用全部启用策略。
+- `candidates`：策略 ID 到参数补丁数组。基线自动占索引 0，`maxTrials` 必须等于补丁数量加一。所有补丁相对同一基线；未知参数、越界、风险预算或杠杆变更、数据约束变更与重复候选均报错。比较重复项前统一数值表示。
+- `sourceResearch`：复用既有研究的原始行情，仍冻结当前策略、账户风控配置和当前引擎版本。保持原时间区间、训练/验证边界及共享成本；只导入行情，不导入旧参数、试验或最终测试结果。`downloads` 记录行情源摘要及零行情请求；新研究结果不能与旧引擎收益拼接。
+- `holdoutMode: "deferred"`：完成训练/验证后保留最终测试，不自动读取。改变已冻结设置会拒绝续跑。最终测试需要另外安排一次固定候选与基线的同区间评估，不能通过更改分段把最终测试当训练数据。
+- `minValidationTradingSymbols` 和 `requireCompleteIndicators`：增加验证成交币种覆盖及启用指标完整性要求。该配置要求训练至少 50 笔、验证至少 30 笔，各至少 3 个币种成交，且无行情断档或指标缺失。
+
+新版本的改善门槛同时要求候选与基线样本充分、训练及验证净收益为正、验证收益超过基线，且两个区间的最差币种回撤均不超上限。本配置上限为 5%。排名优先选取通过上述门槛的候选；没有候选通过时仍展示得分最高的研究结果及 `validationGateReasons`，不会标为已改善，也不会自动进入最终测试。门槛不代表统计显著性或上线资格。
+
+```powershell
+$env:PATH = 'C:\Users\Administrator\.cargo\bin;' + $env:PATH
+cargo build --release --locked --bin nofx-campaign -j 2
+New-Item -ItemType Directory -Force target/profit-research
+Copy-Item -LiteralPath target/release/nofx-campaign.exe -Destination target/profit-research/nofx-campaign.exe
+$env:PM2_HOME = Join-Path (Get-Location) '.pm2'
+node_modules/.bin/pm2.cmd start ecosystem.profit-research.config.json
+```
+
+仅在目标研究程序未运行时复制 exe；启动后将该研究进程设为 BelowNormal 优先级。研究完成正常退出，PM2 保留状态且不会重新计算；中断后使用同一配置和结果目录恢复。
 
 ## 策略代码修改前后对照
 
@@ -68,4 +91,4 @@ PM2 的 `nofx-monthly-research` 与 `nofx-api` 分别管理，研究不需要重
 
 本地 Rust 计算不调用模型，不消耗对话额度；额度影响后续 AI 检查，不会终止已经独立启动的进程。机器应保持开机。关闭 Codex 不影响已启动的 PM2 计算，但本对话的定期检查需要应用运行；断电或重启后可用 PM2 恢复，再从落盘进度继续。
 
-已通过格式、全目标检查、Clippy、90 项默认测试和独立 PostgreSQL/HTTP 集成验证。集成验证额外启动真实 CLI 两次，检查第二次只计算下一项、原结果字节不变、模拟账户不变。
+2026-10-10 已通过格式、全目标检查、Clippy、104 项默认测试和独立 PostgreSQL/HTTP 集成验证。默认忽略的数据库/外网测试不计入通过项。独立集成验证检查随机搜索与固定候选研究各自的真实 CLI 续跑，确认原结果字节不变、模拟账户不变，冻结行情导入不请求行情且暂缓最终测试有效。

@@ -1,0 +1,35 @@
+{
+  "sourceResearch": "output/monthly-enabled",
+  "days": 30,
+  "strategyIds": ["enhanced-trend-v1"],
+  "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", "ZECUSDT", "NEARUSDT"],
+  "initialBalance": 10000,
+  "maxTrials": 8,
+  "seed": 20261009,
+  "minimumCoverage": 0.99,
+  "holdoutMode": "deferred",
+  "candidates": {
+    "enhanced-trend-v1": [
+      {"marketFlowEnabled": true, "marketFlowMinFraction": 0.55},
+      {"marketFlowEnabled": true, "marketFlowMinFraction": 0.6},
+      {"minTrendScore": 73},
+      {"trend15Enabled": true},
+      {"smartExitEnabled": false},
+      {"partialTpEnabled": false},
+      {"trailingTriggerR": 0.8}
+    ]
+  },
+  "optimization": {
+    "trainFraction": 0.6,
+    "validationFraction": 0.2,
+    "minTrades": 50,
+    "minValidationTrades": 30,
+    "minTradingSymbols": 3,
+    "minValidationTradingSymbols": 3,
+    "requireCompleteIndicators": true,
+    "objective": "risk-adjusted",
+    "maxDrawdown": 0.05,
+    "drawdownPenalty": 1,
+    "instabilityPenalty": 0.25
+  }
+}

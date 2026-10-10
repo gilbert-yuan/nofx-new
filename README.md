@@ -2,7 +2,7 @@
 
 后端使用原生 Rust（Axum / Tokio / PostgreSQL），前端保留 Vue / Vite。API、策略分析、模拟成交、订单复核、交易所同步和自动任务均在 Rust 中运行。
 
-Windows 本机已经安装 Rust 1.99.0、Cargo、rustfmt、Clippy 和 MSVC 构建工具。新机器可运行 `npm run setup:rust`；项目工具链由 `rust-toolchain.toml` 固定。
+Windows 本机已经安装 Rust 1.99.0、Cargo、rustfmt、Clippy 和 MSVC 构建工具。新机器需先安装 Rust 和 MSVC 构建工具；项目工具链由 `rust-toolchain.toml` 固定。
 
 ```powershell
 npm install
