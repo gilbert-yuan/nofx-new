@@ -83,10 +83,7 @@ fn optional(v: &Value) -> Option<f64> {
         .or_else(|| v.as_str()?.parse().ok())
         .filter(|n| n.is_finite())
 }
-pub fn score_size(signal: &Value, open_count: usize) -> Option<(f64, f64)> {
-    if open_count as f64 >= env_num("NOFX_MAX_POSITIONS", 10., 1., 100.) {
-        return None;
-    }
+pub fn score_size(signal: &Value) -> Option<(f64, f64)> {
     let p = &signal["plan"];
     let score = [
         &p["trendStrengthScore"],
@@ -137,24 +134,53 @@ pub fn score_size(signal: &Value, open_count: usize) -> Option<(f64, f64)> {
     }
     Some((leverage, margin))
 }
+/// Hard ceiling on a single entry's notional, in USDT. Shared by the live
+/// automation path and the offline replay so both size orders identically.
+pub const MAX_ENTRY_NOTIONAL: f64 = 50.;
+
+/// Every input that decides the size of one entry. Grouped so the live path and
+/// the replay cannot drift apart by omitting a field.
+#[derive(Clone, Copy, Debug)]
+pub struct EntrySize {
+    pub equity: f64,
+    pub margin_pct: f64,
+    pub leverage: f64,
+    pub min_margin: f64,
+    pub notional_pct: f64,
+    pub available: Option<f64>,
+    pub minimum_notional: f64,
+    /// Hard per-order ceiling; `0.` disables it.
+    pub max_notional: f64,
+}
+
 /// Fit the minimum margin by reducing leverage, without increasing capped exposure.
-pub fn entry_size(
-    equity: f64,
-    margin_pct: f64,
-    leverage: f64,
-    min_margin: f64,
-    notional_pct: f64,
-    available: Option<f64>,
-    minimum_notional: f64,
-) -> Option<(f64, f64)> {
-    if ![equity, margin_pct, leverage, min_margin, minimum_notional]
-        .into_iter()
-        .all(f64::is_finite)
+pub fn entry_size(size: EntrySize) -> Option<(f64, f64)> {
+    let EntrySize {
+        equity,
+        margin_pct,
+        leverage,
+        min_margin,
+        notional_pct,
+        available,
+        minimum_notional,
+        max_notional,
+    } = size;
+    if ![
+        equity,
+        margin_pct,
+        leverage,
+        min_margin,
+        minimum_notional,
+        max_notional,
+    ]
+    .into_iter()
+    .all(f64::is_finite)
         || equity <= 0.
         || margin_pct <= 0.
         || leverage < 1.
         || min_margin < 0.
         || minimum_notional < 0.
+        || max_notional < 0.
         || available.is_some_and(|v| !v.is_finite() || v <= 0.)
     {
         return None;
@@ -164,6 +190,11 @@ pub fn entry_size(
     let mut notional = (equity * margin_pct).max(min_margin).max(required_margin) * leverage;
     if notional_pct > 0. && notional_pct <= 1. {
         notional = notional.min(equity * notional_pct);
+    }
+    // Hard per-order ceiling. Applied last so no sizing rule can exceed it, and
+    // so the leverage-fitting loop below shrinks the margin instead of the cap.
+    if max_notional > 0. {
+        notional = notional.min(max_notional);
     }
     if !notional.is_finite() || notional < minimum_notional {
         return None;
@@ -269,29 +300,56 @@ mod tests {
     #[test]
     fn minimum_margin_reduces_leverage_without_raising_exposure() {
         for requested in [3., 5.] {
-            let (leverage, margin) = entry_size(53.77, 0.06, requested, 5., 0.25, Some(50.), 0.)
-                .expect("lower leverage fits the same notional cap");
+            let (leverage, margin) = entry_size(EntrySize {
+                equity: 53.77,
+                margin_pct: 0.06,
+                leverage: requested,
+                min_margin: 5.,
+                notional_pct: 0.25,
+                available: Some(50.),
+                minimum_notional: 0.,
+                max_notional: 0.,
+            })
+            .expect("lower leverage fits the same notional cap");
             assert_eq!(leverage, 2.);
             assert!(margin >= 5.);
             assert!(margin * leverage <= 53.77 * 0.25);
             assert!(margin * (1. + leverage * 12. / 10000.) <= 50.);
         }
         assert_eq!(
-            entry_size(100., 0.06, 3., 5., 0.25, Some(50.), 0.),
+            entry_size(EntrySize {
+                equity: 100.,
+                margin_pct: 0.06,
+                leverage: 3.,
+                min_margin: 5.,
+                notional_pct: 0.25,
+                available: Some(50.),
+                minimum_notional: 0.,
+                max_notional: 0.,
+            }),
             Some((3., 6.))
         );
     }
     #[test]
     fn minimum_margin_still_rejects_insufficient_equity_or_cash() {
-        assert_eq!(entry_size(18., 0.06, 5., 5., 0.25, Some(50.), 0.), None);
-        assert_eq!(entry_size(53.77, 0.06, 5., 5., 0.25, Some(4.99), 0.), None);
-        let (leverage, margin) = entry_size(53.77, 0.06, 5., 5., 0.25, Some(5.01), 0.).unwrap();
+        let sized = |equity, available| {
+            entry_size(EntrySize {
+                equity,
+                margin_pct: 0.06,
+                leverage: 5.,
+                min_margin: 5.,
+                notional_pct: 0.25,
+                available: Some(available),
+                minimum_notional: 0.,
+                max_notional: 0.,
+            })
+        };
+        assert_eq!(sized(18., 50.), None);
+        assert_eq!(sized(53.77, 4.99), None);
+        let (leverage, margin) = sized(53.77, 5.01).unwrap();
         assert_eq!((leverage, margin), (1., 5.));
         assert!(margin * (1. + leverage * 12. / 10000.) <= 5.01);
-        assert_eq!(
-            entry_size(f64::NAN, 0.06, 5., 5., 0.25, Some(50.), 0.),
-            None
-        );
+        assert_eq!(sized(f64::NAN, 50.), None);
     }
     #[test]
     fn sizing_covers_exchange_rounding_and_rejects_minimum_above_risk_cap() {
@@ -303,13 +361,76 @@ mod tests {
         let too_small = crate::paper::aligned_quantity(&info, 5. / price, true).unwrap();
         assert!(too_small * price < 5.);
         let minimum = crate::paper::minimum_entry_notional(&info, price, true).unwrap();
-        let (leverage, margin) = entry_size(53.77, 0.06, 1., 5., 0.25, Some(50.), minimum).unwrap();
+        let (leverage, margin) = entry_size(EntrySize {
+            equity: 53.77,
+            margin_pct: 0.06,
+            leverage: 1.,
+            min_margin: 5.,
+            notional_pct: 0.25,
+            available: Some(50.),
+            minimum_notional: minimum,
+            max_notional: 0.,
+        })
+        .unwrap();
         let quantity =
             crate::paper::aligned_quantity(&info, margin * leverage / price, true).unwrap();
         assert!(quantity * price >= 5.);
         assert!(margin * leverage <= 53.77 * 0.25);
-        assert_eq!(entry_size(53.77, 0.06, 5., 5., 0.25, Some(50.), 20.), None);
+        assert_eq!(
+            entry_size(EntrySize {
+                equity: 53.77,
+                margin_pct: 0.06,
+                leverage: 5.,
+                min_margin: 5.,
+                notional_pct: 0.25,
+                available: Some(50.),
+                minimum_notional: 20.,
+                max_notional: 0.,
+            }),
+            None
+        );
         assert!(crate::paper::minimum_entry_notional(&info, f64::NAN, true).is_err());
+    }
+    /// The per-order ceiling wins over every percentage rule, on both the
+    /// live and the replay path, so a 50 USDT cap really means 50 USDT.
+    #[test]
+    fn per_order_notional_ceiling_caps_every_sizing_rule() {
+        let sized = |leverage, max_notional| {
+            entry_size(EntrySize {
+                equity: 10_000.,
+                margin_pct: 0.06,
+                leverage,
+                min_margin: 5.,
+                notional_pct: 0.25,
+                available: Some(10_000.),
+                minimum_notional: 5.,
+                max_notional,
+            })
+        };
+        for requested in [1., 3., 5., 12.] {
+            let (leverage, margin) = sized(requested, MAX_ENTRY_NOTIONAL)
+                .expect("a 50 USDT ceiling is always fundable at 10k equity");
+            assert!(
+                margin * leverage <= MAX_ENTRY_NOTIONAL,
+                "notional {} exceeded the ceiling",
+                margin * leverage
+            );
+            assert!(
+                margin * leverage >= 5.,
+                "must stay above the exchange minimum"
+            );
+        }
+        // The ceiling scales margin down instead of being silently ignored.
+        let (_, margin) = sized(10., MAX_ENTRY_NOTIONAL).unwrap();
+        assert_eq!(margin, 5.);
+        // A ceiling below the exchange minimum cannot be satisfied.
+        assert_eq!(sized(10., 3.), None);
+        // Rejects a nonsensical ceiling rather than ignoring it.
+        assert_eq!(sized(10., -1.), None);
+        assert_eq!(sized(10., f64::NAN), None);
+        // 0 disables the ceiling, preserving the percentage-only behaviour.
+        let (_, uncapped) = sized(10., 0.).unwrap();
+        assert!(uncapped * 10. > MAX_ENTRY_NOTIONAL);
     }
     #[test]
     fn missing_book_and_excessive_size_fail_closed() {

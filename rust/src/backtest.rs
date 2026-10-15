@@ -363,24 +363,25 @@ pub fn replay(
         )
         .clamp(0.01, 1.);
         if automation_guards::enabled("NOFX_SCORE_SIZING", false) {
-            if let Some((lev, pct)) =
-                automation_guards::score_size(&signal, number(&funds["openCount"], 0.) as usize)
-            {
+            if let Some((lev, pct)) = automation_guards::score_size(&signal) {
                 leverage = lev.min(cap);
                 margin_pct = pct;
             } else {
                 continue;
             }
         }
-        let Some((leverage, margin)) = automation_guards::entry_size(
-            equity,
-            margin_pct,
-            leverage,
-            number(&config["trader"]["minOrderMargin"], 5.),
-            number(&config["trader"]["maxPositionNotionalPct"], 0.25),
-            Some(number(&funds["available"], 0.)),
-            5.,
-        ) else {
+        let Some((leverage, margin)) =
+            automation_guards::entry_size(automation_guards::EntrySize {
+                equity,
+                margin_pct,
+                leverage,
+                min_margin: number(&config["trader"]["minOrderMargin"], 5.),
+                notional_pct: number(&config["trader"]["maxPositionNotionalPct"], 0.25),
+                available: Some(number(&funds["available"], 0.)),
+                minimum_notional: 5.,
+                max_notional: automation_guards::MAX_ENTRY_NOTIONAL,
+            })
+        else {
             continue;
         };
         let record = json!({"id":format!("replay-{now}"),"marketProvider":"binance","strategyId":id,"strategyName":def["name"],"strategyParams":params,"snapshot":{},"analyses":[signal]});
@@ -396,8 +397,44 @@ pub fn replay(
     let final_funds = paper::account_summary(&state, end);
     let equity = number(&final_funds["equity"], initial);
     Ok(
-        json!({"startTime":iso(start),"endTime":iso(end),"initialEquity":initial,"finalEquity":equity,"net":equity-initial,"returnPct":(equity/initial-1.)*100.,"maxDrawdownPct":drawdown*100.,"closedTrades":closed.len(),"winRatePct":if closed.is_empty(){Value::Null}else{json!(wins as f64/closed.len() as f64*100.)},"activeOrders":orders.iter().filter(|o|matches!(o["status"].as_str(),Some("open"|"pending"))).count(),"submitted":submitted,"analyzed":analyzed,"rawEntries":raw_entries,"filtered":filtered,"missing":missing,"blocked":blocked,"marketGaps":market_gaps,"costs":research::costs()}),
+        json!({"startTime":iso(start),"endTime":iso(end),"initialEquity":initial,"finalEquity":equity,"net":equity-initial,"returnPct":(equity/initial-1.)*100.,"maxDrawdownPct":drawdown*100.,"closedTrades":closed.len(),"winRatePct":if closed.is_empty(){Value::Null}else{json!(wins as f64/closed.len() as f64*100.)},"activeOrders":orders.iter().filter(|o|matches!(o["status"].as_str(),Some("open"|"pending"))).count(),"submitted":submitted,"analyzed":analyzed,"rawEntries":raw_entries,"filtered":filtered,"missing":missing,"blocked":blocked,"marketGaps":market_gaps,"costs":research::costs(),"orderFills":order_fills(&state)}),
     )
+}
+
+/// Per-order flat fills for order-level forensics. Derived from the same replay
+/// state as the aggregate result, so totals reconcile with `closedTrades`/`net`.
+fn order_fills(state: &Value) -> Vec<Value> {
+    state["orders"]
+        .as_array()
+        .map(|orders| {
+            orders
+                .iter()
+                .filter(|o| o["status"] == "closed")
+                .map(|o| {
+                    json!({
+                        "symbol":o["symbol"],
+                        "strategyId":o["analysisContext"]["strategyId"],
+                        "direction":o["direction"],
+                        "reason":o["reason"],
+                        "entryAt":o["entryAt"],
+                        "exitAt":o["exitAt"],
+                        "entry":o["entry"],
+                        "exit":o["exit"],
+                        "heldBars":o["heldBars"],
+                        "notional":o["notional"],
+                        "margin":o["margin"],
+                        "leverage":o["leverage"],
+                        "fees":o["fees"],
+                        "funding":o["funding"],
+                        "gross":o["gross"],
+                        "net":o["net"],
+                        "roi":o["roi"],
+                        "partialFills":o["partialFills"],
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub async fn run(db: &Db, input: &Value, config: &Value, adaptive: &Value) -> Result<Value> {

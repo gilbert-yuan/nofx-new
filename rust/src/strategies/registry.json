@@ -331,6 +331,14 @@
           "description": "关闭即回到无量能门槛的旧行为。"
         },
         {
+          "key": "requireMacdConfirm",
+          "label": "强制 MACD 同向确认",
+          "group": "filter",
+          "type": "boolean",
+          "default": false,
+          "description": "开启后，多单要求 MACD 柱为正、空单要求为负；高评分也不能绕过。关闭保留原评分放行规则。"
+        },
+        {
           "key": "longOnly",
           "label": "仅做多（禁空）",
           "group": "filter",
@@ -433,6 +441,17 @@
           "max": 10,
           "step": 0.01,
           "description": "评分最低时的限价回调深度。越大越耐心等价。"
+        },
+        {
+          "key": "pendingGraceMinutes",
+          "label": "挂单信号失效宽限（分钟）",
+          "group": "entry",
+          "type": "number",
+          "default": 0,
+          "min": 0,
+          "max": 60,
+          "step": 1,
+          "description": "连续不合格达到该时长后取消挂单。0 继承全局设置；正值只能缩短全局宽限，方向反转仍立即取消。"
         },
         {
           "key": "scoreFloor",
@@ -794,7 +813,7 @@
           "min": 0,
           "max": 1000,
           "step": 1,
-          "description": "入场后 N 根内禁止智能退出平仓；0 = 关闭。回测显示 15 最优。"
+          "description": "持仓不足 N 根时延后智能退出；0 关闭保护。硬止损、强平、目标止盈和最长持仓限制仍生效，合适值需扣费回测验证。"
         },
         {
           "key": "partialTpEnabled",

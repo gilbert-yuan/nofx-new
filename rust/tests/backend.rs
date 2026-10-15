@@ -1,7 +1,10 @@
 //! Opt-in PostgreSQL and HTTP verification. Always provisions its own disposable database.
 use anyhow::{Context, Result, bail};
 use futures::FutureExt;
-use nofx_core::{db::Db, iso, now_ms};
+use nofx_core::{
+    db::{Db, PoolConfig},
+    iso, now_ms,
+};
 use reqwest::Client;
 use serde_json::{Value, json};
 use sqlx::{ConnectOptions, Connection, PgConnection, postgres::PgConnectOptions};
@@ -110,6 +113,13 @@ fn spawn_server(root: &std::path::Path, options: &PgConnectOptions, port: u16) -
             .env("DATABASE_URL", options.to_url_lossy().as_str())
             .env("DATA_DIR", root.join("data"))
             .env("NOFX_AUTOSTART", "0")
+            .env("NOFX_DB_POOL_MAX_CONNECTIONS", "4")
+            .env("NOFX_DB_POOL_MIN_CONNECTIONS", "1")
+            .env("NOFX_DB_POOL_ACQUIRE_TIMEOUT_MS", "5000")
+            .env("NOFX_DB_POOL_IDLE_TIMEOUT_MS", "0")
+            .env("NOFX_DB_POOL_MAX_LIFETIME_MS", "0")
+            .env("NOFX_DB_POOL_TEST_BEFORE_ACQUIRE", "true")
+            .env("NOFX_DB_LOCK_TIMEOUT_MS", "150")
             .env("NOFX_LONG_ONLY", "false")
             .env("RUST_LOG", "warn")
             .stdout(Stdio::from(log.try_clone()?))
@@ -142,7 +152,86 @@ async fn wait_ready(
     }
     bail!("isolated Rust API did not become ready")
 }
+async fn verify_pool_contract(options: &PgConnectOptions) -> Result<()> {
+    let db = Db::connect_with(
+        options.clone(),
+        PoolConfig {
+            max_connections: 4,
+            min_connections: 1,
+            acquire_timeout_ms: 1500,
+            idle_timeout_ms: 0,
+            max_lifetime_ms: 0,
+            lock_timeout_ms: 150,
+            ..PoolConfig::default()
+        },
+    )
+    .await
+    .context("create test database pool")?;
+    assert!(db.pool.size() >= 1);
+    let mut held = vec![];
+    let mut backend_ids = vec![];
+    for _ in 0..4 {
+        let mut connection = db.pool.acquire().await.context("fill pool to capacity")?;
+        let timeout: String = sqlx::query_scalar("SHOW lock_timeout")
+            .fetch_one(&mut *connection)
+            .await?;
+        assert_eq!(timeout, "150ms");
+        backend_ids.push(
+            sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
+                .fetch_one(&mut *connection)
+                .await?,
+        );
+        held.push(connection);
+    }
+    assert_eq!(db.pool_status()["inUse"], 4);
+    assert_eq!(db.pool_status()["idle"], 0);
+    assert_eq!(db.pool_status()["availableCapacity"], 0);
+    let exhausted = tokio::time::timeout(Duration::from_secs(5), db.pool.acquire()).await?;
+    assert!(matches!(exhausted, Err(sqlx::Error::PoolTimedOut)));
+    let returned_pid = backend_ids.pop().unwrap();
+    drop(held.pop());
+    let mut reused = db
+        .pool
+        .acquire()
+        .await
+        .context("reuse returned connection")?;
+    let reused_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *reused)
+        .await?;
+    assert_eq!(reused_pid, returned_pid);
+    backend_ids.push(reused_pid);
+    drop(reused);
+    drop(held);
+    // Only terminate connections obtained from this pool, in the disposable database.
+    let mut admin = PgConnection::connect_with(options).await?;
+    for pid in &backend_ids {
+        sqlx::query("SELECT pg_terminate_backend($1)")
+            .bind(pid)
+            .execute(&mut admin)
+            .await?;
+    }
+    let mut recovered = db
+        .pool
+        .acquire()
+        .await
+        .context("replace terminated connections")?;
+    let recovered_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *recovered)
+        .await?;
+    assert!(!backend_ids.contains(&recovered_pid));
+    assert!(db.pool.size() <= 4);
+    drop(recovered);
+    db.pool.close().await;
+    assert_eq!(db.pool_status()["closed"], true);
+    assert!(matches!(
+        db.pool.acquire().await,
+        Err(sqlx::Error::PoolClosed)
+    ));
+    Ok(())
+}
+
 async fn run(options: &PgConnectOptions) -> Result<()> {
+    verify_pool_contract(options).await?;
     let root = tempfile::tempdir()?;
     std::fs::create_dir(root.path().join("dist"))?;
     std::fs::write(
@@ -170,10 +259,83 @@ async fn run(options: &PgConnectOptions) -> Result<()> {
     )
     .await?;
     assert_eq!(health["runtime"], "rust");
-    let db = Db {
-        pool: sqlx::PgPool::connect_with(options.clone()).await?,
-    };
+    assert_eq!(health["databasePool"]["config"]["maxConnections"], 4);
+    let pool = request(
+        &client,
+        &base,
+        "GET",
+        api["database"]["pool"].as_str().unwrap(),
+        None,
+        200,
+    )
+    .await?;
+    assert_eq!(pool["config"]["minConnections"], 1);
+    assert!(pool["size"].as_u64().unwrap() <= 4);
+    assert_eq!(pool["closed"], false);
+    let db = Db::from_pool(sqlx::PgPool::connect_with(options.clone()).await?);
     let initial = db.account(false, None).await?;
+    let mut blocking = db.pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(790217)")
+        .execute(&mut *blocking)
+        .await?;
+    let busy = request(
+        &client,
+        &base,
+        "PUT",
+        "/api/paper/capital",
+        Some(json!({"initialBalance":1234})),
+        503,
+    )
+    .await?;
+    assert!(busy["error"].as_str().unwrap().contains("锁等待超时"));
+    request(&client, &base, "GET", "/api/database/pool", None, 200).await?;
+    request(
+        &client,
+        &base,
+        "POST",
+        "/api/automation/tasks/positionReview/trigger",
+        Some(json!({})),
+        202,
+    )
+    .await?;
+    let mut deferred = false;
+    for _ in 0..40 {
+        let status = request(&client, &base, "GET", "/api/automation/status", None, 200).await?;
+        let task = &status["tasks"]["positionReview"];
+        if task["warning"]
+            .as_str()
+            .is_some_and(|warning| warning.contains("下一轮重试"))
+        {
+            assert_eq!(task["running"], false);
+            assert_eq!(task["error"], "");
+            assert!(status["stats"]["errors"].as_array().unwrap().is_empty());
+            deferred = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        deferred,
+        "transient PostgreSQL lock conflict must defer automation"
+    );
+    blocking.rollback().await?;
+    assert_eq!(initial, db.account(false, None).await?);
+    let extension_probe = json!({"emptyObject":{},"emptyArray":[],"list":[true,false,null,"汉字",15,-17,0.125,9007199254740991u64,{},[],"x","y"],"null":null});
+    db.mutate_account(|state| {
+        state["poolExtensionProbe"] = extension_probe.clone();
+        Ok(Value::Null)
+    })
+    .await?;
+    assert_eq!(
+        db.account(false, None).await?["poolExtensionProbe"],
+        extension_probe
+    );
+    db.mutate_account_light(|state| {
+        state.as_object_mut().unwrap().remove("poolExtensionProbe");
+        Ok(Value::Null)
+    })
+    .await?;
+    assert_eq!(initial, db.account(false, None).await?);
     // Historical research must never modify the real simulated account.
     let time = (now_ms() - 5 * 86_400_000).div_euclid(60_000) * 60_000;
     let history_samples = vec![nofx_core::indicator_history::Sample {
@@ -346,6 +508,16 @@ async fn run(options: &PgConnectOptions) -> Result<()> {
     .await?;
     let order=request(&client,&base,"POST","/api/paper/orders",Some(json!({"recordId":"rust-http-record","symbol":"BTCUSDT","strategyId":"enhanced-trend-v1","margin":10,"leverage":2})),200).await?;
     assert_eq!(order["status"], "pending");
+    let probe_id = order["id"].as_str().unwrap();
+    db.mutate_order(probe_id, |state| {
+        state["orders"][0]["poolExtensionProbe"] = extension_probe.clone();
+        Ok(Value::Null)
+    })
+    .await?;
+    assert_eq!(
+        db.account(false, Some(probe_id)).await?["orders"][0]["poolExtensionProbe"],
+        extension_probe
+    );
     let same=request(&client,&base,"POST","/api/paper/orders",Some(json!({"recordId":"rust-http-record","symbol":"BTCUSDT","strategyId":"enhanced-trend-v1","margin":10,"leverage":2})),200).await?;
     assert_eq!(order["id"], same["id"]);
     db.mutate_account(|state| {
@@ -518,7 +690,7 @@ async fn verify_campaign_resume(options: &PgConnectOptions, db: &Db, start: i64)
         .await?;
     let focused_settings = json!({"sourceResearch":"research","strategyIds":[id],
         "symbols":["BTCUSDT"],"maxTrials":2,"holdoutMode":"deferred",
-        "candidates":{id:[{"minTrendScore":73}]},"optimization":settings["optimization"]});
+        "candidates":{id:[{"requireMacdConfirm":true,"pendingGraceMinutes":5}]},"optimization":settings["optimization"]});
     campaign::write_json(&root.path().join("focused.json"), &focused_settings)?;
     let account_before = db.account(true, None).await?;
     let focused = root.path().join("focused");
@@ -545,6 +717,12 @@ async fn verify_campaign_resume(options: &PgConnectOptions, db: &Db, start: i64)
         Ok(())
     };
     focused_command()?;
+    let manifest = campaign::read_json(&focused.join("manifest.json"))?;
+    let candidates = &manifest["strategies"][id]["candidates"];
+    assert_eq!(candidates[0]["requireMacdConfirm"], false);
+    assert_eq!(candidates[0]["pendingGraceMinutes"], 0.);
+    assert_eq!(candidates[1]["requireMacdConfirm"], true);
+    assert_eq!(candidates[1]["pendingGraceMinutes"], 5.);
     let first = focused.join("trials/0000-enhanced-trend-v1-BTCUSDT.json");
     let before = std::fs::read(&first)?;
     focused_command()?;

@@ -604,6 +604,54 @@ mod tests {
         }
     }
     #[test]
+    fn enhanced_macd_gate_blocks_high_score_conflicts_in_both_directions() {
+        let mut conflicts = [false; 2];
+        let mut aligned = [false; 2];
+        for count in 80..140 {
+            for drift in [0.02, 0.035, 0.05, -0.02, -0.035, -0.05] {
+                let mut m = market(&json!({"count":count,"drift":drift,"mode":"normal"}), "1m");
+                for candle in m["klines"].as_array_mut().unwrap().iter_mut().rev().take(5) {
+                    candle["volume"] = json!(2500);
+                }
+                let mut ctx = json!({"params":{"maxVolumeRatio":0}});
+                let baseline = analyze("enhanced-trend-v1", &m, &ctx).unwrap();
+                let direction = match baseline["action"].as_str() {
+                    Some("BUY") => 0,
+                    Some("SELL") => 1,
+                    _ => continue,
+                };
+                let histogram = n(&baseline["plan"]["indicators"]["macd"], "histogram");
+                let same_direction = if direction == 0 {
+                    histogram > 0.
+                } else {
+                    histogram < 0.
+                };
+                ctx["params"]["requireMacdConfirm"] = json!(true);
+                ctx["params"]["pendingGraceMinutes"] = json!(5);
+                let confirmed = analyze("enhanced-trend-v1", &m, &ctx).unwrap();
+                if same_direction {
+                    assert_eq!(confirmed["action"], baseline["action"]);
+                    assert_eq!(confirmed["plan"]["pendingGraceMinutes"], 5.);
+                    aligned[direction] = true;
+                } else {
+                    assert!(n(&baseline["plan"], "trendStrengthScore") >= 70.);
+                    assert_eq!(confirmed["action"], "WAIT", "{confirmed}");
+                    conflicts[direction] = true;
+                }
+            }
+        }
+        assert_eq!(
+            conflicts,
+            [true, true],
+            "fixtures must exercise both score bypasses"
+        );
+        assert_eq!(
+            aligned,
+            [true, true],
+            "valid momentum must still permit entries"
+        );
+    }
+    #[test]
     fn yao_optional_trend_gate_can_be_disabled_without_disabling_entries() {
         let dataset = json!({"count":260,"drift":0.035,"mode":"surge"});
         let m = market(&dataset, "1m");

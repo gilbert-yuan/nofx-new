@@ -410,9 +410,10 @@ pub fn analyze(m: &Value, ctx: &Value) -> Value {
             strength,
         );
     }
-    let long = if bull && (macd.2 > 0. || score >= 70.) {
+    let score_bypass = !b(p, "requireMacdConfirm") && score >= 70.;
+    let long = if bull && (macd.2 > 0. || score_bypass) {
         true
-    } else if bear && (macd.2 < 0. || score >= 70.) {
+    } else if bear && (macd.2 < 0. || score_bypass) {
         false
     } else {
         return hold("缺少关键确认信号，等待。".into(), strength);
@@ -515,7 +516,9 @@ pub fn analyze(m: &Value, ctx: &Value) -> Value {
             }
         }
     }
-    json!({"symbol":symbol,"action":if long{"BUY"}else{"SELL"},"confidence":(0.60+score/250.).min(0.90),"reason":format!("增强分析({score}/100分)：{}",strength["reasons"].as_array().unwrap().iter().take(3).filter_map(|s|s.as_str()).collect::<Vec<_>>().join("；")),"risk":format!("波动率{:.2}%；风险收益比{risk_reward:.2}:1；推荐杠杆{lev}x（保证金风险约{:.2}%）",vol*100.,lev*pct*100.),"plan":{"entryMin":e0,"entryMax":e1,"entryLimit":limit,"stopLoss":stop,"takeProfit":tp3,"takeProfit1":tp1,"takeProfit2":tp2,"takeProfit3":tp3,"riskUnit":actual,"marginRiskPct":lev*pct,"exitRules":exit,"smartExit":exit["smartExit"],"maxHoldBars":p["maxHoldBars"],"riskRewardRatio":risk_reward,"recommendedLeverage":lev,"trendStrengthScore":score,"trend15Filter":filter,"indicators":{"periods":periods,"ma20":fast,"ma50":slow,"atr":a,"rsi":rs,"macd":if macd.0.is_finite(){json!({"histogram":macd.2})}else{Value::Null},"bollinger":bb,"volumeRatio":vr,"support":sr,"resistance":rr}}})
+    let mut signal = json!({"symbol":symbol,"action":if long{"BUY"}else{"SELL"},"confidence":(0.60+score/250.).min(0.90),"reason":format!("增强分析({score}/100分)：{}",strength["reasons"].as_array().unwrap().iter().take(3).filter_map(|s|s.as_str()).collect::<Vec<_>>().join("；")),"risk":format!("波动率{:.2}%；风险收益比{risk_reward:.2}:1；推荐杠杆{lev}x（保证金风险约{:.2}%）",vol*100.,lev*pct*100.),"plan":{"entryMin":e0,"entryMax":e1,"entryLimit":limit,"stopLoss":stop,"takeProfit":tp3,"takeProfit1":tp1,"takeProfit2":tp2,"takeProfit3":tp3,"riskUnit":actual,"marginRiskPct":lev*pct,"exitRules":exit,"smartExit":exit["smartExit"],"maxHoldBars":p["maxHoldBars"],"riskRewardRatio":risk_reward,"recommendedLeverage":lev,"trendStrengthScore":score,"trend15Filter":filter,"indicators":{"periods":periods,"ma20":fast,"ma50":slow,"atr":a,"rsi":rs,"macd":if macd.0.is_finite(){json!({"histogram":macd.2})}else{Value::Null},"bollinger":bb,"volumeRatio":vr,"support":sr,"resistance":rr}}});
+    signal["plan"]["pendingGraceMinutes"] = p["pendingGraceMinutes"].clone();
+    signal
 }
 pub fn review(order: &Value, m: &Value, _ctx: &Value) -> Value {
     let r = rows(m);

@@ -779,6 +779,47 @@ mod tests {
         json!({"openTime":t,"open":o,"high":h,"low":l,"close":c,"volume":1,"confirmed":true})
     }
     #[test]
+    fn smart_min_hold_delays_ma_exit_but_never_the_hard_stop() {
+        let mut o = order();
+        o["plan"]["exitRules"]["smartExit"] = json!({"enabled":true,"barLevelEnabled":true,"barLevel":true,"maPeriod":20,"atrPeriod":14,"maBreakAtr":0.2,"minHoldBars":5});
+        let mut rows: Vec<Value> = (-25..0)
+            .map(|i| row(i * 60000, 100., 100.5, 99.5, 100.))
+            .collect();
+        rows.extend(
+            (0..5).map(|i| row(i * 60000, if i == 0 { 100. } else { 97. }, 100., 96., 97.)),
+        );
+        let first = evaluate(&o, &rows, 120000, &json!({})).unwrap();
+        assert_eq!(first["status"], "open");
+        let resumed = evaluate(&merge(o.clone(), first), &rows, 300000, &json!({})).unwrap();
+        let whole = evaluate(&o, &rows, 300000, &json!({})).unwrap();
+        assert_eq!(whole["reason"], "smart_exit_ma");
+        assert_eq!(whole["heldBars"], 5);
+        assert_eq!(resumed["net"], whole["net"]);
+        rows[25]["low"] = json!(89.);
+        assert_eq!(
+            evaluate(&o, &rows, 60000, &json!({})).unwrap()["reason"],
+            "stop_loss"
+        );
+    }
+    #[test]
+    fn disabling_active_review_alone_keeps_the_independent_bar_exit() {
+        let mut o = order();
+        o["plan"]["exitRules"]["smartExit"] = json!({"enabled":false,"barLevelEnabled":true,"barLevel":true,"maPeriod":20,"atrPeriod":14,"maBreakAtr":0.2,"minHoldBars":0});
+        let mut rows: Vec<Value> = (-25..0)
+            .map(|i| row(i * 60000, 100., 100.5, 99.5, 100.))
+            .collect();
+        rows.push(row(0, 100., 100., 96., 97.));
+        assert_eq!(
+            evaluate(&o, &rows, 60000, &json!({})).unwrap()["reason"],
+            "smart_exit_ma"
+        );
+        o["plan"]["exitRules"]["smartExit"]["barLevelEnabled"] = json!(false);
+        assert_eq!(
+            evaluate(&o, &rows, 60000, &json!({})).unwrap()["status"],
+            "open"
+        );
+    }
+    #[test]
     fn gap_is_resumable_and_expiry_precedes_data() {
         let o = order();
         let gap = evaluate(&o, &[], 60000, &json!({})).unwrap();

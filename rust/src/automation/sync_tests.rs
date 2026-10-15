@@ -94,9 +94,7 @@ async fn all_timeframes_persist_before_trading_filters() -> Result<()> {
     sqlx::query(&format!("CREATE DATABASE \"{name}\""))
         .execute(&mut admin)
         .await?;
-    let db = Db {
-        pool: sqlx::PgPool::connect_with(options.database(&name)).await?,
-    };
+    let db = Db::from_pool(sqlx::PgPool::connect_with(options.database(&name)).await?);
     let result = std::panic::AssertUnwindSafe(run(&db)).catch_unwind().await;
     db.pool.close().await;
     sqlx::query(&format!("DROP DATABASE \"{name}\" WITH (FORCE)"))

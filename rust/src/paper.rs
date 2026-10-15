@@ -135,7 +135,7 @@ pub fn fused_orders(state: &Value) -> Value {
                 })
                 .map(ref_order)
                 .collect();
-            let target = json!({"environment":env,"symbol":symbol,"positionSide":ps,"kind":"position","quantity":qty,"direction":dir,"updateTime":pos["updateTime"],"entry":pos["entryPrice"],"markPrice":pos["markPrice"],"localOrders":refs});
+            let target = json!({"environment":env,"symbol":symbol,"positionSide":ps,"kind":"position","quantity":qty,"direction":dir,"updateTime":pos["updateTime"],"entry":pos["entryPrice"],"markPrice":pos["markPrice"],"margin":qty*n(&pos,"entryPrice",0.)/n(&pos,"leverage",1.).max(1.),"localOrders":refs});
             let mut targets = groups
                 .get(&key)
                 .map(|g| arr(&g["executionTargets"]))
@@ -599,9 +599,6 @@ pub fn submit_paper_order(
     let fused = !state["fusedPoolStartedAt"].is_null();
     let orders = arr(&state["orders"]);
     if !fused && state["unlimitedCapital"] != true {
-        if orders.iter().filter(|o| active(o)).count() >= 20 {
-            bail!("最多同时持有 20 个模拟挂单或持仓。");
-        }
         if orders.iter().any(|o| active(o) && o["symbol"] == symbol) {
             bail!("该币种已有模拟挂单或持仓。");
         }
@@ -833,7 +830,7 @@ pub async fn lock_execution<'a>(
             .fetch_one(&mut *tx)
             .await?;
     if !acquired {
-        bail!("该币种正在执行其他交易操作，请稍后重试。");
+        bail!("409: 该币种正在执行其他交易操作，请稍后重试。");
     }
     Ok(tx)
 }
@@ -883,7 +880,19 @@ pub async fn submit(db: &Db, store: &Store, input: &Value) -> Result<Value> {
     Ok(state["orders"][0].clone())
 }
 
+fn should_refresh_order(order: &Value, manual_close_id: Option<&str>) -> bool {
+    active(order)
+        && match manual_close_id {
+            Some(id) => order["id"] == id,
+            None => order["manualCloseRequested"] != true,
+        }
+}
+
 pub async fn refresh(db: &Db, store: &Store) -> Result<Value> {
+    refresh_internal(db, store, None).await
+}
+
+async fn refresh_internal(db: &Db, store: &Store, manual_close_id: Option<&str>) -> Result<Value> {
     let _guard = lock_execution(db, "system", "paper-refresh", "ALL").await?;
     let state = db.account(true, None).await?;
     let client = Exchange::public()?;
@@ -891,7 +900,7 @@ pub async fn refresh(db: &Db, store: &Store) -> Result<Value> {
     let mut processed = 0;
     for original in arr(&state["orders"])
         .into_iter()
-        .filter(|o| active(o) && o["manualCloseRequested"] != true)
+        .filter(|o| should_refresh_order(o, manual_close_id))
     {
         let id = original["id"]
             .as_str()
@@ -925,7 +934,10 @@ pub async fn refresh(db: &Db, store: &Store) -> Result<Value> {
                 return Ok(Value::Null);
             };
             // A close/cancel issued during network reads wins over this older simulation snapshot.
-            if !active(order) || order["nextTime"] != original["nextTime"] {
+            if !active(order)
+                || order["nextTime"] != original["nextTime"]
+                || order["manualCloseRequested"] != original["manualCloseRequested"]
+            {
                 return Ok(order.clone());
             }
             match result {
@@ -949,8 +961,10 @@ pub async fn refresh(db: &Db, store: &Store) -> Result<Value> {
         Ok(json!({"processed":processed}))
     })
     .await?;
-    if let Err(error) = sync_entries(db, store, None).await {
-        tracing::warn!(%error,"Exchange entries/protection awaiting reconciliation");
+    if manual_close_id.is_none() {
+        if let Err(error) = sync_entries(db, store, None).await {
+            tracing::warn!(%error,"Exchange entries/protection awaiting reconciliation");
+        }
     }
     status(db).await
 }
@@ -1880,7 +1894,7 @@ async fn sync_protection(db: &Db, client: &Exchange, env: &str, order: &Value) -
 
 async fn record_execution(db: &Db, target: &Value, intent: &Value, remote: &Value) -> Result<()> {
     db.mutate_account_light(|state|{let env=target["environment"].as_str().context("执行环境缺失")?;let key=intent["key"].as_str().context("执行键缺失")?;
-        if !state["manualExecutions"].is_object(){state["manualExecutions"]=json!({});}let mut result=intent.clone();patch(&mut result,&json!({"status":remote["status"].as_str().unwrap_or("NEW").to_lowercase(),"orderId":remote["orderId"],"executedQty":n(remote,"executedQty",0.),"updatedAt":iso(now_ms())}));state["manualExecutions"][key]=result;
+        if !state["manualExecutions"].is_object(){state["manualExecutions"]=json!({});}let mut result=intent.clone();patch(&mut result,&json!({"status":remote["status"].as_str().unwrap_or("NEW").to_lowercase(),"orderId":remote["orderId"],"executedQty":n(remote,"executedQty",0.),"exchangeUpdatedAt":if remote["updateTime"].is_null(){intent["exchangeUpdatedAt"].clone()}else{remote["updateTime"].clone()},"updatedAt":iso(now_ms())}));state["manualExecutions"][key]=result;
         for reference in arr(&target["localOrders"]){if let Some(order)=state["orders"].as_array_mut().and_then(|a|a.iter_mut().find(|o|o["id"]==reference["id"])){ensure_links(order);let link=&mut order["exchangeSync"][env];if target["kind"]=="entry_order"{patch(link,&response_link(remote));}else{if !link["closeOrders"].is_array(){link["closeOrders"]=json!([]);}let action=json!({"id":intent["id"],"manual":true,"status":remote["status"].as_str().unwrap_or("NEW").to_lowercase(),"orderId":remote["orderId"],"clientOrderId":intent["clientOrderId"],"executedQty":n(remote,"executedQty",0.),"avgPrice":n(remote,"avgPrice",0.),"lastSyncedAt":iso(now_ms()),"reason":"manual"});let actions=link["closeOrders"].as_array_mut().unwrap();if let Some(existing)=actions.iter_mut().find(|a|a["id"]==intent["id"]){*existing=action;}else{actions.push(action);}}mirror(order);}}
         Ok(Value::Null)
     }).await?;
@@ -1896,6 +1910,25 @@ async fn write_execution(db: &Db, key: &str, intent: &Value) -> Result<()> {
     })
     .await?;
     Ok(())
+}
+
+fn close_position_awaits_update(
+    previous: &Value,
+    position: &Value,
+    confirmed_order: &Value,
+) -> bool {
+    let expected = (n(previous, "remainingBefore", 0.) - n(previous, "executedQty", 0.)).max(0.);
+    if n(position, "positionAmt", 0.).abs() <= expected + 1e-10 {
+        return false;
+    }
+    let filled_at = timestamp(&previous["exchangeUpdatedAt"])
+        .filter(|t| *t > 0)
+        .or_else(|| {
+            (confirmed_order["status"] == "FILLED")
+                .then(|| timestamp(&confirmed_order["updateTime"]).filter(|t| *t > 0))
+                .flatten()
+        });
+    !matches!((timestamp(&position["updateTime"]).filter(|t| *t > 0), filled_at), (Some(position_at), Some(closed_at)) if position_at > closed_at)
 }
 
 /// Fresh exchange exposure is authoritative. Ambiguous writes are reconciled by the
@@ -1922,6 +1955,35 @@ async fn execute_remote_close(
     let (dual, ps) = mode(&client, dir).await?;
     let _guard = lock_execution(db, env, symbol, &ps).await?;
     let key = format!("nofx-execution:{env}:{symbol}:{ps}");
+    if let Some(minimum) = target["minimumCloseMargin"].as_f64() {
+        if let Some(position) = current_position(&client, symbol, &ps, dir).await? {
+            let margin = n(&position, "positionAmt", 0.).abs() * n(&position, "entryPrice", 0.)
+                / n(&position, "leverage", 1.).max(1.);
+            if margin <= minimum {
+                return Ok(
+                    json!({"ok":true,"complete":true,"skipped":true,"environment":env,"symbol":symbol,"margin":margin,"status":"below_margin_threshold"}),
+                );
+            }
+        }
+    }
+    // Filtered closes reconcile their durable client ID on explicit retry; a global
+    // request flag would also close a smaller holding in the other environment.
+    if target["minimumCloseMargin"].is_null() {
+        let refs = arr(&target["localOrders"]);
+        db.mutate_account_light(|state| {
+            for order in state["orders"].as_array_mut().into_iter().flatten() {
+                if refs.iter().any(|r| r["id"] == order["id"]) {
+                    order[if target["kind"] == "entry_order" {
+                        "manualEntryCancelled"
+                    } else {
+                        "manualCloseRequested"
+                    }] = json!(true);
+                }
+            }
+            Ok(Value::Null)
+        })
+        .await?;
+    }
     if target["kind"] == "entry_order" {
         let params = json!({"symbol":symbol,"orderId":target["orderId"]});
         let mut remote = client.signed("GET", "/fapi/v1/order", &params).await?;
@@ -2006,13 +2068,28 @@ async fn execute_remote_close(
         if previous["accountKey"] == account_key
             && previous["status"] == "filled"
             && !previous["remainingBefore"].is_null()
-            && amount
-                > (n(previous, "remainingBefore", 0.) - n(previous, "executedQty", 0.)).max(0.)
-                    + 1e-10
+            && close_position_awaits_update(previous, position.as_ref().unwrap(), &Value::Null)
         {
-            return Ok(
-                json!({"ok":true,"complete":false,"environment":env,"symbol":symbol,"status":"awaiting_position"}),
-            );
+            let confirmed = if timestamp(&previous["exchangeUpdatedAt"])
+                .filter(|t| *t > 0)
+                .is_none()
+            {
+                client
+                    .signed(
+                        "GET",
+                        "/fapi/v1/order",
+                        &json!({"symbol":symbol,"origClientOrderId":previous["clientOrderId"]}),
+                    )
+                    .await
+                    .context("未能确认历史平仓时间，请稍后同步重试；未重复发送订单。")?
+            } else {
+                Value::Null
+            };
+            if close_position_awaits_update(previous, position.as_ref().unwrap(), &confirmed) {
+                return Ok(
+                    json!({"ok":true,"complete":false,"environment":env,"symbol":symbol,"status":"awaiting_position"}),
+                );
+            }
         }
         let info = symbol_info(&client, symbol).await?;
         let quantity =
@@ -2063,7 +2140,46 @@ async fn execute_remote_close(
     bail!("分批平仓达到单次上限，请同步查看剩余持仓。")
 }
 
-async fn close_internal(db: &Db, store: &Store, id: &str, synchronize: bool) -> Result<Value> {
+fn margin_close_row(row: &Value, minimum: f64) -> Option<Value> {
+    if row["status"] != "open" {
+        return None;
+    }
+    let targets = arr(&row["executionTargets"]);
+    if targets.is_empty() {
+        return (n(row, "margin", 0.) > minimum).then(|| row.clone());
+    }
+    let mut selected = vec![];
+    let mut excluded_refs = BTreeSet::new();
+    for mut target in targets {
+        if n(&target, "margin", n(row, "margin", 0.)) > minimum {
+            target["minimumCloseMargin"] = json!(minimum);
+            selected.push(target);
+        } else {
+            for reference in arr(&target["localOrders"]) {
+                excluded_refs.insert(reference["id"].as_str().unwrap_or("").to_owned());
+            }
+        }
+    }
+    if selected.is_empty() {
+        return None;
+    }
+    let refs: Vec<_> = arr(&row["localOrders"])
+        .into_iter()
+        .filter(|r| !excluded_refs.contains(r["id"].as_str().unwrap_or("")))
+        .collect();
+    let mut selected_row = row.clone();
+    selected_row["executionTargets"] = json!(selected);
+    selected_row["localOrders"] = json!(refs);
+    Some(selected_row)
+}
+
+async fn close_internal(
+    db: &Db,
+    store: &Store,
+    id: &str,
+    synchronize: bool,
+    minimum_margin: Option<f64>,
+) -> Result<Value> {
     if synchronize {
         exchange_refresh(db, store).await?;
     }
@@ -2078,25 +2194,36 @@ async fn close_internal(db: &Db, store: &Store, id: &str, synchronize: bool) -> 
                     .any(|reference| reference["id"] == id)
         })
         .context("订单已结束或列表已更新，请同步后重试。")?;
+    let row = if let Some(minimum) = minimum_margin {
+        let Some(selected) = margin_close_row(&row, minimum) else {
+            return Ok(
+                json!({"ok":true,"complete":true,"skipped":true,"status":"below_margin_threshold","results":[]}),
+            );
+        };
+        selected
+    } else {
+        row
+    };
     let refs = arr(&row["localOrders"]);
-    db.mutate_account_light(|state| {
-        for order in state["orders"].as_array_mut().into_iter().flatten() {
-            if refs.iter().any(|r| r["id"] == order["id"]) {
-                order[if row["status"] == "open" {
-                    "manualCloseRequested"
-                } else {
-                    "manualEntryCancelled"
-                }] = json!(true);
-            }
-        }
-        Ok(Value::Null)
-    })
-    .await?;
     let targets = arr(&row["executionTargets"]);
     let mut results = vec![];
     if targets.is_empty() {
+        let previous_close_request = row["manualCloseRequested"].clone();
+        db.mutate_account_light(|state| {
+            for order in state["orders"].as_array_mut().into_iter().flatten() {
+                if refs.iter().any(|r| r["id"] == order["id"]) {
+                    order[if row["status"] == "open" {
+                        "manualCloseRequested"
+                    } else {
+                        "manualEntryCancelled"
+                    }] = json!(true);
+                }
+            }
+            Ok(Value::Null)
+        })
+        .await?;
         if row["status"] == "open" {
-            refresh(db, store).await?;
+            refresh_internal(db, store, row["id"].as_str()).await?;
         }
         let order = db
             .mutate_account_light(|state| {
@@ -2108,6 +2235,13 @@ async fn close_internal(db: &Db, store: &Store, id: &str, synchronize: bool) -> 
                     order["status"] = json!("cancelled");
                     order["reason"] = json!("strategy_cancelled");
                 } else if order["status"] == "open" {
+                    let margin = n(order, "margin", 0.) * share(order);
+                    if minimum_margin.is_some_and(|minimum| margin <= minimum) {
+                        order["manualCloseRequested"] = previous_close_request.clone();
+                        return Ok(
+                            json!({"skipped":true,"status":order["status"],"margin":margin}),
+                        );
+                    }
                     let tf = order["interval"].as_str().unwrap_or("1m");
                     let duration = interval_ms(tf).context("无效订单周期")?;
                     if !order["error"].as_str().unwrap_or("").is_empty()
@@ -2128,14 +2262,14 @@ async fn close_internal(db: &Db, store: &Store, id: &str, synchronize: bool) -> 
                 Ok(order.clone())
             })
             .await?;
-        results.push(json!({"ok":true,"complete":true,"source":"paper","symbol":row["symbol"],"status":order["status"]}));
+        results.push(json!({"ok":true,"complete":true,"skipped":order["skipped"]==true,"source":"paper","symbol":row["symbol"],"status":order["status"]}));
     } else {
         for target in targets {
             results.push(match execute_remote_close(db,store,&target,None).await{Ok(result)=>result,Err(error)=>json!({"ok":false,"environment":target["environment"],"symbol":target["symbol"],"error":error.to_string()})});
         }
         if results
             .iter()
-            .all(|r| r["ok"] == true && r["complete"] == true)
+            .all(|r| r["ok"] == true && r["complete"] == true && r["skipped"] != true)
         {
             db.mutate_account_light(|state| {
                 for order in state["orders"]
@@ -2194,7 +2328,35 @@ async fn close_internal(db: &Db, store: &Store, id: &str, synchronize: bool) -> 
     )
 }
 pub async fn close(db: &Db, store: &Store, id: &str) -> Result<Value> {
-    close_internal(db, store, id, true).await
+    close_internal(db, store, id, true, None).await
+}
+
+pub async fn close_above_margin(db: &Db, store: &Store, input: &Value) -> Result<Value> {
+    let minimum = n(input, "minimumMargin", 50.);
+    if !minimum.is_finite() || minimum < 0. {
+        bail!("保证金筛选金额须为非负数。");
+    }
+    let _guard = lock_execution(db, "system", "close-all", "ALL").await?;
+    exchange_refresh(db, store).await?;
+    let state = db.account(true, None).await?;
+    let mut results = vec![];
+    for row in arr(&fused_orders(&state)["activeOrders"])
+        .into_iter()
+        .filter(|row| margin_close_row(row, minimum).is_some())
+    {
+        let id = row["id"].as_str().context("活动订单无 ID")?;
+        let mut result = close_internal(db, store, id, false, Some(minimum))
+            .await
+            .unwrap_or_else(|e| json!({"ok":false,"error":e.to_string()}));
+        result["id"] = row["id"].clone();
+        result["symbol"] = row["symbol"].clone();
+        result.as_object_mut().unwrap().remove("account");
+        results.push(result);
+    }
+    exchange_refresh(db, store).await?;
+    Ok(
+        json!({"ok":results.iter().all(|r|r["ok"]==true),"minimumMargin":minimum,"results":results,"account":status(db).await?}),
+    )
 }
 pub async fn close_all(db: &Db, store: &Store) -> Result<Value> {
     let _guard = lock_execution(db, "system", "close-all", "ALL").await?;
@@ -2212,7 +2374,7 @@ pub async fn close_all(db: &Db, store: &Store) -> Result<Value> {
             .filter(|r| r["status"] == status)
         {
             let id = row["id"].as_str().context("活动订单无 ID")?;
-            let mut result = close_internal(db, store, id, false)
+            let mut result = close_internal(db, store, id, false, None)
                 .await
                 .unwrap_or_else(|e| json!({"ok":false,"error":e.to_string()}));
             result["id"] = row["id"].clone();
@@ -2389,3 +2551,6 @@ pub async fn cancel_exchange_order(db: &Db, store: &Store, input: &Value) -> Res
     let _ = exchange_refresh(db, store).await;
     Ok(json!({"ok":true,"result":result}))
 }
+
+#[cfg(test)]
+mod manual_close_tests;

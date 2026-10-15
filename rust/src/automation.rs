@@ -17,6 +17,40 @@ use tokio::sync::{Mutex, Semaphore};
 
 const SYNC_INTERVALS: [&str; 6] = ["1m", "5m", "15m", "1h", "4h", "1d"];
 
+fn record_market_error(
+    errors: &mut Vec<String>,
+    waiting: &mut Vec<Value>,
+    location: &str,
+    error: &anyhow::Error,
+) {
+    if let Some(history) = error.downcast_ref::<research::InsufficientHistory>() {
+        let pending = json!({"symbol":history.symbol,"interval":history.interval,"required":history.required,"available":history.available,"reason":history.to_string()});
+        if !waiting.contains(&pending) {
+            waiting.push(pending);
+        }
+    } else {
+        errors.push(format!("{location}: {error}"));
+    }
+}
+
+fn database_deferral(error: &anyhow::Error) -> Option<&'static str> {
+    if error.is::<crate::db::AccountWriteBusy>() {
+        return Some("账户更新繁忙，等待下一轮重试。");
+    }
+    match error.downcast_ref::<sqlx::Error>()? {
+        sqlx::Error::PoolTimedOut => Some("数据库连接池繁忙，等待下一轮重试。"),
+        sqlx::Error::Database(database)
+            if matches!(
+                database.code().as_deref(),
+                Some("55P03" | "40001" | "40P01")
+            ) =>
+        {
+            Some("数据库锁冲突，等待下一轮重试。")
+        }
+        _ => None,
+    }
+}
+
 fn sync_windows(config: &Value, enabled: &[Value]) -> Result<BTreeMap<String, usize>> {
     let limit = number(&config["marketSync"]["limit"], 80.).clamp(80., 1000.) as usize;
     let mut windows: BTreeMap<String, usize> = SYNC_INTERVALS
@@ -164,6 +198,7 @@ impl Automation {
             self.active(),
         );
         state["uptime"] = json!(self.started.elapsed().as_secs_f64());
+        state["databasePool"] = self.db.pool_status();
         state["yaoCoinMeta"] = json!({"targetAmplitudePct":50,"asOf":state["yaoCoinsAt"],"total":state["yaoCoins"].as_array().map(Vec::len).unwrap_or(0),"evaluated":state["analysisMeta"]["marketReady"],"error":state["yaoCoinError"]});
         Ok(state)
     }
@@ -187,11 +222,22 @@ impl Automation {
             let mut state = self.state.lock().await;
             state["tasks"][kind]["running"] = json!(true);
             state["tasks"][kind]["startedAt"] = json!(iso(now_ms()));
+            state["tasks"][kind]["warning"] = json!("");
         }
         let result = if kind == "klineSync" {
             self.scan(self.generation.load(Ordering::SeqCst)).await
         } else {
             self.review().await
+        };
+        let result = match result {
+            Err(error) => match database_deferral(&error) {
+                Some(reason) => {
+                    tracing::warn!(kind, %error, "Automation task deferred until next cycle");
+                    Ok(json!({"deferred":true,"reason":reason}))
+                }
+                None => Err(error),
+            },
+            result => result,
         };
         {
             let mut state = self.state.lock().await;
@@ -204,16 +250,26 @@ impl Automation {
                     .map(|e| e.to_string())
                     .unwrap_or_default()
             );
+            state["tasks"][kind]["warning"] = result
+                .as_ref()
+                .ok()
+                .filter(|summary| summary["deferred"] == true)
+                .map(|summary| summary["reason"].clone())
+                .unwrap_or(json!(""));
             if kind == "klineSync" {
                 state["analysisMeta"]["phase"] = json!(match &result {
+                    Ok(summary) if summary["deferred"] == true => "waiting",
                     Ok(summary) if summary["cancelled"] == true => "cancelled",
                     Ok(_) => "ready",
                     Err(_) => "error",
                 });
                 state["analysisMeta"]["error"] = state["tasks"][kind]["error"].clone();
+                state["analysisMeta"]["warning"] = state["tasks"][kind]["warning"].clone();
             }
             if let Ok(summary) = &result {
-                state["tasks"][kind]["summary"] = summary.clone();
+                if summary["deferred"] != true {
+                    state["tasks"][kind]["summary"] = summary.clone();
+                }
             } else if let Err(e) = &result {
                 let errors = state["stats"]["errors"].as_array_mut().unwrap();
                 errors.push(json!({"at":iso(now_ms()),"task":kind,"error":e.to_string()}));
@@ -504,6 +560,7 @@ impl Automation {
             .filter_map(|v| v.as_str().map(str::to_owned))
             .collect();
         let mut analyzed = 0;
+        let mut waiting_for_history = vec![];
         let concurrency = env_num("NOFX_KLINE_SYNC_CONCURRENCY", 12.).clamp(1., 24.) as usize;
         let jobs = futures::stream::iter(symbols.iter().cloned().map(|symbol| async move {
             let result =
@@ -566,7 +623,7 @@ impl Automation {
             let market = match main {
                 Ok(m) => m,
                 Err(e) => {
-                    errors.push(format!("{symbol}: {e}"));
+                    record_market_error(&mut errors, &mut waiting_for_history, &symbol, &e);
                     continue;
                 }
             };
@@ -577,6 +634,7 @@ impl Automation {
                 continue;
             }
             let mut aux = BTreeMap::new();
+            let mut unavailable_aux = BTreeSet::new();
             let mut shared_confirmation = None;
             let mut shared_indicators = None;
             for strategy in &enabled {
@@ -592,6 +650,11 @@ impl Automation {
                 {
                     let window = number(&strategy["marketWindows"][interval], 80.).clamp(30., 1000.)
                         as usize;
+                    let window_key = (interval.to_owned(), window);
+                    if unavailable_aux.contains(&window_key) {
+                        incomplete = true;
+                        continue;
+                    }
                     if aux.get(interval).is_none_or(|m: &Value| {
                         m["klines"]
                             .as_array()
@@ -611,7 +674,13 @@ impl Automation {
                                 aux.insert(interval.to_owned(), m);
                             }
                             Err(e) => {
-                                errors.push(format!("{symbol}/{interval}: {e}"));
+                                record_market_error(
+                                    &mut errors,
+                                    &mut waiting_for_history,
+                                    &format!("{symbol}/{interval}"),
+                                    &e,
+                                );
+                                unavailable_aux.insert(window_key);
                                 incomplete = true;
                             }
                         }
@@ -649,7 +718,12 @@ impl Automation {
                             {
                                 Ok(m) => m,
                                 Err(error) => {
-                                    errors.push(format!("{symbol}/{id} 特征数据：{error}"));
+                                    record_market_error(
+                                        &mut errors,
+                                        &mut waiting_for_history,
+                                        &format!("{symbol}/{id} 特征数据"),
+                                        &error,
+                                    );
                                     continue;
                                 }
                             }
@@ -904,13 +978,15 @@ impl Automation {
             status["analysisMeta"]["asOf"] = status["opportunitiesAt"].clone();
             status["analysisMeta"]["opportunityCount"] = json!(opportunities.len());
             status["analysisMeta"]["failed"] = json!(errors.len());
+            status["analysisMeta"]["waitingForHistory"] = json!(waiting_for_history);
+            status["analysisMeta"]["waitingForHistoryCount"] = json!(waiting_for_history.len());
             status["stats"]["totalAnalyzed"] =
                 json!(number(&status["stats"]["totalAnalyzed"], 0.) + analyzed as f64);
         }
         // Read-only market reports end here, before any order submission or exchange mutation.
         if data_only {
             return Ok(
-                json!({"dataOnly":true,"reportsOnly":true,"analyzed":analyzed,"eligible":selected.len(),"submitted":0,"failed":errors.len(),"errors":errors,"runId":run_id,"sync":sync}),
+                json!({"dataOnly":true,"reportsOnly":true,"analyzed":analyzed,"eligible":selected.len(),"submitted":0,"failed":errors.len(),"errors":errors,"waitingForHistory":waiting_for_history,"waitingForHistoryCount":waiting_for_history.len(),"runId":run_id,"sync":sync}),
             );
         }
         let mut submitted = 0;
@@ -978,10 +1054,8 @@ impl Automation {
                 .floor()
                 .clamp(1., cap);
             if crate::automation_guards::enabled("NOFX_SCORE_SIZING", false) {
-                let Some((sized_lev, sized_margin)) = crate::automation_guards::score_size(
-                    signal,
-                    number(&funds["openCount"], 0.) as usize,
-                ) else {
+                let Some((sized_lev, sized_margin)) = crate::automation_guards::score_size(signal)
+                else {
                     execution.push(execution_skip(c, "评分仓位规则暂不允许开仓"));
                     continue;
                 };
@@ -1034,15 +1108,18 @@ impl Automation {
                     continue;
                 }
             };
-            let Some((leverage, margin)) = crate::automation_guards::entry_size(
-                equity,
-                margin_pct,
-                leverage,
-                min_margin,
-                number(&config["trader"]["maxPositionNotionalPct"], 0.),
-                available,
-                minimum_notional,
-            ) else {
+            let Some((leverage, margin)) =
+                crate::automation_guards::entry_size(crate::automation_guards::EntrySize {
+                    equity,
+                    margin_pct,
+                    leverage,
+                    min_margin,
+                    notional_pct: number(&config["trader"]["maxPositionNotionalPct"], 0.),
+                    available,
+                    minimum_notional,
+                    max_notional: crate::automation_guards::MAX_ENTRY_NOTIONAL,
+                })
+            else {
                 execution.push(execution_skip(
                     c,
                     "资金或名义仓位上限不足以满足最小下单规模",
@@ -1116,7 +1193,7 @@ impl Automation {
         s["stats"]["totalOrders"] =
             json!(number(&s["stats"]["totalOrders"], 0.) + submitted as f64);
         Ok(
-            json!({"analyzed":analyzed,"eligible":selected.len(),"created":created,"submitted":submitted,"execution":execution,"failed":errors.len(),"errors":errors,"runId":run_id,"sync":sync}),
+            json!({"analyzed":analyzed,"eligible":selected.len(),"created":created,"submitted":submitted,"execution":execution,"failed":errors.len(),"errors":errors,"waitingForHistory":waiting_for_history,"waitingForHistoryCount":waiting_for_history.len(),"runId":run_id,"sync":sync}),
         )
     }
     async fn review(&self) -> Result<Value> {
@@ -1484,9 +1561,6 @@ pub fn entry_guard_at(state: &Value, c: &Value, config: &Value, now: i64) -> Opt
         .iter()
         .filter(|o| o["status"] == "pending" || o["status"] == "open")
         .collect();
-    if active.len() as f64 >= env_num("NOFX_MAX_POSITIONS", 10.) {
-        return Some("达到持仓上限".into());
-    }
     let maximum = number(&c["signal"]["plan"]["maxPositions"], f64::INFINITY);
     if active
         .iter()
@@ -1523,6 +1597,12 @@ fn history(order: &mut Value, report: Value) {
         list.drain(..list.len() - 50);
     }
 }
+fn pending_grace_minutes(order: &Value, global: f64) -> f64 {
+    order["plan"]["pendingGraceMinutes"]
+        .as_f64()
+        .filter(|minutes| minutes.is_finite() && *minutes > 0.)
+        .map_or(global, |minutes| minutes.min(global))
+}
 pub fn apply_pending(order: &mut Value, signal: &Value, now: i64) -> Result<()> {
     let interval = order["interval"].as_str().unwrap_or("1m");
     let open = research::candle_open(now, interval)?;
@@ -1548,8 +1628,10 @@ pub fn apply_pending(order: &mut Value, signal: &Value, now: i64) -> Result<()> 
         let since = number(&order["ineligibleSince"], now as f64);
         order["ineligibleRounds"] = json!(rounds);
         order["ineligibleSince"] = json!(since);
+        let grace = pending_grace_minutes(order, env_num("NOFX_PENDING_GRACE_MIN", 30.));
         cancel = rounds >= env_num("NOFX_PENDING_GRACE_ROUNDS", 240.)
-            || (now as f64 - since) >= env_num("NOFX_PENDING_GRACE_MIN", 30.) * 60000.;
+            || (now as f64 - since) >= grace * 60000.;
+        report["graceMinutes"] = json!(grace);
         report["action"] = json!("held_ineligible");
     } else if !reversal {
         order["ineligibleRounds"] = json!(0);
@@ -1624,6 +1706,98 @@ mod sync_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_transient_database_contention_defers_automation() {
+        for error in [
+            anyhow::Error::new(crate::db::AccountWriteBusy).context("account mutation"),
+            anyhow::Error::new(sqlx::Error::PoolTimedOut).context("read account"),
+        ] {
+            assert!(database_deferral(&error).unwrap().contains("下一轮重试"));
+        }
+        for error in [
+            anyhow::Error::new(sqlx::Error::PoolClosed),
+            anyhow::Error::new(sqlx::Error::ColumnNotFound("missing_column".into())),
+            anyhow::Error::new(sqlx::Error::Io(std::io::Error::other("connection failed"))),
+            anyhow::anyhow!("行情数据断档"),
+        ] {
+            assert!(database_deferral(&error).is_none());
+        }
+    }
+    #[test]
+    fn insufficient_history_is_deduplicated_waiting_but_real_errors_remain_failures() {
+        let shortage = anyhow::Error::new(research::InsufficientHistory {
+            symbol: "CTUSDT".into(),
+            interval: "4h".into(),
+            required: 298,
+            available: 62,
+        })
+        .context("辅助周期读取");
+        let mut errors = vec![];
+        let mut waiting = vec![];
+        for _ in 0..3 {
+            record_market_error(&mut errors, &mut waiting, "CTUSDT/4h", &shortage);
+        }
+        assert!(errors.is_empty());
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0]["available"], 62);
+        record_market_error(
+            &mut errors,
+            &mut waiting,
+            "CTUSDT/4h",
+            &anyhow::anyhow!("K线缺失或重复"),
+        );
+        record_market_error(
+            &mut errors,
+            &mut waiting,
+            "CTUSDT/4h",
+            &anyhow::Error::new(sqlx::Error::PoolTimedOut),
+        );
+        assert_eq!(errors.len(), 2);
+        assert_eq!(waiting.len(), 1);
+    }
+
+    #[test]
+    fn strategy_pending_grace_can_only_shorten_the_global_limit() {
+        for (value, expected) in [
+            (Value::Null, 30.),
+            (json!(0), 30.),
+            (json!(-1), 30.),
+            (json!(5), 5.),
+            (json!(60), 30.),
+        ] {
+            assert_eq!(
+                pending_grace_minutes(&json!({"plan":{"pendingGraceMinutes":value}}), 30.),
+                expected
+            );
+        }
+    }
+    #[test]
+    fn pending_grace_uses_continuous_fresh_ineligibility_and_resets_on_recovery() {
+        let mut order = json!({"status":"pending","direction":"OPEN_LONG","interval":"1m","nextTime":0,"plan":{"pendingGraceMinutes":5}});
+        let mut signal =
+            json!({"eligible":false,"positionRecommendation":"WAIT","dataAsOf":iso(0)});
+        apply_pending(&mut order, &signal, 0).unwrap();
+        assert_eq!(order["ineligibleSince"], 0.);
+        order["nextTime"] = json!(240000);
+        signal["dataAsOf"] = json!(iso(240000));
+        apply_pending(&mut order, &signal, 240000).unwrap();
+        assert_eq!(order["status"], "pending");
+        signal["eligible"] = json!(true);
+        apply_pending(&mut order, &signal, 240000).unwrap();
+        assert_eq!(order["ineligibleRounds"], 0);
+        assert_eq!(order["ineligibleSince"], Value::Null);
+        signal["eligible"] = json!(false);
+        apply_pending(&mut order, &signal, 240000).unwrap();
+        order["nextTime"] = json!(540000);
+        // A stale analysis must not expire an order through this policy.
+        apply_pending(&mut order, &signal, 540000).unwrap();
+        assert_eq!(order["status"], "pending");
+        signal["dataAsOf"] = json!(iso(540000));
+        apply_pending(&mut order, &signal, 540000).unwrap();
+        assert_eq!(order["status"], "cancelled");
+        assert_eq!(order["reason"], "strategy_cancelled");
+    }
     #[test]
     fn entry_confidence_uses_the_lower_default_threshold() {
         let mut config = crate::store::default_config();
@@ -1650,6 +1824,29 @@ mod tests {
             entry_guard_at(&account, &candidate, &config, 0).as_deref(),
             Some("信号置信度低于开仓门槛")
         );
+    }
+    #[test]
+    fn total_order_count_is_unlimited_and_symbol_and_strategy_guards_remain() {
+        let config = json!({"trader":{"enabled":true,"dryRun":false,"allowEntryOrders":true,"minConfidence":0.45}});
+        let mut candidate = json!({"symbol":"TESTUSDT","strategy":{"id":"test"},"signal":{"confidence":0.9,"plan":{"entryLimit":100}}});
+        for count in [10, 100, 1000] {
+            let mut account = json!({"orders":(0..count).map(|i|json!({"symbol":format!("EXISTING{i}USDT"),"status":if i%2==0{"pending"}else{"open"},"analysisContext":{"strategyId":"test"}})).collect::<Vec<_>>()});
+            assert_eq!(entry_guard_at(&account, &candidate, &config, 0), None);
+            candidate["signal"]["plan"]["maxPositions"] = json!(count);
+            assert_eq!(
+                entry_guard_at(&account, &candidate, &config, 0).as_deref(),
+                Some("达到策略持仓上限")
+            );
+            candidate["signal"]["plan"]
+                .as_object_mut()
+                .unwrap()
+                .remove("maxPositions");
+            account["orders"][0]["symbol"] = candidate["symbol"].clone();
+            assert_eq!(
+                entry_guard_at(&account, &candidate, &config, 0).as_deref(),
+                Some("币种已有活动订单")
+            );
+        }
     }
     #[test]
     fn losing_history_allows_entries_and_keeps_symbol_cooldowns() {

@@ -35,6 +35,7 @@ struct App {
     contracts: Mutex<(i64, Vec<Value>, String)>,
     analysis_gate: Semaphore,
     performance_gate: Semaphore,
+    monthly_ml: crate::ml_gateway::Gateway,
 }
 pub async fn serve(root: PathBuf, host: String, port: u16) -> Result<()> {
     let data = std::env::var("DATA_DIR").unwrap_or("data".into());
@@ -52,6 +53,7 @@ pub async fn serve(root: PathBuf, host: String, port: u16) -> Result<()> {
         contracts: Mutex::new((0, vec![], String::new())),
         analysis_gate: Semaphore::new(1),
         performance_gate: Semaphore::new(1),
+        monthly_ml: crate::ml_gateway::Gateway::from_env()?,
     });
     let cors = if let Ok(origin) = std::env::var("CORS_ORIGIN") {
         CorsLayer::new()
@@ -73,7 +75,7 @@ pub async fn serve(root: PathBuf, host: String, port: u16) -> Result<()> {
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .layer(cors)
         .layer(tower_http::trace::TraceLayer::new_for_http())
-        .with_state(app);
+        .with_state(app.clone());
     let autostart = std::env::var("NOFX_AUTOSTART")
         .map(|s| !matches!(s.to_lowercase().as_str(), "0" | "false" | "no"))
         .unwrap_or(true);
@@ -88,12 +90,19 @@ pub async fn serve(root: PathBuf, host: String, port: u16) -> Result<()> {
     }
     let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await?;
     tracing::info!(%host,port,"NOFX native Rust API ready");
-    axum::serve(listener, router)
+    let result = axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;
             automation.stop();
         })
-        .await?;
+        .await;
+    if tokio::time::timeout(std::time::Duration::from_secs(10), app.db.pool.close())
+        .await
+        .is_err()
+    {
+        tracing::warn!(pool = %app.db.pool_status(), "Database pool shutdown still has outstanding connections");
+    }
+    result?;
     Ok(())
 }
 async fn handle(
@@ -128,24 +137,76 @@ async fn handle(
         Ok((status, value)) => (status, Json(value)).into_response(),
         Err(error) => {
             let detail = error.to_string();
-            let status = if detail.starts_with("404:") {
-                StatusCode::NOT_FOUND
-            } else if detail.starts_with("409:") {
-                StatusCode::CONFLICT
-            } else if detail.starts_with("400:") {
-                StatusCode::BAD_REQUEST
-            } else if detail.contains("Binance HTTP")
-                || detail.contains("error sending request")
-                || detail.contains("无法取得行情")
-            {
-                StatusCode::BAD_GATEWAY
+            let (status, message) = api_error(&error);
+            if status == StatusCode::CONFLICT {
+                tracing::info!(path=uri.path(),%detail,"API operation waiting for concurrent work");
             } else {
-                StatusCode::UNPROCESSABLE_ENTITY
-            };
-            tracing::warn!(path=uri.path(),%detail,"API request failed");
-            (status,Json(json!({"error":detail.trim_start_matches("404:").trim_start_matches("409:").trim_start_matches("400:")}))).into_response()
+                tracing::warn!(path=uri.path(),%detail,"API request failed");
+            }
+            (status, Json(json!({"error":message}))).into_response()
         }
     }
+}
+fn api_error(error: &anyhow::Error) -> (StatusCode, String) {
+    if error.is::<crate::db::AccountWriteBusy>() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            crate::db::AccountWriteBusy.to_string(),
+        );
+    }
+    if let Some(database_error) = error.downcast_ref::<sqlx::Error>() {
+        let (status, message) = match database_error {
+            sqlx::Error::PoolTimedOut => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "数据库连接池繁忙，请稍后重试。",
+            ),
+            sqlx::Error::PoolClosed => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "数据库连接池已关闭，请稍后重试。",
+            ),
+            sqlx::Error::Io(_) | sqlx::Error::Tls(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "数据库连接暂不可用，请稍后重试。",
+            ),
+            sqlx::Error::Database(database) if database.code().as_deref() == Some("55P03") => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "数据库锁等待超时，请稍后重试。",
+            ),
+            sqlx::Error::Database(database)
+                if matches!(database.code().as_deref(), Some("40001" | "40P01")) =>
+            {
+                (StatusCode::CONFLICT, "数据库并发更新冲突，请稍后重试。")
+            }
+            _ => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "数据库操作失败，请查看服务日志。",
+            ),
+        };
+        return (status, message.to_owned());
+    }
+    let detail = error.to_string();
+    let status = if detail.starts_with("404:") {
+        StatusCode::NOT_FOUND
+    } else if detail.starts_with("409:") {
+        StatusCode::CONFLICT
+    } else if detail.starts_with("400:") {
+        StatusCode::BAD_REQUEST
+    } else if detail.contains("Binance HTTP")
+        || detail.contains("error sending request")
+        || detail.contains("无法取得行情")
+    {
+        StatusCode::BAD_GATEWAY
+    } else {
+        StatusCode::UNPROCESSABLE_ENTITY
+    };
+    (
+        status,
+        detail
+            .trim_start_matches("404:")
+            .trim_start_matches("409:")
+            .trim_start_matches("400:")
+            .to_owned(),
+    )
 }
 fn q<'a>(query: &'a HashMap<String, String>, key: &str, fallback: &'a str) -> &'a str {
     query.get(key).map(String::as_str).unwrap_or(fallback)
@@ -162,6 +223,32 @@ fn qn(query: &HashMap<String, String>, key: &str, fallback: f64, min: f64, max: 
 fn ok(value: Value) -> Result<(StatusCode, Value)> {
     Ok((StatusCode::OK, value))
 }
+// URI paths retain percent escapes. Decode only the order ID after the route
+// and action suffix have been matched, so escaped delimiters cannot alter routing.
+fn paper_order_path_id(raw: &str) -> Result<String> {
+    let bytes = raw.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut offset = 0;
+    while offset < bytes.len() {
+        if bytes[offset] == b'%' {
+            let pair = bytes
+                .get(offset + 1..offset + 3)
+                .context("400: 订单 ID 的 URL 编码无效")?;
+            let high = char::from(pair[0])
+                .to_digit(16)
+                .context("400: 订单 ID 的 URL 编码无效")?;
+            let low = char::from(pair[1])
+                .to_digit(16)
+                .context("400: 订单 ID 的 URL 编码无效")?;
+            decoded.push((high * 16 + low) as u8);
+            offset += 3;
+        } else {
+            decoded.push(bytes[offset]);
+            offset += 1;
+        }
+    }
+    String::from_utf8(decoded).context("400: 订单 ID 必须是有效 UTF-8")
+}
 async fn dispatch(
     app: &Arc<App>,
     method: &str,
@@ -170,11 +257,15 @@ async fn dispatch(
     input: &Value,
 ) -> Result<(StatusCode, Value)> {
     match (method, path) {
+        ("GET", "/api/ml/health") | ("GET", "/api/ml/models") | ("POST", "/api/ml/signal") => {
+            return Ok(app.monthly_ml.request(method, path, input).await);
+        }
         ("GET", "/api/health") => {
             return ok(
-                json!({"ok":true,"name":"nofx-lite","runtime":"rust","version":env!("CARGO_PKG_VERSION")}),
+                json!({"ok":true,"name":"nofx-lite","runtime":"rust","version":env!("CARGO_PKG_VERSION"),"databasePool":app.db.pool_status()}),
             );
         }
+        ("GET", "/api/database/pool") => return ok(app.db.pool_status()),
         ("GET", "/api/config") => return ok(masked(&app.store.read("config").await?)),
         ("PUT", "/api/config") => {
             let next = app
@@ -442,6 +533,9 @@ async fn dispatch(
         ("POST", "/api/paper/close-all") => {
             return ok(crate::paper::close_all(&app.db, &app.store).await?);
         }
+        ("POST", "/api/paper/close-above-margin") => {
+            return ok(crate::paper::close_above_margin(&app.db, &app.store, input).await?);
+        }
         ("PUT", "/api/paper/capital") => {
             let capital = number(&input["initialBalance"], f64::NAN);
             if !capital.is_finite() || !(1. ..=1_000_000.).contains(&capital) {
@@ -627,13 +721,12 @@ async fn dispatch(
     }
     if let Some(tail) = path.strip_prefix("/api/paper/orders/") {
         if method == "POST" && tail.ends_with("/close") {
-            return ok(
-                crate::paper::close(&app.db, &app.store, tail.trim_end_matches("/close")).await?,
-            );
+            let id = paper_order_path_id(tail.trim_end_matches("/close"))?;
+            return ok(crate::paper::close(&app.db, &app.store, &id).await?);
         }
         if method == "GET" {
-            let id = tail.trim_end_matches("/replay");
-            let state = app.db.account(false, Some(id)).await?;
+            let id = paper_order_path_id(tail.trim_end_matches("/replay"))?;
+            let state = app.db.account(false, Some(&id)).await?;
             let order = state["orders"]
                 .as_array()
                 .and_then(|s| s.first())
@@ -648,9 +741,8 @@ async fn dispatch(
         && method == "POST"
         && tail.ends_with("/close")
     {
-        return ok(
-            crate::paper::close(&app.db, &app.store, tail.trim_end_matches("/close")).await?,
-        );
+        let id = paper_order_path_id(tail.trim_end_matches("/close"))?;
+        return ok(crate::paper::close(&app.db, &app.store, &id).await?);
     }
     if path.starts_with("/api/adaptive/") {
         return adaptive(app, method, path, query, input).await;
@@ -1220,4 +1312,106 @@ async fn smoke(app: &App, input: &Value) -> Result<Value> {
     Ok(
         json!({"ok":true,"demo":true,"testnet":true,"environment":"demo","symbol":symbol,"orderId":order_id,"steps":[{"name":"查规则与价格","ok":true},{"name":"远价挂单","ok":true,"detail":placed},{"name":"查询挂单","ok":true,"detail":remote},{"name":"撤单","ok":true,"detail":cancelled},{"name":"复核撤单","ok":true}]}),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contextual_database_pool_errors_are_retryable_and_sanitized() {
+        let busy =
+            anyhow::Error::new(crate::db::AccountWriteBusy).context("private request context");
+        assert_eq!(
+            api_error(&busy),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                crate::db::AccountWriteBusy.to_string()
+            )
+        );
+        for cause in [
+            sqlx::Error::PoolTimedOut,
+            sqlx::Error::PoolClosed,
+            sqlx::Error::Io(std::io::Error::other("private database detail")),
+        ] {
+            let error = anyhow::Error::new(cause).context("request context");
+            let (status, message) = api_error(&error);
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(!message.contains("private database detail"));
+            assert!(!message.contains("request context"));
+        }
+        assert_eq!(
+            api_error(&anyhow::anyhow!("409: 正在执行交易")),
+            (StatusCode::CONFLICT, " 正在执行交易".into())
+        );
+        assert_eq!(
+            api_error(&anyhow::anyhow!("400: 无效输入")).0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn encoded_activity_id_matches_fused_position() {
+        let state = json!({
+            "orders": [],
+            "exchangeAccounts": {
+                "demo": {
+                    "enabled": true,
+                    "configured": true,
+                    "syncedAt": "2026-10-11T00:00:00Z",
+                    "positions": [{
+                        "symbol": "API3USDT",
+                        "positionSide": "BOTH",
+                        "positionAmt": 3011.7,
+                        "entryPrice": 0.3181,
+                        "leverage": 5
+                    }]
+                }
+            }
+        });
+        let activity = crate::paper::fused_orders(&state);
+        for prefix in ["/api/paper/activity/", "/api/paper/orders/"] {
+            let uri: Uri = format!("{prefix}fused%3Aposition%3AAPI3USDT%3AOPEN_LONG/close")
+                .parse()
+                .unwrap();
+            let raw_id = uri
+                .path()
+                .strip_prefix(prefix)
+                .unwrap()
+                .strip_suffix("/close")
+                .unwrap();
+            assert_ne!(activity["activeOrders"][0]["id"], raw_id);
+            let id = paper_order_path_id(raw_id).unwrap();
+            assert!(
+                activity["activeOrders"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["id"] == id)
+            );
+        }
+    }
+
+    #[test]
+    fn order_id_decoding_preserves_literals_and_decodes_once() {
+        let uuid = "8889a824-0e8c-43e9-b622-194d93823ddc";
+        assert_eq!(paper_order_path_id(uuid).unwrap(), uuid);
+        assert_eq!(
+            paper_order_path_id("fused%3aentry%3aone%2Ctwo").unwrap(),
+            "fused:entry:one,two"
+        );
+        assert_eq!(paper_order_path_id("a+b%252Fclose").unwrap(), "a+b%2Fclose");
+    }
+
+    #[test]
+    fn invalid_order_id_encoding_is_a_bad_request() {
+        for raw in ["fused%", "fused%3", "fused%GG", "fused%FF"] {
+            assert!(
+                paper_order_path_id(raw)
+                    .unwrap_err()
+                    .to_string()
+                    .starts_with("400:")
+            );
+        }
+    }
 }

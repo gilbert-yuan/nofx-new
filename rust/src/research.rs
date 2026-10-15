@@ -9,6 +9,24 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+#[derive(Debug, Clone)]
+pub struct InsufficientHistory {
+    pub symbol: String,
+    pub interval: String,
+    pub required: usize,
+    pub available: usize,
+}
+impl std::fmt::Display for InsufficientHistory {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}：已收盘K线不足，需要至少 {} 根，实际 {} 根",
+            self.symbol, self.required, self.available
+        )
+    }
+}
+impl std::error::Error for InsufficientHistory {}
+
 pub fn costs() -> Value {
     json!({"feeBps":6,"slippageBps":5,"fundingBpsPer8h":3,"notional":10})
 }
@@ -36,10 +54,13 @@ pub fn prepare_market(
     }
     let minimum = limit.min(50.max(limit.saturating_sub(2)));
     if closed.len() < minimum {
-        bail!(
-            "{symbol}：已收盘K线不足，需要至少 {minimum} 根，实际 {} 根",
-            closed.len()
-        );
+        return Err(InsufficientHistory {
+            symbol: symbol.to_owned(),
+            interval: interval.to_owned(),
+            required: minimum,
+            available: closed.len(),
+        }
+        .into());
     }
     let mut previous = None;
     for r in &mut closed {
@@ -509,6 +530,23 @@ pub fn symbols(input: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn new_contract_history_shortage_is_typed_and_full_invalid_history_still_fails() {
+        let rows: Vec<Value> = (0..62).map(|i| json!({"openTime":i*14_400_000i64,"open":1,"high":2,"low":1,"close":2,"volume":1})).collect();
+        let error = prepare_market("CTUSDT", "4h", &rows, 300, 62 * 14_400_000i64).unwrap_err();
+        let shortage = error.downcast_ref::<InsufficientHistory>().unwrap();
+        assert_eq!((shortage.required, shortage.available), (298, 62));
+        assert_eq!(shortage.interval, "4h");
+        let mut invalid = rows;
+        invalid[0]["high"] = json!(0);
+        let invalid_error =
+            prepare_market("CTUSDT", "4h", &invalid, 62, 62 * 14_400_000i64).unwrap_err();
+        assert!(
+            invalid_error
+                .downcast_ref::<InsufficientHistory>()
+                .is_none()
+        );
+    }
     #[test]
     fn normalization_respects_strategy_leverage_and_risk_budget() {
         let now = 1_800_000;

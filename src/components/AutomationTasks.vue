@@ -21,6 +21,7 @@ const analysis = computed(() => state.value?.analysisMeta || {});
 const readOnly = computed(() => state.value?.executionStatus?.readOnly ?? analysis.value.readOnly);
 const analysisBusy = computed(() => ['syncing', 'analyzing', 'enriching'].includes(analysis.value.phase));
 const opportunityEmpty = computed(() => {
+  if (analysis.value.phase === 'waiting') return analysis.value.warning || '等待数据库恢复后继续分析。';
   if (analysis.value.phase === 'error') return `机会分析失败：${analysis.value.error || '请查看任务错误'}`;
   if (analysisBusy.value) return '正在同步行情并生成机会分析，请等待本轮完成。';
   if (!analysis.value.asOf) return '尚未完成机会分析。启动自动任务后，面板会在行情同步完成后更新。';
@@ -63,6 +64,11 @@ onBeforeUnmount(() => { disposed = true; clearInterval(timer); });
     <p v-if="readOnly" class="muted">当前为采集与分析展示模式。行情同步后生成策略机会和妖币预测，自动下单与持仓管理关闭。</p>
     <p v-else class="muted">沿用当前策略配置。全市场按币种逐个拉取并立即分析；订单管理独立更新活跃订单行情。停止后，本轮在安全检查点退出，自动撮合与盈亏刷新也会停止。</p>
     <p v-if="error" class="signal-warning" role="alert">{{ error }}</p>
+    <p v-if="state?.databasePool" class="muted">数据库连接池：使用 {{ state.databasePool.inUse }} / {{ state.databasePool.config.maxConnections }} · 空闲 {{ state.databasePool.idle }}</p>
+    <details v-if="analysis.waitingForHistory?.length" class="muted">
+      <summary>历史数据不足：{{ analysis.waitingForHistory.length }} 项等待补齐</summary>
+      <ul><li v-for="item in analysis.waitingForHistory" :key="`${item.symbol}-${item.interval}-${item.required}`">{{ item.symbol }} · {{ item.interval }}：已有 {{ item.available }} 根，需要 {{ item.required }} 根</li></ul>
+    </details>
     <p v-if="analysis.marketWarning" class="signal-warning">{{ analysis.marketWarning }}</p>
     <p v-if="state?.executionStatus?.reason" class="signal-warning">自动下单状态：{{ state.executionStatus.reason }}</p>
     <p v-else-if="state?.executionStatus?.ready" class="muted">自动下单已就绪 · {{ state.executionStatus.mode === 'demo' ? '币安 Demo' : state.executionStatus.mode === 'live' ? '币安实盘' : state.executionStatus.mode }} · 按策略、确认结果与资金池风控执行。</p>
@@ -81,6 +87,7 @@ onBeforeUnmount(() => { disposed = true; clearInterval(timer); });
         <small>下一轮：{{ state.active && task.enabled ? time(task.nextRunAt) : '—' }}</small>
         <p v-if="key === 'positionReview'">本次启动以来：撤单 {{ task.cancelled || 0 }} · 宽限保留 {{ task.graced || 0 }} · 改价 {{ task.repriced || 0 }}</p>
         <p v-if="task.error" class="signal-warning">{{ task.error }}</p>
+        <p v-if="task.warning" class="signal-warning">{{ task.warning }}</p>
         <div class="task-actions">
           <button class="secondary" :disabled="busy" @click="action(`/automation/tasks/${key}`, 'PUT', { enabled: !task.enabled })">{{ task.enabled ? '暂停此任务' : '启用此任务' }}</button>
           <button class="ghost" :disabled="busy || task.running || !task.enabled" @click="action(`/automation/tasks/${key}/trigger`)">执行一轮</button>

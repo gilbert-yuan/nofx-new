@@ -205,7 +205,7 @@ async fn durable_partial_exit_and_protection() -> Result<()> {
         .max_connections(4)
         .connect_with(options.database(&name))
         .await?;
-    let db = Db { pool };
+    let db = Db::from_pool(pool);
     let result = std::panic::AssertUnwindSafe(run_execution(&db))
         .catch_unwind()
         .await;

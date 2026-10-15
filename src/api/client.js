@@ -22,6 +22,13 @@ export const configApi = {
   put: (body) => api(API.config.put, { method: 'PUT', body })
 };
 
+/** 月度 Chronos + LightGBM 模型：只读分类和验证结果 */
+export const mlApi = {
+  health: () => api(API.ml.health),
+  models: () => api(API.ml.models),
+  signal: (symbol) => api(API.ml.signal, { method: 'POST', body: { symbol }, timeoutMs: 45000 })
+};
+
 export const strategyApi = {
   get: () => api(API.strategy.get),
   put: (body) => api(API.strategy.put, { method: 'PUT', body })

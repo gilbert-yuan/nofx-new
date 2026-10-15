@@ -1,5 +1,13 @@
 {
   "health": "/api/health",
+  "ml": {
+    "health": "/api/ml/health",
+    "models": "/api/ml/models",
+    "signal": "/api/ml/signal"
+  },
+  "database": {
+    "pool": "/api/database/pool"
+  },
   "config": {
     "get": "/api/config",
     "put": "/api/config"

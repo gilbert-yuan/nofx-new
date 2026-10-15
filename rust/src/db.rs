@@ -2,19 +2,31 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use sqlx::{
     PgPool, Postgres, Transaction,
-    postgres::{PgConnectOptions, PgPoolOptions, PgSslMode},
+    postgres::{PgConnectOptions, PgSslMode},
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
     str::FromStr,
-    time::Duration,
+    sync::Arc,
 };
 mod indicators;
+mod pool;
+pub use pool::PoolConfig;
 
 #[derive(Clone)]
 pub struct Db {
     pub pool: PgPool,
+    write_gate: Arc<tokio::sync::Mutex<()>>,
 }
+
+#[derive(Debug)]
+pub struct AccountWriteBusy;
+impl std::fmt::Display for AccountWriteBusy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("账户更新排队超时，请稍后重试。")
+    }
+}
+impl std::error::Error for AccountWriteBusy {}
 #[derive(Clone)]
 struct Def {
     name: &'static str,
@@ -285,7 +297,15 @@ fn keys(d: &Def) -> Vec<&str> {
     k
 }
 impl Db {
+    pub fn from_pool(pool: PgPool) -> Self {
+        Self {
+            pool,
+            write_gate: Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
+
     pub async fn connect() -> Result<Self> {
+        let config = PoolConfig::from_env()?;
         let mut options = if let Ok(url) = std::env::var("DATABASE_URL") {
             PgConnectOptions::from_str(&url)?
         } else {
@@ -314,14 +334,7 @@ impl Db {
                 PgSslMode::Disable
             },
         );
-        let pool = PgPoolOptions::new()
-            .max_connections(12)
-            .acquire_timeout(Duration::from_secs(10))
-            .connect_with(options)
-            .await?;
-        let db = Self { pool };
-        db.init().await?;
-        Ok(db)
+        Self::connect_with(options, config).await
     }
     pub(crate) async fn init(&self) -> Result<()> {
         sqlx::raw_sql("CREATE TABLE IF NOT EXISTS market_indicator_history(symbol TEXT NOT NULL,kind TEXT NOT NULL,observed_at BIGINT NOT NULL,available_at BIGINT NOT NULL,origin TEXT NOT NULL,data JSONB NOT NULL,PRIMARY KEY(symbol,kind,observed_at,origin)); CREATE INDEX IF NOT EXISTS market_indicator_history_range ON market_indicator_history(symbol,observed_at);").execute(&self.pool).await?;
@@ -540,6 +553,14 @@ impl Db {
     where
         F: FnOnce(&mut Value) -> Result<Value>,
     {
+        // Queue this process's writers before taking a scarce pool connection.
+        // PostgreSQL's advisory lock still protects against other processes.
+        let _write_guard = tokio::time::timeout(
+            self.pool.options().get_acquire_timeout(),
+            self.write_gate.lock(),
+        )
+        .await
+        .map_err(|_| AccountWriteBusy)?;
         let mut tx = self.pool.begin().await?;
         sqlx::query("SELECT pg_advisory_xact_lock(790217)")
             .execute(&mut *tx)
@@ -625,22 +646,44 @@ async fn read_account(
         // Array prefixes precede their children, preserving hydration order while
         // allowing the (account_id, order_id, path) / (account_id, path) primary keys.
         let ordering = if order { "t.order_id,t.path" } else { "t.path" };
+        // Decode paths and strings directly instead of serializing every complete row
+        // to JSON in PostgreSQL. Numeric JSON preserves its existing representation.
+        let owner = if order { "t.order_id" } else { "NULL::TEXT" };
         let query = format!(
-            "SELECT to_jsonb(t)FROM {name} t WHERE t.account_id=1{filter} ORDER BY {ordering}"
+            "SELECT {owner},t.path,t.value_kind,t.text_value,to_jsonb(t.number_value),t.boolean_value FROM {name} t WHERE t.account_id=1{filter} ORDER BY {ordering}"
         );
         let rows = if order && order_id.is_some() {
-            sqlx::query_scalar::<_, Value>(&query)
+            sqlx::query_as::<_, ExtensionRow>(&query)
                 .bind(order_id)
                 .fetch_all(&mut **tx)
                 .await?
         } else {
-            sqlx::query_scalar::<_, Value>(&query)
+            sqlx::query_as::<_, ExtensionRow>(&query)
                 .fetch_all(&mut **tx)
                 .await?
         };
-        tables.insert(name.to_owned(), rows);
+        tables.insert(
+            name.to_owned(),
+            rows.into_iter().map(extension_row_value).collect(),
+        );
     }
     hydrate(&tables)
+}
+type ExtensionRow = (
+    Option<String>,
+    Vec<String>,
+    String,
+    Option<String>,
+    Option<Value>,
+    Option<bool>,
+);
+
+fn extension_row_value((owner, path, kind, text, number, boolean): ExtensionRow) -> Value {
+    let mut row = json!({"account_id":1,"path":path,"value_kind":kind,"text_value":text,"number_value":number,"boolean_value":boolean});
+    if let Some(owner) = owner {
+        row["order_id"] = json!(owner);
+    }
+    row
 }
 pub fn put(root: &mut Value, path: &[String], value: Value) {
     if path.is_empty() {

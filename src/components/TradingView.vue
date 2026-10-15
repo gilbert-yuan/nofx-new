@@ -18,6 +18,11 @@ let disposed = false;
 let loadSequence = 0;
 const activeOrders = computed(() => accountData.value?.activeOrders || (accountData.value?.orders || []).filter(o => ['pending', 'open'].includes(o.status)));
 const activityCounts = computed(() => ({ positions: activeOrders.value.filter(o => o.status === 'open').length, pending: activeOrders.value.filter(o => o.status === 'pending').length }));
+const largeMarginOrders = computed(() => activeOrders.value.filter(order => order.status === 'open' && (
+  order.executionTargets?.length
+    ? order.executionTargets.some(target => Number(target.margin ?? order.margin) > 50)
+    : Number(order.margin) > 50
+)));
 const exchangeAccounts = computed(() => Object.values(accountData.value?.exchangeAccounts || {}).filter(account => account.enabled));
 
 // 币安绑定订单（exchangeSync.demo / exchangeSync.live）
@@ -264,8 +269,9 @@ async function setCapital() {
 
 function describeAction(result) {
   const items = result.results || [];
-  const issues = items.flatMap(item => item.results || [item]).filter(item => item.error || item.warning || item.complete === false);
-  actionMessage.value = issues.length ? issues.map(item => `${item.symbol || ''} ${item.error || item.warning || '已提交，等待币安持仓确认'}`).join('；') : '操作已完成，资金池和订单列表已更新。';
+  const actions = items.flatMap(item => item.results?.length ? item.results : [item]);
+  const issues = actions.filter(item => item.error || item.warning || item.complete === false || item.skipped);
+  actionMessage.value = issues.length ? issues.map(item => `${item.symbol || ''} ${item.error || item.warning || (item.skipped ? '保证金已低于筛选条件，已跳过' : '已提交，等待币安持仓确认')}`).join('；') : '操作已完成，资金池和订单列表已更新。';
   if (result.account) accountData.value = result.account;
 }
 async function closeOrder(order) {
@@ -289,6 +295,14 @@ async function closeAll() {
   if (!confirm(`确认平掉全部 ${activityCounts.value.positions} 个持仓，并撤销 ${activityCounts.value.pending} 个待入场订单？${live ? '包括币安实盘仓位。' : ''}完成后暂停新开仓，需手动恢复。`)) return;
   busy.value = true; error.value = ''; actionMessage.value = ''; ++loadSequence;
   try { describeAction(await api('/paper/close-all', { method: 'POST', timeoutMs: 600000 })); }
+  catch (err) { error.value = err.message; await loadAccount({ silent: true }); }
+  finally { busy.value = false; }
+}
+async function closeLargeMarginOrders() {
+  const live = largeMarginOrders.value.some(order => order.executionTargets?.some(target => target.environment === 'live' && Number(target.margin ?? order.margin) > 50));
+  if (!confirm(`确认平掉保证金大于 50 USDT 的 ${largeMarginOrders.value.length} 个持仓？${live ? '包括符合条件的币安实盘仓位。' : ''}对应持仓的待入场余量会一起撤销。`)) return;
+  busy.value = true; error.value = ''; actionMessage.value = ''; ++loadSequence;
+  try { describeAction(await api('/paper/close-above-margin', { method: 'POST', body: { minimumMargin: 50 }, timeoutMs: 600000 })); }
   catch (err) { error.value = err.message; await loadAccount({ silent: true }); }
   finally { busy.value = false; }
 }
@@ -415,6 +429,7 @@ onUnmounted(() => { disposed = true; ++loadSequence; clearTimeout(pollTimer); })
         <button class="ghost" :disabled="busy" @click="showCapitalForm = !showCapitalForm; capitalInput = accountData.initialBalance">
           {{ showCapitalForm ? '取消设置' : '设置资金池初始金额' }}
         </button>
+        <button class="btn-small btn-danger" :disabled="busy || !largeMarginOrders.length" @click="closeLargeMarginOrders">平仓保证金 &gt; 50 USDT（{{ largeMarginOrders.length }}）</button>
         <button class="btn-small btn-danger" :disabled="busy || !activeOrders.length" @click="closeAll">全部平仓并撤单</button>
         <button v-if="accountData.entriesPaused" class="ghost" :disabled="busy" @click="resumeEntries">恢复开仓</button>
       </div>

@@ -22,3 +22,7 @@ output/
 # Rust build products; Cargo.lock is committed for reproducibility.
 /target/
 !scripts/setup-rust.ps1
+!scripts/start-local-model.ps1
+!scripts/export-chronos-onnx.py
+!scripts/ml-fastapi.py
+!scripts/train-monthly-model.ps1

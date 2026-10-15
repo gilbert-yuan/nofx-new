@@ -2,6 +2,8 @@
 
 后端使用原生 Rust（Axum / Tokio / PostgreSQL），前端保留 Vue / Vite。API、策略分析、模拟成交、订单复核、交易所同步和自动任务均在 Rust 中运行。
 
+全币种月度 ML 流程使用 Rust 采集 Binance USDT 合约的官方公开归档或公共 REST 历史行情与辅助指标，以 Chronos-Bolt-Tiny 预测、LightGBM 分类决策，并按共同时间边界清除标签泄漏。运行 `powershell -File scripts/train-monthly-model.ps1` 顺序完成采集、预测校准与训练；参数及研究模型接口见 [月度模型流水线](docs/ml-monthly-pipeline.md)。本轮已完成 869 个合约训练和回放，分类准确率小幅提高但成本后亏损，保持研究模式；实际指标见 [最终评估](reports/ml-global-monthly-evaluation-20261015.md)。
+
 Windows 本机已经安装 Rust 1.99.0、Cargo、rustfmt、Clippy 和 MSVC 构建工具。新机器需先安装 Rust 和 MSVC 构建工具；项目工具链由 `rust-toolchain.toml` 固定。
 
 ```powershell
@@ -18,13 +20,19 @@ $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
 
 新增后端测试和回测使用 Rust，复用 `nofx_core`。策略管理已提供历史指标补齐与参数组合回测入口，使用共享策略、模拟成交及成本模型；操作与限制见 [历史指标回测说明](docs/indicator-backtest.md)。
 
+PostgreSQL 连接由共享 SQLx 连接池管理，默认最大 12、预热 2 个连接。可在 `.env` 设置 `NOFX_DB_POOL_MAX_CONNECTIONS`（4..1024）、`NOFX_DB_POOL_MIN_CONNECTIONS`（0..最大值）、`NOFX_DB_POOL_ACQUIRE_TIMEOUT_MS`（默认 10000）、`NOFX_DB_POOL_IDLE_TIMEOUT_MS`（默认 600000）、`NOFX_DB_POOL_MAX_LIFETIME_MS`（默认 1800000）和 `NOFX_DB_POOL_TEST_BEFORE_ACQUIRE`（默认 true）；空闲和生命周期超时设为 0 可禁用回收。`NOFX_DB_LOCK_TIMEOUT_MS` 默认 10000，限制 SQL 锁等待。参数在启动时校验，修改后重启生效；每个服务/研究进程各自拥有连接池，最大连接数需计入数据库总预算。`GET /api/database/pool` 与 `/api/health` 的 `databasePool` 返回连接总数、空闲数、使用数和实际配置，查询状态无需占用数据库连接。连接池繁忙或锁等待超时返回 HTTP 503，并发交易冲突返回 409；写操作不会自动重放。
+
 月度全部启用策略的持续研究使用 `nofx-campaign`，自动补齐 12 个代表币种的数据，逐项保存结果并支持断点续跑；后台启动、状态与扩展方式见 [月度研究说明](docs/monthly-campaign.md)。
 
 自动 K 线采集覆盖 `marketSync.symbolsText` 指定的币种（`ALL` 表示全部 Binance USDT 永续合约），同步 `1m / 5m / 15m / 1h / 4h / 1d`、配置周期及启用策略所需的辅助周期。成交额和策略黑名单只影响交易分析；新币的已有历史也会保存，分析仍要求足够且连续的已收盘 K 线。
 
+历史长度不足的币种在分析状态和本轮汇总的 `waitingForHistory` 中显示所需/已有根数，不计为运行失败；同一币种、周期和窗口的失败辅助行情读取在一轮分析中只执行一次。数据断档、过期或请求失败仍保留错误并阻止相应策略执行。
+
+账户写入在进程内先排队再获取数据库连接，跨进程仍由 PostgreSQL 事务锁保护。自动任务遇到连接池繁忙、账户排队超时或数据库锁冲突时显示“等待下一轮重试”，保留上一次成功汇总；其他数据库与行情错误仍显示为失败。连接池状态中的 `accountWriteBusy` 表示账户写入正在进行，`availableCapacity` 表示还能新建的连接数量。
+
 需要采集与分析展示时，可在 `data/config.json` 中设置 `marketSync.dataOnly: true`，或通过 `PUT /api/config` 保存该设置。该模式同步行情并生成只读的策略机会与妖币预测，跳过下单、持仓复核和交易账户同步，也不新增交易分析记录；切换模式后重启服务。`GET /api/history/sync/status` 返回各币种、周期的同步状态和错误明细。`GET /api/automation/status` 的 `analysisMeta` 返回分析阶段、分析次数、行情就绪数量和实际更新时间。
 
-启用策略只决定参与分析的策略。自动执行还要求 `marketSync.dataOnly: false`、`trader.enabled: true`、`trader.dryRun: false` 和 `trader.allowEntryOrders: true`，并完成执行环境的账户同步。`executionStatus` 返回全局执行状态和阻止原因，机会卡片的 `execution` 返回逐币种执行结果；`created` 统计本地订单记录，`submitted` 统计已确认提交到执行目标的订单。每轮新增订单受 `trader.maxNewEntriesPerCycle` 限制。
+启用策略只决定参与分析的策略。自动执行还要求 `marketSync.dataOnly: false`、`trader.enabled: true`、`trader.dryRun: false` 和 `trader.allowEntryOrders: true`，并完成执行环境的账户同步。`executionStatus` 返回全局执行状态和阻止原因，机会卡片的 `execution` 返回逐币种执行结果；`created` 统计本地订单记录，`submitted` 统计已确认提交到执行目标的订单。活动订单总数量不设上限，旧的 `NOFX_MAX_POSITIONS` 环境变量不再生效；资金、单币冲突和策略显式持仓风控仍生效。每轮新增订单受 `trader.maxNewEntriesPerCycle` 限制。
 
 仓位计算同时满足最小保证金、交易所最小成交额与数量步长、单笔名义仓位上限和可用资金（含手续费预留）。最小成交额之上预留一档数量，避免数量取整后不足；所需规模超过资金或名义仓位限额时仍跳过。建议杠杆导致保证金低于门槛时，在相同名义仓位预算内逐级降低杠杆；即使 1 倍杠杆仍不满足门槛则跳过，不提高风险限额。
 
