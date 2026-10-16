@@ -10,6 +10,23 @@
   },
   "strategies": [
     {
+      "id": "chronos-lightgbm-v1",
+      "name": "Chronos + LightGBM",
+      "description": "Chronos-Bolt-Tiny 预测，LightGBM 判断信号，共享账户风控与止盈止损；仅支持 Binance Demo 自动执行。",
+      "engine": "monthly-ml",
+      "modelId": "chronos-bolt-tiny-lightgbm-global-calibrated",
+      "needsAux": [],
+      "marketWindow": 256,
+      "marketWindows": {},
+      "marketContext": {},
+      "planInterval": "1h",
+      "paramSchema": [],
+      "priority": 100,
+      "builtin": true,
+      "requiresModelService": true,
+      "prefilter": null
+    },
+    {
       "id": "enhanced-trend-v1",
       "name": "增强趋势 v1",
       "description": "多指标综合评分（均线/MACD/RSI/布林/量能 + Ichimoku/DMI/Supertrend/OBV），限价回调挂单入场，R 口径止盈止损 + 分批止盈 + 均线失守智能退出。当前生产策略。",

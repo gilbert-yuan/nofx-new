@@ -39,6 +39,9 @@ struct Args {
     concurrency: usize,
     #[arg(long, default_value_t = 30)]
     days: u32,
+    /// Exclusive UTC date, frozen in the manifest (for example 2026-10-14).
+    #[arg(long)]
+    end_date: Option<NaiveDate>,
     #[arg(long, default_value_t = 256)]
     warmup_hours: u32,
     #[arg(long, value_delimiter = ',')]
@@ -49,12 +52,21 @@ struct Args {
     /// Use only frozen archives; no network requests, including directory listings.
     #[arg(long)]
     cache_only: bool,
+    /// Reuse verified raw ZIP/CHECKSUM pairs from existing dataset roots read-only.
+    #[arg(long)]
+    raw_cache_dir: Vec<PathBuf>,
+    /// Preserve real historical rows of contracts absent on the final UTC day.
+    #[arg(long)]
+    include_inactive: bool,
 }
 #[derive(Clone)]
 struct Archive {
     client: reqwest::Client,
     root: PathBuf,
     cache_only: bool,
+    raw_cache_dirs: Vec<PathBuf>,
+    inventory: bool,
+    include_inactive: bool,
 }
 struct File {
     bytes: Vec<u8>,
@@ -76,10 +88,27 @@ async fn main() -> Result<()> {
         "concurrency must be 1..=8"
     );
     ensure!(
-        (1..=90).contains(&args.days) && args.warmup_hours <= 2048,
+        (1..=730).contains(&args.days) && args.warmup_hours <= 2048,
         "Invalid window"
     );
     fs::create_dir_all(&args.output_dir)?;
+    let root = fs::canonicalize(&args.output_dir)?;
+    let mut raw_cache_dirs = Vec::new();
+    for cache in &args.raw_cache_dir {
+        let cache = fs::canonicalize(cache).context("Raw cache directory does not exist")?;
+        ensure!(
+            cache != root && cache.is_dir(),
+            "Raw cache must be a different dataset root"
+        );
+        ensure!(
+            !raw_cache_dirs.contains(&cache),
+            "Duplicate raw cache directory"
+        );
+        raw_cache_dirs.push(cache);
+    }
+    let raw_cache_fingerprints: Vec<Value> = raw_cache_dirs.iter().map(|root| -> Result<Value> {
+        Ok(json!({"root":root,"manifest_sha256":ml_dataset::file_digest(&root.join("manifest.json"))?}))
+    }).collect::<Result<_>>()?;
     let _writer = ml_dataset::collector_lock(&args.output_dir)?;
     let archive = Archive {
         client: reqwest::Client::builder()
@@ -90,6 +119,9 @@ async fn main() -> Result<()> {
             .build()?,
         root: args.output_dir.clone(),
         cache_only: args.cache_only,
+        raw_cache_dirs,
+        inventory: args.days > 90 || args.include_inactive,
+        include_inactive: args.include_inactive,
     };
     if args.probe {
         let latest = archive.latest_day().await?;
@@ -111,7 +143,28 @@ async fn main() -> Result<()> {
             saved["schema_version"] == 1
                 && saved["days"] == args.days
                 && saved["warmup_hours"] == args.warmup_hours
-                && saved["provider"] == "Binance Public Data archives",
+                && saved["provider"] == "Binance Public Data archives"
+                && saved["include_inactive"].as_bool().unwrap_or(false) == args.include_inactive
+                && saved["raw_cache_dirs"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    == serde_json::to_value(&archive.raw_cache_dirs)?
+                        .as_array()
+                        .unwrap()
+                        .clone()
+                && saved["raw_cache_fingerprints"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    == raw_cache_fingerprints
+                && saved["collector_code_sha256"]
+                    .as_str()
+                    .is_none_or(|sha| sha
+                        == hex::encode(Sha256::digest(include_bytes!("nofx-ml-archive.rs"))))
+                && args
+                    .end_date
+                    .is_none_or(|day| saved["end_ms"] == day_ms(day)),
             "Resume parameters differ; use a new directory"
         );
         saved
@@ -120,12 +173,27 @@ async fn main() -> Result<()> {
             !matches!(args.phase, Phase::History),
             "Collect candles before history"
         );
-        let latest = archive.latest_day().await?;
-        let end = day_ms(latest + Days::days(1));
-        let dirs = archive.list("data/futures/um/daily/klines/").await?;
+        let (latest, end) = if let Some(end_date) = args.end_date {
+            ensure!(
+                end_date <= Utc::now().date_naive(),
+                "end-date must exclude the current incomplete UTC day"
+            );
+            let latest = end_date - Days::days(1);
+            archive.verify_day(latest).await?;
+            (latest, day_ms(end_date))
+        } else {
+            let latest = archive.latest_day().await?;
+            (latest, day_ms(latest + Days::days(1)))
+        };
+        let mut dirs = archive.list("data/futures/um/daily/klines/").await?;
+        if args.include_inactive {
+            dirs.extend(archive.list("data/futures/um/monthly/klines/").await?);
+        }
         let symbols = universe(&dirs, &args.symbols)?;
         json!({"schema_version":1,"status":"collecting","train_ready":false,"history_complete":false,"days":args.days,"warmup_hours":args.warmup_hours,
-            "provider":"Binance Public Data archives","universe":"Public USD-M archive USDT directories; eligibility requires complete newest published UTC day; current REST trading status unavailable; not all global coins",
+            "provider":"Binance Public Data archives","universe":if args.include_inactive {"Public USD-M daily/monthly archive USDT directory union; historical inactive rows preserved separately from current eligibility; current REST trading status unavailable; not all global coins"} else {"Public USD-M archive USDT directories; eligibility requires complete newest published UTC day; current REST trading status unavailable; not all global coins"},
+            "include_inactive":args.include_inactive,"raw_cache_dirs":archive.raw_cache_dirs,"archive_inventory_enabled":archive.inventory,
+            "raw_cache_fingerprints":raw_cache_fingerprints,"collector_code_sha256":hex::encode(Sha256::digest(include_bytes!("nofx-ml-archive.rs"))),
             "latest_published_utc_day":latest.to_string(),"start_ms":end-i64::from(args.days)*DAY_MS,"end_ms":end,"end_exclusive_ms":end,
             "lookback_start_ms":end-i64::from(args.days)*DAY_MS-i64::from(args.warmup_hours)*HOUR_MS,
             "collected_at_ms":nofx_core::now_ms(),"proxy_used":false,"account_credentials_used":false,"orders_enabled":false,
@@ -186,7 +254,10 @@ async fn main() -> Result<()> {
             .as_array()
             .unwrap()
             .iter()
-            .filter(|e| e["training_eligible"] == true)
+            .filter(|e| {
+                e["training_eligible"] == true
+                    || (args.include_inactive && e["historical_training_eligible"] == true)
+            })
             .filter(|e| {
                 args.symbols.is_empty()
                     || args.symbols.iter().any(|name| {
@@ -200,7 +271,9 @@ async fn main() -> Result<()> {
             "Requested history symbols must be unique eligible manifest entries"
         );
         for entry in manifest["symbols"].as_array_mut().unwrap() {
-            if entry["training_eligible"] != true {
+            if entry["training_eligible"] != true
+                && !(args.include_inactive && entry["historical_training_eligible"] == true)
+            {
                 entry["history_status"] = json!("excluded_ineligible");
             }
         }
@@ -247,7 +320,11 @@ async fn main() -> Result<()> {
             .as_array()
             .unwrap()
             .iter()
-            .filter(|e| e["training_eligible"] == true && e["history_status"] != "complete")
+            .filter(|e| {
+                (e["training_eligible"] == true
+                    || (args.include_inactive && e["historical_training_eligible"] == true))
+                    && e["history_status"] != "complete"
+            })
             .count();
         manifest["history_complete"] = json!(true);
         manifest["history_all_available"] = json!(errors == 0);
@@ -265,7 +342,7 @@ async fn main() -> Result<()> {
         "{}",
         serde_json::to_string_pretty(
             &json!({"manifest":manifest_path,"status":manifest["status"],"candidates":manifest["symbols"].as_array().unwrap().len(),
-        "eligible_symbols":manifest["eligible_symbols"],"failed_symbols":manifest["failed_symbols"],"history_complete":manifest["history_complete"],"start_ms":start,"end_ms":end})
+        "eligible_symbols":manifest["eligible_symbols"],"historically_eligible_symbols":manifest["historically_eligible_symbols"],"failed_symbols":manifest["failed_symbols"],"history_complete":manifest["history_complete"],"start_ms":start,"end_ms":end})
         )?
     );
     Ok(())
@@ -308,8 +385,9 @@ impl Archive {
         let path = self.root.join(&relative);
         let check_path = self.root.join(format!("{relative}.CHECKSUM"));
         let url = format!("{BASE}/{key}");
-        let (bytes, check) = if path.exists() && check_path.exists() {
-            (fs::read(&path)?, fs::read_to_string(&check_path)?)
+        let cached = raw_pair(&archive_roots(self), &relative)?;
+        let (bytes, check, reused) = if let Some((bytes, check, root)) = cached {
+            (bytes, check, (root != self.root).then_some(root))
         } else {
             if self.cache_only {
                 return Ok(None);
@@ -341,27 +419,10 @@ impl Archive {
             (
                 ml_dataset::bounded_response_bytes(response, ml_archive::MAX_ZIP_BYTES).await?,
                 check,
+                None,
             )
         };
-        ensure!(bytes.len() <= ml_archive::MAX_ZIP_BYTES, "ZIP too large");
-        let parts: Vec<_> = check.split_whitespace().collect();
-        let expected = parts.first().context("Empty checksum")?;
-        ensure!(
-            expected.len() == 64 && expected.chars().all(|c| c.is_ascii_hexdigit()),
-            "Invalid published SHA256"
-        );
-        if let Some(name) = parts.get(1) {
-            ensure!(
-                name.trim_start_matches('*') == key.rsplit('/').next().unwrap(),
-                "Checksum filename mismatch"
-            );
-        }
-        let sha = hex::encode(Sha256::digest(&bytes));
-        ensure!(
-            sha.eq_ignore_ascii_case(expected),
-            "Archive checksum mismatch: {url}"
-        );
-        ensure!(bytes.starts_with(b"PK"), "Not a ZIP");
+        let sha = verify_raw(&bytes, &check, key)?;
         if path.exists() {
             ensure!(
                 ml_dataset::file_digest(&path)? == sha,
@@ -372,26 +433,31 @@ impl Archive {
         }
         if !check_path.exists() {
             write_bytes(&check_path, check.as_bytes())?;
+        } else {
+            verify_raw(&bytes, &fs::read_to_string(&check_path)?, key)?;
         }
         Ok(Some(File {
             bytes,
-            source: json!({"url":url,"zip_path":relative,"checksum_path":format!("{relative}.CHECKSUM"),"sha256":sha}),
+            source: json!({"url":url,"zip_path":relative,"checksum_path":format!("{relative}.CHECKSUM"),"sha256":sha,"reused_from_read_only_dataset":reused}),
         }))
     }
     async fn list(&self, prefix: &str) -> Result<Vec<String>> {
         if self.cache_only {
-            let directory = self.root.join("raw").join(prefix);
-            if !directory.exists() {
-                return Ok(Vec::new());
-            }
             let mut prefixes = Vec::new();
-            for entry in fs::read_dir(directory)? {
-                let entry = entry?;
-                if entry.file_type()?.is_dir() {
-                    prefixes.push(format!("{prefix}{}/", entry.file_name().to_string_lossy()));
+            for root in archive_roots(self) {
+                let directory = root.join("raw").join(prefix);
+                if directory.exists() {
+                    for entry in fs::read_dir(directory)? {
+                        let entry = entry?;
+                        if entry.file_type()?.is_dir() {
+                            prefixes
+                                .push(format!("{prefix}{}/", entry.file_name().to_string_lossy()));
+                        }
+                    }
                 }
             }
             prefixes.sort();
+            prefixes.dedup();
             return Ok(prefixes);
         }
         let mut marker = None::<String>;
@@ -457,6 +523,212 @@ impl Archive {
         }
         anyhow::bail!("No BTC archive within latest3 full UTC days; refusing older-month fallback")
     }
+
+    async fn verify_day(&self, day: NaiveDate) -> Result<()> {
+        let file = self
+            .download(&daily_key("klines", "BTCUSDT", Some("1h"), day))
+            .await?
+            .context("Requested final UTC day has no published BTC archive")?;
+        let first = day_ms(day);
+        let rows = ml_archive::klines(&ml_archive::read_csv(&file.bytes)?, first, first + DAY_MS)?;
+        ensure!(
+            ml_dataset::candle_coverage(&rows, first, first + DAY_MS)?.complete,
+            "Requested final BTC archive is not a complete UTC day"
+        );
+        Ok(())
+    }
+
+    /// Restrict S3 enumeration to one contract and the requested key range.
+    /// The initial marker skips older years and the upper bound ends pagination.
+    async fn available_keys(
+        &self,
+        category: &str,
+        symbol: &str,
+        interval: Option<&str>,
+        monthly: bool,
+        start: i64,
+        end: i64,
+    ) -> Result<BTreeSet<String>> {
+        let range = inventory_range(category, symbol, interval, monthly, start, end)?;
+        let identity = json!({"schema_version":1,"prefix":range.0,"lower":range.1,"upper":range.2,
+            "cache_only":self.cache_only,"raw_cache_dirs":self.raw_cache_dirs});
+        let path = self
+            .root
+            .join("inventory")
+            .join(format!("{}.json", ml_dataset::digest(&identity)?));
+        if path.exists() {
+            let doc = ml_dataset::read_json(&path)?;
+            ensure!(
+                doc["identity"] == identity
+                    && doc["keys_sha256"] == ml_dataset::digest(&doc["keys"])?,
+                "Archive inventory checksum mismatch"
+            );
+            let keys: BTreeSet<String> = serde_json::from_value(doc["keys"].clone())?;
+            ensure!(
+                keys.iter().all(|key| key.starts_with(&range.0)
+                    && key.as_str() >= range.1.as_str()
+                    && key.as_str() < range.2.as_str()
+                    && key.ends_with(".zip")),
+                "Invalid frozen archive inventory key"
+            );
+            return Ok(keys);
+        }
+        let mut keys = BTreeSet::new();
+        if self.cache_only {
+            for root in archive_roots(self) {
+                let directory = root.join("raw").join(&range.0);
+                if !directory.exists() {
+                    continue;
+                }
+                for item in fs::read_dir(directory)? {
+                    let item = item?;
+                    if item.file_type()?.is_file() {
+                        let key = format!("{}{}", range.0, item.file_name().to_string_lossy());
+                        if key.as_str() >= range.1.as_str()
+                            && key.as_str() < range.2.as_str()
+                            && key.ends_with(".zip")
+                            && root.join("raw").join(format!("{key}.CHECKSUM")).exists()
+                        {
+                            keys.insert(key);
+                        }
+                    }
+                }
+            }
+        } else {
+            let mut marker = range.1.trim_end_matches(".zip").to_owned();
+            loop {
+                let mut url = reqwest::Url::parse(BUCKET)?;
+                url.query_pairs_mut()
+                    .append_pair("prefix", &range.0)
+                    .append_pair("marker", &marker)
+                    .append_pair("max-keys", "1000");
+                let response = self.get(url.as_str()).await?;
+                ensure!(
+                    response.status().is_success(),
+                    "Archive inventory HTTP {}",
+                    response.status()
+                );
+                let text = String::from_utf8(
+                    ml_dataset::bounded_response_bytes(response, 4 * 1024 * 1024).await?,
+                )?;
+                let listing = parse_listing(&text)?;
+                ensure!(
+                    listing.prefixes.iter().all(|prefix| prefix == &range.0),
+                    "Unexpected inventory common prefix"
+                );
+                let reached_end = listing.keys.iter().any(|key| key >= &range.2);
+                for key in &listing.keys {
+                    ensure!(
+                        key.starts_with(&range.0),
+                        "Archive inventory escaped requested prefix"
+                    );
+                    if key >= &range.1 && key < &range.2 && key.ends_with(".zip") {
+                        keys.insert(key.clone());
+                    }
+                }
+                if !listing.truncated || reached_end {
+                    break;
+                }
+                let next = listing
+                    .next
+                    .or_else(|| listing.keys.last().cloned())
+                    .context("Truncated inventory lacks marker")?;
+                ensure!(next > marker, "Archive inventory made no progress");
+                marker = next;
+            }
+        }
+        let doc = json!({"identity":identity,"keys":keys,"keys_sha256":ml_dataset::digest(&keys)?,
+            "listed_at_ms":nofx_core::now_ms(),"source":if self.cache_only {"verified raw cache filenames"} else {"Binance public S3 key listing"}});
+        ml_dataset::write_new(&path, &doc)?;
+        Ok(keys)
+    }
+}
+
+fn archive_roots(archive: &Archive) -> Vec<PathBuf> {
+    std::iter::once(archive.root.clone())
+        .chain(archive.raw_cache_dirs.iter().cloned())
+        .collect()
+}
+
+fn raw_pair(roots: &[PathBuf], relative: &str) -> Result<Option<(Vec<u8>, String, PathBuf)>> {
+    for root in roots {
+        let path = root.join(relative);
+        let check = root.join(format!("{relative}.CHECKSUM"));
+        if path.exists() && check.exists() {
+            ensure!(
+                fs::metadata(&path)?.len() <= ml_archive::MAX_ZIP_BYTES as u64
+                    && fs::metadata(&check)?.len() <= 4096,
+                "Raw cache pair exceeds size limit"
+            );
+            return Ok(Some((
+                fs::read(path)?,
+                fs::read_to_string(check)?,
+                root.clone(),
+            )));
+        }
+    }
+    Ok(None)
+}
+
+fn verify_raw(bytes: &[u8], check: &str, key: &str) -> Result<String> {
+    ensure!(
+        bytes.len() <= ml_archive::MAX_ZIP_BYTES && check.len() <= 4096,
+        "Archive exceeds size limit"
+    );
+    let parts: Vec<_> = check.split_whitespace().collect();
+    let expected = parts.first().context("Empty checksum")?;
+    ensure!(
+        parts.len() <= 2 && expected.len() == 64 && expected.chars().all(|c| c.is_ascii_hexdigit()),
+        "Invalid published SHA256"
+    );
+    if let Some(name) = parts.get(1) {
+        ensure!(
+            name.trim_start_matches('*') == key.rsplit('/').next().unwrap(),
+            "Checksum filename mismatch"
+        );
+    }
+    let sha = hex::encode(Sha256::digest(bytes));
+    ensure!(
+        sha.eq_ignore_ascii_case(expected),
+        "Archive checksum mismatch: {key}"
+    );
+    ensure!(bytes.starts_with(b"PK"), "Not a ZIP");
+    Ok(sha)
+}
+
+fn inventory_range(
+    category: &str,
+    symbol: &str,
+    interval: Option<&str>,
+    monthly: bool,
+    start: i64,
+    end: i64,
+) -> Result<(String, String, String)> {
+    ensure!(start < end, "Invalid archive inventory range");
+    let first = date(start)?;
+    let cutoff = date(end)?;
+    let key = |day| {
+        if monthly {
+            monthly_key(category, symbol, interval, day)
+        } else {
+            daily_key(category, symbol, interval, day)
+        }
+    };
+    let lower = key(if monthly {
+        NaiveDate::from_ymd_opt(first.year(), first.month(), 1).unwrap()
+    } else {
+        first
+    });
+    let upper = key(if monthly {
+        next_month(NaiveDate::from_ymd_opt(cutoff.year(), cutoff.month(), 1).unwrap())
+    } else {
+        cutoff
+    });
+    let prefix = format!(
+        "{}/",
+        lower.rsplit_once('/').context("Invalid inventory key")?.0
+    );
+    Ok((prefix, lower, upper))
 }
 
 fn parse_listing(text: &str) -> Result<Listing> {
@@ -498,10 +770,11 @@ fn universe(dirs: &[String], selected: &[String]) -> Result<Vec<Value>> {
         .collect();
     let selected: BTreeSet<_> = normalized.iter().cloned().collect();
     ensure!(selected.len() == normalized.len(), "Duplicate symbols");
-    let mut rows = Vec::new();
+    let mut rows = BTreeMap::new();
     for dir in dirs {
         let Some(symbol) = dir
             .strip_prefix("data/futures/um/daily/klines/")
+            .or_else(|| dir.strip_prefix("data/futures/um/monthly/klines/"))
             .and_then(|s| s.strip_suffix('/'))
         else {
             continue;
@@ -510,10 +783,10 @@ fn universe(dirs: &[String], selected: &[String]) -> Result<Vec<Value>> {
             continue;
         }
         let supported = nofx_core::exchange::valid_symbol(symbol).is_ok();
-        rows.push(json!({"symbol":symbol,"status":if supported {"pending"} else {"unsupported_symbol"},"training_eligible":false,"history_status":"pending",
+        rows.insert(symbol.to_owned(), json!({"symbol":symbol,"status":if supported {"pending"} else {"unsupported_symbol"},"training_eligible":false,"historical_training_eligible":false,"history_status":"pending",
             "error":if supported {Value::Null} else {json!("Unsupported symbol in system validator")}}));
     }
-    rows.sort_by(|a, b| a["symbol"].as_str().cmp(&b["symbol"].as_str()));
+    let rows: Vec<_> = rows.into_values().collect();
     ensure!(!rows.is_empty(), "No USDT archive candidates");
     ensure!(
         selected.is_empty() || rows.len() == selected.len(),
@@ -553,34 +826,46 @@ async fn candles(
         );
         doc
     } else {
-        let Some(latest) = archive
-            .download(&daily_key(
-                "klines",
-                symbol,
-                Some("1h"),
-                date(end - DAY_MS)?,
-            ))
-            .await?
-        else {
-            return Ok(
-                json!({"status":"unavailable_latest_day","rows":0,"training_eligible":false,"error":"Newest complete UTC day not published: stopped, delisted, or unavailable cannot be distinguished"}),
+        if !archive.include_inactive {
+            let Some(latest) = archive
+                .download(&daily_key(
+                    "klines",
+                    symbol,
+                    Some("1h"),
+                    date(end - DAY_MS)?,
+                ))
+                .await?
+            else {
+                return Ok(
+                    json!({"status":"unavailable_latest_day","rows":0,"training_eligible":false,"error":"Newest complete UTC day not published: stopped, delisted, or unavailable cannot be distinguished"}),
+                );
+            };
+            let rows =
+                ml_archive::klines(&ml_archive::read_csv(&latest.bytes)?, end - DAY_MS, end)?;
+            ensure!(
+                ml_dataset::candle_coverage(&rows, end - DAY_MS, end)?.complete,
+                "Newest symbol day incomplete"
             );
-        };
-        let rows = ml_archive::klines(&ml_archive::read_csv(&latest.bytes)?, end - DAY_MS, end)?;
-        ensure!(
-            ml_dataset::candle_coverage(&rows, end - DAY_MS, end)?.complete,
-            "Newest symbol day incomplete"
-        );
+        }
         let (records, sources, missing) =
             period(archive, "klines", symbol, Some("1h"), lookback, end, true).await?;
         let rows = ml_archive::klines(&records, lookback, end)?;
-        ensure!(!rows.is_empty(), "No hourly candles");
+        if rows.is_empty() {
+            return Ok(
+                json!({"status":"unavailable_requested_window","rows":0,"training_eligible":false,
+                "historical_training_eligible":false,"missing_archives":missing,"error":"No real hourly observations published in requested window"}),
+            );
+        }
         let first = rows[0]["openTime"].as_i64().unwrap();
         let coverage = ml_dataset::candle_coverage(&rows, first, end)?;
+        let available_end = rows.last().unwrap()["openTime"].as_i64().unwrap() + HOUR_MS;
+        let historical_coverage = ml_dataset::candle_coverage(&rows, first, available_end)?;
         let datasets = json!({"1h":rows});
         let doc = json!({"symbol":symbol,"datasets":datasets,"samples":[],"metadata":{"schema_version":1,"source":"Binance Public Data USD-M archive ZIP/CSV",
             "collected_at_ms":nofx_core::now_ms(),"start_ms":first,"lookback_start_ms":lookback,"training_start_ms":start,"end_exclusive_ms":end,"coverage":coverage,
             "content_sha256":ml_dataset::digest(&datasets)?,"closed_only":true,"immutable":true,"sources":sources,"missing_archives":missing,
+            "available_end_exclusive_ms":available_end,"historical_coverage":historical_coverage,
+            "missing_suffix_hours":(end-available_end)/HOUR_MS,"inactive_at_window_end":available_end<end,
             "missing_prefix_hours":(first-lookback)/HOUR_MS,"short_prefix_reason":"New listing and unpublished earlier archive cannot be distinguished"}});
         ml_dataset::write_new(&path, &doc)?;
         doc
@@ -589,14 +874,35 @@ async fn candles(
         .as_array()
         .context("Missing hourly rows")?;
     let first = doc["metadata"]["start_ms"].as_i64().unwrap();
+    let mut fields = candle_eligibility(rows, lookback, start, end)?;
+    fields["path"] = json!(relative);
+    fields["sha256"] = json!(ml_dataset::file_digest(&path)?);
+    fields["effective_start_ms"] = json!(first);
+    Ok(fields)
+}
+
+fn candle_eligibility(rows: &[Value], lookback: i64, start: i64, end: i64) -> Result<Value> {
+    let first = rows
+        .first()
+        .and_then(|row| row["openTime"].as_i64())
+        .context("No hourly rows")?;
+    let available_end = rows
+        .last()
+        .and_then(|row| row["openTime"].as_i64())
+        .context("Missing final openTime")?
+        + HOUR_MS;
     let coverage = ml_dataset::candle_coverage(rows, first, end)?;
-    let eligible = coverage.complete
-        && rows.len() >= 256 + 12 + 24
-        && end > start.max(first + 256 * HOUR_MS) + 12 * HOUR_MS;
+    let historical_coverage = ml_dataset::candle_coverage(rows, first, available_end)?;
+    let enough = rows.len() >= 256 + 12 + 24
+        && available_end > start.max(first + 256 * HOUR_MS) + 12 * HOUR_MS;
     Ok(
-        json!({"path":relative,"sha256":ml_dataset::file_digest(&path)?,"status":if coverage.complete {"complete"} else {"partial"},"rows":rows.len(),
-        "training_eligible":eligible,"effective_start_ms":first,"missing_hours":coverage.missing_hours,"missing_warmup_hours":(first-lookback)/HOUR_MS,
-        "requested_coverage_complete":first==lookback&&coverage.complete,"coverage":coverage,"error":Value::Null}),
+        json!({"status":if coverage.complete {"complete"} else if historical_coverage.complete && available_end<end {"historical_inactive"} else {"partial"},
+        "rows":rows.len(),"training_eligible":coverage.complete&&enough,
+        "historical_training_eligible":historical_coverage.complete&&enough,"effective_start_ms":first,
+        "available_end_exclusive_ms":available_end,"inactive_at_window_end":available_end<end,
+        "missing_hours":coverage.missing_hours,"missing_warmup_hours":(first-lookback)/HOUR_MS,"missing_suffix_hours":(end-available_end)/HOUR_MS,
+        "requested_coverage_complete":first==lookback&&coverage.complete,"coverage":coverage,
+        "historical_coverage":historical_coverage,"error":Value::Null}),
     )
 }
 async fn period(
@@ -613,27 +919,49 @@ async fn period(
     let mut missing = Vec::new();
     let first = date(start)?;
     let cutoff = date(end)?;
+    let monthly_keys = if archive.inventory && monthly {
+        Some(
+            archive
+                .available_keys(category, symbol, interval, true, start, end)
+                .await?,
+        )
+    } else {
+        None
+    };
+    let mut daily_keys = None;
     let mut month = NaiveDate::from_ymd_opt(first.year(), first.month(), 1).unwrap();
     while month < cutoff {
         let next = next_month(month);
         let mut got = false;
         if monthly && next <= cutoff {
-            if let Some(file) = archive
-                .download(&monthly_key(category, symbol, interval, month))
-                .await?
-            {
-                append_csv(&mut records, ml_archive::read_csv(&file.bytes)?)?;
-                sources.push(file.source);
-                got = true;
+            let key = monthly_key(category, symbol, interval, month);
+            if download_listed(archive, &key, monthly_keys.as_ref()) {
+                if let Some(file) = archive.download(&key).await? {
+                    append_csv(&mut records, ml_archive::read_csv(&file.bytes)?)?;
+                    sources.push(file.source);
+                    got = true;
+                }
             }
         }
         if !got {
+            if archive.inventory && daily_keys.is_none() {
+                daily_keys = Some(
+                    archive
+                        .available_keys(category, symbol, interval, false, start, end)
+                        .await?,
+                );
+            }
             let mut day = month.max(first);
             while day < next.min(cutoff) {
                 let key = daily_key(category, symbol, interval, day);
-                match archive.download(&key).await? {
+                let file = if download_listed(archive, &key, daily_keys.as_ref()) {
+                    archive.download(&key).await?
+                } else {
+                    None
+                };
+                match file {
                 Some(file)=>{append_csv(&mut records, ml_archive::read_csv(&file.bytes)?)?;sources.push(file.source);},
-                None=>missing.push(json!({"url":format!("{BASE}/{key}"),"utc_day":day.to_string(),"reason":"archive_not_published"}))
+                None=>missing.push(json!({"url":format!("{BASE}/{key}"),"utc_day":day.to_string(),"reason":if archive.cache_only {"not_in_verified_raw_cache"} else {"archive_not_published"},"publication_listing_checked":daily_keys.is_some()}))
             }
                 day += Days::days(1);
             }
@@ -641,6 +969,14 @@ async fn period(
         month = next;
     }
     Ok((records, sources, missing))
+}
+
+fn download_listed(archive: &Archive, key: &str, inventory: Option<&BTreeSet<String>>) -> bool {
+    inventory.is_none_or(|keys| keys.contains(key))
+        || archive_roots(archive).iter().any(|root| {
+            root.join("raw").join(key).exists()
+                && root.join("raw").join(format!("{key}.CHECKSUM")).exists()
+        })
 }
 const DATASETS: [&str; 10] = [
     "funding",
@@ -697,8 +1033,18 @@ async fn history(
         cats.iter()
             .any(|p| p == &format!("data/futures/um/{period}/{name}/"))
     };
-    if has(daily, "daily", "metrics") {
-        match period(archive, "metrics", symbol, None, start, end, false).await {
+    if has(daily, "daily", "metrics") || has(monthly, "monthly", "metrics") {
+        match period(
+            archive,
+            "metrics",
+            symbol,
+            None,
+            start,
+            end,
+            has(monthly, "monthly", "metrics"),
+        )
+        .await
+        {
             Ok((records, raw, missing)) => match metrics_for_symbol(&records, symbol, start, end) {
                 Ok(parsed) => {
                     datasets.extend(parsed);
@@ -719,9 +1065,24 @@ async fn history(
         let cutoff = date(end)?;
         let mut month = NaiveDate::from_ymd_opt(first.year(), first.month(), 1).unwrap();
         let mut records = Vec::new();
+        let funding_keys = if archive.inventory {
+            Some(
+                archive
+                    .available_keys("fundingRate", symbol, None, true, start, end)
+                    .await?,
+            )
+        } else {
+            None
+        };
         while month < cutoff {
             let next = next_month(month);
-            match archive.download(&monthly_key("fundingRate",symbol,None,month)).await {
+            let key = monthly_key("fundingRate", symbol, None, month);
+            let file = if download_listed(archive, &key, funding_keys.as_ref()) {
+                archive.download(&key).await
+            } else {
+                Ok(None)
+            };
+            match file {
             Ok(Some(file))=>match ml_archive::read_csv(&file.bytes) {Ok(rows)=>{append_csv(&mut records, rows)?;sources.push(file.source);},Err(e)=>errors.push(json!({"dataset":"funding","error":format!("{e:#}")}))},
             Ok(None) if has(daily,"daily","fundingRate")=>match period(archive,"fundingRate",symbol,None,start.max(day_ms(month)),end.min(day_ms(next)),false).await {
                 Ok((rows,raw,missing))=>{append_csv(&mut records, rows)?;sources.extend(raw);for item in missing {errors.push(json!({"dataset":"funding","detail":item}));}},Err(e)=>errors.push(json!({"dataset":"funding","error":format!("{e:#}")}))},
@@ -899,16 +1260,28 @@ fn status(manifest: &mut Value, finished: bool) -> Result<()> {
     let entries = manifest["symbols"].as_array().context("Missing entries")?;
     let ok = entries.iter().filter(|e| e["status"] == "complete").count();
     let pending = entries.iter().filter(|e| e["status"] == "pending").count();
-    let failed = entries.len() - ok - pending;
+    let inactive = entries
+        .iter()
+        .filter(|e| e["status"] == "historical_inactive")
+        .count();
+    let failed = entries.len() - ok - pending - inactive;
     let eligible = entries
         .iter()
         .filter(|e| e["training_eligible"] == true)
+        .count();
+    let historically_eligible = entries
+        .iter()
+        .filter(|e| e["historical_training_eligible"] == true)
         .count();
     manifest["successful_symbols"] = json!(ok);
     manifest["failed_symbols"] = json!(failed);
     manifest["pending_symbols"] = json!(pending);
     manifest["eligible_symbols"] = json!(eligible);
+    manifest["historically_eligible_symbols"] = json!(historically_eligible);
+    manifest["historical_inactive_symbols"] = json!(inactive);
     manifest["train_ready"] = json!(finished && pending == 0 && eligible > 0);
+    manifest["historical_train_ready"] =
+        json!(finished && pending == 0 && historically_eligible > 0);
     manifest["status"] = json!(if finished && pending == 0 {
         if failed == 0 {
             "candles_complete"
@@ -941,6 +1314,108 @@ fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn expanded_window_and_inventory_skip_old_years_and_include_boundary_month() {
+        let args = Args::try_parse_from([
+            "archive",
+            "--days",
+            "180",
+            "--end-date",
+            "2026-10-14",
+            "--include-inactive",
+            "--raw-cache-dir",
+            "old-dataset",
+        ])
+        .unwrap();
+        let end = day_ms(args.end_date.unwrap());
+        assert_eq!(
+            date(end - i64::from(args.days) * DAY_MS)
+                .unwrap()
+                .to_string(),
+            "2026-04-17"
+        );
+        let first = day_ms(NaiveDate::from_ymd_opt(2026, 4, 6).unwrap()) + 8 * HOUR_MS;
+        let (prefix, lower, upper) =
+            inventory_range("klines", "BTCUSDT", Some("1h"), false, first, end).unwrap();
+        assert_eq!(prefix, "data/futures/um/daily/klines/BTCUSDT/1h/");
+        assert!(lower.ends_with("2026-04-06.zip"));
+        assert!(upper.ends_with("2026-10-14.zip"));
+        let (_, lower, upper) =
+            inventory_range("fundingRate", "BTCUSDT", None, true, first, end).unwrap();
+        assert!(lower.ends_with("2026-04.zip"));
+        assert!(upper.ends_with("2026-11.zip"));
+        assert!(inventory_range("klines", "BTCUSDT", Some("1h"), false, end, first).is_err());
+    }
+
+    #[test]
+    fn historical_inactive_rows_are_kept_without_fabricating_suffix_or_bridging_gaps() {
+        let rows: Vec<_> = (0..300).map(|index| json!({"openTime":index*HOUR_MS,
+            "closeTime":(index+1)*HOUR_MS-1,"confirmed":true,"open":10.0,"high":11.0,"low":9.0,"close":10.5,
+            "volume":100.0,"quoteVolume":1000.0,"takerBuyVolume":40.0,"takerBuyQuoteVolume":400.0,"tradeCount":7})).collect();
+        let fields = candle_eligibility(&rows, 0, 256 * HOUR_MS, 360 * HOUR_MS).unwrap();
+        assert_eq!(fields["training_eligible"], false);
+        assert_eq!(fields["historical_training_eligible"], true);
+        assert_eq!(fields["available_end_exclusive_ms"], 300 * HOUR_MS);
+        assert_eq!(fields["missing_suffix_hours"], 60);
+        assert_eq!(fields["status"], "historical_inactive");
+        let mut gapped = rows.clone();
+        gapped.remove(280);
+        assert_eq!(
+            candle_eligibility(&gapped, 0, 256 * HOUR_MS, 360 * HOUR_MS).unwrap()["historical_training_eligible"],
+            false
+        );
+        assert_eq!(
+            candle_eligibility(&rows[..280], 0, 256 * HOUR_MS, 360 * HOUR_MS).unwrap()["historical_training_eligible"],
+            false
+        );
+        assert_eq!(
+            candle_eligibility(&rows, 0, 256 * HOUR_MS, 300 * HOUR_MS).unwrap()["training_eligible"],
+            true
+        );
+    }
+
+    #[test]
+    fn borrowed_raw_pair_is_read_only_and_still_requires_exact_checksum_and_name() {
+        let directory =
+            std::env::temp_dir().join(format!("nofx-raw-reuse-{}", uuid::Uuid::new_v4()));
+        let source = directory.join("source");
+        let target = directory.join("target");
+        let key = "data/futures/um/daily/klines/BTCUSDT/1h/BTCUSDT-1h-2026-10-01.zip";
+        let relative = format!("raw/{key}");
+        let path = source.join(&relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        let bytes = b"PKverified immutable fixture";
+        let sha = hex::encode(Sha256::digest(bytes));
+        let check = format!("{sha}  BTCUSDT-1h-2026-10-01.zip\n");
+        fs::write(&path, bytes).unwrap();
+        fs::write(source.join(format!("{relative}.CHECKSUM")), &check).unwrap();
+        let pair = raw_pair(&[target.clone(), source.clone()], &relative)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pair.2, source);
+        assert_eq!(verify_raw(&pair.0, &pair.1, key).unwrap(), sha);
+        assert!(!target.join(&relative).exists());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        let mut changed = pair.0;
+        changed[2] ^= 1;
+        assert!(verify_raw(&changed, &pair.1, key).is_err());
+        assert!(verify_raw(bytes, &check.replace("BTCUSDT", "ETHUSDT"), key).is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn daily_and_monthly_universe_union_includes_inactive_symbols_once() {
+        let dirs = vec![
+            "data/futures/um/daily/klines/BTCUSDT/".to_owned(),
+            "data/futures/um/monthly/klines/BTCUSDT/".to_owned(),
+            "data/futures/um/monthly/klines/OLDUSDT/".to_owned(),
+        ];
+        let entries = universe(&dirs, &[]).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["symbol"], "BTCUSDT");
+        assert_eq!(entries[1]["symbol"], "OLDUSDT");
+    }
     #[test]
     fn metrics_identity_must_match_the_requested_archive_symbol() {
         let header = "create_time,symbol,sum_open_interest,sum_open_interest_value,count_toptrader_long_short_ratio,sum_toptrader_long_short_ratio,count_long_short_ratio,sum_taker_long_short_vol_ratio";

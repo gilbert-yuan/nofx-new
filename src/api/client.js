@@ -26,7 +26,8 @@ export const configApi = {
 export const mlApi = {
   health: () => api(API.ml.health),
   models: () => api(API.ml.models),
-  signal: (symbol) => api(API.ml.signal, { method: 'POST', body: { symbol }, timeoutMs: 45000 })
+  signal: (symbol) => api(API.ml.signal, { method: 'POST', body: { symbol }, timeoutMs: 45000 }),
+  pipeline: (symbol, signal) => api(API.ml.pipeline, { method: 'POST', body: { symbol }, signal, timeoutMs: 45000 })
 };
 
 export const strategyApi = {

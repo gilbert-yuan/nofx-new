@@ -84,6 +84,18 @@ path = "rust/src/bin/nofx-ml-monthly-train.rs"
 name = "nofx-ml-monthly-predict"
 path = "rust/src/bin/nofx-ml-monthly-predict.rs"
 
+[[bin]]
+name = "nofx-ml-optimize"
+path = "rust/src/bin/nofx-ml-optimize.rs"
+
+[[bin]]
+name = "nofx-ml-direction-check"
+path = "rust/src/bin/nofx-ml-direction-check.rs"
+
+[[bin]]
+name = "nofx-ml-rolling-train"
+path = "rust/src/bin/nofx-ml-rolling-train.rs"
+
 [[test]]
 name = "backend-integration"
 path = "rust/tests/backend.rs"

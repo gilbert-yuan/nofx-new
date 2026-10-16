@@ -532,8 +532,7 @@ impl MonthlyPredictor {
         let target_end = origin_ms
             .checked_add(crate::ml_features::HORIZON as i64 * HOUR_MS)
             .context("Forecast target time overflow")?;
-        Ok(
-            json!({"schema_version":2,"symbol":symbol,"interval":"1h","origin_ms":origin_ms,"data_as_of_ms":origin_ms,"observed_at_ms":now_ms,
+        let mut output = json!({"schema_version":2,"symbol":symbol,"interval":"1h","origin_ms":origin_ms,"data_as_of_ms":origin_ms,"observed_at_ms":now_ms,
             "model_fingerprint":self.fingerprint,"model_variant":"chronos-bolt-tiny-lightgbm-global-calibrated","candidate_status":"research_only",
             "trained_before_ms":self.earliest_origin_ms,"evaluation_end_ms":self.manifest["split"]["test_end_ms"],
             "action":action,"probabilities":{"SELL":probabilities[0],"HOLD":probabilities[1],"BUY":probabilities[2]},
@@ -541,8 +540,11 @@ impl MonthlyPredictor {
             "historical_source_errors":history["errors"],"historical_available_feature_count":historical.iter().skip(10).filter(|mask| **mask > 0.0).count(),
             "data_mode":"provided_closed_candles","stale":origin_ms<now_ms.div_euclid(HOUR_MS)*HOUR_MS,"forecast_target_end_ms":target_end,"forecast_target_still_future":target_end>now_ms,"live_eligible":false,
             "decision_semantics":{"BUY":"OPEN_LONG candidate","SELL":"OPEN_SHORT candidate","HOLD":"no new order candidate"},
-            "advisory_only":true,"real_trading_enabled":false,"account_credentials_loaded":false,"trade_execution_permitted":false,"orders_enabled":false}),
-        )
+            "advisory_only":true,"real_trading_enabled":false,"account_credentials_loaded":false,"trade_execution_permitted":false,"orders_enabled":false});
+        let risk = serde_json::from_value(self.manifest["risk"].clone())
+            .context("Invalid model risk configuration")?;
+        crate::ml_pipeline::attach(&mut output, rows, &risk);
+        Ok(output)
     }
 }
 

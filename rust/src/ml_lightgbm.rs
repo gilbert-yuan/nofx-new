@@ -173,6 +173,75 @@ pub struct TrainingSummary {
     pub parameters: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidationCheckpoint {
+    pub iteration: usize,
+    pub log_loss: f64,
+    pub improved: bool,
+}
+
+/// Validation-only model selection metadata, separate from the stable training
+/// summary. Direct model-text loads do not reconstruct this training history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EarlyStoppingSummary {
+    pub validation_rows: usize,
+    pub patience_rounds: usize,
+    pub check_every: usize,
+    pub rounds_executed: usize,
+    pub trained_iterations: usize,
+    pub best_iteration: usize,
+    pub best_validation_log_loss: f64,
+    pub stopped_early: bool,
+    pub patience_exhausted: bool,
+    pub stop_reason: String,
+    pub validation_checkpoints: Vec<ValidationCheckpoint>,
+}
+
+#[derive(Clone, Copy)]
+struct ValidationInputs<'a> {
+    features: &'a [Vec<f64>],
+    labels: &'a [usize],
+    patience_rounds: usize,
+    check_every: usize,
+}
+
+struct EarlyStoppingState {
+    best_iteration: usize,
+    best_loss: f64,
+    checkpoints: Vec<ValidationCheckpoint>,
+}
+impl EarlyStoppingState {
+    fn new() -> Self {
+        Self {
+            best_iteration: 0,
+            best_loss: f64::INFINITY,
+            checkpoints: Vec::new(),
+        }
+    }
+
+    fn record(&mut self, iteration: usize, loss: f64) -> Result<bool> {
+        ensure!(
+            loss.is_finite() && loss >= 0.,
+            "Invalid validation log loss"
+        );
+        let improved = loss < self.best_loss;
+        if improved {
+            self.best_iteration = iteration;
+            self.best_loss = loss;
+        }
+        self.checkpoints.push(ValidationCheckpoint {
+            iteration,
+            log_loss: loss,
+            improved,
+        });
+        Ok(improved)
+    }
+
+    fn patience_exhausted(&self, iteration: usize, patience: usize) -> bool {
+        !self.checkpoints.is_empty() && iteration.saturating_sub(self.best_iteration) >= patience
+    }
+}
+
 /// One owned multiclass CPU model. Keep external access behind a Mutex when
 /// serving requests; prediction requires mutable access and is never parallel
 /// on the same handle. Distinct independently owned models may train in parallel.
@@ -182,6 +251,7 @@ pub struct LightGbmModel {
     // Training datasets must outlive their booster, including save/predict.
     _dataset: Option<Dataset>,
     summary: TrainingSummary,
+    early_stopping: Option<EarlyStoppingSummary>,
     _not_sync: PhantomData<Cell<()>>,
 }
 
@@ -225,8 +295,53 @@ impl LightGbmModel {
         parameters: &str,
         iterations: usize,
     ) -> Result<Self> {
+        Self::train_impl(runtime, features, labels, parameters, iterations, None)
+    }
+
+    /// Select boosting iterations using only the caller-supplied independent
+    /// validation slice. The caller must purge all label horizons beforehand;
+    /// calibration, confirmation and holdout rows must never be passed here.
+    /// Patience counts native boosting rounds, not validation checkpoints.
+    #[allow(clippy::too_many_arguments)]
+    pub fn train_config_with_validation(
+        runtime: Arc<LightGbmRuntime>,
+        features: &[Vec<f64>],
+        labels: &[usize],
+        parameters: &str,
+        max_iterations: usize,
+        validation_features: &[Vec<f64>],
+        validation_labels: &[usize],
+        patience_rounds: usize,
+        check_every: usize,
+    ) -> Result<Self> {
+        Self::train_impl(
+            runtime,
+            features,
+            labels,
+            parameters,
+            max_iterations,
+            Some(ValidationInputs {
+                features: validation_features,
+                labels: validation_labels,
+                patience_rounds,
+                check_every,
+            }),
+        )
+    }
+
+    fn train_impl(
+        runtime: Arc<LightGbmRuntime>,
+        features: &[Vec<f64>],
+        labels: &[usize],
+        parameters: &str,
+        iterations: usize,
+        validation: Option<ValidationInputs<'_>>,
+    ) -> Result<Self> {
         validate_training_config(parameters, iterations)?;
         let (rows, cols, values, class_counts) = prepare_training(features, labels)?;
+        if let Some(validation) = validation {
+            validate_validation_inputs(validation, cols)?;
+        }
         let native_parameters = CString::new(parameters)?;
         let started = Instant::now();
         let mut dataset_handle = ptr::null_mut();
@@ -291,16 +406,41 @@ impl LightGbmModel {
                 training_ms: 0.0,
                 parameters: parameters.to_owned(),
             },
+            early_stopping: None,
             _not_sync: PhantomData,
         };
-        for _ in 0..iterations {
+        let mut stopping = validation.map(|_| EarlyStoppingState::new());
+        let mut best_text = None;
+        let mut rounds_executed = 0;
+        let mut stop_reason = "maximum_iterations";
+        for round in 1..=iterations {
             let mut finished = 0;
             model.runtime.check(
                 unsafe { (model.runtime.booster_update)(model.handle, &mut finished) },
                 "update boosting iteration",
             )?;
-            // Native LightGBM may stop before 100 when no further split is possible.
+            rounds_executed = round;
+            if let Some(validation) = validation
+                && (round % validation.check_every == 0 || round == iterations || finished != 0)
+            {
+                let (_, native_iteration) = model.native_dimensions()?;
+                let loss =
+                    multiclass_log_loss(&model.predict(validation.features)?, validation.labels)?;
+                let state = stopping.as_mut().expect("Validation stopping state exists");
+                if state.record(native_iteration, loss)? {
+                    best_text = Some(model.model_text()?);
+                }
+                if finished == 0
+                    && round < iterations
+                    && state.patience_exhausted(native_iteration, validation.patience_rounds)
+                {
+                    stop_reason = "validation_patience";
+                    break;
+                }
+            }
+            // Native LightGBM may stop when no further split is possible.
             if finished != 0 {
+                stop_reason = "native_finished";
                 break;
             }
         }
@@ -311,6 +451,38 @@ impl LightGbmModel {
         );
         model.summary.iterations = iterations;
         model.summary.training_ms = started.elapsed().as_secs_f64() * 1000.0;
+        if let (Some(validation), Some(state)) = (validation, stopping) {
+            let text = best_text.context("No validation checkpoint produced a best model")?;
+            let mut summary = model.summary.clone();
+            let runtime = model.runtime.clone();
+            // Release the training booster/dataset before loading the snapshot.
+            // The returned model owns only the best trees, not the later rounds.
+            drop(model);
+            let mut restored = Self::load(runtime, &text)?;
+            ensure!(
+                restored.summary.feature_count == cols
+                    && restored.summary.iterations == state.best_iteration,
+                "Best validation snapshot dimensions changed during restoration"
+            );
+            summary.iterations = state.best_iteration;
+            summary.training_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let requested_iterations = summary.requested_iterations;
+            restored.summary = summary;
+            restored.early_stopping = Some(EarlyStoppingSummary {
+                validation_rows: validation.features.len(),
+                patience_rounds: validation.patience_rounds,
+                check_every: validation.check_every,
+                rounds_executed,
+                trained_iterations: iterations,
+                best_iteration: state.best_iteration,
+                best_validation_log_loss: state.best_loss,
+                stopped_early: rounds_executed < requested_iterations,
+                patience_exhausted: stop_reason == "validation_patience",
+                stop_reason: stop_reason.to_owned(),
+                validation_checkpoints: state.checkpoints,
+            });
+            return Ok(restored);
+        }
         Ok(model)
     }
 
@@ -347,6 +519,7 @@ impl LightGbmModel {
                 training_ms: 0.0,
                 parameters: String::new(),
             },
+            early_stopping: None,
             _not_sync: PhantomData,
         };
         let (features, actual_iterations) = model.native_dimensions()?;
@@ -364,6 +537,10 @@ impl LightGbmModel {
 
     pub fn summary(&self) -> &TrainingSummary {
         &self.summary
+    }
+
+    pub fn early_stopping_summary(&self) -> Option<&EarlyStoppingSummary> {
+        self.early_stopping.as_ref()
     }
 
     fn native_dimensions(&self) -> Result<(usize, usize)> {
@@ -481,6 +658,52 @@ impl LightGbmModel {
         std::fs::write(path, self.model_text()?)
             .with_context(|| format!("Write LightGBM model {}", path.display()))
     }
+}
+
+fn validate_validation_inputs(
+    validation: ValidationInputs<'_>,
+    expected_cols: usize,
+) -> Result<()> {
+    ensure!(
+        (1..=1000).contains(&validation.patience_rounds)
+            && (1..=1000).contains(&validation.check_every)
+            && validation.check_every <= validation.patience_rounds,
+        "Validation check interval and patience must be in 1..=1000 with check interval <= patience"
+    );
+    ensure!(
+        !validation.features.is_empty() && validation.features.len() == validation.labels.len(),
+        "Validation feature/label rows must be nonempty and equal"
+    );
+    let (_, cols, _) = flatten_features(validation.features)?;
+    ensure!(
+        cols == expected_cols,
+        "Validation feature count differs from training"
+    );
+    ensure!(
+        validation.labels.iter().all(|label| *label < NUM_CLASSES),
+        "Validation labels must be SELL=0,HOLD=1,BUY=2"
+    );
+    Ok(())
+}
+
+fn multiclass_log_loss(probabilities: &[[f64; NUM_CLASSES]], labels: &[usize]) -> Result<f64> {
+    ensure!(
+        !labels.is_empty() && probabilities.len() == labels.len(),
+        "Validation prediction/label count mismatch"
+    );
+    let mut loss = 0.;
+    for (probabilities, label) in probabilities.iter().zip(labels) {
+        ensure!(*label < NUM_CLASSES, "Invalid validation class");
+        ensure!(
+            probabilities
+                .iter()
+                .all(|value| value.is_finite() && (0. ..=1.).contains(value))
+                && (probabilities.iter().sum::<f64>() - 1.).abs() <= 1e-8,
+            "Invalid validation probabilities"
+        );
+        loss -= probabilities[*label].max(1e-15).ln();
+    }
+    Ok(loss / labels.len() as f64)
 }
 
 fn validate_training_config(parameters: &str, iterations: usize) -> Result<()> {
@@ -653,6 +876,107 @@ mod tests {
     }
 
     #[test]
+    fn validation_refuses_invalid_shapes_labels_and_early_stopping_parameters() {
+        let features = vec![vec![1., 2.], vec![3., 4.]];
+        let labels = vec![SELL, BUY];
+        let valid = ValidationInputs {
+            features: &features,
+            labels: &labels,
+            patience_rounds: 20,
+            check_every: 5,
+        };
+        validate_validation_inputs(valid, 2).unwrap();
+        assert!(validate_validation_inputs(valid, 3).is_err());
+        for (patience_rounds, check_every) in [(0, 5), (20, 0), (4, 5), (1001, 5), (20, 1001)] {
+            assert!(
+                validate_validation_inputs(
+                    ValidationInputs {
+                        patience_rounds,
+                        check_every,
+                        ..valid
+                    },
+                    2
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            validate_validation_inputs(
+                ValidationInputs {
+                    features: &[],
+                    labels: &[],
+                    ..valid
+                },
+                2
+            )
+            .is_err()
+        );
+        assert!(
+            validate_validation_inputs(
+                ValidationInputs {
+                    labels: &labels[..1],
+                    ..valid
+                },
+                2
+            )
+            .is_err()
+        );
+        assert!(
+            validate_validation_inputs(
+                ValidationInputs {
+                    labels: &[SELL, NUM_CLASSES],
+                    ..valid
+                },
+                2
+            )
+            .is_err()
+        );
+        let ragged = vec![vec![1., 2.], vec![3.]];
+        assert!(
+            validate_validation_inputs(
+                ValidationInputs {
+                    features: &ragged,
+                    ..valid
+                },
+                2
+            )
+            .is_err()
+        );
+        let nonfinite = vec![vec![1., 2.], vec![3., f64::INFINITY]];
+        assert!(
+            validate_validation_inputs(
+                ValidationInputs {
+                    features: &nonfinite,
+                    ..valid
+                },
+                2
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn validation_patience_counts_rounds_and_equal_loss_does_not_reset_it() {
+        let mut state = EarlyStoppingState::new();
+        assert!(state.record(5, 0.8).unwrap());
+        assert!(state.record(10, 0.7).unwrap());
+        assert!(!state.record(15, 0.7).unwrap());
+        assert!(!state.patience_exhausted(29, 20));
+        assert!(state.patience_exhausted(30, 20));
+        assert_eq!(state.best_iteration, 10);
+        assert!(state.record(30, 0.6).unwrap());
+        assert!(!state.patience_exhausted(30, 20));
+        assert_eq!(state.best_iteration, 30);
+        assert!(state.record(35, f64::NAN).is_err());
+        assert!(state.record(35, -0.1).is_err());
+        let loss = multiclass_log_loss(&[[0.8, 0.1, 0.1], [0.1, 0.1, 0.8]], &[SELL, BUY]).unwrap();
+        assert!((loss + 0.8_f64.ln()).abs() < 1e-12);
+        assert!(multiclass_log_loss(&[[0.1, 0.2, 0.3]], &[HOLD]).is_err());
+        assert!(multiclass_log_loss(&[], &[]).is_err());
+        assert!(multiclass_log_loss(&[[0.8, 0.1, 0.1]], &[NUM_CLASSES]).is_err());
+    }
+
+    #[test]
     fn probability_decoder_rejects_invalid_outputs_and_preserves_class_order() {
         assert_eq!(
             decode_probabilities(&[0.1, 0.2, 0.7]).unwrap(),
@@ -713,5 +1037,100 @@ mod tests {
             .join()
             .unwrap();
         assert_eq!(moved, predicted);
+    }
+
+    #[test]
+    #[ignore = "requires installed CPU LightGBM native runtime"]
+    fn native_validation_stops_overfit_and_restores_best_snapshot_with_training_metadata() {
+        let path = std::env::var_os("NOFX_LIGHTGBM_LIBRARY")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| DEFAULT_RUNTIME_PATH.into());
+        let runtime = LightGbmRuntime::load(&path).unwrap();
+        let mut features = Vec::new();
+        let mut labels = Vec::new();
+        let mut validation_features = Vec::new();
+        let mut validation_labels = Vec::new();
+        for class in 0..NUM_CLASSES {
+            for index in 0..120 {
+                features.push(vec![
+                    class as f64 * 10. + index as f64 / 120.,
+                    index as f64 / 120.,
+                ]);
+                validation_features.push(vec![
+                    class as f64 * 10. + (index as f64 + 0.5) / 120.,
+                    (index as f64 + 0.5) / 120.,
+                ]);
+                labels.push(class);
+                // A deterministic distribution shift exposes later overfitting:
+                // confidence in the training class worsens validation log loss.
+                validation_labels.push((class + 1) % NUM_CLASSES);
+            }
+        }
+        let parameters = TRAIN_PARAMETERS.replace("learning_rate=0.05", "learning_rate=0.2");
+        let mut model = LightGbmModel::train_config_with_validation(
+            runtime.clone(),
+            &features,
+            &labels,
+            &parameters,
+            200,
+            &validation_features,
+            &validation_labels,
+            20,
+            5,
+        )
+        .unwrap();
+        let stopping = model.early_stopping_summary().unwrap().clone();
+        assert!(
+            stopping.patience_exhausted,
+            "Unexpected stopping history: {stopping:?}"
+        );
+        assert!(stopping.stopped_early && stopping.rounds_executed < 200);
+        assert_eq!(stopping.best_iteration, 5);
+        assert_eq!(stopping.trained_iterations, 25);
+        assert_eq!(model.summary().iterations, stopping.best_iteration);
+        assert_eq!(model.summary().requested_iterations, 200);
+        assert_eq!(model.summary().train_rows, 360);
+        assert_eq!(model.summary().class_counts, [120; NUM_CLASSES]);
+        assert_eq!(model.summary().parameters, parameters);
+        assert!(
+            stopping
+                .validation_checkpoints
+                .iter()
+                .skip(1)
+                .all(|checkpoint| checkpoint.log_loss > stopping.best_validation_log_loss)
+        );
+        let probabilities = model.predict(&features).unwrap();
+        assert!(
+            (multiclass_log_loss(
+                &model.predict(&validation_features).unwrap(),
+                &validation_labels,
+            )
+            .unwrap()
+                - stopping.best_validation_log_loss)
+                .abs()
+                < 1e-12
+        );
+        let text = model.model_text().unwrap();
+        let mut loaded = LightGbmModel::load(runtime.clone(), &text).unwrap();
+        assert_eq!(loaded.summary().iterations, stopping.best_iteration);
+        assert_eq!(loaded.predict(&features).unwrap(), probabilities);
+        assert!(loaded.early_stopping_summary().is_none());
+        let mut exact_best = LightGbmModel::train_config(
+            runtime,
+            &features,
+            &labels,
+            &parameters,
+            stopping.best_iteration,
+        )
+        .unwrap();
+        assert_eq!(exact_best.predict(&features).unwrap(), probabilities);
+        assert!(exact_best.early_stopping_summary().is_none());
+        let encoded = serde_json::to_vec(&stopping).unwrap();
+        let decoded: EarlyStoppingSummary = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.best_iteration, stopping.best_iteration);
+        assert_eq!(
+            decoded.validation_checkpoints.len(),
+            stopping.validation_checkpoints.len()
+        );
     }
 }

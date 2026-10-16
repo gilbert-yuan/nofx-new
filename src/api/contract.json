@@ -3,7 +3,8 @@
   "ml": {
     "health": "/api/ml/health",
     "models": "/api/ml/models",
-    "signal": "/api/ml/signal"
+    "signal": "/api/ml/signal",
+    "pipeline": "/api/ml/pipeline"
   },
   "database": {
     "pool": "/api/database/pool"

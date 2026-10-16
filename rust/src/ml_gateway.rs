@@ -38,7 +38,7 @@ impl Gateway {
         let upstream_path = match (method, path) {
             ("GET", "/api/ml/health") => "/health",
             ("GET", "/api/ml/models") => "/models",
-            ("POST", "/api/ml/signal") => {
+            ("POST", "/api/ml/signal" | "/api/ml/pipeline") => {
                 if input
                     .as_object()
                     .is_none_or(|object| object.len() != 1 || !object.contains_key("symbol"))
@@ -51,7 +51,11 @@ impl Gateway {
                         json!({"error":"模型信号仅接受有效 symbol；不接受方向、订单、账户或外部特征"}),
                     );
                 }
-                "/signal"
+                if path.ends_with("/pipeline") {
+                    "/pipeline"
+                } else {
+                    "/signal"
+                }
             }
             _ => return (StatusCode::NOT_FOUND, json!({"error":"模型接口不存在"})),
         };
@@ -87,6 +91,18 @@ impl Gateway {
                         && value["real_trading_enabled"] == false,
                     "Upstream is not the read-only monthly model service"
                 );
+                if upstream_path == "/pipeline" {
+                    anyhow::ensure!(
+                        value["pipeline"]["id"] == "chronos-lightgbm-risk-v1"
+                            && value["symbol"] == input["symbol"]
+                            && value["pipeline"]["execution_action"] == "HOLD"
+                            && value["pipeline"]["trade_execution_permitted"] == false
+                            && value["risk_management"]["entry_permitted"] == false
+                            && value["risk_management"]["orders_enabled"] == false
+                            && value["risk_management"]["real_trading_enabled"] == false,
+                        "Upstream lacks the research risk-management pipeline"
+                    );
+                }
             }
             Ok::<_, anyhow::Error>((status, value))
         }
@@ -123,6 +139,14 @@ mod tests {
             )
             .route("/models", get(|| async { Json(json!({"orders_enabled":true})) }))
             .route(
+                "/pipeline",
+                post(|Json(value): Json<Value>| async move {
+                    Json(json!({"symbol":value["symbol"],"orders_enabled":false,"advisory_only":true,"real_trading_enabled":false,
+                        "pipeline":{"id":"chronos-lightgbm-risk-v1","execution_action":"HOLD","trade_execution_permitted":false},
+                        "risk_management":{"entry_permitted":value["symbol"]=="ETHUSDT","orders_enabled":false,"real_trading_enabled":false}}))
+                }),
+            )
+            .route(
                 "/signal",
                 post(|Json(value): Json<Value>| async move {
                     Json(json!({"symbol":value["symbol"],"action":"HOLD","orders_enabled":false,"advisory_only":true,"real_trading_enabled":false}))
@@ -135,6 +159,18 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(response["symbol"], "BTCUSDT");
         assert_eq!(response["orders_enabled"], false);
+        let (status, response) = gateway
+            .request("POST", "/api/ml/pipeline", &json!({"symbol":"BTCUSDT"}))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response["risk_management"]["entry_permitted"], false);
+        assert_eq!(
+            gateway
+                .request("POST", "/api/ml/pipeline", &json!({"symbol":"ETHUSDT"}))
+                .await
+                .0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
         assert_eq!(
             gateway.request("GET", "/api/ml/models", &json!({})).await.0,
             StatusCode::SERVICE_UNAVAILABLE
@@ -146,6 +182,10 @@ mod tests {
         ] {
             assert_eq!(
                 gateway.request("POST", "/api/ml/signal", &input).await.0,
+                StatusCode::BAD_REQUEST
+            );
+            assert_eq!(
+                gateway.request("POST", "/api/ml/pipeline", &input).await.0,
                 StatusCode::BAD_REQUEST
             );
         }

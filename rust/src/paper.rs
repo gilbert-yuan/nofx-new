@@ -504,6 +504,16 @@ pub fn submit_paper_order(
     input: &Value,
     now: i64,
 ) -> Result<Value> {
+    submit_paper_order_inner(state, record, input, now, None)
+}
+
+pub(crate) fn submit_paper_order_inner(
+    state: &mut Value,
+    record: &Value,
+    input: &Value,
+    now: i64,
+    config: Option<&Value>,
+) -> Result<Value> {
     let symbol = input["symbol"].as_str().context("下单须指定币种")?;
     crate::exchange::valid_symbol(symbol)?;
     let requested = input["strategyId"]
@@ -540,6 +550,15 @@ pub fn submit_paper_order(
     });
     if let Some(o) = existing {
         return Ok(o.clone());
+    }
+    if signal["strategyId"] == crate::ml_execution::STRATEGY_ID {
+        crate::ml_execution::authorize_new(
+            state,
+            config.context("模型订单须通过已配置的 Demo 执行入口")?,
+            signal,
+            input,
+            now,
+        )?;
     }
     if signal["eligible"] != true
         || !signal["plan"].is_object()
@@ -869,8 +888,11 @@ pub async fn status(db: &Db) -> Result<Value> {
 pub async fn submit(db: &Db, store: &Store, input: &Value) -> Result<Value> {
     let record_id = input["recordId"].as_str().context("须指定分析记录")?;
     let record = db.record(record_id).await?.context("分析记录不存在")?;
+    let config = store.read("config").await?;
     let order = db
-        .mutate_account_light(|state| submit_paper_order(state, &record, input, now_ms()))
+        .mutate_account_light(|state| {
+            submit_paper_order_inner(state, &record, input, now_ms(), Some(&config))
+        })
         .await?;
     let id = order["id"].as_str().context("Order id")?.to_owned();
     if let Err(error) = sync_entries(db, store, Some(&id)).await {
@@ -889,23 +911,38 @@ fn should_refresh_order(order: &Value, manual_close_id: Option<&str>) -> bool {
 }
 
 pub async fn refresh(db: &Db, store: &Store) -> Result<Value> {
-    refresh_internal(db, store, None).await
+    refresh_internal(db, store, None, None).await
 }
 
-async fn refresh_internal(db: &Db, store: &Store, manual_close_id: Option<&str>) -> Result<Value> {
+pub async fn refresh_strategy(db: &Db, store: &Store, strategy: &str) -> Result<Value> {
+    refresh_internal(db, store, None, Some(strategy)).await
+}
+
+async fn refresh_internal(
+    db: &Db,
+    store: &Store,
+    manual_close_id: Option<&str>,
+    strategy: Option<&str>,
+) -> Result<Value> {
     let _guard = lock_execution(db, "system", "paper-refresh", "ALL").await?;
     let state = db.account(true, None).await?;
     let client = Exchange::public()?;
     let now = now_ms();
     let mut processed = 0;
+    let mut selected_ids = vec![];
     for original in arr(&state["orders"])
         .into_iter()
         .filter(|o| should_refresh_order(o, manual_close_id))
+        .filter(|o| {
+            strategy
+                .is_none_or(|id| o["strategyId"] == id || o["analysisContext"]["strategyId"] == id)
+        })
     {
         let id = original["id"]
             .as_str()
             .context("Order missing id")?
             .to_owned();
+        selected_ids.push(id.clone());
         let symbol = original["symbol"]
             .as_str()
             .context("Order missing symbol")?;
@@ -962,7 +999,13 @@ async fn refresh_internal(db: &Db, store: &Store, manual_close_id: Option<&str>)
     })
     .await?;
     if manual_close_id.is_none() {
-        if let Err(error) = sync_entries(db, store, None).await {
+        if strategy.is_some() {
+            for id in selected_ids {
+                if let Err(error) = sync_entries(db, store, Some(&id)).await {
+                    tracing::warn!(%error,"Model exchange protection awaiting reconciliation");
+                }
+            }
+        } else if let Err(error) = sync_entries(db, store, None).await {
             tracing::warn!(%error,"Exchange entries/protection awaiting reconciliation");
         }
     }
@@ -1354,6 +1397,9 @@ async fn sync_entry(
     env: &str,
     order: &Value,
 ) -> Result<()> {
+    if crate::ml_execution::is_model_order(order) {
+        anyhow::ensure!(env == "demo", "模型订单禁止路由到实盘");
+    }
     let id = order["id"].as_str().context("Order id")?;
     let symbol = order["symbol"].as_str().context("Order symbol")?;
     let dir = order["direction"].as_str().context("Order direction")?;
@@ -1433,6 +1479,14 @@ async fn sync_entry(
         bail!("开仓暂停、持仓未同步或资金池超限，暂不执行。");
     }
     // Querying before the first send recovers a crash after the server accepted a prior request.
+    if crate::ml_execution::is_model_order(order) {
+        crate::ml_execution::recheck_pending(
+            &db.account(true, None).await?,
+            config,
+            order,
+            now_ms(),
+        )?;
+    }
     match client
         .signed(
             "GET",
@@ -1552,6 +1606,9 @@ pub async fn sync_entries(db: &Db, store: &Store, only: Option<&str>) -> Result<
         }
         let client = Exchange::new(&config, env)?;
         for order in arr(&state["orders"]) {
+            if crate::ml_execution::is_model_order(&order) && env != "demo" {
+                continue;
+            }
             if only.is_none() && !needs_exchange_sync(&order, env) {
                 continue;
             }
@@ -2223,7 +2280,7 @@ async fn close_internal(
         })
         .await?;
         if row["status"] == "open" {
-            refresh_internal(db, store, row["id"].as_str()).await?;
+            refresh_internal(db, store, row["id"].as_str(), None).await?;
         }
         let order = db
             .mutate_account_light(|state| {

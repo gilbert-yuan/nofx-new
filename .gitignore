@@ -26,3 +26,5 @@ output/
 !scripts/export-chronos-onnx.py
 !scripts/ml-fastapi.py
 !scripts/train-monthly-model.ps1
+!scripts/optimize-ml-model.ps1
+!scripts/improve-ml-model.ps1

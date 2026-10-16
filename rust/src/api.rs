@@ -257,8 +257,27 @@ async fn dispatch(
     input: &Value,
 ) -> Result<(StatusCode, Value)> {
     match (method, path) {
-        ("GET", "/api/ml/health") | ("GET", "/api/ml/models") | ("POST", "/api/ml/signal") => {
-            return Ok(app.monthly_ml.request(method, path, input).await);
+        ("GET", "/api/ml/health")
+        | ("GET", "/api/ml/models")
+        | ("POST", "/api/ml/signal" | "/api/ml/pipeline") => {
+            let (status, mut output) = app.monthly_ml.request(method, path, input).await;
+            if status.is_success() {
+                let config = app.store.read("config").await?;
+                if crate::ml_execution::demo_enabled(&config) {
+                    let account = app.db.account(true, None).await?;
+                    crate::ml_execution::describe(
+                        &mut output,
+                        &account,
+                        &config,
+                        now_ms(),
+                        app.automation.active(),
+                    );
+                } else {
+                    output["operating_mode"] = json!("research");
+                    output["research_mode"] = json!(true);
+                }
+            }
+            return Ok((status, output));
         }
         ("GET", "/api/health") => {
             return ok(

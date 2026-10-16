@@ -38,7 +38,7 @@ struct Args {
     lightgbm_runtime: PathBuf,
     #[arg(long, default_value_t = 4)]
     threads: usize,
-    /// Serve /health, /models and /signal on loopback only.
+    /// Serve /health, /models, /signal and /pipeline on loopback only.
     #[arg(long)]
     serve: bool,
     #[arg(long, default_value_t = 18084)]
@@ -250,6 +250,7 @@ async fn main() -> Result<()> {
             .route("/health", get(health))
             .route("/models", get(models))
             .route("/signal", post(signal))
+            .route("/pipeline", post(signal))
             .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
             .with_state(app);
         let listener =

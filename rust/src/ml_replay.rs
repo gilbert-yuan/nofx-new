@@ -209,8 +209,8 @@ pub fn position_size(signal: &Value, equity: f64, config: &ReplayConfig) -> Resu
     )
 }
 
-#[derive(Debug)]
-struct RiskLedger {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RiskLedger {
     peak: f64,
     max_drawdown: f64,
     day: Option<i64>,
@@ -222,7 +222,7 @@ struct RiskLedger {
 }
 
 impl RiskLedger {
-    fn new(equity: f64) -> Self {
+    pub(crate) fn new(equity: f64) -> Self {
         Self {
             peak: equity,
             max_drawdown: 0.,
@@ -235,7 +235,7 @@ impl RiskLedger {
         }
     }
 
-    fn observe(&mut self, now: i64, equity: f64, config: &ReplayConfig) -> (f64, f64) {
+    pub(crate) fn observe(&mut self, now: i64, equity: f64, config: &ReplayConfig) -> (f64, f64) {
         let day = now.div_euclid(DAY);
         if self.day != Some(day) {
             // The close at midnight establishes that day's opening equity.
@@ -256,6 +256,16 @@ impl RiskLedger {
             self.halt_at = Some(now);
         }
         (drawdown, daily_loss)
+    }
+
+    pub(crate) fn entry_block(&self) -> Option<&'static str> {
+        if self.drawdown_halted {
+            Some("达到模型账户最大回撤限制")
+        } else if self.daily_paused {
+            Some("达到模型账户当日亏损限制，等待下一 UTC 日")
+        } else {
+            None
+        }
     }
 }
 

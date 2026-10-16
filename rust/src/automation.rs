@@ -111,7 +111,11 @@ impl Automation {
         self.active.load(Ordering::SeqCst)
     }
     pub async fn start(self: &Arc<Self>) -> Result<()> {
-        let data_only = self.store.read("config").await?["marketSync"]["dataOnly"] == true;
+        let config = self.store.read("config").await?;
+        if crate::ml_execution::demo_enabled(&config) {
+            crate::ml_execution::validate_config(&config)?;
+        }
+        let data_only = config["marketSync"]["dataOnly"] == true;
         if self.active.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
@@ -459,6 +463,9 @@ impl Automation {
     }
     async fn scan(&self, token: u64) -> Result<Value> {
         let config = self.store.read("config").await?;
+        if crate::ml_execution::demo_enabled(&config) {
+            return crate::ml_demo::scan(self, token, &config).await;
+        }
         let data_only = config["marketSync"]["dataOnly"] == true;
         let registry = strategies::list(&config, &self.store.read("strategies").await?);
         let enabled: Vec<Value> = registry["strategies"]
@@ -1197,7 +1204,13 @@ impl Automation {
         )
     }
     async fn review(&self) -> Result<Value> {
-        crate::paper::refresh(&self.db, &self.store).await?;
+        let ml_only = crate::ml_execution::demo_enabled(&self.store.read("config").await?);
+        if ml_only {
+            crate::paper::refresh_strategy(&self.db, &self.store, crate::ml_execution::STRATEGY_ID)
+                .await?;
+        } else {
+            crate::paper::refresh(&self.db, &self.store).await?;
+        }
         let snapshot = self.db.account(true, None).await?;
         let orders = snapshot["orders"].as_array().unwrap();
         let mut reviewed = 0;
@@ -1205,6 +1218,7 @@ impl Automation {
         for order in orders
             .iter()
             .filter(|o| o["status"] == "pending" || o["status"] == "open")
+            .filter(|o| !ml_only || crate::ml_execution::is_model_order(o))
         {
             let id = order["id"].as_str().unwrap();
             let symbol = order["symbol"].as_str().unwrap_or("");
@@ -1256,6 +1270,16 @@ impl Automation {
                 continue;
             }
             let now = now_ms();
+            if strategy_id == crate::ml_execution::STRATEGY_ID && order["status"] == "pending" {
+                let (status, prediction) = crate::ml_gateway::Gateway::from_env()?
+                    .request("POST", "/api/ml/pipeline", &json!({"symbol":symbol}))
+                    .await;
+                if !status.is_success() {
+                    errors.push(format!("{symbol}: {}", prediction["error"]));
+                    continue;
+                }
+                context["mlPrediction"] = prediction;
+            }
             if order["status"] == "pending"
                 && crate::market_filters::needs_remote(&context["params"])
             {
@@ -1310,6 +1334,11 @@ impl Automation {
         s["stats"]["totalReviews"] =
             json!(number(&s["stats"]["totalReviews"], 0.) + reviewed as f64);
         Ok(json!({"reviewed":reviewed,"failed":errors.len(),"errors":errors}))
+    }
+}
+impl Automation {
+    pub(crate) fn token_matches(&self, token: u64) -> bool {
+        self.generation.load(Ordering::SeqCst) == token
     }
 }
 fn trading_mode_block(config: &Value) -> Option<&'static str> {

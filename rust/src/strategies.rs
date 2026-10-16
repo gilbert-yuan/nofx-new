@@ -202,6 +202,18 @@ pub fn analyze(id: &str, market: &Value, context: &Value) -> Result<Value> {
         "structure-short-v1" => structure::analyze(false, market, &ctx),
         "enhanced-trend-v1" => enhanced::analyze(market, &ctx),
         "yao-coin-ambush-v1" => yao::analyze(market, &ctx),
+        crate::ml_execution::STRATEGY_ID => {
+            if ctx["mlPrediction"].is_object() {
+                crate::ml_execution::signal(&ctx["mlPrediction"], market, crate::now_ms())?
+            } else {
+                wait(
+                    market,
+                    "等待 Chronos/LightGBM 实时模型服务",
+                    &Value::Null,
+                    json!({}),
+                )
+            }
+        }
         _ => bail!("未知策略：{id}"),
     };
     if ctx["deferMarketFilters"] != true {
@@ -734,7 +746,10 @@ mod tests {
     }
     #[test]
     fn registration_preserves_schemas_and_validation() {
-        assert_eq!(definitions().len(), 7);
+        assert_eq!(definitions().len(), 8);
+        let model = definition(crate::ml_execution::STRATEGY_ID).unwrap();
+        assert_eq!(model["engine"], "monthly-ml");
+        assert_eq!(model["planInterval"], "1h");
         let p = resolve_params(
             "h4-mean-reversion-v1",
             &json!({"longOnly":"yes","maxLeverage":9000,"atrPeriod":14}),

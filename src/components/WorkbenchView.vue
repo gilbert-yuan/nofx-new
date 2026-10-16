@@ -1,6 +1,7 @@
 <script setup>
 import { computed } from 'vue';
 import KlineChart from './KlineChart.vue';
+import MlPipeline from './MlPipeline.vue';
 const props = defineProps({ chartDate: String, activeSymbol: String, interval: String, rows: Array, chart: Object, marketLoading: Boolean, klineSyncLoading: Boolean, scope: Object });
 defineEmits(['update:chartDate', 'refresh', 'fetch-latest']);
 const last = computed(() => props.rows.at(-1));
@@ -23,5 +24,6 @@ const price = value => Number.isFinite(Number(value)) ? Number(value).toLocaleSt
     <div class="market-column">
       <KlineChart :date="chartDate" @update:date="$emit('update:chartDate', $event)" :chart="chart" :rows="rows" :loading="marketLoading"><template #actions><button class="ghost" @click="$emit('refresh')" :disabled="marketLoading || klineSyncLoading">{{ marketLoading ? '加载中…' : '刷新当前 K 线' }}</button></template></KlineChart>
     </div>
+    <MlPipeline :symbol="activeSymbol" :historical="Boolean(chartDate)" />
   </div>
 </template>

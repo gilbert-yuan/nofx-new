@@ -2,7 +2,15 @@
 
 后端使用原生 Rust（Axum / Tokio / PostgreSQL），前端保留 Vue / Vite。API、策略分析、模拟成交、订单复核、交易所同步和自动任务均在 Rust 中运行。
 
-全币种月度 ML 流程使用 Rust 采集 Binance USDT 合约的官方公开归档或公共 REST 历史行情与辅助指标，以 Chronos-Bolt-Tiny 预测、LightGBM 分类决策，并按共同时间边界清除标签泄漏。运行 `powershell -File scripts/train-monthly-model.ps1` 顺序完成采集、预测校准与训练；参数及研究模型接口见 [月度模型流水线](docs/ml-monthly-pipeline.md)。本轮已完成 869 个合约训练和回放，分类准确率小幅提高但成本后亏损，保持研究模式；实际指标见 [最终评估](reports/ml-global-monthly-evaluation-20261015.md)。
+行情工作台已接入「AI 信号与风控」：Chronos-Bolt-Tiny 预测价格 → LightGBM 判断信号 → 共享 Rust 风控与止盈止损。支持只读研究和 Binance Demo 自动执行，Demo 订单复用现有交易、账户对账和持仓复核引擎。运行模式、开关与限制见 [模型交易链路](docs/ml-trading-pipeline.md)。
+
+本机 Demo 实例使用 `http://127.0.0.1:3101`，启用记录与当前限制见 [Demo 运行验收](reports/ml-demo-activation-20261015.md)。
+
+当前模型的交易参数可使用 Rust `nofx-ml-optimize` 搜索，以扣成本净收益比较48组门槛、ATR保护和持有时间，并在锁定参数后做历史分段复核；运行及限制见 [模型参数优化](docs/ml-parameter-optimization.md)，实际结果见 [2026-10-16 参数优化报告](reports/ml-parameter-optimization-20261016.md)。
+
+模型训练层的后续优化使用180天归档、共享成交引擎标签、三窗口 LightGBM 搜索与验证早停、独立概率校准，以及 Chronos 区间校准和消融。执行入口为 `powershell -File scripts/improve-ml-model.ps1`；阶段计划、验收门槛与状态文件见 [模型优化计划](docs/ml-model-improvement-plan-20261016.md)。候选验证不修改 Demo 配置。
+
+全币种月度 ML 流程使用 Rust 采集 Binance USDT 合约的官方公开归档或公共 REST 历史行情与辅助指标，以 Chronos-Bolt-Tiny 预测、LightGBM 分类决策，并按共同时间边界清除标签泄漏。运行 `powershell -File scripts/train-monthly-model.ps1` 顺序完成采集、预测校准与训练；参数及模型接口见 [月度模型流水线](docs/ml-monthly-pipeline.md)。本轮已完成 869 个合约训练和回放，分类准确率小幅提高但成本后亏损；模型评估仍保留 `research_only`，Demo 执行由独立运行开关控制。实际指标见 [最终评估](reports/ml-global-monthly-evaluation-20261015.md)。
 
 Windows 本机已经安装 Rust 1.99.0、Cargo、rustfmt、Clippy 和 MSVC 构建工具。新机器需先安装 Rust 和 MSVC 构建工具；项目工具链由 `rust-toolchain.toml` 固定。
 
