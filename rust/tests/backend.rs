@@ -390,7 +390,23 @@ async fn run(options: &PgConnectOptions) -> Result<()> {
         200,
     )
     .await?;
-    assert_eq!(strategies["strategies"].as_array().unwrap().len(), 7);
+    assert_eq!(
+        strategies["strategies"].as_array().unwrap().len(),
+        nofx_core::strategies::definitions().len()
+    );
+    let martin = request(
+        &client,
+        &base,
+        "GET",
+        "/api/strategies/martin-luk-pullback-v1",
+        None,
+        200,
+    )
+    .await?;
+    assert_eq!(martin["id"], "martin-luk-pullback-v1");
+    assert_eq!(martin["enabled"], false);
+    assert_eq!(martin["params"]["riskPerTrade"], 0.005);
+    assert_eq!(martin["params"]["maxNotionalPct"], 0.35);
     let opportunities = request(
         &client,
         &base,

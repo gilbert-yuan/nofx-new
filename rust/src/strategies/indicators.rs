@@ -200,6 +200,49 @@ pub fn adx(r: &[Value], p: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
         .collect();
     (ax, pd, md)
 }
+/// Sequential Supertrend with stateful band flips and a Wilder-smoothed ATR.
+/// Returns 1.0 (bullish) / -1. (bearish); NaN when the window is too short.
+pub fn supertrend(r: &[Value], period: usize, multiplier: f64) -> f64 {
+    if period == 0 || r.len() < period + 2 || !multiplier.is_finite() || multiplier <= 0. {
+        return f64::NAN;
+    }
+    let tr = true_ranges(r);
+    let mut atr = mean(&tr[1..=period]);
+    if !(atr > 0.) {
+        return f64::NAN;
+    }
+    let mut fu = f64::INFINITY;
+    let mut fl = f64::NEG_INFINITY;
+    let mut trend = 1.;
+    for i in 1..r.len() {
+        if i > period {
+            atr = (atr * (period - 1) as f64 + tr[i]) / period as f64;
+        }
+        let mid = (n(&r[i], "high") + n(&r[i], "low")) / 2.;
+        let bu = mid + multiplier * atr;
+        let bl = mid - multiplier * atr;
+        if i == 1 {
+            fu = bu;
+            fl = bl;
+            continue;
+        }
+        let prev_close = n(&r[i - 1], "close");
+        if bu < fu || prev_close > fu {
+            fu = bu;
+        }
+        if bl > fl || prev_close < fl {
+            fl = bl;
+        }
+        let line = if trend > 0. { fl } else { fu };
+        let close = n(&r[i], "close");
+        if close > line {
+            trend = 1.;
+        } else if close < line {
+            trend = -1.;
+        }
+    }
+    trend
+}
 pub fn finite_candle(r: &Value) -> bool {
     ["open", "high", "low", "close"].iter().all(|k| {
         r[k].as_f64()
@@ -283,6 +326,26 @@ pub fn skill_structure(r: &[Value]) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn supertrend_tracks_sustained_direction_and_rejects_short_windows() {
+        let up: Vec<Value> = (0..60)
+            .map(|i| {
+                let p = 100. + i as f64;
+                json!({"high": p + 1., "low": p - 1., "close": p})
+            })
+            .collect();
+        let down: Vec<Value> = (0..60)
+            .map(|i| {
+                let p = 100. - i as f64;
+                json!({"high": p + 1., "low": p - 1., "close": p})
+            })
+            .collect();
+        assert_eq!(supertrend(&up, 10, 3.), 1.);
+        assert_eq!(supertrend(&down, 10, 3.), -1.);
+        assert!(supertrend(&up[..5], 10, 3.).is_nan());
+        assert!(supertrend(&up, 10, 0.).is_nan());
+    }
 
     #[test]
     fn enhanced_macd_uses_every_fast_ema_update() {

@@ -356,6 +356,17 @@
           "description": "开启后，多单要求 MACD 柱为正、空单要求为负；高评分也不能绕过。关闭保留原评分放行规则。"
         },
         {
+          "key": "macdBypassScore",
+          "label": "MACD 绕过评分线",
+          "group": "filter",
+          "type": "number",
+          "default": 70,
+          "min": 0,
+          "max": 100,
+          "step": 1,
+          "description": "未开启强制 MACD 确认时，综合评分达到该线即可绕过 MACD 同向要求；低于该线仍需 MACD 柱同向。"
+        },
+        {
           "key": "longOnly",
           "label": "仅做多（禁空）",
           "group": "filter",
@@ -4316,6 +4327,367 @@
         }
       ],
       "priority": 85,
+      "builtin": true,
+      "prefilter": null
+    },
+    {
+      "id": "martin-luk-pullback-v1",
+      "name": "Martin Luk 强势回调（本地适配）",
+      "description": "参考 Martin Luk 强势标的首次回调、EMA/AVWAP 与紧止损原则，面向加密市场量化适配：4h 趋势筛选、15m 首次回调确认、固定峰值 AVWAP；默认只做多，单笔账户风险 0.5%（含共享成本）、名义仓位上限 35%。首次回调采用本地机械定义，默认不自动启用；不是原版精确复制，未宣称回测收益。",
+      "engine": "martin-luk",
+      "modelId": "martin-luk-pullback-rules-v1",
+      "needsAux": [
+        "4h",
+        "15m"
+      ],
+      "marketWindow": 80,
+      "marketWindows": {
+        "4h": 240,
+        "15m": 240
+      },
+      "marketContext": {},
+      "planInterval": "15m",
+      "paramSchema": [
+        {
+          "key": "emaFast",
+          "label": "快速均线周期（4h 根）",
+          "group": "indicator",
+          "type": "number",
+          "default": 9,
+          "min": 2,
+          "max": 30,
+          "step": 1,
+          "description": "强势趋势与回调支撑使用的快速 EMA 周期，默认 9 根已收盘 4h K 线。"
+        },
+        {
+          "key": "emaMedium",
+          "label": "中速均线周期（4h 根）",
+          "group": "indicator",
+          "type": "number",
+          "default": 21,
+          "min": 3,
+          "max": 60,
+          "step": 1,
+          "description": "强势趋势与回调支撑使用的中速 EMA 周期；需高于快速周期。"
+        },
+        {
+          "key": "emaSlow",
+          "label": "慢速均线周期（4h 根）",
+          "group": "indicator",
+          "type": "number",
+          "default": 50,
+          "min": 10,
+          "max": 120,
+          "step": 1,
+          "description": "多头排列的慢速 EMA 周期；需高于中速周期。"
+        },
+        {
+          "key": "momentumBars",
+          "label": "动量观察长度（4h 根）",
+          "group": "filter",
+          "type": "number",
+          "default": 30,
+          "min": 6,
+          "max": 96,
+          "step": 1,
+          "description": "衡量已收盘 4h 价格涨幅的回看长度，默认 30 根约 5 天。"
+        },
+        {
+          "key": "minMomentumPct",
+          "label": "最低动量涨幅（比例）",
+          "group": "filter",
+          "type": "number",
+          "default": 0.1,
+          "min": 0,
+          "max": 2,
+          "step": 0.01,
+          "description": "观察期最低价格涨幅，0.10 表示 10%；用于筛选强势币种。"
+        },
+        {
+          "key": "adrDays",
+          "label": "平均波幅观察长度（24h 组）",
+          "group": "filter",
+          "type": "number",
+          "default": 14,
+          "min": 2,
+          "max": 20,
+          "step": 1,
+          "description": "每连续 6 根已收盘 4h K 线合成一组 24h 波幅，再取最近各组的均值；不是按日历日计算的股票 ADR。"
+        },
+        {
+          "key": "minAdrPct",
+          "label": "最低平均波幅（比例）",
+          "group": "filter",
+          "type": "number",
+          "default": 0.05,
+          "min": 0,
+          "max": 0.5,
+          "step": 0.005,
+          "description": "24h 分组平均波幅下限，0.05 表示 5%；不是最新一根 K 线振幅。"
+        },
+        {
+          "key": "peakLookback",
+          "label": "波段峰值回看（4h 根）",
+          "group": "entry",
+          "type": "number",
+          "default": 12,
+          "min": 3,
+          "max": 24,
+          "step": 1,
+          "description": "在最近已收盘 4h K 线中定位本波段高点，并用该峰值所在时段固定 AVWAP 起点。"
+        },
+        {
+          "key": "maxPullbackBars",
+          "label": "回调最长等待（15m 根）",
+          "group": "entry",
+          "type": "number",
+          "default": 128,
+          "min": 4,
+          "max": 200,
+          "step": 1,
+          "description": "自本波段峰值起允许等待首次回调的最大 15m 根数，默认 128 根为 32 小时。"
+        },
+        {
+          "key": "supportToleranceAtr",
+          "label": "支撑接近容差（ATR）",
+          "group": "entry",
+          "type": "number",
+          "default": 0.35,
+          "min": 0,
+          "max": 2,
+          "step": 0.05,
+          "description": "以 15m ATR 衡量价格接近 4h EMA9、EMA21 和固定峰值 AVWAP 支撑的容差。"
+        },
+        {
+          "key": "maxSupportBreakAtr",
+          "label": "支撑最大下探（ATR）",
+          "group": "entry",
+          "type": "number",
+          "default": 0.75,
+          "min": 0,
+          "max": 3,
+          "step": 0.05,
+          "description": "允许首次回调短暂下探支撑的最大距离，以 15m ATR 为单位；超出则视为支撑失效。"
+        },
+        {
+          "key": "maxChaseAtr",
+          "label": "确认后最大追价（ATR）",
+          "group": "entry",
+          "type": "number",
+          "default": 1,
+          "min": 0.1,
+          "max": 3,
+          "step": 0.1,
+          "description": "15m 收盘转强后，入场价高于支撑的最大距离；超过则等待，避免远离失效位置追价。"
+        },
+        {
+          "key": "minConfluence",
+          "label": "最少支撑重合数",
+          "group": "entry",
+          "type": "number",
+          "default": 2,
+          "min": 1,
+          "max": 3,
+          "step": 1,
+          "description": "同一根 15m 高低区间在容差内接触 4h 快速 EMA、中速 EMA、固定峰值 AVWAP 三项中的最少数量。"
+        },
+        {
+          "key": "atrPeriod",
+          "label": "波动率周期（15m 根）",
+          "group": "indicator",
+          "type": "number",
+          "default": 14,
+          "min": 2,
+          "max": 50,
+          "step": 1,
+          "description": "用于支撑容差、追价限制和止损缓冲的 15m ATR 周期。"
+        },
+        {
+          "key": "stopBufferAtr",
+          "label": "回调低点止损缓冲（ATR）",
+          "group": "protection",
+          "type": "number",
+          "default": 0.15,
+          "min": 0,
+          "max": 1,
+          "step": 0.05,
+          "description": "在回调失效低点外预留的 15m ATR 缓冲，减少恰好触及低点造成的噪声止损。"
+        },
+        {
+          "key": "minStopPct",
+          "label": "最小止损距离（比例）",
+          "group": "protection",
+          "type": "number",
+          "default": 0.003,
+          "min": 0.001,
+          "max": 0.05,
+          "step": 0.001,
+          "description": "初始止损的最小价格比例，0.003 表示 0.3%；结构止损更近时向外放宽，最终风险还按入场区间上沿检查。"
+        },
+        {
+          "key": "maxStopPct",
+          "label": "最大止损距离（比例）",
+          "group": "protection",
+          "type": "number",
+          "default": 0.035,
+          "min": 0.002,
+          "max": 0.1,
+          "step": 0.001,
+          "description": "入场价到初始止损的最大比例，0.035 表示 3.5%；超出则不交易。"
+        },
+        {
+          "key": "maxStopAdrFraction",
+          "label": "止损占平均波幅上限",
+          "group": "protection",
+          "type": "number",
+          "default": 0.5,
+          "min": 0.1,
+          "max": 1,
+          "step": 0.05,
+          "description": "初始价格止损距离不得超过 24h 分组平均波幅的该比例，默认一半。"
+        },
+        {
+          "key": "targetR",
+          "label": "远端目标（R）",
+          "group": "protection",
+          "type": "number",
+          "default": 10,
+          "min": 3,
+          "max": 30,
+          "step": 0.5,
+          "description": "远端获利目标为初始价格风险的倍数，默认 10R；可提前由 15m EMA 退出，实际盈利不保证达到该目标。"
+        },
+        {
+          "key": "minNetRr",
+          "label": "最低净收益风险比",
+          "group": "protection",
+          "type": "number",
+          "default": 2,
+          "min": 1,
+          "max": 10,
+          "step": 0.1,
+          "description": "扣除共享手续费、滑点和持仓资金费成本后，候选计划至少需要达到的收益风险比。"
+        },
+        {
+          "key": "maxHoldBars",
+          "label": "最长持仓（15m 根）",
+          "group": "position",
+          "type": "number",
+          "default": 192,
+          "min": 4,
+          "max": 1000,
+          "step": 1,
+          "description": "持仓超时由共享交易模拟引擎处理，默认 192 根 15m K 线为 48 小时。"
+        },
+        {
+          "key": "riskPerTrade",
+          "label": "单笔账户风险（比例）",
+          "group": "risk",
+          "type": "number",
+          "default": 0.005,
+          "min": 0.0001,
+          "max": 0.01,
+          "step": 0.0001,
+          "description": "按账户权益倒推名义仓位；默认 0.005 为 0.5%，预算包含初始止损及共享成本模型，不因最小下单额放大风险。"
+        },
+        {
+          "key": "maxNotionalPct",
+          "label": "单笔名义仓位上限（比例）",
+          "group": "risk",
+          "type": "number",
+          "default": 0.35,
+          "min": 0.01,
+          "max": 0.35,
+          "step": 0.01,
+          "description": "单笔名义仓位不得超过账户权益的该比例，默认且最大为 35%；杠杆与评分仓位规则不能突破此约束。"
+        },
+        {
+          "key": "maxPositions",
+          "label": "本策略同时在途订单上限",
+          "group": "position",
+          "type": "number",
+          "default": 5,
+          "min": 1,
+          "max": 20,
+          "step": 1,
+          "description": "本策略同时存在的挂单和持仓数量上限；账户和单币种的共享风控仍然生效。"
+        },
+        {
+          "key": "exitEmaPeriod",
+          "label": "退出均线周期（15m 根）",
+          "group": "exit",
+          "type": "number",
+          "default": 9,
+          "min": 2,
+          "max": 50,
+          "step": 1,
+          "description": "多头已收盘 15m 价格失守该 EMA 时退出；这是本地机械规则，不代表原作者的固定通用参数。"
+        },
+        {
+          "key": "exitMinHoldBars",
+          "label": "退出最小持仓（15m 根）",
+          "group": "exit",
+          "type": "number",
+          "default": 1,
+          "min": 0,
+          "max": 20,
+          "step": 1,
+          "description": "入场后至少经过该数量的 15m K 线才启用 EMA 收盘退出；初始硬止损始终有效。"
+        },
+        {
+          "key": "partialTpEnabled",
+          "label": "启用分批止盈",
+          "group": "exit",
+          "type": "boolean",
+          "default": false,
+          "description": "默认关闭，保留趋势持仓。开启后按下列固定 R 档位分批，属于本地可选规则，不复制原作者主观退出。"
+        },
+        {
+          "key": "partialTp1R",
+          "label": "第一档分批目标（R）",
+          "group": "exit",
+          "type": "number",
+          "default": 3,
+          "min": 1,
+          "max": 10,
+          "step": 0.5,
+          "description": "启用分批止盈后，第一档触发价相对初始风险的倍数；需低于第二档。"
+        },
+        {
+          "key": "partialTp2R",
+          "label": "第二档分批目标（R）",
+          "group": "exit",
+          "type": "number",
+          "default": 5,
+          "min": 2,
+          "max": 20,
+          "step": 0.5,
+          "description": "启用分批止盈后，第二档触发价相对初始风险的倍数。"
+        },
+        {
+          "key": "partialTp1ClosePct",
+          "label": "第一档平仓比例",
+          "group": "exit",
+          "type": "number",
+          "default": 0.15,
+          "min": 0.05,
+          "max": 0.4,
+          "step": 0.05,
+          "description": "第一档触发时平掉初始仓位的该比例，0.15 表示 15%。"
+        },
+        {
+          "key": "partialTp2ClosePct",
+          "label": "第二档平仓比例",
+          "group": "exit",
+          "type": "number",
+          "default": 0.15,
+          "min": 0.05,
+          "max": 0.4,
+          "step": 0.05,
+          "description": "第二档触发时平掉初始仓位的该比例，0.15 表示 15%；剩余仓位继续由 EMA、目标或超时退出。"
+        }
+      ],
+      "priority": 80,
       "builtin": true,
       "prefilter": null
     }

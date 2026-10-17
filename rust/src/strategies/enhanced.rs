@@ -1,4 +1,6 @@
-use super::indicators::{atr, closes, ema_first, enhanced_macd, mean, rsi_simple};
+use super::indicators::{
+    adx, atr, closes, ema, enhanced_macd, last, macd, mean, rsi_simple, supertrend,
+};
 use super::{
     b, defaults, exit_rules, exit_rules_for, local_review_with_atr, n, plan_risk_unit, rows,
 };
@@ -6,9 +8,6 @@ use crate::number;
 use serde_json::{Map, Value, json};
 fn period(p: &Value, key: &str) -> usize {
     n(p, key).max(1.).floor() as usize
-}
-fn average_tail(v: &[f64], p: usize) -> f64 {
-    mean(&v[v.len().saturating_sub(p)..])
 }
 fn volume(r: &[Value], p: &Value) -> f64 {
     let recent = period(p, "volumeRecentPeriod");
@@ -61,7 +60,10 @@ fn support_resistance(r: &[Value], p: &Value) -> (f64, f64) {
         (false, true) => std::cmp::Ordering::Greater,
         _ => std::cmp::Ordering::Equal,
     });
-    bins.retain(|b| b.1 >= 3);
+    // 命中阈值随回看长度缩放：50 根窗口下随机噪音 bin 命中 3 次的概率约 40%，
+    // 提高到 max(3, lookback/10) 才能把噪音位过滤掉。
+    let min_hits = 3usize.max(lp / 10);
+    bins.retain(|b| b.1 >= min_hits);
     bins.sort_by_key(|a| std::cmp::Reverse(a.1));
     let levels: Vec<f64> = bins
         .iter()
@@ -81,44 +83,61 @@ fn support_resistance(r: &[Value], p: &Value) -> (f64, f64) {
 fn strength(r: &[Value], p: &Value) -> Value {
     let c = closes(r);
     let close = *c.last().unwrap();
-    let fast = average_tail(&c, period(p, "maFastPeriod"));
-    let slow = average_tail(&c, period(p, "maSlowPeriod"));
     let mut score = 0.;
     let mut reasons: Vec<String> = vec![];
-    if fast > slow && close > fast {
-        score += 20.;
-        reasons.push("多头均线排列完美".into());
-    } else if fast < slow && close < fast {
-        score += 20.;
-        reasons.push("空头均线排列完美".into());
-    } else if (fast - slow).abs() < slow * 0.005 {
-        reasons.push("均线纠缠，趋势不明".into());
-    } else {
-        score += 8.;
-        reasons.push("均线排列一般".into());
+    // 均线统一为 SMA 播种的 EMA，与 15m 趋势闸门同一标准。
+    let fast = last(&ema(&c, period(p, "maFastPeriod")));
+    let slow = last(&ema(&c, period(p, "maSlowPeriod")));
+    if fast.is_finite() && slow.is_finite() {
+        if fast > slow && close > fast {
+            score += 15.;
+            reasons.push("多头均线排列完美".into());
+        } else if fast < slow && close < fast {
+            score += 15.;
+            reasons.push("空头均线排列完美".into());
+        } else if (fast - slow).abs() < slow * 0.005 {
+            reasons.push("均线纠缠，趋势不明".into());
+        } else {
+            score += 6.;
+            reasons.push("均线排列一般".into());
+        }
     }
-    let macd = enhanced_macd(
+    let (ml, ms, mh) = macd(
         &c,
         period(p, "macdFastPeriod"),
         period(p, "macdSlowPeriod"),
         period(p, "macdSignalPeriod"),
     );
-    if macd.0.is_finite() {
-        if macd.2.abs() > (c[c.len().saturating_sub(10)] - close).abs() * 0.002 {
-            if (macd.2 > 0. && macd.0 > macd.1) || (macd.2 < 0. && macd.0 < macd.1) {
-                score += 15.;
-                reasons.push(
-                    if macd.2 > 0. {
-                        "MACD金叉且柱状图扩大"
-                    } else {
-                        "MACD死叉且柱状图扩大"
-                    }
-                    .into(),
-                );
-            } else {
-                score += 8.;
-                reasons.push("MACD信号中等".into());
-            }
+    let macd_line = last(&ml);
+    let macd_signal = last(&ms);
+    let hist = last(&mh);
+    if hist.is_finite() && macd_line.is_finite() && macd_signal.is_finite() {
+        // “柱状图扩大”以近 5 根柱幅均值为基准，替代旧的价格差 hack。
+        let baseline = mean(
+            &mh.iter()
+                .rev()
+                .skip(1)
+                .take(4)
+                .copied()
+                .filter(|x| x.is_finite())
+                .collect::<Vec<_>>(),
+        );
+        let expanding = baseline.is_finite() && hist.abs() > 0. && hist.abs() > baseline;
+        let cross =
+            (hist > 0. && macd_line > macd_signal) || (hist < 0. && macd_line < macd_signal);
+        if expanding && cross {
+            score += 12.;
+            reasons.push(
+                if hist > 0. {
+                    "MACD金叉且柱状图扩大"
+                } else {
+                    "MACD死叉且柱状图扩大"
+                }
+                .into(),
+            );
+        } else if cross {
+            score += 8.;
+            reasons.push("MACD信号中等".into());
         } else {
             score += 5.;
             reasons.push("MACD信号较弱".into());
@@ -127,11 +146,11 @@ fn strength(r: &[Value], p: &Value) -> Value {
     let rs = rsi_simple(&c, period(p, "rsiPeriod"));
     if rs.is_finite() {
         let text = if rs > 50. && rs < 70. {
-            score += 12.;
-            "RSI健康多头区"
+            score += 10.;
+            "RSI中高位(50-70)"
         } else if rs < 50. && rs > 30. {
-            score += 12.;
-            "RSI健康空头区"
+            score += 10.;
+            "RSI中低位(30-50)"
         } else if rs >= 70. {
             score += 5.;
             "RSI超买"
@@ -148,116 +167,100 @@ fn strength(r: &[Value], p: &Value) -> Value {
     if !bb.is_null() {
         let pos = (close - n(&bb, "lower")) / (n(&bb, "upper") - n(&bb, "lower"));
         let text = if pos > 0.3 && pos < 0.7 {
-            score += 10.;
+            score += 8.;
             "价格在布林带中轨"
         } else if pos > 0.8 {
-            score += 6.;
+            score += 5.;
             "价格接近布林带上轨"
         } else if pos < 0.2 {
-            score += 6.;
+            score += 5.;
             "价格接近布林带下轨"
         } else {
-            score += 8.;
+            score += 6.;
             "价格在布林带正常区域"
         };
         reasons.push(text.into());
     }
+    // 量能按可行区间 [minVolumeRatio, maxVolumeRatio] 内的相对位置打分，与 analyze
+    // 的量能闸门对齐，避免“加分项永远拿不到”的死分。
     let vr = volume(r, p);
     if vr.is_finite() {
-        let text = if vr > 1.8 {
-            score += 13.;
-            format!("成交量大幅放大({vr:.2}倍)")
-        } else if vr > 1.5 {
-            score += 9.;
-            format!("成交量温和放大({vr:.2}倍)")
-        } else if vr >= 0.7 {
-            score += 7.;
-            "成交量平稳".into()
+        let lo = n(p, "minVolumeRatio");
+        let hi = n(p, "maxVolumeRatio");
+        let t = if hi > lo {
+            ((vr - lo) / (hi - lo)).clamp(0., 1.)
         } else {
-            score += 3.;
-            "成交量萎缩".into()
+            0.5
         };
-        reasons.push(text);
+        score += 3. + 10. * t;
+        reasons.push(format!("量比{vr:.2}(闸门区间{:.0}%分位)", t * 100.));
     }
+    // Ichimoku：云图按标准前移 kijun 根后再与现价比较。
     let tenkan = period(p, "ichimokuTenkanPeriod");
     let kijun = period(p, "ichimokuKijunPeriod");
     let span = period(p, "ichimokuSpanPeriod");
-    let mid = |k: usize| {
-        let w = &r[r.len() - k..];
-        (w.iter()
-            .map(|r| n(r, "high"))
-            .fold(f64::NEG_INFINITY, f64::max)
-            + w.iter().map(|r| n(r, "low")).fold(f64::INFINITY, f64::min))
-            / 2.
-    };
-    if r.len() >= tenkan.max(kijun).max(span) {
-        let t = mid(tenkan);
-        let k = mid(kijun);
+    let shift = kijun;
+    let kmax = tenkan.max(kijun).max(span);
+    if r.len() >= kmax + shift {
+        let end = r.len() - 1 - shift;
+        let mid_at = |end: usize, k: usize| {
+            let w = &r[end + 1 - k..=end];
+            (w.iter()
+                .map(|x| n(x, "high"))
+                .fold(f64::NEG_INFINITY, f64::max)
+                + w.iter().map(|x| n(x, "low")).fold(f64::INFINITY, f64::min))
+                / 2.
+        };
+        let t = mid_at(end, tenkan);
+        let k = mid_at(end, kijun);
         let sa = (t + k) / 2.;
-        let sb = mid(span);
-        let (strength, signal) = if close > sa.max(sb) {
+        let sb = mid_at(end, span);
+        let (s, signal) = if close > sa.max(sb) {
             (30. + if t > k { 20. } else { 0. }, "BULLISH")
         } else if close < sa.min(sb) {
             (30. + if t < k { 20. } else { 0. }, "BEARISH")
         } else {
             (0., "NEUTRAL")
         };
-        score += strength / 7.;
-        reasons.push(format!("Ichimoku{signal}({strength}/70)"));
+        score += s / 3.5;
+        reasons.push(format!("Ichimoku{signal}({s}/70)"));
     }
+    // ADX：使用共享的平滑实现（+DI/-DI/ADX），替代原始的 DM 占比近似。
     let dp = period(p, "dmiPeriod");
-    if r.len() > dp {
-        let mut plus = 0.;
-        let mut minus = 0.;
-        let mut tr = 0.;
-        for i in r.len() - dp..r.len() {
-            let up = n(&r[i], "high") - n(&r[i - 1], "high");
-            let down = n(&r[i - 1], "low") - n(&r[i], "low");
-            if up > 0. && up > down {
-                plus += up;
+    if r.len() > 2 * dp {
+        let (ax, pd, md) = adx(r, dp);
+        let ax = last(&ax);
+        if ax.is_finite() {
+            if ax > 25. {
+                score += 10.;
+                reasons.push(format!("ADX强趋势({ax:.1})"));
+            } else if ax > 20. {
+                score += 5.;
+                reasons.push(format!("ADX中等趋势({ax:.1})"));
+            } else {
+                score += 2.;
+                reasons.push(format!("ADX弱趋势({ax:.1})"));
             }
-            if down > 0. && down > up {
-                minus += down;
+            let (pd, md) = (last(&pd), last(&md));
+            if pd.is_finite() && md.is_finite() {
+                reasons.push(format!("+DI{pd:.1}/-DI{md:.1}"));
             }
-            tr += (n(&r[i], "high") - n(&r[i], "low"))
-                .max((n(&r[i], "high") - n(&r[i - 1], "close")).abs())
-                .max((n(&r[i], "low") - n(&r[i - 1], "close")).abs());
-        }
-        let pd = plus / tr * 100.;
-        let md = minus / tr * 100.;
-        let ax = (pd - md).abs() / (pd + md) * 100.;
-        if ax > 25. {
-            score += 8.;
-            reasons.push(format!("ADX强趋势({ax:.1})"));
-        } else if ax > 20. {
-            score += 5.;
-            reasons.push(format!("ADX中等趋势({ax:.1})"));
-        } else {
-            score += 2.;
-            reasons.push(format!("ADX弱趋势({ax:.1})"));
         }
     }
+    // Supertrend：带翻转状态机的标准实现。
     let sp = period(p, "supertrendPeriod");
-    if r.len() >= sp {
-        let mut a = 0.;
-        for i in r.len() - sp + 1..r.len() {
-            let prev = n(&r[i - 1], "close");
-            a += (n(&r[i], "high") - n(&r[i], "low"))
-                .max((n(&r[i], "high") - prev).abs())
-                .max((n(&r[i], "low") - prev).abs());
-        }
-        a /= sp as f64;
-        let row = r.last().unwrap();
-        let mid = (n(row, "high") + n(row, "low")) / 2.;
-        let trend = if close > mid - n(p, "supertrendMultiplier") * a {
-            "BULLISH"
-        } else if close < mid + n(p, "supertrendMultiplier") * a {
-            "BEARISH"
+    if r.len() > sp + 2 {
+        let st = supertrend(&r, sp, n(p, "supertrendMultiplier"));
+        if st.is_finite() {
+            score += 8.;
+            reasons.push(format!(
+                "Supertrend{}",
+                if st > 0. { "BULLISH" } else { "BEARISH" }
+            ));
         } else {
-            "NEUTRAL"
-        };
-        score += if trend == "NEUTRAL" { 3. } else { 7. };
-        reasons.push(format!("Supertrend{trend}"));
+            score += 3.;
+            reasons.push("SupertrendNEUTRAL".into());
+        }
     }
     if r.len() >= 2 {
         let op = period(p, "obvPeriod");
@@ -277,7 +280,7 @@ fn strength(r: &[Value], p: &Value) -> Value {
             obvs.push(ov);
         }
         if obvs.len() > 10 {
-            score += 5.;
+            score += 7.;
             reasons.push(
                 if obvs.last() > obvs.first() {
                     "OBVRISING"
@@ -287,7 +290,7 @@ fn strength(r: &[Value], p: &Value) -> Value {
                 .into(),
             );
         } else {
-            score += 2.;
+            score += 3.;
             reasons.push("OBV中性".into());
         }
     }
@@ -302,6 +305,7 @@ pub fn analyze(m: &Value, ctx: &Value) -> Value {
         ("maFastPeriod", "maSlowPeriod", true),
         ("macdFastPeriod", "macdSlowPeriod", true),
         ("volumeRecentPeriod", "volumeLookbackPeriod", true),
+        ("supportRecentPeriod", "supportLookbackPeriod", true),
         ("trend15EmaFast", "trend15EmaSlow", b(p, "trend15Enabled")),
     ] {
         if enabled && period(p, fast) >= period(p, slow) {
@@ -311,6 +315,14 @@ pub fn analyze(m: &Value, ctx: &Value) -> Value {
     let max_volume = n(p, "maxVolumeRatio");
     if b(p, "requireVolumeConfirm") && max_volume > 0. && n(p, "minVolumeRatio") >= max_volume {
         return hold("参数冲突：最低量比必须低于最高量比。".into(), Value::Null);
+    }
+    if b(p, "partialTpEnabled")
+        && (n(p, "partialTp1R") >= n(p, "partialTp2R") || n(p, "partialTp2R") >= n(p, "mainTpR"))
+    {
+        return hold(
+            "参数冲突：分批止盈需满足 1R < 2R < 主止盈 R。".into(),
+            Value::Null,
+        );
     }
     let mut need = 50;
     for key in [
@@ -338,8 +350,8 @@ pub fn analyze(m: &Value, ctx: &Value) -> Value {
     }
     let c = closes(&r);
     let close = *c.last().unwrap();
-    let fast = average_tail(&c, period(p, "maFastPeriod"));
-    let slow = average_tail(&c, period(p, "maSlowPeriod"));
+    let fast = last(&ema(&c, period(p, "maFastPeriod")));
+    let slow = last(&ema(&c, period(p, "maSlowPeriod")));
     let a = atr(&r, period(p, "atrPeriod"));
     let macd = enhanced_macd(
         &c,
@@ -377,20 +389,17 @@ pub fn analyze(m: &Value, ctx: &Value) -> Value {
     if bull && rs < n(p, "minRsiLong") {
         return hold(
             format!("多头信号但RSI偏弱（{rs:.1}），等待动能确认。"),
-            Value::Null,
+            strength,
         );
     }
     if bear && rs > n(p, "maxRsiShort") {
         return hold(
             format!("空头信号但RSI偏强（{rs:.1}），等待动能确认。"),
-            Value::Null,
+            strength,
         );
     }
     if bear && rs < 30. {
-        return hold(
-            "空头信号但RSI超卖，避免在下跌末端追空。".into(),
-            Value::Null,
-        );
+        return hold("空头信号但RSI超卖，避免在下跌末端追空。".into(), strength);
     }
     if b(p, "requireVolumeConfirm") && vr.is_finite() && vr <= n(p, "minVolumeRatio") {
         return hold(
@@ -410,7 +419,9 @@ pub fn analyze(m: &Value, ctx: &Value) -> Value {
             strength,
         );
     }
-    let score_bypass = !b(p, "requireMacdConfirm") && score >= 70.;
+    // 高分信号可绕过 MACD 确认（阈值为 macdBypassScore，默认 70）：
+    // 评分是主判据，MACD 是弱信号的附加确认。
+    let score_bypass = !b(p, "requireMacdConfirm") && score >= n(p, "macdBypassScore");
     let long = if bull && (macd.2 > 0. || score_bypass) {
         true
     } else if bear && (macd.2 < 0. || score_bypass) {
@@ -436,8 +447,8 @@ pub fn analyze(m: &Value, ctx: &Value) -> Value {
             );
         }
         let c15 = closes(&r15);
-        let ef = ema_first(&c15, period(p, "trend15EmaFast"));
-        let es = ema_first(&c15, period(p, "trend15EmaSlow"));
+        let ef = last(&ema(&c15, period(p, "trend15EmaFast")));
+        let es = last(&ema(&c15, period(p, "trend15EmaSlow")));
         let a15 = atr(&r15, 14);
         let ap = a15 / c15.last().unwrap();
         let sep = (ef - es) / a15;
@@ -474,13 +485,23 @@ pub fn analyze(m: &Value, ctx: &Value) -> Value {
     let depth =
         n(p, "pullbackAtrDeep") + (n(p, "pullbackAtrShallow") - n(p, "pullbackAtrDeep")) * t;
     let limit = close - sign * depth * a;
+    // 统一 R 口径：unit 同时是止损距离、风险单位（riskUnit）与各档止盈的间距基准，
+    // 止损挂在目标成交价（limit）外侧一个 unit。此前 plan 中并存 unit /
+    // |limit-stop| / close-stop 三套基准，导致“3R 止盈”名不副实、移动止损跟踪距离
+    // 随信号强度漂移。e0/e1 仅作为挂单有效期内市价漂移的容忍带。
     let unit = (a * n(p, "stopAtr")).max(close * n(p, "minStopPct"));
-    let stop = if long { e0 - unit } else { e1 + unit };
-    let anchor = if long { e1 } else { e0 };
-    let tp1 = anchor + sign * unit;
-    let mut tp2 = anchor + sign * unit * 2.;
-    let mut tp3 = anchor + sign * unit * n(p, "mainTpR");
-    let rr_from = |target: f64| (target - close).abs() / (close - stop).abs();
+    if !(limit > 0.) {
+        return hold("回调深度超过现价，行情数据异常。".into(), strength);
+    }
+    let stop = limit - sign * unit;
+    if !(stop > 0.) {
+        return hold("止损价非正，行情数据异常。".into(), strength);
+    }
+    let tp1 = limit + sign * unit;
+    let mut tp2 = limit + sign * unit * 2.;
+    let mut tp3 = limit + sign * unit * n(p, "mainTpR");
+    // 盈亏比统一按目标成交价口径计算：rr_from(x) = |x - limit| / riskUnit。
+    let rr_from = |target: f64| (target - limit).abs() / unit;
     let level = if long { rr } else { sr };
     if if long {
         level < tp3 && level > tp1
@@ -488,25 +509,42 @@ pub fn analyze(m: &Value, ctx: &Value) -> Value {
         level > tp3 && level < tp1
     } {
         let narrowed = level + sign * unit;
-        if rr_from(narrowed) >= n(p, "srNarrowMinRr") {
+        let narrowed_rr = rr_from(narrowed);
+        if narrowed_rr >= n(p, "srNarrowMinRr") {
             tp2 = level;
             tp3 = narrowed;
+        } else if narrowed_rr < n(p, "minRiskReward") {
+            return hold(
+                format!(
+                    "{}位 {:.4} 截断后盈亏比仅 {:.2}:1，本轮放弃。",
+                    if long { "阻力" } else { "支撑" },
+                    level,
+                    narrowed_rr
+                ),
+                strength,
+            );
         }
     }
     let risk_reward = rr_from(tp3);
     if risk_reward < n(p, "minRiskReward") {
         return hold(
-            format!("风险收益比不足（{risk_reward:.2}:1），等待更好位置。"),
+            format!("风险收益比不足（{risk_reward:.2}:1），检查主止盈 R 与最小盈亏比参数。"),
             Value::Null,
         );
     }
-    let actual = (limit - stop).abs();
-    let pct = actual / limit;
+    let pct = unit / limit;
     let lev = (n(p, "riskBudgetPct") / pct)
         .floor()
         .max(1.)
         .min(n(p, "maxLeverage"));
     let exit = exit_rules(p);
+    let mt = n(p, "minTrendScore");
+    let ceil = n(p, "scoreCeil");
+    let confidence = if ceil > mt {
+        (0.55 + (score - mt) / (ceil - mt) * 0.4).clamp(0.55, 0.95)
+    } else {
+        0.95
+    };
     let mut periods = Map::new();
     if let Some(def) = super::definition("enhanced-trend-v1") {
         for spec in def["paramSchema"].as_array().unwrap() {
@@ -516,7 +554,7 @@ pub fn analyze(m: &Value, ctx: &Value) -> Value {
             }
         }
     }
-    let mut signal = json!({"symbol":symbol,"action":if long{"BUY"}else{"SELL"},"confidence":(0.60+score/250.).min(0.90),"reason":format!("增强分析({score}/100分)：{}",strength["reasons"].as_array().unwrap().iter().take(3).filter_map(|s|s.as_str()).collect::<Vec<_>>().join("；")),"risk":format!("波动率{:.2}%；风险收益比{risk_reward:.2}:1；推荐杠杆{lev}x（保证金风险约{:.2}%）",vol*100.,lev*pct*100.),"plan":{"entryMin":e0,"entryMax":e1,"entryLimit":limit,"stopLoss":stop,"takeProfit":tp3,"takeProfit1":tp1,"takeProfit2":tp2,"takeProfit3":tp3,"riskUnit":actual,"marginRiskPct":lev*pct,"exitRules":exit,"smartExit":exit["smartExit"],"maxHoldBars":p["maxHoldBars"],"riskRewardRatio":risk_reward,"recommendedLeverage":lev,"trendStrengthScore":score,"trend15Filter":filter,"indicators":{"periods":periods,"ma20":fast,"ma50":slow,"atr":a,"rsi":rs,"macd":if macd.0.is_finite(){json!({"histogram":macd.2})}else{Value::Null},"bollinger":bb,"volumeRatio":vr,"support":sr,"resistance":rr}}});
+    let mut signal = json!({"symbol":symbol,"action":if long{"BUY"}else{"SELL"},"confidence":confidence,"reason":format!("增强分析({score}/100分)：{}",strength["reasons"].as_array().unwrap().iter().take(3).filter_map(|s|s.as_str()).collect::<Vec<_>>().join("；")),"risk":format!("波动率{:.2}%；风险收益比{risk_reward:.2}:1；推荐杠杆{lev}x（保证金风险约{:.2}%）；均线失守智能退出可能先于初始止损触发",vol*100.,lev*pct*100.),"plan":{"entryMin":e0,"entryMax":e1,"entryLimit":limit,"stopLoss":stop,"takeProfit":tp3,"takeProfit1":tp1,"takeProfit2":tp2,"takeProfit3":tp3,"riskUnit":unit,"marginRiskPct":lev*pct,"exitRules":exit,"smartExit":exit["smartExit"],"maxHoldBars":p["maxHoldBars"],"riskRewardRatio":risk_reward,"recommendedLeverage":lev,"trendStrengthScore":score,"trend15Filter":filter,"indicators":{"periods":periods,"ma20":fast,"ma50":slow,"atr":a,"rsi":rs,"macd":if macd.0.is_finite(){json!({"histogram":macd.2})}else{Value::Null},"bollinger":bb,"volumeRatio":vr,"support":sr,"resistance":rr}}});
     signal["plan"]["pendingGraceMinutes"] = p["pendingGraceMinutes"].clone();
     signal
 }
@@ -538,7 +576,7 @@ pub fn review(order: &Value, m: &Value, _ctx: &Value) -> Value {
         return json!({"action":"HOLD","reason":"指标周期所需数据不足。"});
     }
     let close = *c.last().unwrap();
-    let ma = average_tail(&c, mp);
+    let ma = last(&ema(&c, mp));
     let a = atr(&r, ap);
     let long = order["direction"] == "OPEN_LONG";
     let sign = if long { 1. } else { -1. };
@@ -551,7 +589,8 @@ pub fn review(order: &Value, m: &Value, _ctx: &Value) -> Value {
         period(&p, "macdSignalPeriod"),
     );
     let mut code = "";
-    if sign * (close - ma) <= 0.
+    if ma.is_finite()
+        && sign * (close - ma) <= 0.
         && (close - ma).abs() > a * n(smart, "maBreakAtr")
         && (!pr.is_finite() || pr < n(smart, "maExitMaxProfitR"))
     {

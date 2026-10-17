@@ -16,6 +16,7 @@ use std::time::Duration;
 
 #[cfg(test)]
 mod execution_tests;
+mod strategy_risk;
 
 fn n(v: &Value, k: &str, d: f64) -> f64 {
     number(&v[k], d)
@@ -684,6 +685,12 @@ pub(crate) fn submit_paper_order_inner(
     } else {
         signal["plan"].clone()
     };
+    // Strategy risk limits belong to the frozen analysis. A caller may override
+    // execution prices, but cannot remove or relax the original sizing policy.
+    let risk_sizing = signal["plan"].get("riskSizing");
+    if let Some(sizing) = risk_sizing {
+        plan["riskSizing"] = sizing.clone();
+    }
     for k in ["stopLoss", "takeProfit"] {
         if !input[k].is_null() {
             plan[k] = json!(n(input, k, f64::NAN));
@@ -722,8 +729,22 @@ pub(crate) fn submit_paper_order_inner(
         }
     }
     let costs = json!({"feeBps":6,"slippageBps":5,"fundingBpsPer8h":3,"notional":10});
-    let notional = margin * leverage;
     let funds = account_summary(state, now);
+    let (margin, leverage) = if let Some(sizing) = risk_sizing {
+        strategy_risk::constrain(
+            sizing,
+            &plan,
+            &costs,
+            n(&funds, "equity", f64::NAN),
+            margin,
+            leverage,
+            long,
+            duration,
+        )?
+    } else {
+        (margin, leverage)
+    };
+    let notional = margin * leverage;
     if state["entriesPaused"] == true {
         bail!("统一资金池已暂停开仓。");
     }

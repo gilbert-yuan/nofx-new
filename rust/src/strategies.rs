@@ -10,6 +10,8 @@ mod enhanced;
 mod h4;
 #[path = "strategies/indicators.rs"]
 pub mod indicators;
+#[path = "strategies/martin_luk.rs"]
+mod martin_luk;
 #[path = "strategies/opportunity.rs"]
 mod opportunity;
 #[path = "strategies/structure.rs"]
@@ -202,6 +204,7 @@ pub fn analyze(id: &str, market: &Value, context: &Value) -> Result<Value> {
         "structure-short-v1" => structure::analyze(false, market, &ctx),
         "enhanced-trend-v1" => enhanced::analyze(market, &ctx),
         "yao-coin-ambush-v1" => yao::analyze(market, &ctx),
+        "martin-luk-pullback-v1" => martin_luk::analyze(market, &ctx),
         crate::ml_execution::STRATEGY_ID => {
             if ctx["mlPrediction"].is_object() {
                 crate::ml_execution::signal(&ctx["mlPrediction"], market, crate::now_ms())?
@@ -228,6 +231,7 @@ pub fn review(id: &str, order: &Value, market: &Value, context: &Value) -> Resul
     Ok(match id {
         "h4-chandelier-breakout-v1" => h4::chandelier_review(order, market),
         "enhanced-trend-v1" => enhanced::review(order, market, context),
+        "martin-luk-pullback-v1" => martin_luk::review(order, market),
         _ => local_review(order, market),
     })
 }
@@ -771,7 +775,7 @@ mod tests {
     }
     #[test]
     fn registration_preserves_schemas_and_validation() {
-        assert_eq!(definitions().len(), 8);
+        assert_eq!(definitions().len(), 9);
         let model = definition(crate::ml_execution::STRATEGY_ID).unwrap();
         assert_eq!(model["engine"], "monthly-ml");
         assert_eq!(model["planInterval"], "1h");

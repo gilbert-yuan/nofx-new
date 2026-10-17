@@ -315,7 +315,7 @@ pub fn replay(
             .iter_mut()
             .filter(|o| o["status"] == "pending")
         {
-            if plan_tf == "1m" {
+            if plan_tf == "1m" || id == "martin-luk-pullback-v1" {
                 automation::apply_pending(order, &signal, now)?;
             }
         }
