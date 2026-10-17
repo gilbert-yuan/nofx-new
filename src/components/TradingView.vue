@@ -201,8 +201,9 @@ const precise = value => value == null || !Number.isFinite(Number(value)) ? '—
 // 交易所仍有持仓、本地单据却已全部平仓时，直接写「已平仓」会与「实际持仓」自相矛盾。
 // 这种情况是账实差异，明确标成待对账，用户才知道该点平仓把交易所那部分平掉。
 function localStatusNote(order, local) {
-  if (local.status === 'closed' && order.status === 'open' && order.source && order.source !== 'paper') {
-    return order.reconciliationPending ? '已平仓 · 交易所有持仓，待对账' : '已平仓';
+  if (order.reconciliationPending && order.status === 'open'
+      && order.source && order.source !== 'paper') {
+    return `${status(local.status)} · 交易所有持仓，待对账`;
   }
   return status(local.status);
 }
@@ -553,7 +554,7 @@ onUnmounted(() => { disposed = true; ++loadSequence; clearTimeout(pollTimer); })
                   v-for="local in order.localOrders || []"
                   :key="local.id"
                   class="local-order-note"
-                  :class="{ 'reconcile-note': local.status === 'closed' && order.reconciliationPending }"
+                  :class="{ 'reconcile-note': order.reconciliationPending }"
                 >本地模拟：{{ localStatusNote(order, local) }}</small>
               </td>
               <td>{{ order.leverage }}x</td>

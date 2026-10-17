@@ -16,13 +16,15 @@ pub const HORIZON_HOURS: usize = 12;
 pub const MODEL_HORIZON: usize = 64;
 pub const HOUR_MS: i64 = 3_600_000;
 pub const QUARTER_HOUR_MS: i64 = 900_000;
+pub const FOUR_HOUR_MS: i64 = 4 * HOUR_MS;
 /// Model output points are steps in the input timeframe, not necessarily hours.
 pub const HORIZON_STEPS: usize = 12;
 
 pub fn interval_ms(interval: &str) -> Result<i64> {
     match interval {
-        "1h" => Ok(HOUR_MS),
         "15m" => Ok(QUARTER_HOUR_MS),
+        "1h" => Ok(HOUR_MS),
+        "4h" => Ok(FOUR_HOUR_MS),
         _ => anyhow::bail!("Unsupported ML candle interval: {interval}"),
     }
 }

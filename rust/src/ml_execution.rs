@@ -10,6 +10,18 @@ use serde_json::{Value, json};
 
 pub const STRATEGY_ID: &str = "chronos-lightgbm-v1";
 const HOUR: i64 = 3_600_000;
+/// Exit policy (11-bar hold, no 0-bar MA exit) deployed 2026-10-17 13:12 UTC+8.
+/// Trades closed before this belong to the previous, measured-negative rule.
+pub const DEFAULT_FORWARD_EPOCH_MS: i64 = 1_792_213_920_000;
+
+/// Start of the forward-validation window. Overridable so a future policy change
+/// can reset the window without a rebuild.
+pub fn forward_epoch_ms() -> i64 {
+    std::env::var("NOFX_ML_FORWARD_EPOCH")
+        .ok()
+        .and_then(|value| timestamp(&json!(value)))
+        .unwrap_or(DEFAULT_FORWARD_EPOCH_MS)
+}
 
 pub fn demo_enabled(config: &Value) -> bool {
     config["ml"]["mode"] == "demo"
@@ -224,12 +236,15 @@ fn authorize(
     // A raw classifier probability is not an edge: 94% of the emitted values sit in
     // [0.40, 0.60) while the realized win rate is 28.6%, so the confidence floor
     // above passes nearly everything. Require the strategy's realized net
-    // expectancy (fees and funding already inside) to clear the configured floor.
+    // expectancy (fees and funding already inside) to clear the configured floor,
+    // measured on the forward window only: the earlier record was produced by the
+    // exit rule this change retired, so it cannot veto its own replacement.
     // Checked before capacity so the reported blocker is the real one: a book that is
     // merely full hides "this strategy has no measured edge at all".
     let min_edge_bps = crate::automation_guards::env_num("NOFX_ML_MIN_EDGE_BPS", 25., -1e4, 1e4);
     let history = state["orders"].as_array().map(Vec::as_slice).unwrap_or(&[]);
-    crate::ml_edge::require(history, STRATEGY_ID, min_edge_bps)?;
+    let epoch = forward_epoch_ms();
+    let gate = crate::ml_edge::gate(history, STRATEGY_ID, epoch, min_edge_bps)?;
     ensure_capacity(&funds, state)?;
     let prediction = &signal["mlPrediction"];
     ensure!(
@@ -285,7 +300,18 @@ fn authorize(
         "Demo 已有同币种远端持仓或挂单"
     );
     let cfg = policy(prediction);
-    let size = ml_replay::position_size(signal, funds["equity"].as_f64().unwrap(), &cfg)?;
+    let mut size = ml_replay::position_size(signal, funds["equity"].as_f64().unwrap(), &cfg)?;
+    // Until the forward window clears the scaling bar every *new* position is a
+    // probe: the same cap is applied by the submitter, so `authorize_new` and the
+    // order that actually reaches the exchange cannot disagree about size.
+    // `budget_usdt` keeps the unclamped number so that re-checking an order that
+    // was already accepted under a larger cap does not retroactively invalidate it.
+    let budget = size["margin_usdt"].as_f64().unwrap_or(0.);
+    let cap = crate::ml_edge::margin_cap(history, STRATEGY_ID, epoch);
+    size["budget_usdt"] = json!(budget);
+    size["margin_usdt"] = json!(budget.min(cap));
+    size["probe"] = json!(cap.is_finite());
+    size["edge_verdict"] = gate["verdict"].clone();
     Ok(size)
 }
 
@@ -447,10 +473,13 @@ mod tests {
         seed_edge(&mut state, now);
         let signal = normalized(&prediction, now);
         let record = json!({"id":"model-record","interval":"1h","strategyId":STRATEGY_ID,"analyses":[signal]});
-        let input = json!({"recordId":"model-record","symbol":"BTCUSDT","strategyId":STRATEGY_ID,"margin":50.,"leverage":1});
+        // The forward window is empty in a fixture dated 1970, so the gate is in
+        // probe mode and only the probe margin is authorised.
+        let margin = crate::ml_edge::probe_margin();
+        let input = json!({"recordId":"model-record","symbol":"BTCUSDT","strategyId":STRATEGY_ID,"margin":margin,"leverage":1});
         assert!(paper::submit_paper_order(&mut state.clone(), &record, &input, now).is_err());
         for (key, value) in [
-            ("margin", json!(51.)),
+            ("margin", json!(margin + 1.)),
             ("leverage", json!(2)),
             ("stopLoss", json!(1.)),
             ("executionPlan", json!({"stopLoss":1.})),
@@ -474,7 +503,7 @@ mod tests {
                 .unwrap();
         assert_eq!(order["strategyId"], STRATEGY_ID);
         assert_eq!(order["leverage"], 1.);
-        assert_eq!(order["notional"], 50.);
+        assert_eq!(order["notional"], margin);
         assert_eq!(
             state["orders"].as_array().unwrap().len(),
             crate::ml_edge::MIN_OBSERVATIONS + 1
@@ -485,13 +514,25 @@ mod tests {
                 .unwrap()["id"],
             order["id"]
         );
-        // Without any realized history the net-edge gate refuses to authorise risk.
-        let history = state["orders"].clone();
-        state["orders"] = json!([]);
-        let error =
-            authorize_new(&mut state, &config, &record["analyses"][0], &input, now).unwrap_err();
-        assert!(format!("{error:#}").contains("样本不足"), "{error:#}");
-        state["orders"] = history;
+        // Sizing above the probe cap is refused for as long as the forward window is
+        // thin - that is what keeps the experiment cheap instead of either freezing
+        // it or scaling it on an unmeasured edge.
+        let (fresh_config, fresh_state, fresh_prediction) = fixture(now);
+        let budget = authorize(
+            &fresh_state,
+            &fresh_config,
+            &normalized(&fresh_prediction, now),
+            now,
+            None,
+        )
+        .unwrap();
+        assert_eq!(budget["probe"], true, "前向窗口为空时只能是探针仓");
+        assert_eq!(budget["edge_verdict"], "probe");
+        assert_eq!(budget["margin_usdt"], crate::ml_edge::probe_margin());
+        assert!(
+            budget["budget_usdt"].as_f64().unwrap() >= budget["margin_usdt"].as_f64().unwrap(),
+            "未封顶的风险预算仍然上报，供待成交订单复核使用"
+        );
     }
 
     #[test]
@@ -627,8 +668,10 @@ mod tests {
 pub fn recheck_pending(state: &Value, config: &Value, order: &Value, now: i64) -> Result<()> {
     let signal = &order["analysisContext"]["signal"];
     let size = authorize(state, config, signal, now, order["id"].as_str())?;
+    // Compare against the unclamped budget: the probe cap applies to new orders
+    // only, otherwise deploying a smaller size would cancel every pending order.
     ensure!(
-        number(&order["margin"], f64::INFINITY) <= number(&size["margin_usdt"], 0.) + 1e-8
+        number(&order["margin"], f64::INFINITY) <= number(&size["budget_usdt"], 0.) + 1e-8
             && number(&order["leverage"], 0.) == 1.,
         "待成交订单已超过当前模型账户风控预算"
     );

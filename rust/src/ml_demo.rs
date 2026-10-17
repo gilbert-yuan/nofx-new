@@ -1,7 +1,7 @@
 //! Bounded, rotating Demo scan using the existing account, order and exit engine.
 use crate::{
     automation::{self, Automation},
-    iso,
+    iso, ml_edge,
     ml_execution::{self, STRATEGY_ID},
     ml_gateway::Gateway,
     now_ms, number, paper, research, strategies,
@@ -227,6 +227,16 @@ pub async fn scan(automation: &Automation, token: u64, config: &Value) -> Result
             cards[index]["execution"]["reason"] = json!(reason);
             continue;
         }
+        // Same cap the execution boundary applies, derived from the forward window
+        // so the order that leaves here is sized by the policy that is running.
+        let cap = crate::ml_edge::margin_cap(
+            current["orders"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+            STRATEGY_ID,
+            ml_execution::forward_epoch_ms(),
+        );
         let result = submit_candidate(
             automation,
             config,
@@ -234,6 +244,7 @@ pub async fn scan(automation: &Automation, token: u64, config: &Value) -> Result
             &candidate["signal"],
             &candidate["market"],
             &candidate["prediction"],
+            cap,
             (&run_id, token),
         )
         .await;
@@ -258,7 +269,15 @@ pub async fn scan(automation: &Automation, token: u64, config: &Value) -> Result
     for (index, symbol) in card_symbols.iter().enumerate() {
         outcomes.push(json!({"symbol":symbol,"execution":cards[index]["execution"]}));
     }
-    let summary = json!({"mode":"demo_auto","universe":symbols.len(),"batch":targets.len(),"analyzed":analyzed,"ranked":ranked,"created":created,"submitted":submitted,"execution":outcomes,"failed":errors.len(),"errors":errors,"runId":run_id});
+    let forward = {
+        let account = automation.db.account(true, None).await?;
+        let orders = account["orders"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        ml_edge::forward(orders, STRATEGY_ID, ml_execution::forward_epoch_ms())
+    };
+    let summary = json!({"mode":"demo_auto","universe":symbols.len(),"batch":targets.len(),"analyzed":analyzed,"ranked":ranked,"created":created,"submitted":submitted,"forward":forward,"execution":outcomes,"failed":errors.len(),"errors":errors,"runId":run_id});
     let mut state = automation.state.lock().await;
     state["ml"]["cursor"] = json!((cursor + targets.len()) % symbols.len());
     state["ml"]["lastRun"] = json!(iso(now_ms()));
@@ -281,12 +300,13 @@ async fn submit_candidate(
     signal: &Value,
     market: &Value,
     prediction: &Value,
+    margin_cap: f64,
     (run_id, token): (&str, u64),
 ) -> Result<Value> {
     let now = now_ms();
     let symbol = signal["symbol"].as_str().context("模型币种缺失")?;
     let size = &prediction["risk_management"]["position_size"];
-    let margin = number(&size["margin_usdt"], 0.);
+    let margin = number(&size["margin_usdt"], 0.).min(margin_cap);
     let info = automation
         .market
         .contracts()

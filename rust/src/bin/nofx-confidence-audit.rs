@@ -9,7 +9,7 @@
 //! Read-only: opens the account with the full extension set, never writes.
 use anyhow::{Context, Result};
 use nofx_core::{db::Db, number, timestamp};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::path::PathBuf;
 
 const STRATEGY: &str = "chronos-lightgbm-v1";
@@ -74,12 +74,24 @@ async fn run(out: PathBuf) -> Result<()> {
             continue;
         }
         let wins = rows.iter().filter(|(_, bps, _)| *bps > 0.).count();
-        let win_sum: f64 = rows.iter().filter(|(_, b, _)| *b > 0.).map(|(_, b, _)| b).sum();
-        let loss_sum: f64 = rows.iter().filter(|(_, b, _)| *b <= 0.).map(|(_, b, _)| b).sum();
+        let win_sum: f64 = rows
+            .iter()
+            .filter(|(_, b, _)| *b > 0.)
+            .map(|(_, b, _)| b)
+            .sum();
+        let loss_sum: f64 = rows
+            .iter()
+            .filter(|(_, b, _)| *b <= 0.)
+            .map(|(_, b, _)| b)
+            .sum();
         let losses = rows.len() - wins;
         let win_rate = wins as f64 / rows.len() as f64;
         let avg_win = if wins > 0 { win_sum / wins as f64 } else { 0. };
-        let avg_loss = if losses > 0 { loss_sum / losses as f64 } else { 0. };
+        let avg_loss = if losses > 0 {
+            loss_sum / losses as f64
+        } else {
+            0.
+        };
         buckets.push(json!({
             "from": low, "to": high,
             "trades": rows.len(),
@@ -101,13 +113,20 @@ async fn run(out: PathBuf) -> Result<()> {
         let wins = rows.iter().filter(|(_, b, _)| *b > 0.).count();
         let win_rate = wins as f64 / rows.len() as f64;
         let avg_win = if wins > 0 {
-            rows.iter().filter(|(_, b, _)| *b > 0.).map(|(_, b, _)| b).sum::<f64>() / wins as f64
+            rows.iter()
+                .filter(|(_, b, _)| *b > 0.)
+                .map(|(_, b, _)| b)
+                .sum::<f64>()
+                / wins as f64
         } else {
             0.
         };
         let losses = rows.len() - wins;
         let avg_loss = if losses > 0 {
-            rows.iter().filter(|(_, b, _)| *b <= 0.).map(|(_, b, _)| b).sum::<f64>()
+            rows.iter()
+                .filter(|(_, b, _)| *b <= 0.)
+                .map(|(_, b, _)| b)
+                .sum::<f64>()
                 / losses as f64
         } else {
             0.
@@ -143,7 +162,11 @@ async fn run(out: PathBuf) -> Result<()> {
     let path = out.join("confidence-calibration.json");
     std::fs::write(&path, serde_json::to_vec_pretty(&report)?)?;
 
-    println!("已平仓且带置信度：{} 笔；在场信号：{} 个", closed.len(), open_p.len());
+    println!(
+        "已平仓且带置信度：{} 笔；在场信号：{} 个",
+        closed.len(),
+        open_p.len()
+    );
     println!(
         "在场信号分位：p50={:.3} p75={:.3} p90={:.3} max={:.3}",
         quantile(0.5),
@@ -178,6 +201,3 @@ async fn run(out: PathBuf) -> Result<()> {
     println!("\n清单：{}", path.display());
     Ok(())
 }
-
-#[allow(dead_code)]
-fn _assert_value(_: &Value) {}

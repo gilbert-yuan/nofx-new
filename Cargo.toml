@@ -105,6 +105,14 @@ name = "nofx-ml-rolling-train"
 path = "rust/src/bin/nofx-ml-rolling-train.rs"
 
 [[bin]]
+name = "nofx-ml-rolling-benchmark"
+path = "rust/src/bin/nofx-ml-rolling-benchmark.rs"
+
+[[bin]]
+name = "nofx-ml-forecast-sweep"
+path = "rust/src/bin/nofx-ml-forecast-sweep.rs"
+
+[[bin]]
 name = "nofx-ml-diagnose"
 path = "rust/src/bin/nofx-ml-diagnose.rs"
 

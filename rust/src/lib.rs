@@ -38,6 +38,7 @@ pub mod ml_training_data;
 pub mod optimizer;
 pub mod paper;
 pub mod research;
+pub mod rolling_bench;
 pub mod simulator;
 pub mod spot;
 pub mod store;
