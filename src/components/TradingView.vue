@@ -198,6 +198,15 @@ const orderStats = computed(() => {
 const precise = value => value == null || !Number.isFinite(Number(value)) ? '—'
   : Number(value).toLocaleString('zh-CN', { useGrouping: false, maximumSignificantDigits: 10 });
 
+// 交易所仍有持仓、本地单据却已全部平仓时，直接写「已平仓」会与「实际持仓」自相矛盾。
+// 这种情况是账实差异，明确标成待对账，用户才知道该点平仓把交易所那部分平掉。
+function localStatusNote(order, local) {
+  if (local.status === 'closed' && order.status === 'open' && order.source && order.source !== 'paper') {
+    return order.reconciliationPending ? '已平仓 · 交易所有持仓，待对账' : '已平仓';
+  }
+  return status(local.status);
+}
+
 // 加载模拟账户数据
 async function loadAccount({ silent = false } = {}) {
   const sequence = ++loadSequence;
@@ -540,7 +549,12 @@ onUnmounted(() => { disposed = true; ++loadSequence; clearTimeout(pollTimer); })
               </td>
               <td>
                 {{ order.status === 'closed' ? '已平仓' : order.source && order.source !== 'paper' ? (order.status === 'open' ? '实际持仓' : order.remoteStatus === 'partially_filled' ? '部分成交 · 余量待入场' : '等待入场') : status(order.status) }}
-                <small v-for="local in order.localOrders || []" :key="local.id" class="local-order-note">本地模拟：{{ status(local.status) }}</small>
+                <small
+                  v-for="local in order.localOrders || []"
+                  :key="local.id"
+                  class="local-order-note"
+                  :class="{ 'reconcile-note': local.status === 'closed' && order.reconciliationPending }"
+                >本地模拟：{{ localStatusNote(order, local) }}</small>
               </td>
               <td>{{ order.leverage }}x</td>
               <td :title="'买入金额 ' + fmt(order.buyAmount ?? order.notional) + ' USDT'">{{ order.margin != null ? fmt(order.margin) : '—' }}</td>
@@ -814,6 +828,7 @@ onUnmounted(() => { disposed = true; ++loadSequence; clearTimeout(pollTimer); })
 .exchange-sync-overview p { margin: 6px 0; }
 .exchange-sync-overview small { color: var(--text-tertiary); }
 .local-order-note { display: block; color: var(--text-tertiary); font-size: 11px; }
+.local-order-note.reconcile-note { color: var(--warning); }
 .capital-form {
   display: flex;
   gap: 10px;

@@ -363,3 +363,17 @@ async fn live_public_klines_decode_through_configured_transport() -> Result<()> 
     }
     Ok(())
 }
+
+#[test]
+fn only_an_explicit_proxy_setting_can_route_exchange_traffic() {
+    // Ambient HTTP_PROXY/HTTPS_PROXY must stay irrelevant: they belong to whatever shell or IDE
+    // launched the process, and a dead one there took every exchange call offline with
+    // `tunnel error ... os error 10061` while direct access was fine.
+    assert_eq!(proxy_choice(None), None);
+    assert_eq!(proxy_choice(Some("")), None, "blank must not mean a proxy");
+    assert_eq!(proxy_choice(Some("   ")), None);
+    assert_eq!(
+        proxy_choice(Some("  http://127.0.0.1:7890 ")),
+        Some("http://127.0.0.1:7890".to_owned())
+    );
+}

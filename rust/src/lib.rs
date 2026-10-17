@@ -15,6 +15,7 @@ pub mod market_indicators;
 pub mod ml_archive;
 pub mod ml_dataset;
 pub mod ml_demo;
+pub mod ml_edge;
 pub mod ml_execution;
 pub mod ml_features;
 pub mod ml_gateway;

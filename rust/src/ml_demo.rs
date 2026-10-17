@@ -59,8 +59,19 @@ pub async fn scan(automation: &Automation, token: u64, config: &Value) -> Result
         .collect();
     let universe = research::symbols(&json!({"symbolsText":config["marketSync"]["symbolsText"]}));
     let entries = research::symbols(&json!({"symbolsText":config["trader"]["entrySymbolsText"]}));
+    // Newly listed micro caps are where the measured losses concentrate: the five
+    // worst fills were all fresh listings losing 8-13% of notional in one trade.
+    // A 5M quote-volume floor let almost every new contract through, so require
+    // real turnover and a listing history long enough to have a distribution.
     let minimum =
-        crate::automation_guards::env_num("NOFX_MIN_QUOTE_VOL_24H", 5_000_000., 0., f64::MAX);
+        crate::automation_guards::env_num("NOFX_MIN_QUOTE_VOL_24H", 50_000_000., 0., f64::MAX);
+    let min_listed_days =
+        crate::automation_guards::env_num("NOFX_MIN_LISTING_DAYS", 30., 0., 3650.);
+    let listed_cutoff = now_ms() - (min_listed_days * 86_400_000.) as i64;
+    let onboard: BTreeMap<&str, i64> = contracts
+        .iter()
+        .filter_map(|c| Some((c["symbol"].as_str()?, number(&c["onboardDate"], 0.) as i64)))
+        .collect();
     let mut symbols: Vec<String> = contracts
         .iter()
         .filter_map(|c| c["symbol"].as_str())
@@ -72,6 +83,12 @@ pub async fn scan(automation: &Automation, token: u64, config: &Value) -> Result
                 &ticker_map.get(*s).unwrap_or(&Value::Null)["quoteVolume"],
                 0.,
             ) >= minimum
+        })
+        .filter(|s| {
+            // Missing onboardDate is treated as unknown, not as "listed long ago".
+            onboard
+                .get(*s)
+                .is_some_and(|listed| *listed > 0 && *listed <= listed_cutoff)
         })
         .map(str::to_owned)
         .collect();
@@ -106,8 +123,14 @@ pub async fn scan(automation: &Automation, token: u64, config: &Value) -> Result
     let mut analyzed = 0;
     let mut created = 0;
     let mut submitted = 0;
-    let mut cards = vec![];
+    let mut cards: Vec<Value> = vec![];
+    let mut card_symbols: Vec<String> = vec![];
     let mut outcomes = vec![];
+    // Pass one analyses every symbol in the batch but submits nothing: the batch is
+    // ranked, and only the best `maxNewEntriesPerCycle` scores get the risk budget.
+    // Submitting inside the scan loop meant the slot went to whichever symbol the
+    // rotation cursor reached first, which is not a decision about quality.
+    let mut ready: Vec<(Value, usize)> = vec![];
     for symbol in &targets {
         if !automation.token_matches(token) {
             break;
@@ -166,51 +189,76 @@ pub async fn scan(automation: &Automation, token: u64, config: &Value) -> Result
             strategies::opportunity_report(&signal, &market, &confirmation, &strategy, now_ms());
         let mut card = signal["opportunityReport"].clone();
         card["execution"] = json!({"status":"skipped","reason":"Demo 账户或模型开仓条件未满足"});
-        if prediction["risk_management"]["entry_permitted"] == true && created < maximum {
-            let candidate =
-                json!({"symbol":symbol,"signal":signal,"strategy":strategy,"market":market});
-            if let Some(reason) = automation::entry_guard_at(&account, &candidate, config, now_ms())
-            {
-                card["execution"]["reason"] = json!(reason);
-            } else {
-                let result = submit_candidate(
-                    automation,
-                    config,
-                    &strategy,
-                    &signal,
-                    &market,
-                    &prediction,
-                    (&run_id, token),
-                )
-                .await;
-                match result {
-                    Ok(order) => {
-                        created += 1;
-                        let confirmed = matches!(
-                            order["exchangeSync"]["demo"]["status"].as_str(),
-                            Some("submitted" | "new" | "partially_filled" | "filled")
-                        );
-                        if confirmed {
-                            submitted += 1;
-                        }
-                        card["execution"] = json!({"status":if confirmed{"submitted"}else{"created"},"environment":"demo","orderId":order["id"],"exchangeStatus":order["exchangeSync"]["demo"]["status"],"reason":order["exchangeSync"]["demo"]["lastError"]});
-                    }
-                    Err(error) => {
-                        errors.push(format!("{symbol} 开仓：{error:#}"));
-                        card["execution"]["reason"] = json!(format!("{error:#}"));
-                    }
-                }
-            }
+        let index = cards.len();
+        cards.push(card);
+        card_symbols.push(symbol.clone());
+        if prediction["risk_management"]["entry_permitted"] == true {
+            ready.push((
+                json!({"symbol":symbol,"signal":signal,"strategy":strategy,"market":market,"prediction":prediction}),
+                index,
+            ));
         } else if let Some(reason) = prediction["risk_management"]["blocked_reasons"]
             .as_array()
             .and_then(|r| r.first())
         {
-            card["execution"]["reason"] = reason.clone();
+            cards[index]["execution"]["reason"] = reason.clone();
         }
-        outcomes.push(json!({"symbol":symbol,"execution":card["execution"]}));
-        cards.push(card);
     }
-    let summary = json!({"mode":"demo_auto","universe":symbols.len(),"batch":targets.len(),"analyzed":analyzed,"created":created,"submitted":submitted,"execution":outcomes,"failed":errors.len(),"errors":errors,"runId":run_id});
+    let ranked = ready.len();
+    ready.sort_by(|a, b| {
+        automation::score(&b.0)
+            .total_cmp(&automation::score(&a.0))
+            .then_with(|| {
+                number(&b.0["signal"]["confidence"], 0.)
+                    .total_cmp(&number(&a.0["signal"]["confidence"], 0.))
+            })
+            .then_with(|| a.0["symbol"].as_str().cmp(&b.0["symbol"].as_str()))
+    });
+    for (rank, (candidate, index)) in ready.into_iter().enumerate() {
+        if !automation.token_matches(token) {
+            break;
+        }
+        if created >= maximum {
+            cards[index]["execution"] = json!({"status":"skipped","reason":format!("评分第 {} 位，本轮 {} 个开仓名额已用完", rank + 1, maximum)});
+            continue;
+        }
+        let current = automation.db.account(true, None).await?;
+        if let Some(reason) = automation::entry_guard_at(&current, &candidate, config, now_ms()) {
+            cards[index]["execution"]["reason"] = json!(reason);
+            continue;
+        }
+        let result = submit_candidate(
+            automation,
+            config,
+            &strategy,
+            &candidate["signal"],
+            &candidate["market"],
+            &candidate["prediction"],
+            (&run_id, token),
+        )
+        .await;
+        match result {
+            Ok(order) => {
+                created += 1;
+                let confirmed = matches!(
+                    order["exchangeSync"]["demo"]["status"].as_str(),
+                    Some("submitted" | "new" | "partially_filled" | "filled")
+                );
+                if confirmed {
+                    submitted += 1;
+                }
+                cards[index]["execution"] = json!({"status":if confirmed{"submitted"}else{"created"},"environment":"demo","orderId":order["id"],"exchangeStatus":order["exchangeSync"]["demo"]["status"],"rank":rank+1,"reason":order["exchangeSync"]["demo"]["lastError"]});
+            }
+            Err(error) => {
+                errors.push(format!("{} 开仓：{error:#}", candidate["symbol"]));
+                cards[index]["execution"]["reason"] = json!(format!("{error:#}"));
+            }
+        }
+    }
+    for (index, symbol) in card_symbols.iter().enumerate() {
+        outcomes.push(json!({"symbol":symbol,"execution":cards[index]["execution"]}));
+    }
+    let summary = json!({"mode":"demo_auto","universe":symbols.len(),"batch":targets.len(),"analyzed":analyzed,"ranked":ranked,"created":created,"submitted":submitted,"execution":outcomes,"failed":errors.len(),"errors":errors,"runId":run_id});
     let mut state = automation.state.lock().await;
     state["ml"]["cursor"] = json!((cursor + targets.len()) % symbols.len());
     state["ml"]["lastRun"] = json!(iso(now_ms()));

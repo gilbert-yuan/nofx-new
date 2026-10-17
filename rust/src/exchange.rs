@@ -2,10 +2,24 @@ use anyhow::{Context, Result, bail};
 use hmac::{Hmac, Mac};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 use tokio::sync::Mutex;
 mod market_context;
 mod rate_limit;
+
+/// Contract metadata changes only when the venue lists or delists a symbol, but the payload is
+/// roughly 900KB and measures ~7s to fetch on this link. Fetching it per call was the dominant
+/// cost of closing a position and of every account sweep, so it is cached per environment.
+const EXCHANGE_INFO_TTL_MS: i64 = 600_000;
+fn info_cache() -> &'static Mutex<BTreeMap<String, (i64, BTreeMap<String, Value>)>> {
+    static CACHE: OnceLock<Mutex<BTreeMap<String, (i64, BTreeMap<String, Value>)>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
 
 #[derive(Clone)]
 pub struct Exchange {
@@ -40,6 +54,47 @@ impl Exchange {
     }
     pub fn public() -> Result<Self> {
         Self::new(&json!({"binance":{"demo":false}}), "live")
+    }
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+    /// Per-contract metadata, served from a shared per-environment cache.
+    pub async fn info(&self, symbol: &str) -> Result<Value> {
+        let base = self.base.clone();
+        let now = crate::now_ms();
+        {
+            let cache = info_cache().lock().await;
+            if let Some((at, contracts)) = cache.get(&base) {
+                if now.saturating_sub(*at) < EXCHANGE_INFO_TTL_MS {
+                    // A full listing without this symbol is authoritative: refetching would only
+                    // re-download 900KB to learn the same thing.
+                    return contracts
+                        .get(symbol)
+                        .cloned()
+                        .context("目标交易环境不支持该合约");
+                }
+            }
+        }
+        let started = tokio::time::Instant::now();
+        let raw = self
+            .public_request("/fapi/v1/exchangeInfo", &json!({}))
+            .await?;
+        let mut contracts = BTreeMap::new();
+        for row in raw["symbols"].as_array().context("合约信息格式错误")? {
+            if let Some(name) = row["symbol"].as_str() {
+                contracts.insert(name.to_owned(), row.clone());
+            }
+        }
+        // Only logged on a miss, so the log also proves the cache is doing its job.
+        tracing::info!(
+            base = %base,
+            ms = started.elapsed().as_millis() as i64,
+            symbols = contracts.len(),
+            "Fetched exchange contract metadata"
+        );
+        let mut cache = info_cache().lock().await;
+        cache.insert(base, (now, contracts.clone()));
+        contracts.remove(symbol).context("目标交易环境不支持该合约")
     }
     pub fn new(config: &Value, environment: &str) -> Result<Self> {
         let b = &config["binance"];
@@ -284,7 +339,7 @@ impl Exchange {
         let data = self
             .public_request("/fapi/v1/exchangeInfo", &json!({}))
             .await?;
-        let mut rows:Vec<Value>=data["symbols"].as_array().context("合约列表格式错误")?.iter().filter(|s|s["status"]=="TRADING"&&s["contractType"]=="PERPETUAL"&&s["quoteAsset"]=="USDT"&&s["marginAsset"]=="USDT").map(|s|json!({"symbol":s["symbol"],"baseCoin":s["baseAsset"],"quoteCoin":s["quoteAsset"],"filters":s["filters"],"maxLeverage":s["filters"].as_array().and_then(|f|f.iter().find(|f|f["filterType"]=="LEVERAGE_FILTER")).map(|f|crate::number(&f["maxLeverage"],0.)),"marketProvider":"binance"})).collect();
+        let mut rows:Vec<Value>=data["symbols"].as_array().context("合约列表格式错误")?.iter().filter(|s|s["status"]=="TRADING"&&s["contractType"]=="PERPETUAL"&&s["quoteAsset"]=="USDT"&&s["marginAsset"]=="USDT").map(|s|json!({"symbol":s["symbol"],"baseCoin":s["baseAsset"],"quoteCoin":s["quoteAsset"],"filters":s["filters"],"onboardDate":s["onboardDate"],"maxLeverage":s["filters"].as_array().and_then(|f|f.iter().find(|f|f["filterType"]=="LEVERAGE_FILTER")).map(|f|crate::number(&f["maxLeverage"],0.)),"marketProvider":"binance"})).collect();
         rows.sort_by(|a, b| a["symbol"].as_str().cmp(&b["symbol"].as_str()));
         Ok(rows)
     }
@@ -292,7 +347,49 @@ impl Exchange {
         self.market_context(symbol, &Value::Null, false).await
     }
 }
+/// Proxy support is opt-in through `NOFX_HTTP_PROXY` and nothing else.
+///
+/// Ambient `HTTP_PROXY` / `HTTPS_PROXY` describe the shell that happened to launch the process
+/// (IDE sandboxes, CI agents, terminal wrappers), not this service's network policy. Honouring
+/// them means a proxy that dies with that shell silently takes every exchange call down with
+/// `tunnel error ... os error 10061`, while a direct connection is perfectly healthy.
+fn explicit_proxy() -> Option<String> {
+    proxy_choice(std::env::var("NOFX_HTTP_PROXY").ok().as_deref())
+}
+/// Blank is treated as "no proxy" so an empty default in a process manager cannot be mistaken
+/// for a configured proxy.
+fn proxy_choice(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+fn note_ignored_proxy() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            let Ok(value) = std::env::var(key) else {
+                continue;
+            };
+            if value.trim().is_empty() {
+                continue;
+            }
+            tracing::warn!(
+                variable = key,
+                %value,
+                "Ignoring inherited proxy; set NOFX_HTTP_PROXY to opt in"
+            );
+        }
+    });
+}
 fn http_client(reuse_idle_connections: bool) -> Result<reqwest::Client> {
+    note_ignored_proxy();
     let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(8))
@@ -301,13 +398,10 @@ fn http_client(reuse_idle_connections: bool) -> Result<reqwest::Client> {
     if !reuse_idle_connections {
         builder = builder.pool_max_idle_per_host(0);
     }
-    if let Some(proxy) = std::env::var("HTTPS_PROXY")
-        .ok()
-        .or_else(|| std::env::var("HTTP_PROXY").ok())
-        .filter(|s| !s.is_empty())
-    {
-        builder = builder.proxy(reqwest::Proxy::all(proxy)?);
-    }
+    builder = match explicit_proxy() {
+        Some(proxy) => builder.proxy(reqwest::Proxy::all(proxy)?),
+        None => builder.no_proxy(),
+    };
     Ok(builder.build()?)
 }
 fn futures_base(demo: bool, live_override: Option<&str>) -> String {

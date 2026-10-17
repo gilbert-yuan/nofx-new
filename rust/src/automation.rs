@@ -544,7 +544,7 @@ impl Automation {
         };
         let ticker_available = tickers.as_array().is_some_and(|t| !t.is_empty());
         if env_bool("NOFX_LIQUIDITY_SCREEN", true) && (!data_only || ticker_available) {
-            let minimum = env_num("NOFX_MIN_QUOTE_VOL_24H", 5_000_000.);
+            let minimum = env_num("NOFX_MIN_QUOTE_VOL_24H", 50_000_000.);
             symbols.retain(|s| {
                 tickers
                     .as_array()
@@ -1484,7 +1484,7 @@ fn env_bool(name: &str, fallback: bool) -> bool {
         .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(fallback)
 }
-fn score(c: &Value) -> f64 {
+pub(crate) fn score(c: &Value) -> f64 {
     for v in [
         &c["signal"]["plan"]["trendStrengthScore"],
         &c["signal"]["score"],

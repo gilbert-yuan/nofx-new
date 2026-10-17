@@ -173,3 +173,281 @@
 现在手动平仓已不受其影响，但这条定时器事实上永远跑不完一轮，
 意味着**账户快照与持仓对账的实时性只有约 31–46 秒**，而不是设计的 15 秒。
 要根治得拆小 `ledger::synchronize` 的粒度或改成增量同步，属独立改造项，本轮未动。
+
+---
+
+# 追加：`exchange-refresh` 全局锁是什么、为什么可以去掉
+
+日期：2026-10-17 12:00
+
+## 这把锁保护的不是订单
+
+`exchange_refresh` 的临界区里**没有任何订单级操作**。它做的是：
+
+1. 读全量 state（`db.account`）；
+2. 每个 env：逐条解析 `capitalReservations`（每条一次 `GET /fapi/v1/order`），
+   然后 `positionRisk` + `openOrders` 并发拉取；
+3. `ledger::synchronize(...)` 把交易所成交/资金费并入本地账本；
+4. 一次 `mutate_account_light` 把 `exchangeAccounts[env]` 整份快照写回，并 `reconcile_orders`。
+
+锁 key 是 `system:exchange-refresh:ALL` —— 一个全局 key，**不分账户、不分币种**。
+所以它看起来"锁住了所有订单"，实际它锁的是"账户快照的读-改-写"这一件事。
+
+订单级的互斥早就单独存在：`nofx-execution:{env}:{symbol}:{positionSide}`，
+入场、平仓、保护单各自按币种串行。刷新根本不参与。
+
+## 为什么它其实是冗余的
+
+三项证据：
+
+1. **账本写入天然幂等。** `ledger.rs` 只写三张表，全部带冲突处理：
+   - `simulation_exchange_fills` → `ON CONFLICT(environment,account_key,symbol,trade_id) DO NOTHING`
+   - `simulation_exchange_funding` → `ON CONFLICT(environment,account_key,flow_id) DO NOTHING`
+   - `simulation_exchange_cursors` → `ON CONFLICT ... DO UPDATE`
+   重复并发执行不会重复入账。
+2. **账户写入自带事务锁。** `mutate_account_light` → `mutate_account_mode` 内部有
+   `write_gate` + `pg_advisory_xact_lock(790217)`，并在事务内重读 state。两个刷新并发写入，
+   后写者覆盖前写者，但两者都是同一时刻的交易所真相，不会产生结构损坏或重复入账。
+3. **其余步骤都是只读。** `positionRisk` / `openOrders` / `prices` 不写任何东西。
+
+它唯一还买到的，只是"别把同一份刷新跑两遍"（省 HTTP 调用）。而代价是：
+**一条 advisory 事务锁被持有 31 秒，同时钉住池子里的一条连接**（`max_connections=12`），
+并且把所有账户、所有调用方串行化。
+
+## 改动
+
+1. 删掉 `lock_execution(db,"system","exchange-refresh","ALL")`，换成进程内**按账户**互斥：
+   `refresh_guard(env)` = 每个 env 一个 `tokio::sync::Mutex`。只防重复工作，不占数据库连接。
+2. 拆两条路径：
+   - `exchange_refresh`（后台）→ `lock().await`，排队执行；
+   - `exchange_refresh_soft`（用户操作）→ `try_lock()`，拿不到就跳过，用上一个快照。
+3. 新增**刷新新鲜度闸门** `refresh_if_stale()`：`LAST_REFRESH_AT` 距今 < 90 秒就完全不刷新。
+   没有这道闸门会从"409"变成"每个请求自己跑 30 秒刷新"，问题只是换了个形态。
+4. 删掉 `close_internal` **结尾**那次刷新：仓位已平、本地已记录，`status` 就是准的，
+   再花 30 秒（甚至因报错掩盖成功）纯属负收益。
+
+## 实测
+
+| 指标 | 改造前 | 改造后 |
+|---|---|---|
+| 平仓请求耗时（3 次探测） | 2s / 2s / **31s**（取决于是否抢到锁） | **2.3s / 1.8s / 2.0s** |
+| 平仓被 409 拒绝 | 命中锁即失败 | 0 |
+| `Exchange account synchronization deferred 409` | 反复出现 | 部署后 **0** |
+| 连接池 `inUse` | 4–6（一条被 31s 事务长期占用） | 3–4，无长期占用 |
+| 后台刷新是否正常 | 是 | 是（`syncedAt` 持续推进，positions=97） |
+
+`cargo test --lib` 278 passed（新增 `refresh_freshness_window_expires`），
+`durable_partial_exit_and_protection` 端到端 pass。
+
+## 为什么没动 `paper-refresh`
+
+`refresh_internal` 用的是同一把全局锁（`system:paper-refresh:ALL`），但它**不能照搬**：
+它在循环里基于**顶部读到的过期快照**逐单算结果，最后用一个 patch 应用回去。
+并发两遍会丢更新（例如中间有人手工平仓，另一遍会用旧状态把它覆盖回去）。
+`exchange-refresh` 是"整份快照替换 + 幂等 upsert"，性质不同，才敢去掉。
+`paper-refresh` 要动，得先把它的写入改成带版本号的乐观并发，属独立改造。
+
+## 前提与限制
+
+进程内互斥假设**单进程部署**。当前 PM2 是 fork 模式单实例，成立。
+若将来起多个 `nofx-server` 实例，需要换成 `pg_try_advisory_lock`（会话级）或数据库租约，
+否则多进程会各刷各的（仍幂等，只是重复劳动）。
+
+---
+
+# 事故复盘：继承死代理导致交易所全面断网
+
+日期：2026-10-17 12:05 报障 → 12:20 恢复
+
+## 现象
+
+```
+Binance public GET https://fapi.binance.com/fapi/v1/exchangeInfo failed after 3 attempt(s):
+error sending request for url (https://fapi.binance.com/fapi/v1/exchangeInfo):
+client error (Connect): tunnel error: failed to create underlying connection:
+tcp connect error: 由于目标计算机积极拒绝，无法连接。 (os error 10061)
+```
+
+`demo-fapi` 与 `fapi` 同时失败，`klineSync` 连续报错 —— 不是单个域名问题，是整个出站链路断了。
+
+## 根因
+
+`pm2 env <id>` 显示交易进程环境里有：
+
+```
+HTTP_PROXY:  http://127.0.0.1:50172
+HTTPS_PROXY: http://127.0.0.1:50172
+```
+
+50172 是**执行命令的 shell 被注入的沙箱代理端口**，不是 `ecosystem.config.json` 里写的 7890。
+前几次用 `pm2 stop/start` 重启时，PM2 把当前 shell 的环境一起带进了子进程。
+沙箱代理随会话关闭后端口不再监听，于是每个请求都变成 CONNECT 隧道失败。
+
+实测对照：
+
+| 方式 | 结果 |
+|---|---|
+| `curl -x http://127.0.0.1:50172 https://fapi.binance.com/fapi/v1/time` | `000`（连接被拒） |
+| `curl https://fapi.binance.com/fapi/v1/time`（直连） | `200` |
+
+**结论：网络本身没问题，是进程被塞了一个死代理。**
+
+## 代码层的责任
+
+`exchange.rs::http_client()` 原本主动读取 `HTTPS_PROXY` / `HTTP_PROXY` 并据此设置 reqwest 代理：
+
+```rust
+if let Some(proxy) = std::env::var("HTTPS_PROXY").ok()
+    .or_else(|| std::env::var("HTTP_PROXY").ok())
+    .filter(|s| !s.is_empty()) {
+    builder = builder.proxy(reqwest::Proxy::all(proxy)?);
+}
+```
+
+这等于把"谁启动了我这个进程"的环境当成了网络策略。交易服务的出站策略不该被调度器的
+环境变量决定 —— 一个已经消失的代理足以让整个系统静默瘫痪。
+
+## 修复
+
+1. **代理改为显式 opt-in**：只认 `NOFX_HTTP_PROXY`，未设置或为空一律 `.no_proxy()` 直连。
+2. **可观测**：检测到继承的 `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/小写变体时，
+   用 `std::sync::Once` 打一条 WARN
+   `Ignoring inherited proxy; set NOFX_HTTP_PROXY to opt in`，附变量名与原值。
+3. **配置清理**：移除 `ecosystem.config.json` 中 `nofx-api` 的 `HTTP_PROXY`/`HTTPS_PROXY`
+   （7890 同样无人监听，是同一颗雷）。
+4. **重启纪律**：见 `MEMORY.md` —— 必须
+   `env -u HTTP_PROXY -u HTTPS_PROXY ... pm2 start ecosystem.nofx-runtime.json`，
+   并在重启后校验 `pm2 env` 无代理、`syncedAt` 推进。
+
+## 验证：主动注入毒代理
+
+不是"改完看着好像好了"，而是故意把死代理塞回去：
+
+```bash
+HTTP_PROXY=http://127.0.0.1:50172 HTTPS_PROXY=http://127.0.0.1:50172 \
+  pm2 start ecosystem.nofx-runtime.json --update-env
+```
+
+结果：
+
+| 检查项 | 结果 |
+|---|---|
+| `pm2 env` 里是否真有毒值 | 有（50172 确实在进程环境中） |
+| 启动日志 | 4 条 `Ignoring inherited proxy`（HTTP_PROXY/HTTPS_PROXY/大小写变体） |
+| `exchangeAccounts.demo.syncedAt` | 持续推进 |
+| `exchangeAccounts.demo.error` | 空 |
+| `tunnel error` 出现次数 | **0** |
+
+说明即使外部再污染环境变量，交易进程仍能直连。
+
+随后干净重启，`pm2 env | grep -c proxy = 0`，`syncedAt` 持续推进，`positions=92`，
+`klineSync` / `positionReview` 均 enabled，ML `lastRun` 正常。
+`cargo test --lib` 279 passed（新增 `only_an_explicit_proxy_setting_can_route_exchange_traffic`）。
+
+## 教训
+
+1. **长驻交易进程的网络策略必须显式声明**，不能依赖继承的环境变量。
+2. **重启前先看 `pm2 env`**：这是唯一能看到"进程实际拿到了什么环境"的地方。
+3. 事故期间的表现具有欺骗性：进程活着、API 返回 200、只是所有交易所调用失败 ——
+   监控应盯 `exchangeAccounts.*.error` 与 `syncedAt` 停滞，而不只是进程存活。
+
+---
+
+# 手动平仓慢：合约信息每次都重新下载 900KB
+
+日期：2026-10-17 12:35
+
+## 定位过程
+
+先量化平仓路径上的每一步，而不是凭感觉猜：
+
+| 路径 | 实测耗时 |
+|---|---|
+| `GET /fapi/v1/exchangeInfo`（单次，902KB） | **6.77s** |
+| `GET /fapi/v1/time` | 1.55s |
+| `/api/paper/account`（含 `db.account` 全量读） | 1.99–2.22s |
+| 平仓探测（不存在的订单 ID） | 1.89–2.34s |
+
+## 主因
+
+`paper::symbol_info()` 每次都无条件拉取全量 `/fapi/v1/exchangeInfo`
+（**902KB、742 个合约、单次 6.0–6.8 秒**），只为从中取一个合约：
+
+```rust
+let info = client.public_request("/fapi/v1/exchangeInfo", &json!({})).await?;
+info["symbols"].as_array()
+    .and_then(|a| a.iter().find(|s| s["symbol"] == symbol))
+```
+
+调用点 4 处（`paper.rs` 1704 / 2004 / 2146 / 2476）。其中 `sync_protection`（2004）
+对**每个**活跃仓位各调一次 —— 94 个仓位就是 94 次 6 秒的下载。
+
+后果有两个：
+
+1. **平仓慢**：`execute_remote_close` 在提交平仓单前要取合约信息，直接 +6 秒。
+2. **后台刷新慢**（承接上面的遗留问题）：`sync_protection` 反复下载，
+   每轮扫描耗时几十秒 —— 实测 `exchange-refresh` 接口 **46.8s**。
+
+附带发现：后台每轮还会逐个仓位持 per-symbol 锁做多次网络往返，
+手动平仓撞上时要等 `lock_execution_wait`（最长 12 秒）。
+
+## 修复
+
+1. **`Exchange::info()` 加进程内缓存**，按环境（base URL）分区，TTL 10 分钟：
+   - 命中直接返回单合约；
+   - 缓存里全量列表不含该合约时直接判"环境不支持"，**不再为已知不存在的合约重下 900KB**；
+   - 未命中才拉取，并重建 symbol → 合约 的索引表。
+   
+   理由：合约信息只在上市/下架时变化，是典型的"写少读多"数据。
+2. **`Exchange::info()` 加 miss 埋点**：只在真正拉取时打
+   `Fetched exchange contract metadata base=... ms=... symbols=...`。
+   因为只在 miss 时记录，日志本身就是缓存是否生效的证据。
+3. **`execute_remote_close` 加耗时埋点**：`Remote close finished ms=...`，
+   按 target 分别记录，下次平仓可以直接从日志读出耗时构成，不用再猜。
+
+## 验证
+
+部署后 60 秒内：
+
+```
+1  条  Fetched exchange contract metadata
+       base=https://demo-fapi.binance.com ms=6045 symbols=742
+```
+
+**只拉取了 1 次，耗时 6045ms**，之后全部命中缓存。
+改动前同样的时间窗口内会发生几十次同样的 6 秒下载。
+
+`cargo test --lib` 279 passed。
+
+## 未进一步改动的部分（有理由）
+
+1. **平仓响应里的 `status(db)`（约 2s）没有删**。
+   前端 `TradingView.vue:275` 有 `if (result.account) accountData.value = result.account;`，
+   直接用它更新界面。删掉只是把 2 秒从后端挪到前端，净收益为零。
+2. **入口 `db.account(true, None)`（约 2s）保留**。
+   `fused_orders()` 需要全量状态才能算融合池，无法只读单行。
+3. **没有动 `close_above_margin` / `close_all` 的批量路径**。
+
+## 预期与实际
+
+平仓耗时构成（估算，待真实操作复核）：
+
+| 阶段 | 改动前 | 改动后 |
+|---|---|---|
+| 入口 `db.account` | 2.0s | 2.0s |
+| 等待币种锁 | 0–12s | 趋近 0（远程同步变快） |
+| 合约信息 | **6.0–6.8s** | **≈0（命中缓存）** |
+| 其余交易所往返（持仓/挂单/下单/保护单） | ~2.5s | ~2.5s |
+| 响应 `status(db)` | 2.0s | 2.0s |
+| **合计** | **约 13–23s** | **约 6.5s** |
+
+剩下 4 秒是两次全量账户读（`db.account`），属于另一条独立的优化主线
+（此前已记录：单次读要 diff 78436 行扩展表），本轮未触碰。
+
+## 遗留
+
+1. `db.account(true, None)` 单次 2 秒，是平仓与刷新的共同底座开销。
+   要做需要引入增量读或状态缓存，改动面大，需单独评估。
+2. `Exchange::contracts()`（币种列表）也独立调用 `exchangeInfo`，未复用本次缓存。
+3. `mode()`（`positionSide/dual`）是账户级配置却每次都问交易所，
+   也可缓存，本轮未做（收益约 0.4s）。

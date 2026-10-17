@@ -216,7 +216,7 @@ pub fn entry_size(size: EntrySize) -> Option<(f64, f64)> {
 }
 pub fn screen(ticker: &Value, market: Option<&Value>) -> bool {
     let volume = optional(&ticker["quoteVolume"]);
-    if volume.is_none_or(|v| v < env_num("NOFX_MIN_QUOTE_VOL_24H", 5_000_000., 0., 1e12)) {
+    if volume.is_none_or(|v| v < env_num("NOFX_MIN_QUOTE_VOL_24H", 50_000_000., 0., 1e12)) {
         return false;
     }
     if let Some(m) = market

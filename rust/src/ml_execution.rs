@@ -149,7 +149,7 @@ pub fn signal(prediction: &Value, market: &Value, now: i64) -> Result<Value> {
     Ok(signal)
 }
 
-fn ensure_capacity(funds: &Value) -> Result<()> {
+fn ensure_capacity(funds: &Value, state: &Value) -> Result<()> {
     // Position count is bounded only by margin here, so a broad scan can fill the
     // whole equity and leave `available` negative. Keep a reserve for fees, funding
     // and adverse moves instead of opening until the ledger refuses.
@@ -161,7 +161,42 @@ fn ensure_capacity(funds: &Value) -> Result<()> {
         "持仓占用已达权益的 {:.0}% 缓冲上限，暂停新增订单",
         ceiling * 100.
     );
+    // Breadth is not diversification when every position is 1% of equity: 96
+    // simultaneous names multiplied the round-trip cost by 96 while the single
+    // fat-tail winner (+2197bps) was worth only ~11 USDT. Cap the book and spend
+    // the same risk budget on the highest-scoring signals instead.
+    let maximum =
+        crate::automation_guards::env_num("NOFX_ML_MAX_POSITIONS", 18., 1., 500.) as usize;
+    let held = state["orders"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|o| is_model_order(o) && matches!(o["status"].as_str(), Some("pending" | "open")))
+        .count();
+    ensure!(
+        held < maximum,
+        "模型持仓 {held} 个已达并发上限 {maximum} 个"
+    );
     Ok(())
+}
+
+/// Every model order must be governed by the frozen 11-bar protection, including
+/// orders that were created before the rule existed. Leaving a legacy plan in
+/// place means the order keeps exiting on the 0-bar MA break: 54% of the measured
+/// positions closed on their first bar for -153bps each.
+pub fn enforce_exit_rules(order: &mut Value) -> bool {
+    if !is_model_order(order) || !matches!(order["status"].as_str(), Some("pending" | "open")) {
+        return false;
+    }
+    let horizon = crate::strategies::ml_horizon_exit_rules();
+    if order["plan"].is_null() || order["plan"]["exitRules"] == horizon {
+        return false;
+    }
+    if !order["plan"].is_object() {
+        return false;
+    }
+    order["plan"]["exitRules"] = horizon;
+    true
 }
 
 fn authorize(
@@ -181,12 +216,21 @@ fn authorize(
         funds["canOpen"] == true,
         "Demo 资金或挂单占用不允许新增订单"
     );
-    ensure_capacity(&funds)?;
     ensure!(signal["eligible"] == true, "模型未生成有效新仓计划");
     ensure!(
         number(&signal["confidence"], 0.) >= number(&config["trader"]["minConfidence"], 0.45),
         "模型分类概率低于配置开仓门槛"
     );
+    // A raw classifier probability is not an edge: 94% of the emitted values sit in
+    // [0.40, 0.60) while the realized win rate is 28.6%, so the confidence floor
+    // above passes nearly everything. Require the strategy's realized net
+    // expectancy (fees and funding already inside) to clear the configured floor.
+    // Checked before capacity so the reported blocker is the real one: a book that is
+    // merely full hides "this strategy has no measured edge at all".
+    let min_edge_bps = crate::automation_guards::env_num("NOFX_ML_MIN_EDGE_BPS", 25., -1e4, 1e4);
+    let history = state["orders"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    crate::ml_edge::require(history, STRATEGY_ID, min_edge_bps)?;
+    ensure_capacity(&funds, state)?;
     let prediction = &signal["mlPrediction"];
     ensure!(
         prediction["data_mode"] == "live_public",
@@ -306,14 +350,68 @@ mod tests {
         state["exchangeAccounts"]["demo"]["syncedAt"] = json!(iso(now));
         state["exchangeAccounts"]["demo"]["metricsSyncedAt"] = json!(iso(now));
     }
+    /// Realized history that clears the net-edge gate: 30 closed winners, +200bps each.
+    fn seed_edge(state: &mut Value, now: i64) {
+        let history: Vec<Value> = (0..crate::ml_edge::MIN_OBSERVATIONS)
+            .map(|i| {
+                json!({"id":format!("h{i}"),"status":"closed","strategyId":STRATEGY_ID,
+                "notional":50.,"net":1.,"exitAt":iso(now-(40-i as i64)*HOUR)})
+            })
+            .collect();
+        state["orders"] = json!(history);
+    }
 
     #[test]
     fn capacity_buffer_blocks_entries_before_margin_is_exhausted() {
-        assert!(ensure_capacity(&json!({"committed":700.,"equity":1000.})).is_ok());
-        assert!(ensure_capacity(&json!({"committed":800.,"equity":1000.})).is_ok());
-        assert!(ensure_capacity(&json!({"committed":801.,"equity":1000.})).is_err());
-        assert!(ensure_capacity(&json!({"committed":1000.,"equity":1000.})).is_err());
-        assert!(ensure_capacity(&json!({"committed":0.,"equity":0.})).is_err());
+        let empty = json!({"orders":[]});
+        assert!(ensure_capacity(&json!({"committed":700.,"equity":1000.}), &empty).is_ok());
+        assert!(ensure_capacity(&json!({"committed":800.,"equity":1000.}), &empty).is_ok());
+        assert!(ensure_capacity(&json!({"committed":801.,"equity":1000.}), &empty).is_err());
+        assert!(ensure_capacity(&json!({"committed":1000.,"equity":1000.}), &empty).is_err());
+        assert!(ensure_capacity(&json!({"committed":0.,"equity":0.}), &empty).is_err());
+    }
+
+    #[test]
+    fn concurrent_positions_are_capped_before_the_book_spreads_over_every_name() {
+        let orders: Vec<Value> = (0..18)
+            .map(|i| {
+                json!({"id":format!("m{i}"),"status":"open","strategyId":STRATEGY_ID,"symbol":format!("S{i}USDT")})
+            })
+            .collect();
+        let full = json!({"orders":orders});
+        let error = ensure_capacity(&json!({"committed":100.,"equity":1000.}), &full).unwrap_err();
+        assert!(format!("{error:#}").contains("并发上限"));
+        // Closed orders and other strategies do not occupy the model's slots.
+        let mut mixed = full.clone();
+        mixed["orders"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id":"done","status":"closed","strategyId":STRATEGY_ID}));
+        mixed["orders"].as_array_mut().unwrap()[0]["strategyId"] = json!("enhanced-trend-v1");
+        assert!(ensure_capacity(&json!({"committed":100.,"equity":1000.}), &mixed).is_ok());
+    }
+
+    #[test]
+    fn legacy_model_plans_are_migrated_to_the_horizon_protection() {
+        let mut legacy = json!({
+            "id":"legacy","status":"open","strategyId":STRATEGY_ID,
+            "plan":{"maxHoldBars":11,"exitRules":crate::strategies::exit_rules_for(&json!({}))}
+        });
+        assert_eq!(legacy["plan"]["exitRules"]["smartExit"]["enabled"], true);
+        assert!(enforce_exit_rules(&mut legacy));
+        assert_eq!(
+            legacy["plan"]["exitRules"],
+            crate::strategies::ml_horizon_exit_rules()
+        );
+        // Idempotent: a second pass has nothing to change.
+        assert!(!enforce_exit_rules(&mut legacy));
+        // Orders that are already done, or belong to another strategy, are untouched.
+        let mut closed =
+            json!({"status":"closed","strategyId":STRATEGY_ID,"plan":{"exitRules":{}}});
+        assert!(!enforce_exit_rules(&mut closed));
+        let mut other =
+            json!({"status":"open","strategyId":"enhanced-trend-v1","plan":{"exitRules":{}}});
+        assert!(!enforce_exit_rules(&mut other));
     }
 
     #[test]
@@ -346,6 +444,7 @@ mod tests {
     fn demo_order_uses_shared_ledger_and_rejects_duplicate_and_overrides() {
         let now = 300 * HOUR + 1000;
         let (config, mut state, prediction) = fixture(now);
+        seed_edge(&mut state, now);
         let signal = normalized(&prediction, now);
         let record = json!({"id":"model-record","interval":"1h","strategyId":STRATEGY_ID,"analyses":[signal]});
         let input = json!({"recordId":"model-record","symbol":"BTCUSDT","strategyId":STRATEGY_ID,"margin":50.,"leverage":1});
@@ -376,21 +475,30 @@ mod tests {
         assert_eq!(order["strategyId"], STRATEGY_ID);
         assert_eq!(order["leverage"], 1.);
         assert_eq!(order["notional"], 50.);
-        assert_eq!(state["orders"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            state["orders"].as_array().unwrap().len(),
+            crate::ml_edge::MIN_OBSERVATIONS + 1
+        );
         // The existing idempotent record retry returns the same order.
         assert_eq!(
             paper::submit_paper_order_inner(&mut state, &record, &input, now, Some(&config))
                 .unwrap()["id"],
             order["id"]
         );
+        // Without any realized history the net-edge gate refuses to authorise risk.
+        let history = state["orders"].clone();
         state["orders"] = json!([]);
-        assert!(authorize_new(&mut state, &config, &record["analyses"][0], &input, now).is_err());
+        let error =
+            authorize_new(&mut state, &config, &record["analyses"][0], &input, now).unwrap_err();
+        assert!(format!("{error:#}").contains("样本不足"), "{error:#}");
+        state["orders"] = history;
     }
 
     #[test]
     fn account_sync_live_environment_and_small_equity_fail_closed() {
         let now = 300 * HOUR + 1000;
-        let (config, state, prediction) = fixture(now);
+        let (config, mut state, prediction) = fixture(now);
+        seed_edge(&mut state, now);
         let signal = normalized(&prediction, now);
         for key in ["syncedAt", "metricsSyncedAt"] {
             let mut stale = state.clone();
@@ -427,8 +535,9 @@ mod tests {
             .is_ok()
         );
         let mut other = state.clone();
-        other["orders"] =
-            json!([{"id":"other","symbol":"BTCUSDT","status":"pending","margin":1.,"notional":1.}]);
+        other["orders"].as_array_mut().unwrap().push(
+            json!({"id":"other","symbol":"BTCUSDT","status":"pending","margin":1.,"notional":1.}),
+        );
         assert!(authorize(&other, &config, &signal, now, None).is_err());
     }
 
@@ -436,14 +545,19 @@ mod tests {
     fn closed_history_gaps_do_not_override_active_account_reconciliation() {
         let now = 300 * HOUR + 1000;
         let (config, mut state, prediction) = fixture(now);
+        seed_edge(&mut state, now);
         let signal = normalized(&prediction, now);
-        state["orders"] = json!([{"id":"old","symbol":"SOLUSDT","status":"closed","accountingIncomplete":true,"net":0.}]);
+        state["orders"].as_array_mut().unwrap().push(
+            json!({"id":"old","symbol":"SOLUSDT","status":"closed","accountingIncomplete":true,"net":0.}),
+        );
         let funds = paper::account_summary(&state, now);
         assert_eq!(funds["accountingComplete"], false);
         assert_eq!(funds["syncReady"], true);
         assert!(authorize(&state, &config, &signal, now, None).is_ok());
 
-        state["orders"] = json!([{"id":"unreconciled","symbol":"SOLUSDT","status":"open","direction":"OPEN_LONG","entry":100.,"margin":100.,"notional":100.}]);
+        state["orders"].as_array_mut().unwrap().push(
+            json!({"id":"unreconciled","symbol":"SOLUSDT","status":"open","direction":"OPEN_LONG","entry":100.,"margin":100.,"notional":100.}),
+        );
         state["exchangeAccounts"]["demo"]["orderMetrics"]["unreconciled"] =
             json!({"filledQty":1.,"remainingQty":1.,"entryQty":1.,"entryNotional":100.});
         assert_eq!(paper::account_summary(&state, now)["syncReady"], false);
@@ -490,7 +604,8 @@ mod tests {
     #[test]
     fn stale_predictions_and_paused_worker_never_authorize_execution() {
         let now = 300 * HOUR + 1000;
-        let (config, state, mut prediction) = fixture(now);
+        let (config, mut state, mut prediction) = fixture(now);
+        seed_edge(&mut state, now);
         describe(&mut prediction, &state, &config, now, false);
         assert_eq!(prediction["research_mode"], false);
         assert_eq!(prediction["risk_management"]["account_risk_checked"], true);

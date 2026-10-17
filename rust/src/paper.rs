@@ -141,21 +141,34 @@ pub fn fused_orders(state: &Value) -> Value {
             if qty <= 0. {
                 continue;
             }
+            // Only local orders that still carry open exposure belong under an exchange
+            // position. A fully exited local order (remainingQty == 0) must not be listed:
+            // the UI renders every reference as a status line ("本地模拟：已平仓"), which
+            // made users read closed orders as evidence of a mismatch. Closed orders with
+            // remainingQty > 0 stay referenced — that is the orphan-reconciliation case.
             let refs: Vec<Value> = orders
                 .iter()
                 .filter(|o| {
                     o["symbol"] == symbol
                         && o["direction"] == dir
-                        && (n(binding(o, env), "executedQty", 0.) > 0.
-                            || n(
-                                &snap["orderMetrics"][o["id"].as_str().unwrap_or("")],
-                                "remainingQty",
-                                0.,
-                            ) > 1e-10)
+                        && (n(
+                            &snap["orderMetrics"][o["id"].as_str().unwrap_or("")],
+                            "remainingQty",
+                            0.,
+                        ) > 1e-10
+                            || (o["status"] != "closed"
+                                && n(binding(o, env), "executedQty", 0.) > 0.))
                 })
                 .map(ref_order)
                 .collect();
-            let target = json!({"environment":env,"symbol":symbol,"positionSide":ps,"kind":"position","quantity":qty,"direction":dir,"updateTime":pos["updateTime"],"entry":pos["entryPrice"],"markPrice":pos["markPrice"],"margin":qty*n(&pos,"entryPrice",0.)/n(&pos,"leverage",1.).max(1.),"localOrders":refs});
+            // A position held on the exchange with no surviving local order is orphaned: the
+            // exchange carries exposure while every local order says it was closed. Flag it so
+            // the UI reports "待对账" instead of presenting a bare "已平仓" contradiction.
+            let orphaned = !refs.is_empty()
+                && !refs
+                    .iter()
+                    .any(|r| matches!(r["status"].as_str(), Some("open" | "pending")));
+            let target = json!({"environment":env,"symbol":symbol,"positionSide":ps,"kind":"position","quantity":qty,"direction":dir,"updateTime":pos["updateTime"],"entry":pos["entryPrice"],"markPrice":pos["markPrice"],"margin":qty*n(&pos,"entryPrice",0.)/n(&pos,"leverage",1.).max(1.),"localOrders":refs,"reconciliationPending":orphaned});
             let mut targets = groups
                 .get(&key)
                 .map(|g| arr(&g["executionTargets"]))
@@ -191,7 +204,11 @@ pub fn fused_orders(state: &Value) -> Value {
                     0.,
                 );
             let floating = n(&pos, "unrealized", n(&pos, "unRealizedProfit", 0.));
-            let row = json!({"id":format!("fused:{key}"),"source":format!("binance-{env}"),"sourceLabel":if env=="demo"{"币安模拟盘"}else{"币安实盘"},"environment":env,"kind":"position","symbol":symbol,"direction":dir,"positionSide":ps,"status":"open","entry":pos["entryPrice"],"markPrice":pos["markPrice"],"quantity":qty,"notional":pos["notional"],"leverage":leverage,"margin":amount/leverage,"buyAmount":amount,"unrealized":floating,"realized":realized,"net":realized+floating,"roi":if amount>0.{json!((realized+floating)/(amount/leverage))}else{Value::Null},"liquidationPrice":pos["liquidationPrice"],"createdAt":timestamp(&pos["updateTime"]).map(iso).unwrap_or_else(||snap["syncedAt"].as_str().unwrap_or("").into()),"localOrders":all_refs,"executionTargets":targets,"stale":!snap["error"].as_str().unwrap_or("").is_empty(),"syncedAt":snap["syncedAt"],"syncError":snap["error"]});
+            let merged_orphaned = !all_refs.is_empty()
+                && !all_refs
+                    .iter()
+                    .any(|r| matches!(r["status"].as_str(), Some("open" | "pending")));
+            let row = json!({"id":format!("fused:{key}"),"source":format!("binance-{env}"),"sourceLabel":if env=="demo"{"币安模拟盘"}else{"币安实盘"},"environment":env,"kind":"position","symbol":symbol,"direction":dir,"positionSide":ps,"status":"open","entry":pos["entryPrice"],"markPrice":pos["markPrice"],"quantity":qty,"notional":pos["notional"],"leverage":leverage,"margin":amount/leverage,"buyAmount":amount,"unrealized":floating,"realized":realized,"net":realized+floating,"roi":if amount>0.{json!((realized+floating)/(amount/leverage))}else{Value::Null},"liquidationPrice":pos["liquidationPrice"],"createdAt":timestamp(&pos["updateTime"]).map(iso).unwrap_or_else(||snap["syncedAt"].as_str().unwrap_or("").into()),"localOrders":all_refs,"reconciliationPending":merged_orphaned,"executionTargets":targets,"stale":!snap["error"].as_str().unwrap_or("").is_empty(),"syncedAt":snap["syncedAt"],"syncError":snap["error"]});
             groups.insert(key, row);
         }
         for remote in arr(&snap["orders"]) {
@@ -1064,7 +1081,13 @@ async fn refresh_internal(
                 return Ok::<Value,anyhow::Error>(json!({"status":"expired","reason":"entry_not_submitted","error":"交易所未接受该开仓，已释放保证金占用。"}));
             }
             if original["marketProvider"] != "binance" { bail!("行情来源已经切换为 Binance；旧订单不能使用其他交易所行情推进，请取消并重新分析。"); }
-            let mut order=original.clone();if order["status"]=="pending" && timestamp(&order["createdAt"]).map(|t|now>=t+86400000).unwrap_or(false){advance_paper_order(&mut order,&[],now)?;return Ok::<Value,anyhow::Error>(order);}
+            let mut order=original.clone();
+            // Legacy model plans keep the 0-bar MA exit that was measured closing 54% of
+            // positions on their first bar. Re-apply the frozen horizon protection on every
+            // refresh so an order created before the rule existed converges without a migration script.
+            let migrated=crate::ml_execution::enforce_exit_rules(&mut order);
+            if migrated { tracing::info!(order=%id, symbol=%symbol, "Migrated model order to the frozen 11-bar exit rules"); }
+            if order["status"]=="pending" && timestamp(&order["createdAt"]).map(|t|now>=t+86400000).unwrap_or(false){advance_paper_order(&mut order,&[],now)?;return Ok::<Value,anyhow::Error>(order);}
             let next=timestamp(&order["nextTime"]).context("Order checkpoint missing")?;let smart=&order["plan"]["exitRules"]["smartExit"];let history=n(smart,"maPeriod",20.).max(n(smart,"atrPeriod",14.)).max(80.) as i64+2;let start=next-history*ms;
             let namespaced=storage_symbol(symbol,original["marketProvider"].as_str().unwrap_or("binance"))?;let mut rows=db.candles(&namespaced,tf,100000,Some(start),Some(now)).await?;
             let desired=next.div_euclid(ms)*ms;let has_latest=rows.last().and_then(|r|timestamp(&r["openTime"])).map(|t|t+ms>=now.div_euclid(ms)*ms).unwrap_or(false);
@@ -1104,7 +1127,12 @@ async fn refresh_internal(
                         order["exchange"] = legacy;
                         processed += 1;
                     }
-                    Err(ref error) => order["error"] = json!(error.to_string()),
+                    Err(ref error) => {
+                        // Persist the protection migration even when market data failed,
+                        // otherwise a flaky refresh silently keeps the legacy exit rules.
+                        crate::ml_execution::enforce_exit_rules(order);
+                        order["error"] = json!(error.to_string());
+                    }
                 }
             }
             Ok(Value::Null)
@@ -1486,14 +1514,7 @@ pub fn aligned_price(info: &Value, price: f64) -> Result<f64> {
     Ok(formatted(aligned).parse()?)
 }
 async fn symbol_info(client: &Exchange, symbol: &str) -> Result<Value> {
-    let info = client
-        .public_request("/fapi/v1/exchangeInfo", &json!({}))
-        .await?;
-    info["symbols"]
-        .as_array()
-        .and_then(|a| a.iter().find(|s| s["symbol"] == symbol))
-        .cloned()
-        .context("目标交易环境不支持该合约")
+    client.info(symbol).await
 }
 async fn mode(client: &Exchange, direction: &str) -> Result<(bool, String)> {
     let mode = client
@@ -2649,7 +2670,23 @@ async fn close_internal(
         results.push(json!({"ok":true,"complete":true,"skipped":order["skipped"]==true,"source":"paper","symbol":row["symbol"],"status":order["status"]}));
     } else {
         for target in targets {
-            results.push(match execute_remote_close(db,store,&target,None).await{Ok(result)=>result,Err(error)=>json!({"ok":false,"environment":target["environment"],"symbol":target["symbol"],"error":error.to_string()})});
+            // Timed so a slow close can be attributed to the exchange round trip instead of
+            // guessed at: the log reports each target separately.
+            let started = tokio::time::Instant::now();
+            let outcome = match execute_remote_close(db, store, &target, None).await {
+                Ok(result) => result,
+                Err(error) => {
+                    json!({"ok":false,"environment":target["environment"],"symbol":target["symbol"],"error":error.to_string()})
+                }
+            };
+            tracing::info!(
+                symbol = target["symbol"].as_str().unwrap_or(""),
+                environment = target["environment"].as_str().unwrap_or(""),
+                ms = started.elapsed().as_millis() as i64,
+                ok = outcome["ok"] == true,
+                "Remote close finished"
+            );
+            results.push(outcome);
         }
         if results
             .iter()

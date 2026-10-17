@@ -3,7 +3,7 @@
     {
       "name": "nofx-api",
       "cwd": "D:/UGit/nofx-new",
-      "script": "data/ml/runtime-20261017-1036/bin/nofx-server.exe",
+      "script": "data/ml/runtime-20261017-1305/bin/nofx-server.exe",
       "args": "--root D:/UGit/nofx-new --host 127.0.0.1 --port 3100",
       "interpreter": "none",
       "autorestart": true,
@@ -15,7 +15,11 @@
       "env": {
         "NODE_ENV": "production",
         "PORT": "3100",
-        "NOFX_MIN_QUOTE_VOL_24H": "5000000"
+        "NOFX_MIN_QUOTE_VOL_24H": "50000000",
+        "NOFX_MIN_LISTING_DAYS": "30",
+        "NOFX_ML_MAX_POSITIONS": "18",
+        "NOFX_ML_MAX_COMMITTED_PCT": "0.80",
+        "NOFX_ML_MIN_EDGE_BPS": "25"
       }
     }
   ]

@@ -33,6 +33,14 @@ name = "nofx-order-export"
 path = "rust/src/bin/nofx-order-export.rs"
 
 [[bin]]
+name = "nofx-orphan-audit"
+path = "rust/src/bin/nofx-orphan-audit.rs"
+
+[[bin]]
+name = "nofx-confidence-audit"
+path = "rust/src/bin/nofx-confidence-audit.rs"
+
+[[bin]]
 name = "nofx-local-model-eval"
 path = "rust/src/bin/nofx-local-model-eval.rs"
 

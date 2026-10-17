@@ -14,8 +14,6 @@
       "env": {
         "NODE_ENV": "production",
         "PORT": 3100,
-        "HTTP_PROXY": "http://127.0.0.1:7890",
-        "HTTPS_PROXY": "http://127.0.0.1:7890",
         "NOFX_MIN_TREND_SCORE": "73",
         "NOFX_LONG_ONLY": "true",
         "NOFX_SMART_MA_ATR": "2.0",

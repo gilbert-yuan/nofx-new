@@ -130,6 +130,82 @@ fn dual_environment_state(demo_margin: f64, live_margin: f64) -> Value {
 }
 
 #[test]
+fn a_fully_exited_local_order_is_not_listed_under_the_exchange_position() {
+    let mut open = local_position("open-order", 50.);
+    open["exchangeSync"] = json!({"demo": {"executedQty": 240.}});
+    let mut closed = local_position("closed-order", 50.);
+    closed["status"] = json!("closed");
+    closed["exchangeSync"] = json!({"demo": {"executedQty": 2371.}});
+    // Closed locally while exchange exposure remains (orphan) — must stay referenced.
+    let mut orphan = local_position("orphan-order", 50.);
+    orphan["status"] = json!("closed");
+    orphan["exchangeSync"] = json!({"demo": {"executedQty": 100.}});
+    // A position whose only local order is already closed is a ledger difference, not a
+    // contradiction: it must be flagged for reconciliation.
+    let mut lost = local_position("lost-order", 50.);
+    lost["symbol"] = json!("ETHUSDT");
+    lost["status"] = json!("closed");
+    lost["exchangeSync"] = json!({"demo": {"executedQty": 70.}});
+    let snapshot = json!({
+        "enabled": true,
+        "configured": true,
+        "syncedAt": "2026-10-17T04:00:00Z",
+        "positions": [{
+            "symbol": "BTCUSDT",
+            "positionSide": "BOTH",
+            "positionAmt": 340.,
+            "entryPrice": 100.,
+            "leverage": 1.
+        }, {
+            "symbol": "ETHUSDT",
+            "positionSide": "BOTH",
+            "positionAmt": 70.,
+            "entryPrice": 100.,
+            "leverage": 1.
+        }],
+        "orderMetrics": {
+            "open-order": {"symbol": "BTCUSDT", "direction": "OPEN_LONG", "entryQty": 240., "filledQty": 240., "exitQty": 0., "remainingQty": 240.},
+            "closed-order": {"symbol": "BTCUSDT", "direction": "OPEN_LONG", "entryQty": 2371., "filledQty": 2371., "exitQty": 2371., "remainingQty": 0.},
+            "orphan-order": {"symbol": "BTCUSDT", "direction": "OPEN_LONG", "entryQty": 100., "filledQty": 100., "exitQty": 0., "remainingQty": 100.},
+            "lost-order": {"symbol": "ETHUSDT", "direction": "OPEN_LONG", "entryQty": 70., "filledQty": 70., "exitQty": 0., "remainingQty": 70.}
+        }
+    });
+    let state = json!({
+        "orders": [open, closed, orphan, lost],
+        "exchangeAccounts": {"demo": snapshot}
+    });
+    let rows = fused_orders(&state);
+    let row = arr(&rows["activeOrders"])
+        .into_iter()
+        .find(|r| r["id"] == "fused:position:BTCUSDT:OPEN_LONG")
+        .expect("exchange position row");
+    assert_eq!(row["reconciliationPending"], false);
+    let refs = arr(&row["localOrders"]);
+    let ids: Vec<&str> = refs.iter().map(|r| r["id"].as_str().unwrap()).collect();
+    assert!(ids.contains(&"open-order"));
+    assert!(ids.contains(&"orphan-order"));
+    assert!(
+        !ids.contains(&"closed-order"),
+        "fully exited local order must not be listed under the exchange position: {ids:?}"
+    );
+    let target_refs = arr(&row["executionTargets"][0]["localOrders"]);
+    let target_ids: Vec<&str> = target_refs
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert!(!target_ids.contains(&"closed-order"));
+    let lost_row = arr(&rows["activeOrders"])
+        .into_iter()
+        .find(|r| r["id"] == "fused:position:ETHUSDT:OPEN_LONG")
+        .expect("orphan-only position row");
+    assert_eq!(
+        lost_row["reconciliationPending"], true,
+        "a position whose local orders are all closed must be flagged for reconciliation"
+    );
+    assert_eq!(arr(&lost_row["localOrders"]).len(), 1);
+}
+
+#[test]
 fn margin_selection_uses_each_environment_and_preserves_shared_small_positions() {
     let activity = fused_orders(&dual_environment_state(100., 40.));
     let row = &activity["activeOrders"][0];
