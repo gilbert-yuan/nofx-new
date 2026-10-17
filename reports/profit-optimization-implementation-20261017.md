@@ -239,3 +239,16 @@ env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u al
    它现在不影响开仓（`canOpen=true`），但会让熔断判断基于不完整账本。
 2. `minConfidence` 仍是 0.65 的兜底（概率本身不携带信息，真正的门槛是净期望）。
 3. 前向样本到 200 笔之前，`ready_to_scale` 恒为 false，单笔名义不会放大。
+
+---
+
+# 更正（17:00）：第九节的「前向 52 笔 / +176bps」作废
+
+第九节把 `source=binance-demo` 的外部平仓记录算进了策略边际。复核后：
+
+- 52 笔里只有 **4 笔**是策略自己的 11 根 `timeout` 出场（净 +3.81U / +190bps）；
+- 41 笔 `manual`（+42.10U）来自 14:08–14:32 的孤儿仓清理；
+- 6 笔 `smart_exit_ma` + 1 笔 `timeout` 是仓位被外部清掉后、账本沿用旧 `reason` 补记（无平仓单）。
+
+因此当时的门槛判定是 `open`，正确判定应为 `probe`。归因过滤器与复核见
+[前向证据归因修正](profit-optimization-attribution-20261017.md)。
