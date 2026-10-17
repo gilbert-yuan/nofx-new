@@ -15,11 +15,23 @@ pub const CONTEXT_LENGTH: usize = 256;
 pub const HORIZON_HOURS: usize = 12;
 pub const MODEL_HORIZON: usize = 64;
 pub const HOUR_MS: i64 = 3_600_000;
+pub const QUARTER_HOUR_MS: i64 = 900_000;
+/// Model output points are steps in the input timeframe, not necessarily hours.
+pub const HORIZON_STEPS: usize = 12;
+
+pub fn interval_ms(interval: &str) -> Result<i64> {
+    match interval {
+        "1h" => Ok(HOUR_MS),
+        "15m" => Ok(QUARTER_HOUR_MS),
+        _ => anyhow::bail!("Unsupported ML candle interval: {interval}"),
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ContextRecord {
     pub symbol: String,
-    /// First future hourly candle's open time, after the context has closed.
+    /// First future candle's open time, after the context has closed. A bare
+    /// legacy record uses 1h; non-hourly persisted inputs use IntervalContextRecord.
     pub origin_ms: i64,
     pub context_end_open_ms: i64,
     pub context: Vec<f32>,
@@ -31,10 +43,15 @@ pub struct ContextRecord {
 
 impl ContextRecord {
     pub fn validate(&self) -> Result<()> {
+        self.validate_for_interval("1h")
+    }
+
+    pub fn validate_for_interval(&self, interval: &str) -> Result<()> {
+        let step_ms = interval_ms(interval)?;
         crate::exchange::valid_symbol(&self.symbol)?;
         ensure!(
             self.context.len() == CONTEXT_LENGTH,
-            "Chronos requires exactly {CONTEXT_LENGTH} hourly closes"
+            "Chronos requires exactly {CONTEXT_LENGTH} closed {interval} candles"
         );
         ensure!(
             self.context
@@ -44,10 +61,10 @@ impl ContextRecord {
         );
         ensure!(
             self.context_end_open_ms >= 0
-                && self.context_end_open_ms % HOUR_MS == 0
-                && self.origin_ms % HOUR_MS == 0
-                && self.context_end_open_ms.checked_add(HOUR_MS) == Some(self.origin_ms),
-            "origin_ms must be the hour immediately after context_end_open_ms"
+                && self.context_end_open_ms % step_ms == 0
+                && self.origin_ms % step_ms == 0
+                && self.context_end_open_ms.checked_add(step_ms) == Some(self.origin_ms),
+            "origin_ms must be the {interval} boundary immediately after context_end_open_ms"
         );
         if let Some(times) = &self.context_open_ms {
             ensure!(
@@ -55,10 +72,10 @@ impl ContextRecord {
                 "Context timestamp count must equal context length"
             );
             for (index, time) in times.iter().enumerate() {
-                let distance = (CONTEXT_LENGTH - index) as i64 * HOUR_MS;
+                let distance = (CONTEXT_LENGTH - index) as i64 * step_ms;
                 ensure!(
                     self.origin_ms.checked_sub(distance) == Some(*time),
-                    "Context contains a missing, duplicate or future hourly candle"
+                    "Context contains a missing, duplicate or future {interval} candle"
                 );
             }
         }
@@ -69,6 +86,20 @@ impl ContextRecord {
             );
         }
         Ok(())
+    }
+}
+
+/// Explicit interval envelope keeps existing hourly ContextRecord JSON and Rust
+/// callers compatible while making quarter-hour caches self describing.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct IntervalContextRecord {
+    pub interval: String,
+    #[serde(flatten)]
+    pub record: ContextRecord,
+}
+impl IntervalContextRecord {
+    pub fn validate(&self) -> Result<()> {
+        self.record.validate_for_interval(&self.interval)
     }
 }
 
@@ -96,6 +127,30 @@ pub struct ForecastRecord {
     /// Raw model quantiles are preserved; crossing intervals are exposed.
     pub quantile_crossings: usize,
     pub inference_ms: f64,
+}
+
+impl ForecastRecord {
+    pub fn interval_ms(&self) -> Result<i64> {
+        interval_ms(&self.interval)
+    }
+
+    /// Validate real elapsed duration separately from the number of model steps.
+    /// Existing hourly JSON needs no migration: 12 points / 12h remains valid.
+    pub fn horizon_steps(&self) -> Result<usize> {
+        let step = self.interval_ms()?;
+        ensure!(
+            self.q10.len() == HORIZON_STEPS
+                && self.q50.len() == HORIZON_STEPS
+                && self.q90.len() == HORIZON_STEPS
+                && i64::try_from(self.horizon_hours)
+                    .ok()
+                    .and_then(|hours| hours.checked_mul(HOUR_MS))
+                    == Some(HORIZON_STEPS as i64 * step),
+            "Forecast steps and elapsed horizon do not match interval {}",
+            self.interval
+        );
+        Ok(HORIZON_STEPS)
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -195,13 +250,22 @@ impl ChronosModel {
     }
 
     pub fn forecast(&mut self, record: &ContextRecord) -> Result<ForecastRecord> {
-        record.validate()?;
+        self.forecast_for_interval(record, "1h")
+    }
+
+    pub fn forecast_for_interval(
+        &mut self,
+        record: &ContextRecord,
+        interval: &str,
+    ) -> Result<ForecastRecord> {
+        record.validate_for_interval(interval)?;
         let started = Instant::now();
         let input = Tensor::from_array(([1_usize, CONTEXT_LENGTH], record.context.clone()))?;
         let outputs = self.session.run(ort::inputs!["context" => input])?;
         let (shape, values) = outputs["quantile_preds"].try_extract_tensor::<f32>()?;
-        decode_forecast(
+        decode_forecast_for_interval(
             record,
+            interval,
             &shape[..],
             values,
             started.elapsed().as_secs_f64() * 1000.0,
@@ -209,12 +273,25 @@ impl ChronosModel {
     }
 }
 
+#[cfg(test)]
 fn decode_forecast(
     record: &ContextRecord,
     shape: &[i64],
     values: &[f32],
     inference_ms: f64,
 ) -> Result<ForecastRecord> {
+    decode_forecast_for_interval(record, "1h", shape, values, inference_ms)
+}
+
+fn decode_forecast_for_interval(
+    record: &ContextRecord,
+    interval: &str,
+    shape: &[i64],
+    values: &[f32],
+    inference_ms: f64,
+) -> Result<ForecastRecord> {
+    record.validate_for_interval(interval)?;
+    let step_ms = interval_ms(interval)?;
     ensure!(
         shape == [1, 9, MODEL_HORIZON as i64] && values.len() == 9 * MODEL_HORIZON,
         "Expected ONNX forecasts shaped [1, 9, {MODEL_HORIZON}], got {shape:?}"
@@ -239,8 +316,8 @@ fn decode_forecast(
         context_end_open_ms: record.context_end_open_ms,
         history_sha256: record.history_sha256.clone(),
         current_price: f64::from(*record.context.last().context("Empty context")?),
-        interval: "1h".into(),
-        horizon_hours: HORIZON_HOURS,
+        interval: interval.into(),
+        horizon_hours: (HORIZON_STEPS as i64 * step_ms / HOUR_MS) as usize,
         q10,
         q50,
         q90,
@@ -252,30 +329,44 @@ fn decode_forecast(
 /// Fetch only complete, consecutive hourly candles using the existing public
 /// exchange client. This path has no account, database or order dependency.
 pub async fn live_context(symbol: &str) -> Result<ContextRecord> {
+    Ok(live_context_for_interval(symbol, "1h").await?.record)
+}
+
+pub async fn live_context_for_interval(
+    symbol: &str,
+    interval: &str,
+) -> Result<IntervalContextRecord> {
+    let step_ms = interval_ms(interval)?;
     crate::exchange::valid_symbol(symbol)?;
-    let origin_ms = crate::now_ms().div_euclid(HOUR_MS) * HOUR_MS;
+    let origin_ms = crate::now_ms().div_euclid(step_ms) * step_ms;
     let exchange = crate::exchange::Exchange::public()?;
     let mut rows = exchange
-        .klines(symbol, "1h", CONTEXT_LENGTH + 4, None, Some(origin_ms - 1))
+        .klines(
+            symbol,
+            interval,
+            CONTEXT_LENGTH + 4,
+            None,
+            Some(origin_ms - 1),
+        )
         .await?;
     rows.retain(|row| {
         row["confirmed"] == true
             && row["openTime"]
                 .as_i64()
-                .is_some_and(|time| time >= 0 && time + HOUR_MS <= origin_ms)
+                .is_some_and(|time| time >= 0 && time + step_ms <= origin_ms)
     });
     rows.sort_by_key(|row| row["openTime"].as_i64().unwrap_or(0));
     rows.dedup_by_key(|row| row["openTime"].as_i64().unwrap_or(0));
     ensure!(
         rows.len() >= CONTEXT_LENGTH,
-        "Insufficient closed hourly candles for {symbol}"
+        "Insufficient closed {interval} candles for {symbol}"
     );
     let rows = &rows[rows.len() - CONTEXT_LENGTH..];
     for (index, row) in rows.iter().enumerate() {
-        let expected = origin_ms - (CONTEXT_LENGTH - index) as i64 * HOUR_MS;
+        let expected = origin_ms - (CONTEXT_LENGTH - index) as i64 * step_ms;
         ensure!(
             row["openTime"].as_i64() == Some(expected),
-            "Missing or stale hourly candle for {symbol} at {expected}"
+            "Missing or stale {interval} candle for {symbol} at {expected}"
         );
     }
     let context = rows
@@ -285,7 +376,7 @@ pub async fn live_context(symbol: &str) -> Result<ContextRecord> {
     let record = ContextRecord {
         symbol: symbol.into(),
         origin_ms,
-        context_end_open_ms: origin_ms - HOUR_MS,
+        context_end_open_ms: origin_ms - step_ms,
         context,
         context_open_ms: Some(
             rows.iter()
@@ -294,8 +385,11 @@ pub async fn live_context(symbol: &str) -> Result<ContextRecord> {
         ),
         history_sha256: None,
     };
-    record.validate()?;
-    Ok(record)
+    record.validate_for_interval(interval)?;
+    Ok(IntervalContextRecord {
+        interval: interval.into(),
+        record,
+    })
 }
 
 #[cfg(test)]
@@ -339,6 +433,39 @@ mod tests {
         assert!(input.validate().is_ok());
         input.context_open_ms.as_mut().unwrap()[10] += HOUR_MS;
         assert!(input.validate().is_err());
+    }
+
+    #[test]
+    fn quarter_hour_context_preserves_real_interval_and_elapsed_horizon() {
+        let mut input = record();
+        input.origin_ms = 301 * QUARTER_HOUR_MS;
+        input.context_end_open_ms = 300 * QUARTER_HOUR_MS;
+        input.context_open_ms = Some(
+            (0..CONTEXT_LENGTH)
+                .map(|index| input.origin_ms - (CONTEXT_LENGTH - index) as i64 * QUARTER_HOUR_MS)
+                .collect(),
+        );
+        assert!(input.validate().is_err());
+        assert!(input.validate_for_interval("15m").is_ok());
+        let envelope = IntervalContextRecord {
+            interval: "15m".into(),
+            record: input.clone(),
+        };
+        let json = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(json["interval"], "15m");
+        let roundtrip: IntervalContextRecord = serde_json::from_value(json).unwrap();
+        roundtrip.validate().unwrap();
+        let values = vec![100.; 9 * MODEL_HORIZON];
+        let mut forecast =
+            decode_forecast_for_interval(&input, "15m", &[1, 9, 64], &values, 0.).unwrap();
+        assert_eq!(forecast.interval, "15m");
+        assert_eq!(forecast.horizon_hours, 3);
+        assert_eq!(forecast.horizon_steps().unwrap(), 12);
+        forecast.horizon_hours = 12;
+        assert!(forecast.horizon_steps().is_err());
+        input.context_open_ms.as_mut().unwrap()[10] += QUARTER_HOUR_MS;
+        assert!(input.validate_for_interval("15m").is_err());
+        assert!(input.validate_for_interval("5m").is_err());
     }
 
     #[test]

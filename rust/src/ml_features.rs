@@ -45,6 +45,43 @@ pub const CHRONOS_FEATURE_NAMES: &[&str] = &[
     "chronos_mean_q50_return",
 ];
 
+/// Quarter-hour indicators retain their bar counts. Their names explicitly
+/// identify steps so 24 bars (6h) can never be mistaken for 24 hours.
+pub fn base_feature_names_for_interval(interval: &str) -> Result<Vec<String>> {
+    crate::chronos::interval_ms(interval)?;
+    if interval == "1h" {
+        return Ok(BASE_FEATURE_NAMES.iter().map(|s| (*s).into()).collect());
+    }
+    Ok(BASE_FEATURE_NAMES
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let name = if i < 7 {
+                name.replace('h', "_bars")
+            } else if i >= 21 {
+                (*name).into()
+            } else {
+                format!("{name}_bars")
+            };
+            format!("15m_{name}")
+        })
+        .collect())
+}
+
+pub fn chronos_feature_names_for_interval(interval: &str) -> Result<Vec<String>> {
+    crate::chronos::interval_ms(interval)?;
+    Ok(CHRONOS_FEATURE_NAMES
+        .iter()
+        .map(|name| {
+            if interval == "1h" {
+                (*name).into()
+            } else {
+                format!("15m_{name}_steps")
+            }
+        })
+        .collect())
+}
+
 fn price(row: &Value) -> f64 {
     number(&row["close"], f64::NAN)
 }
@@ -63,17 +100,22 @@ fn ema(values: &[f64], period: usize) -> f64 {
 }
 
 pub fn validate_hourly(rows: &[Value]) -> Result<()> {
-    ensure!(!rows.is_empty(), "Empty hourly data");
+    validate_interval(rows, "1h")
+}
+
+pub fn validate_interval(rows: &[Value], interval: &str) -> Result<()> {
+    let step_ms = crate::chronos::interval_ms(interval)?;
+    ensure!(!rows.is_empty(), "Empty {interval} data");
     let mut previous = None;
     for row in rows {
         ensure!(simulator::valid_candle(row), "Invalid OHLCV candle");
         ensure!(row["confirmed"] != false, "Unclosed input candle");
         let open =
             timestamp(&row["openTime"]).ok_or_else(|| anyhow::anyhow!("Missing candle time"))?;
-        ensure!(open >= 0 && open % HOUR == 0, "Non-hourly timestamp");
+        ensure!(open >= 0 && open % step_ms == 0, "Non-{interval} timestamp");
         ensure!(
-            previous.is_none_or(|prior| open - prior == HOUR),
-            "Hourly gap, duplicate or unsorted data"
+            previous.is_none_or(|prior| open - prior == step_ms),
+            "{interval} gap, duplicate or unsorted data"
         );
         previous = Some(open);
     }
@@ -82,12 +124,17 @@ pub fn validate_hourly(rows: &[Value]) -> Result<()> {
 
 /// Only rows before `end` participate; end is an exclusive closed-prefix boundary.
 pub fn base_features(rows: &[Value], end: usize) -> Result<Vec<f64>> {
+    base_features_for_interval(rows, end, "1h")
+}
+
+pub fn base_features_for_interval(rows: &[Value], end: usize, interval: &str) -> Result<Vec<f64>> {
+    let step_ms = crate::chronos::interval_ms(interval)?;
     ensure!(
         end >= CONTEXT && end <= rows.len(),
         "Need 256 closed-prefix observations"
     );
     let prefix = &rows[end - CONTEXT..end];
-    validate_hourly(prefix)?;
+    validate_interval(prefix, interval)?;
     let close: Vec<f64> = prefix.iter().map(price).collect();
     let current = *close.last().unwrap();
     let mut output = Vec::with_capacity(BASE_FEATURE_NAMES.len());
@@ -150,8 +197,12 @@ pub fn base_features(rows: &[Value], end: usize) -> Result<Vec<f64>> {
     } else {
         0.0
     });
-    let origin = timestamp(&last["openTime"]).unwrap() + HOUR;
-    let hour = origin.div_euclid(HOUR).rem_euclid(24) as f64;
+    let origin = timestamp(&last["openTime"]).unwrap() + step_ms;
+    let hour = if interval == "1h" {
+        origin.div_euclid(HOUR).rem_euclid(24) as f64
+    } else {
+        origin.rem_euclid(24 * HOUR) as f64 / HOUR as f64
+    };
     let weekday = (origin.div_euclid(86_400_000) + 3).rem_euclid(7) as f64;
     let tau = std::f64::consts::TAU;
     output.extend([
@@ -169,7 +220,7 @@ pub fn base_features(rows: &[Value], end: usize) -> Result<Vec<f64>> {
 
 pub fn chronos_features(forecast: &ForecastRecord) -> Result<Vec<f64>> {
     ensure!(
-        forecast.quantile_crossings == 0 && forecast.horizon_hours == HORIZON,
+        forecast.quantile_crossings == 0 && forecast.horizon_steps()? == HORIZON,
         "Invalid Chronos horizon or crossing"
     );
     ensure!(
@@ -283,5 +334,38 @@ mod tests {
         assert!(label(&data, 290).is_none());
         data[200]["openTime"] = json!(199 * HOUR);
         assert!(base_features(&data, 256).is_err());
+    }
+
+    #[test]
+    fn quarter_hour_features_are_causal_and_have_distinct_bar_schema() {
+        let mut data = rows();
+        for (index, row) in data.iter_mut().enumerate() {
+            row["openTime"] = json!(index as i64 * crate::chronos::QUARTER_HOUR_MS);
+        }
+        let original = base_features_for_interval(&data, 257, "15m").unwrap();
+        let current = number(&data[256]["close"], 0.);
+        let prior = number(&data[255]["close"], 0.);
+        assert_eq!(original[0], current / prior - 1.);
+        let names = base_feature_names_for_interval("15m").unwrap();
+        assert_eq!(names[0], "15m_return_1_bars");
+        assert_eq!(names.len(), original.len());
+        assert_ne!(names, base_feature_names_for_interval("1h").unwrap());
+        let fractional_hour = (257 * crate::chronos::QUARTER_HOUR_MS) % (24 * HOUR);
+        assert!(
+            (original[21]
+                - (std::f64::consts::TAU * fractional_hour as f64 / (24 * HOUR) as f64).sin())
+            .abs()
+                < 1e-12
+        );
+        assert!(base_features(&data, 257).is_err());
+        for row in &mut data[257..] {
+            row["close"] = json!(1e9);
+        }
+        assert_eq!(
+            original,
+            base_features_for_interval(&data, 257, "15m").unwrap()
+        );
+        data[100]["openTime"] = json!(99 * crate::chronos::QUARTER_HOUR_MS);
+        assert!(base_features_for_interval(&data, 257, "15m").is_err());
     }
 }

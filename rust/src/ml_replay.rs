@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 const HOUR: i64 = 3_600_000;
 const DAY: i64 = 86_400_000;
 
-/// A decision made at a closed hourly boundary. Probabilities and metadata are
+/// A decision made at a closed candle boundary. Probabilities and metadata are
 /// retained verbatim so every model version, fold and rejected signal is auditable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplaySignal {
@@ -30,6 +30,9 @@ pub struct ReplaySignal {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReplayConfig {
+    /// Genuine source-candle duration. Existing serialized configurations default
+    /// to 1h; 15m data must be fetched independently rather than interpolated.
+    pub candle_interval_ms: i64,
     pub starting_equity: f64,
     /// Zero selects the earliest supplied signal (or first candle close).
     pub start_ms: i64,
@@ -47,6 +50,7 @@ pub struct ReplayConfig {
 impl Default for ReplayConfig {
     fn default() -> Self {
         Self {
+            candle_interval_ms: HOUR,
             starting_equity: 1000.,
             start_ms: 0,
             end_ms: i64::MAX,
@@ -62,7 +66,21 @@ impl Default for ReplayConfig {
 }
 
 impl ReplayConfig {
+    pub fn candle_interval(&self) -> Result<&'static str> {
+        match self.candle_interval_ms {
+            HOUR => Ok("1h"),
+            900_000 => Ok("15m"),
+            _ => bail!("ML replay supports genuine 1h or 15m candles"),
+        }
+    }
+
+    /// Preserve the existing 24-candle pending window when changing timeframe.
+    pub fn pending_order_ttl_ms(&self) -> i64 {
+        24 * self.candle_interval_ms
+    }
+
     fn validate(&self) -> Result<()> {
+        self.candle_interval()?;
         ensure!(
             self.starting_equity.is_finite() && self.starting_equity > 0.,
             "Starting equity must be finite and positive"
@@ -93,11 +111,11 @@ fn canonical_decision(value: &str) -> Result<&'static str> {
     }
 }
 
-fn close_at(row: &Value) -> Result<i64> {
+fn close_at(row: &Value, interval_ms: i64) -> Result<i64> {
     timestamp(&row["openTime"])
-        .context("Invalid hourly openTime")?
-        .checked_add(HOUR)
-        .context("Hourly candle timestamp overflow")
+        .context("Invalid candle openTime")?
+        .checked_add(interval_ms)
+        .context("Candle timestamp overflow")
 }
 
 fn active(order: &Value) -> bool {
@@ -113,21 +131,44 @@ fn confidence(signal: &ReplaySignal, decision: &str) -> f64 {
 }
 
 /// Build/validate a plan using only the closed prefix. The common 11 held bars
-/// account for the production one-hour entry delay in a 12-hour prediction.
+/// account for the production one-candle entry delay in a 12-candle prediction.
+/// This compatibility entry point retains the original 1h semantics.
 pub fn normalize_signal(
     symbol: &str,
     closed_prefix: &[Value],
     signal: &ReplaySignal,
 ) -> Result<Value> {
+    normalize_signal_with_config(symbol, closed_prefix, signal, &ReplayConfig::default())
+}
+
+pub fn normalize_signal_with_config(
+    symbol: &str,
+    closed_prefix: &[Value],
+    signal: &ReplaySignal,
+    config: &ReplayConfig,
+) -> Result<Value> {
+    config.validate()?;
     ensure!(closed_prefix.len() >= 15, "ATR needs 15 closed candles");
+    for pair in closed_prefix.windows(2) {
+        let previous = timestamp(&pair[0]["openTime"]).context("Invalid prefix candle time")?;
+        let next = timestamp(&pair[1]["openTime"]).context("Invalid prefix candle time")?;
+        ensure!(
+            previous.rem_euclid(config.candle_interval_ms) == 0
+                && next == previous + config.candle_interval_ms,
+            "Signal prefix must contain contiguous candles of its configured interval"
+        );
+    }
     ensure!(
-        close_at(closed_prefix.last().context("Empty closed prefix")?)? == signal.origin_ms,
+        close_at(
+            closed_prefix.last().context("Empty closed prefix")?,
+            config.candle_interval_ms
+        )? == signal.origin_ms,
         "Signal origin must equal the latest closed candle boundary"
     );
     let decision = canonical_decision(&signal.decision)?;
     let market = research::prepare_market(
         symbol,
-        "1h",
+        config.candle_interval()?,
         closed_prefix,
         closed_prefix.len().min(256),
         signal.origin_ms,
@@ -155,6 +196,7 @@ pub fn normalize_signal(
     normalized["policyMetadata"] = signal.metadata.clone();
     normalized["riskAtr"] = json!(atr);
     normalized["analysisEngine"] = json!("local_ml_replay");
+    normalized["pendingOrderTtlMs"] = json!(config.pending_order_ttl_ms());
     Ok(normalized)
 }
 
@@ -190,7 +232,9 @@ pub fn position_size(signal: &Value, equity: f64, config: &ReplayConfig) -> Resu
         "Invalid plan for risk sizing"
     );
     let stop_fraction = (entry - stop).abs() / entry;
-    let cost_fraction = fee + fee * stop / entry + funding * hold / 8.;
+    // Funding remains an absolute eight-hour clock, never a count of candles.
+    let held_hours = hold * config.candle_interval_ms as f64 / HOUR as f64;
+    let cost_fraction = fee + fee * stop / entry + funding * held_hours / 8.;
     let loss_fraction = stop_fraction + cost_fraction;
     let budget = equity * config.risk_fraction;
     let cap = config
@@ -345,14 +389,18 @@ pub fn replay(
 ) -> Result<Value> {
     config.validate()?;
     crate::exchange::valid_symbol(symbol)?;
-    ensure!(!rows.is_empty(), "Replay requires hourly candles");
+    let interval_ms = config.candle_interval_ms;
+    ensure!(!rows.is_empty(), "Replay requires closed candles");
     let mut closes = Vec::with_capacity(rows.len());
     for row in rows {
         ensure!(simulator::valid_candle(row), "Invalid replay candle");
-        let end = close_at(row)?;
-        ensure!(end.rem_euclid(HOUR) == 0, "Unaligned hourly candle");
+        let end = close_at(row, interval_ms)?;
+        ensure!(end.rem_euclid(interval_ms) == 0, "Unaligned replay candle");
         if let Some(previous) = closes.last() {
-            ensure!(end == previous + HOUR, "Missing or duplicate hourly candle");
+            ensure!(
+                end == previous + interval_ms,
+                "Missing or duplicate replay candle"
+            );
         }
         closes.push(end);
     }
@@ -369,8 +417,8 @@ pub fn replay(
         config.end_ms
     };
     ensure!(
-        start.rem_euclid(HOUR) == 0 && end.rem_euclid(HOUR) == 0,
-        "Replay boundaries must be hourly aligned"
+        start.rem_euclid(interval_ms) == 0 && end.rem_euclid(interval_ms) == 0,
+        "Replay boundaries must align to the configured candle interval"
     );
     ensure!(start <= end, "Replay start must not follow end");
     ensure!(
@@ -382,7 +430,7 @@ pub fn replay(
     for (index, signal) in signals.iter().enumerate() {
         canonical_decision(&signal.decision)?;
         ensure!(
-            signal.origin_ms.rem_euclid(HOUR) == 0,
+            signal.origin_ms.rem_euclid(interval_ms) == 0,
             "Unaligned signal origin"
         );
         if signal.origin_ms < start || signal.origin_ms > end {
@@ -452,7 +500,7 @@ pub fn replay(
             if let Some(reason) = rejection {
                 item["outcome"] = json!(reason);
             } else {
-                match normalize_signal(symbol, prefix, signal) {
+                match normalize_signal_with_config(symbol, prefix, signal, config) {
                     Ok(normalized) => {
                         item["normalized_signal"] = normalized.clone();
                         if normalized["eligible"] != true {
@@ -561,11 +609,14 @@ pub fn replay(
         "HOLD":"no new order; existing production protection remains active"});
     let risk_policy = json!({"max_active_orders_per_symbol":1,"leverage":1,"daily_timezone":"UTC",
         "default_stop_atr":2,"default_target_atr":5,"default_held_bars":11,
-        "first_entry_delay_hours":1,"pending_ttl_hours":24,"gaps_can_exceed_estimated_risk":true});
+        "candle_interval_ms":interval_ms,"first_entry_delay_bars":1,
+        "first_entry_delay_hours":interval_ms as f64/HOUR as f64,
+        "pending_ttl_bars":24,"pending_ttl_hours":config.pending_order_ttl_ms() as f64/HOUR as f64,
+        "gaps_can_exceed_estimated_risk":true});
     Ok(
-        json!({"schema_version":1,"symbol":symbol,"interval":"1h","start_ms":start,"end_ms":end,
+        json!({"schema_version":1,"symbol":symbol,"interval":config.candle_interval()?,"start_ms":start,"end_ms":end,
         "start":iso(start),"end":iso(end),"starting_equity":config.starting_equity,
-        "config":config,"costs":research::costs(),"scope":"One finite-capital account per symbol; hourly close mark-to-market; no real exchange execution",
+        "config":config,"costs":research::costs(),"scope":"One finite-capital account per symbol; configured candle close mark-to-market; no real exchange execution",
         "decision_semantics":decision_semantics,"risk_policy":risk_policy,"metrics":metrics,
         "final_account":final_account,"signal_log":log,"orders":orders,"equity_curve":curve}),
     )
@@ -589,6 +640,89 @@ mod tests {
             metadata: json!({"fold":1}),
             plan: None,
         }
+    }
+
+    fn quarter_hour_candles(count: usize) -> Vec<Value> {
+        let mut rows = candles(count);
+        for (index, row) in rows.iter_mut().enumerate() {
+            row["openTime"] = json!(index as i64 * 900_000);
+        }
+        rows
+    }
+
+    #[test]
+    fn quarter_hour_replay_preserves_bar_delay_and_absolute_funding_clock() {
+        let quarter = 900_000;
+        let origin = 96 * quarter;
+        let config = ReplayConfig {
+            candle_interval_ms: quarter,
+            start_ms: origin,
+            end_ms: origin + 12 * quarter,
+            ..ReplayConfig::default()
+        };
+        let rows = quarter_hour_candles(144);
+        let normalized =
+            normalize_signal_with_config("BTCUSDT", &rows[..96], &signal(origin, "BUY"), &config)
+                .unwrap();
+        assert_eq!(normalized["interval"], "15m");
+        assert_eq!(normalized["pendingOrderTtlMs"], 24 * quarter);
+        let result = replay("BTCUSDT", &rows, &[signal(origin, "BUY")], &config).unwrap();
+        let order = &result["orders"][0];
+        assert_eq!(order["interval"], "15m");
+        assert_eq!(order["status"], "closed");
+        assert_eq!(timestamp(&order["entryAt"]), Some(origin + quarter));
+        assert_eq!(timestamp(&order["exitAt"]), Some(origin + 12 * quarter));
+        assert_eq!(order["heldBars"], 11);
+        let expected_funding =
+            number(&order["notional"], 0.) * 0.0003 * 11. * quarter as f64 / (8 * HOUR) as f64;
+        assert!((number(&order["funding"], f64::NAN) - expected_funding).abs() < 1e-9);
+        let fees = number(&result["metrics"]["fees_usdt"], 0.);
+        let slip = number(&result["metrics"]["slippage_usdt"], 0.);
+        assert!((number(&order["net"], 0.) + fees + slip + expected_funding).abs() < 1e-9);
+        let hourly = normalize_signal("BTCUSDT", &candles(96), &signal(96 * HOUR, "BUY")).unwrap();
+        let hourly_cost = number(
+            &position_size(&hourly, 1000., &ReplayConfig::default()).unwrap()["cost_fraction"],
+            0.,
+        );
+        let quarter_cost = number(
+            &position_size(&normalized, 1000., &config).unwrap()["cost_fraction"],
+            0.,
+        );
+        assert!((hourly_cost - quarter_cost - 0.0003 * 11. * 0.75 / 8.).abs() < 1e-12);
+    }
+
+    #[test]
+    fn quarter_hour_expiry_and_interval_mismatch_are_not_hourly() {
+        let quarter = 900_000;
+        let origin = 96 * quarter;
+        let config = ReplayConfig {
+            candle_interval_ms: quarter,
+            start_ms: origin,
+            end_ms: origin + 48 * quarter,
+            ..ReplayConfig::default()
+        };
+        let mut rows = quarter_hour_candles(144);
+        for row in &mut rows[96..] {
+            row["open"] = json!(120.);
+            row["high"] = json!(121.);
+            row["low"] = json!(119.);
+            row["close"] = json!(120.);
+        }
+        let result = replay("BTCUSDT", &rows, &[signal(origin, "BUY")], &config).unwrap();
+        let order = &result["orders"][0];
+        assert_eq!(order["status"], "expired");
+        assert_eq!(timestamp(&order["expiredAt"]), Some(origin + 24 * quarter));
+        assert_eq!(number(&order["entry"], 0.), 0.);
+        assert!(replay("BTCUSDT", &candles(144), &[signal(origin, "BUY")], &config).is_err());
+        assert!(
+            normalize_signal_with_config(
+                "BTCUSDT",
+                &candles(96),
+                &signal(95 * HOUR + quarter, "BUY"),
+                &config
+            )
+            .is_err()
+        );
     }
 
     #[test]

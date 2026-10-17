@@ -28,3 +28,4 @@ output/
 !scripts/train-monthly-model.ps1
 !scripts/optimize-ml-model.ps1
 !scripts/improve-ml-model.ps1
+!scripts/train-profit-model.ps1

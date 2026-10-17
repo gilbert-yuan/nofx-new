@@ -28,8 +28,8 @@ pub fn attach(output: &mut Value, rows: &[Value], config: &ml_replay::ReplayConf
                     match ml_replay::position_size(&normalized, config.starting_equity, config) {
                         Ok(sizing) => {
                             plan = normalized["plan"].clone();
-                            // Freeze the very same exit-rule defaults used by production replay.
-                            plan["exitRules"] = strategies::exit_rules_for(&plan);
+                            // Short-horizon ML holds keep trailing/partial TP, not the 0-bar MA exit.
+                            plan["exitRules"] = strategies::ml_horizon_exit_rules();
                             size = sizing;
                             status = "ready_research";
                         }
@@ -153,6 +153,11 @@ mod tests {
             assert_eq!(risk["entry_permitted"], false);
             assert_eq!(risk["account_risk_checked"], false);
             assert_eq!(output["pipeline"]["execution_action"], "HOLD");
+            assert_eq!(
+                risk["plan"]["exitRules"],
+                strategies::ml_horizon_exit_rules()
+            );
+            assert_eq!(risk["plan"]["exitRules"]["smartExit"]["enabled"], false);
         }
     }
 

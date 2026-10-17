@@ -273,6 +273,16 @@ pub fn exit_rules_for(plan: &Value) -> Value {
     }
     rules
 }
+/// Frozen 11-bar Chronos/LightGBM protection. Keep trailing and partial take
+/// profit, but do not inherit the enhanced-trend 0-bar MA exit: that rule is
+/// sized for ~120 one-minute bars, not an 11-hour forecast hold.
+pub fn ml_horizon_exit_rules() -> Value {
+    let mut rules = exit_rules_for(&json!({}));
+    rules["smartExit"]["enabled"] = json!(false);
+    rules["smartExit"]["barLevelEnabled"] = json!(false);
+    rules["smartExit"]["minHoldBars"] = json!(11);
+    rules
+}
 pub fn tightest_stop(order: &Value, long: bool) -> f64 {
     let mut vals = vec![
         n(&order["initialPlan"], "stopLoss"),
@@ -745,6 +755,21 @@ mod tests {
         }
     }
     #[test]
+    fn ml_horizon_exit_keeps_partial_tp_and_disables_zero_bar_ma_exit() {
+        let legacy = exit_rules_for(&json!({}));
+        let horizon = ml_horizon_exit_rules();
+        assert_eq!(legacy["smartExit"]["enabled"], true);
+        assert_eq!(legacy["smartExit"]["minHoldBars"], 0.);
+        assert_eq!(horizon["smartExit"]["enabled"], false);
+        assert_eq!(horizon["smartExit"]["barLevelEnabled"], false);
+        assert_eq!(horizon["smartExit"]["minHoldBars"], 11.);
+        assert_eq!(horizon["partialTp"], legacy["partialTp"]);
+        assert_eq!(horizon["trailing"], legacy["trailing"]);
+        let overridden = exit_rules_for(&json!({"exitRules":{"smartExit":{"enabled":false}}}));
+        assert_eq!(overridden["smartExit"]["enabled"], false);
+        assert_eq!(overridden["smartExit"]["minHoldBars"], 0.);
+    }
+    #[test]
     fn registration_preserves_schemas_and_validation() {
         assert_eq!(definitions().len(), 8);
         let model = definition(crate::ml_execution::STRATEGY_ID).unwrap();
@@ -761,6 +786,16 @@ mod tests {
         assert_eq!(p["rejected"].as_array().unwrap().len(), 1);
         let l = list(&json!({}), &json!({}));
         assert_eq!(l["enabled"], json!(["enhanced-trend-v1"]));
+        let reversion = defaults("h4-mean-reversion-v1");
+        assert_eq!(number(&reversion["maxAtrPct"], 0.), 0.06);
+        assert_eq!(number(&reversion["minNetRr"], 0.), 1.625);
+        assert_eq!(number(&reversion["maxHoldBars"], 0.), 17.);
+        assert_eq!(number(&reversion["autoMarginPct"], 0.), 0.015);
+        assert_eq!(number(&reversion["maxPositions"], 0.), 50.);
+        assert_eq!(number(&reversion["rsiOversold"], 0.), 35.);
+        assert_eq!(number(&reversion["rsiOverbought"], 0.), 70.);
+        assert_eq!(reversion["longOnly"], false);
+        assert_eq!(reversion["tpToMean"], true);
     }
     #[test]
     fn market_opportunity_preserves_market_execution() {

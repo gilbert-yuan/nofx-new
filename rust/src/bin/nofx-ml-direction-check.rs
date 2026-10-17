@@ -195,7 +195,7 @@ fn main() -> Result<()> {
         "Source cost model differs"
     );
     ensure!(
-        run["execution_defaults"] == nofx_core::strategies::exit_rules_for(&json!({})),
+        run["execution_defaults"] == nofx_core::strategies::ml_horizon_exit_rules(),
         "Source frozen protection defaults differ"
     );
     let development = ReplayConfig {

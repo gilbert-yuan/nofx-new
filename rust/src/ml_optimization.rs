@@ -125,6 +125,7 @@ fn build_signal(
     point: &ProbabilityPoint,
     parameters: &StrategyParameters,
     end_ms: i64,
+    exits: &Value,
 ) -> Result<ReplaySignal> {
     let last = closed_prefix.last().context("Missing closed prefix")?;
     let last_close = timestamp(&last["openTime"])
@@ -181,7 +182,7 @@ fn build_signal(
         "riskUnit":parameters.stop_atr * atr,
         "maxHoldBars":parameters.max_hold_bars
     });
-    plan["exitRules"] = strategies::exit_rules_for(&plan);
+    plan["exitRules"] = exits.clone();
     signal.plan = Some(plan);
     let normalized = ml_replay::normalize_signal(symbol, closed_prefix, &signal)?;
     if normalized["plan"].is_object() {
@@ -199,6 +200,22 @@ pub fn evaluate(
     source: &SymbolData,
     parameters: &StrategyParameters,
     config: &ReplayConfig,
+) -> Result<Value> {
+    evaluate_with_exits(
+        source,
+        parameters,
+        config,
+        &strategies::ml_horizon_exit_rules(),
+    )
+}
+
+/// Same frozen signals and shared engine as [`evaluate`], with an explicit
+/// exit-rule snapshot so a caller can compare the previous 0-bar MA exit.
+pub fn evaluate_with_exits(
+    source: &SymbolData,
+    parameters: &StrategyParameters,
+    config: &ReplayConfig,
+    exits: &Value,
 ) -> Result<Value> {
     parameters.validate()?;
     ensure!(
@@ -280,6 +297,7 @@ pub fn evaluate(
             point,
             parameters,
             config.end_ms,
+            exits,
         )?);
     }
     let mut result = ml_replay::replay(&source.symbol, &source.rows, &signals, config)?;
@@ -401,6 +419,7 @@ mod tests {
                 &source.predictions[0],
                 &parameters,
                 config.end_ms,
+                &strategies::ml_horizon_exit_rules(),
             )
             .is_err()
         );
@@ -468,5 +487,32 @@ mod tests {
             false
         );
         assert_eq!(result["metrics"]["comparison_complete"], true);
+    }
+
+    #[test]
+    fn horizon_exits_hold_through_an_in_stop_ma_break_that_legacy_rules_cut() {
+        let (mut source, config) = fixture();
+        for row in &mut source.rows[25..] {
+            row["open"] = json!(100.);
+            row["high"] = json!(100.);
+            row["low"] = json!(97.);
+            row["close"] = json!(97.5);
+        }
+        let parameters = StrategyParameters::default();
+        let legacy = evaluate_with_exits(
+            &source,
+            &parameters,
+            &config,
+            &strategies::exit_rules_for(&json!({})),
+        )
+        .unwrap();
+        let horizon = evaluate(&source, &parameters, &config).unwrap();
+        assert_eq!(legacy["orders"][0]["reason"], "smart_exit_ma");
+        assert_eq!(horizon["orders"][0]["reason"], "timeout");
+        assert_eq!(
+            horizon["orders"][0]["plan"]["exitRules"],
+            strategies::ml_horizon_exit_rules()
+        );
+        assert_ne!(legacy["orders"][0]["net"], horizon["orders"][0]["net"]);
     }
 }

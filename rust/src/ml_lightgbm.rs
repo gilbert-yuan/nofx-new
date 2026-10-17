@@ -28,6 +28,7 @@ pub const NUM_CLASSES: usize = 3;
 pub const MIN_TRAIN_ROWS: usize = 90;
 pub const TRAIN_ITERATIONS: usize = 100;
 pub const TRAIN_PARAMETERS: &str = "boosting=gbdt device_type=cpu objective=multiclass num_class=3 metric=multi_logloss deterministic=true force_col_wise=true num_threads=4 num_leaves=15 min_data_in_leaf=30 lambda_l2=5 learning_rate=0.05 max_depth=5 seed=42 feature_fraction_seed=42 bagging_seed=42 data_random_seed=42 feature_fraction=1 bagging_fraction=1 bagging_freq=0 verbosity=-1";
+pub const REGRESSION_PARAMETERS: &str = "boosting=gbdt device_type=cpu objective=regression metric=l2 deterministic=true force_col_wise=true num_threads=4 num_leaves=15 min_data_in_leaf=30 lambda_l2=5 learning_rate=0.05 max_depth=5 seed=42 feature_fraction_seed=42 bagging_seed=42 data_random_seed=42 feature_fraction=1 bagging_fraction=1 bagging_freq=0 verbosity=-1";
 const FLOAT32: c_int = 0;
 const FLOAT64: c_int = 1;
 const PREDICT_NORMAL: c_int = 0;
@@ -184,6 +185,11 @@ pub struct ValidationCheckpoint {
 /// summary. Direct model-text loads do not reconstruct this training history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EarlyStoppingSummary {
+    /// The checkpoint `log_loss` / `best_validation_log_loss` field names are
+    /// retained for compatibility. Their values use this named metric: actual
+    /// multiclass log loss for classifiers, MAE/MSE for a regressor.
+    #[serde(default = "classification_validation_metric")]
+    pub metric: String,
     pub validation_rows: usize,
     pub patience_rounds: usize,
     pub check_every: usize,
@@ -195,6 +201,10 @@ pub struct EarlyStoppingSummary {
     pub patience_exhausted: bool,
     pub stop_reason: String,
     pub validation_checkpoints: Vec<ValidationCheckpoint>,
+}
+
+fn classification_validation_metric() -> String {
+    "multi_logloss".to_owned()
 }
 
 #[derive(Clone, Copy)]
@@ -469,6 +479,7 @@ impl LightGbmModel {
             let requested_iterations = summary.requested_iterations;
             restored.summary = summary;
             restored.early_stopping = Some(EarlyStoppingSummary {
+                metric: classification_validation_metric(),
                 validation_rows: validation.features.len(),
                 patience_rounds: validation.patience_rounds,
                 check_every: validation.check_every,
@@ -660,6 +671,555 @@ impl LightGbmModel {
     }
 }
 
+/// Metadata for scalar cost-adjusted return regression. Loaded model text does
+/// not recover training rows, early-stopping history, or the original parameters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegressionTrainingSummary {
+    pub train_rows: usize,
+    pub feature_count: usize,
+    pub requested_iterations: usize,
+    pub iterations: usize,
+    pub training_ms: f64,
+    pub parameters: String,
+    pub objective: String,
+    pub validation_metric: String,
+}
+
+#[derive(Clone, Copy)]
+struct RegressionValidation<'a> {
+    features: &'a [Vec<f64>],
+    targets: &'a [f64],
+    patience_rounds: usize,
+    check_every: usize,
+}
+
+/// One scalar CPU return model, accepting negative, zero and positive targets.
+/// Like the classifier, this is Send but !Sync and prediction needs &mut self.
+pub struct LightGbmRegressor {
+    // Reuse only private native ownership and objective-independent text export.
+    // No classifier training, class validation or probability decoding is used.
+    owner: LightGbmModel,
+    summary: RegressionTrainingSummary,
+}
+
+impl LightGbmRegressor {
+    pub fn train_config(
+        runtime: Arc<LightGbmRuntime>,
+        features: &[Vec<f64>],
+        targets: &[f64],
+        parameters: &str,
+        iterations: usize,
+    ) -> Result<Self> {
+        Self::train_impl(runtime, features, targets, parameters, iterations, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn train_config_with_validation(
+        runtime: Arc<LightGbmRuntime>,
+        features: &[Vec<f64>],
+        targets: &[f64],
+        parameters: &str,
+        max_iterations: usize,
+        validation_features: &[Vec<f64>],
+        validation_targets: &[f64],
+        patience_rounds: usize,
+        check_every: usize,
+    ) -> Result<Self> {
+        Self::train_impl(
+            runtime,
+            features,
+            targets,
+            parameters,
+            max_iterations,
+            Some(RegressionValidation {
+                features: validation_features,
+                targets: validation_targets,
+                patience_rounds,
+                check_every,
+            }),
+        )
+    }
+
+    fn train_impl(
+        runtime: Arc<LightGbmRuntime>,
+        features: &[Vec<f64>],
+        targets: &[f64],
+        parameters: &str,
+        iterations: usize,
+        validation: Option<RegressionValidation<'_>>,
+    ) -> Result<Self> {
+        let (objective, metric) = validate_regression_parameters(parameters, iterations)?;
+        ensure!(
+            features.len() >= MIN_TRAIN_ROWS,
+            "Regression training requires at least {MIN_TRAIN_ROWS} rows"
+        );
+        let (rows, cols, values) = flatten_features(features)?;
+        let native_targets = regression_targets(targets, rows)?;
+        if let Some(v) = validation {
+            ensure!(
+                (1..=1000).contains(&v.patience_rounds)
+                    && (1..=1000).contains(&v.check_every)
+                    && v.check_every <= v.patience_rounds,
+                "Invalid regression validation patience/check interval"
+            );
+            let (validation_rows, validation_cols, _) = flatten_features(v.features)?;
+            ensure!(
+                validation_cols == cols,
+                "Regression validation feature count mismatch"
+            );
+            regression_targets(v.targets, validation_rows)?;
+        }
+        let native_parameters = CString::new(parameters)?;
+        let started = Instant::now();
+        let mut dataset_handle = ptr::null_mut();
+        // SAFETY: synchronous row-major f64 matrix, dimensions/buffer validated.
+        runtime.check(
+            unsafe {
+                (runtime.dataset_create)(
+                    values.as_ptr().cast(),
+                    FLOAT64,
+                    rows as i32,
+                    cols as i32,
+                    1,
+                    native_parameters.as_ptr(),
+                    ptr::null_mut(),
+                    &mut dataset_handle,
+                )
+            },
+            "create regression dataset",
+        )?;
+        ensure!(!dataset_handle.is_null(), "Null regression dataset");
+        let dataset = Dataset {
+            handle: dataset_handle,
+            runtime: runtime.clone(),
+        };
+        let label_field = CString::new("label")?;
+        // LightGBM DatasetSetField(label) requires float32 even for regression.
+        runtime.check(
+            unsafe {
+                (runtime.dataset_set_field)(
+                    dataset.handle,
+                    label_field.as_ptr(),
+                    native_targets.as_ptr().cast(),
+                    rows as c_int,
+                    FLOAT32,
+                )
+            },
+            "set regression targets",
+        )?;
+        let mut handle = ptr::null_mut();
+        runtime.check(
+            unsafe {
+                (runtime.booster_create)(dataset.handle, native_parameters.as_ptr(), &mut handle)
+            },
+            "create regression booster",
+        )?;
+        ensure!(!handle.is_null(), "Null regression booster");
+        let mut model = Self {
+            owner: LightGbmModel {
+                handle,
+                runtime,
+                _dataset: Some(dataset),
+                summary: TrainingSummary {
+                    train_rows: rows,
+                    feature_count: cols,
+                    class_counts: [0; NUM_CLASSES],
+                    requested_iterations: iterations,
+                    iterations: 0,
+                    training_ms: 0.,
+                    parameters: parameters.to_owned(),
+                },
+                early_stopping: None,
+                _not_sync: PhantomData,
+            },
+            summary: RegressionTrainingSummary {
+                train_rows: rows,
+                feature_count: cols,
+                requested_iterations: iterations,
+                iterations: 0,
+                training_ms: 0.,
+                parameters: parameters.to_owned(),
+                objective,
+                validation_metric: metric.clone(),
+            },
+        };
+        model.native_dimensions()?; // Check scalar output before allocating prediction buffers.
+        let mut state = EarlyStoppingState::new();
+        let mut best_text = None;
+        let mut rounds_executed = 0;
+        let mut stop_reason = "maximum_iterations";
+        for round in 1..=iterations {
+            let mut finished = 0;
+            model.owner.runtime.check(
+                unsafe { (model.owner.runtime.booster_update)(model.owner.handle, &mut finished) },
+                "update regression iteration",
+            )?;
+            rounds_executed = round;
+            if let Some(v) = validation
+                && (round % v.check_every == 0 || round == iterations || finished != 0)
+            {
+                let (_, native_iteration) = model.native_dimensions()?;
+                let loss =
+                    regression_validation_loss(&model.predict(v.features)?, v.targets, &metric)?;
+                if state.record(native_iteration, loss)? {
+                    best_text = Some(model.model_text()?);
+                }
+                if finished == 0
+                    && round < iterations
+                    && state.patience_exhausted(native_iteration, v.patience_rounds)
+                {
+                    stop_reason = "validation_patience";
+                    break;
+                }
+            }
+            if finished != 0 {
+                stop_reason = "native_finished";
+                break;
+            }
+        }
+        let (native_features, trained_iterations) = model.native_dimensions()?;
+        ensure!(
+            native_features == cols,
+            "Regression trained feature count mismatch"
+        );
+        model.summary.iterations = trained_iterations;
+        model.summary.training_ms = started.elapsed().as_secs_f64() * 1000.;
+        if let Some(v) = validation {
+            let text = best_text.context("Regression produced no validation checkpoint")?;
+            let mut summary = model.summary.clone();
+            let runtime = model.owner.runtime.clone();
+            drop(model);
+            let mut restored = Self::from_text(runtime, &text)?;
+            ensure!(
+                restored.summary.feature_count == cols
+                    && restored.summary.iterations == state.best_iteration,
+                "Regression best-snapshot dimensions changed during restoration"
+            );
+            summary.iterations = state.best_iteration;
+            summary.training_ms = started.elapsed().as_secs_f64() * 1000.;
+            restored.summary = summary;
+            restored.owner.early_stopping = Some(EarlyStoppingSummary {
+                metric,
+                validation_rows: v.features.len(),
+                patience_rounds: v.patience_rounds,
+                check_every: v.check_every,
+                rounds_executed,
+                trained_iterations,
+                best_iteration: state.best_iteration,
+                best_validation_log_loss: state.best_loss,
+                stopped_early: rounds_executed < iterations,
+                patience_exhausted: stop_reason == "validation_patience",
+                stop_reason: stop_reason.to_owned(),
+                validation_checkpoints: state.checkpoints,
+            });
+            return Ok(restored);
+        }
+        Ok(model)
+    }
+
+    /// Read scalar regression model text via Rust (including Unicode paths).
+    pub fn load(runtime: Arc<LightGbmRuntime>, path: &Path) -> Result<Self> {
+        Self::from_text(
+            runtime,
+            &std::fs::read_to_string(path)
+                .with_context(|| format!("Read regression model {}", path.display()))?,
+        )
+    }
+
+    fn from_text(runtime: Arc<LightGbmRuntime>, text: &str) -> Result<Self> {
+        ensure!(
+            !text.is_empty() && text.len() <= MAX_MODEL_TEXT_BYTES,
+            "Invalid regression model text size"
+        );
+        let objective = text
+            .lines()
+            .find_map(|line| line.split_whitespace().next()?.strip_prefix("objective="))
+            .filter(|name| matches!(*name, "regression" | "regression_l1" | "huber"))
+            .context("Model must use scalar regression/regression_l1/huber objective")?
+            .to_owned();
+        let native_text = CString::new(text).context("Regression model contains NUL")?;
+        let mut iterations = 0;
+        let mut handle = ptr::null_mut();
+        runtime.check(
+            unsafe { (runtime.booster_load)(native_text.as_ptr(), &mut iterations, &mut handle) },
+            "load regression model text",
+        )?;
+        ensure!(!handle.is_null(), "Null loaded regression booster");
+        let mut model = Self {
+            owner: LightGbmModel {
+                handle,
+                runtime,
+                _dataset: None,
+                summary: TrainingSummary {
+                    train_rows: 0,
+                    feature_count: 0,
+                    class_counts: [0; NUM_CLASSES],
+                    requested_iterations: 0,
+                    iterations: 0,
+                    training_ms: 0.,
+                    parameters: String::new(),
+                },
+                early_stopping: None,
+                _not_sync: PhantomData,
+            },
+            summary: RegressionTrainingSummary {
+                train_rows: 0,
+                feature_count: 0,
+                requested_iterations: 0,
+                iterations: 0,
+                training_ms: 0.,
+                parameters: String::new(),
+                objective,
+                validation_metric: "not_available_from_training_metadata".to_owned(),
+            },
+        };
+        let (features, actual_iterations) = model.native_dimensions()?;
+        ensure!(
+            iterations >= 0 && iterations as usize == actual_iterations,
+            "Invalid loaded regression iteration count"
+        );
+        model.summary.feature_count = features;
+        model.summary.iterations = actual_iterations;
+        Ok(model)
+    }
+
+    fn native_dimensions(&self) -> Result<(usize, usize)> {
+        let mut outputs = 0;
+        let mut features = 0;
+        let mut iterations = 0;
+        let api = &self.owner.runtime;
+        api.check(
+            unsafe { (api.booster_classes)(self.owner.handle, &mut outputs) },
+            "get regression output count",
+        )?;
+        ensure!(
+            outputs == 1,
+            "Regression model must have exactly one output"
+        );
+        api.check(
+            unsafe { (api.booster_features)(self.owner.handle, &mut features) },
+            "get regression feature count",
+        )?;
+        api.check(
+            unsafe { (api.booster_iteration)(self.owner.handle, &mut iterations) },
+            "get regression iteration count",
+        )?;
+        ensure!(
+            features > 0 && iterations >= 0,
+            "Invalid regression dimensions"
+        );
+        Ok((features as usize, iterations as usize))
+    }
+
+    pub fn predict(&mut self, features: &[Vec<f64>]) -> Result<Vec<f64>> {
+        if features.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (rows, cols, values) = flatten_features(features)?;
+        ensure!(
+            cols == self.summary.feature_count && self.native_dimensions()?.0 == cols,
+            "Regression prediction feature count mismatch"
+        );
+        let mut output = vec![0_f64; rows];
+        let mut output_len = 0;
+        // Scalar inference is bounded independently of a loaded model's thread
+        // settings, leaving CPU and memory headroom for the running API.
+        let parameters = CString::new("num_threads=1")?;
+        // SAFETY: scalar output was checked before allocating rows f64 values;
+        // FLOAT64 describes the input matrix; the C API always writes doubles.
+        self.owner.runtime.check(
+            unsafe {
+                (self.owner.runtime.booster_predict)(
+                    self.owner.handle,
+                    values.as_ptr().cast(),
+                    FLOAT64,
+                    rows as i32,
+                    cols as i32,
+                    1,
+                    PREDICT_NORMAL,
+                    0,
+                    -1,
+                    parameters.as_ptr(),
+                    &mut output_len,
+                    output.as_mut_ptr(),
+                )
+            },
+            "predict scalar returns",
+        )?;
+        ensure!(
+            output_len == rows as i64 && output.iter().all(|v| v.is_finite()),
+            "Invalid regression prediction output shape/values"
+        );
+        Ok(output)
+    }
+
+    pub fn summary(&self) -> &RegressionTrainingSummary {
+        &self.summary
+    }
+    pub fn early_stopping_summary(&self) -> Option<&EarlyStoppingSummary> {
+        self.owner.early_stopping.as_ref()
+    }
+    pub fn model_text(&self) -> Result<String> {
+        self.owner.model_text()
+    }
+    pub fn save(&self, path: &Path) -> Result<()> {
+        self.owner.save(path)
+    }
+}
+
+fn regression_targets(targets: &[f64], rows: usize) -> Result<Vec<f32>> {
+    ensure!(
+        rows > 0 && targets.len() == rows,
+        "Regression feature/target count mismatch"
+    );
+    targets
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let native = *value as f32;
+            ensure!(
+                value.is_finite() && native.is_finite(),
+                "Regression target {index} is nonfinite or outside float32 range"
+            );
+            Ok(native)
+        })
+        .collect()
+}
+
+fn regression_validation_loss(predictions: &[f64], targets: &[f64], metric: &str) -> Result<f64> {
+    ensure!(
+        !targets.is_empty() && predictions.len() == targets.len(),
+        "Regression validation target/prediction count mismatch"
+    );
+    ensure!(
+        matches!(metric, "l1" | "l2"),
+        "Unsupported regression validation metric"
+    );
+    let loss = predictions.iter().zip(targets).try_fold(
+        0.,
+        |sum, (prediction, target)| -> Result<f64> {
+            ensure!(
+                prediction.is_finite() && target.is_finite(),
+                "Nonfinite regression validation input"
+            );
+            let residual = prediction - target;
+            let value = if metric == "l1" {
+                residual.abs()
+            } else {
+                residual * residual
+            };
+            let next = sum + value;
+            ensure!(next.is_finite(), "Regression validation loss overflow");
+            Ok(next)
+        },
+    )? / targets.len() as f64;
+    Ok(loss)
+}
+
+fn validate_regression_parameters(parameters: &str, iterations: usize) -> Result<(String, String)> {
+    ensure!(
+        (1..=1000).contains(&iterations),
+        "Regression iterations must be 1..=1000"
+    );
+    ensure!(
+        parameters.len() <= 16_384 && !parameters.contains('\0'),
+        "Invalid regression parameters"
+    );
+    let mut values = std::collections::BTreeMap::new();
+    for parameter in parameters.split_whitespace() {
+        let (key, value) = parameter
+            .split_once('=')
+            .context("Regression parameters must be key=value")?;
+        ensure!(
+            !value.is_empty() && values.insert(key, value).is_none(),
+            "Empty or duplicate regression parameter {key}"
+        );
+        ensure!(
+            matches!(
+                key,
+                "objective"
+                    | "metric"
+                    | "device_type"
+                    | "boosting"
+                    | "deterministic"
+                    | "force_col_wise"
+                    | "num_threads"
+                    | "num_leaves"
+                    | "min_data_in_leaf"
+                    | "lambda_l1"
+                    | "lambda_l2"
+                    | "learning_rate"
+                    | "max_depth"
+                    | "seed"
+                    | "feature_fraction_seed"
+                    | "bagging_seed"
+                    | "data_random_seed"
+                    | "feature_fraction"
+                    | "bagging_fraction"
+                    | "bagging_freq"
+                    | "verbosity"
+                    | "alpha"
+                    | "max_bin"
+                    | "min_gain_to_split"
+            ),
+            "Unsupported regression parameter {key}"
+        );
+    }
+    let objective = *values
+        .get("objective")
+        .context("Regression objective is required")?;
+    let metric = *values
+        .get("metric")
+        .context("Regression validation metric is required")?;
+    ensure!(
+        matches!(objective, "regression" | "regression_l1" | "huber"),
+        "Unsupported scalar regression objective"
+    );
+    ensure!(
+        matches!(metric, "l1" | "l2"),
+        "Regression metric must be l1/l2"
+    );
+    for (key, expected) in [
+        ("device_type", "cpu"),
+        ("deterministic", "true"),
+        ("force_col_wise", "true"),
+    ] {
+        ensure!(
+            values.get(key) == Some(&expected),
+            "Regression requires {key}={expected}"
+        );
+    }
+    ensure!(
+        values.get("boosting").is_none_or(|v| *v == "gbdt"),
+        "Regression supports gbdt only"
+    );
+    for (key, value) in &values {
+        if !matches!(
+            *key,
+            "objective"
+                | "metric"
+                | "device_type"
+                | "boosting"
+                | "deterministic"
+                | "force_col_wise"
+        ) {
+            ensure!(
+                value.parse::<f64>().is_ok_and(|v| v.is_finite()),
+                "Regression {key} must be finite numeric"
+            );
+        }
+    }
+    if let Some(threads) = values.get("num_threads") {
+        ensure!(
+            threads
+                .parse::<usize>()
+                .is_ok_and(|v| (1..=64).contains(&v)),
+            "Regression num_threads must be 1..=64"
+        );
+    }
+    Ok((objective.to_owned(), metric.to_owned()))
+}
+
 fn validate_validation_inputs(
     validation: ValidationInputs<'_>,
     expected_cols: usize,
@@ -834,6 +1394,205 @@ fn decode_probabilities(values: &[f64]) -> Result<Vec<[f64; NUM_CLASSES]>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regression_accepts_signed_targets_and_rejects_invalid_values_or_shape() {
+        assert_eq!(
+            regression_targets(&[-2., 0., 3.], 3).unwrap(),
+            vec![-2_f32, 0., 3.]
+        );
+        for targets in [
+            vec![f64::NAN],
+            vec![f64::INFINITY],
+            vec![f64::NEG_INFINITY],
+            vec![f64::MAX],
+        ] {
+            assert!(regression_targets(&targets, 1).is_err());
+        }
+        assert!(regression_targets(&[], 0).is_err());
+        assert!(regression_targets(&[1.], 2).is_err());
+        assert_eq!(
+            regression_validation_loss(&[-2., 0., 2.], &[-1., 0., -1.], "l1").unwrap(),
+            4. / 3.
+        );
+        assert_eq!(
+            regression_validation_loss(&[-2., 0., 2.], &[-1., 0., -1.], "l2").unwrap(),
+            10. / 3.
+        );
+        assert!(regression_validation_loss(&[], &[], "l2").is_err());
+        assert!(regression_validation_loss(&[f64::NAN], &[0.], "l1").is_err());
+        assert!(regression_validation_loss(&[f64::MAX], &[-f64::MAX], "l2").is_err());
+    }
+
+    #[test]
+    fn regression_parameters_refuse_classification_gpu_aliases_and_custom_code() {
+        for objective in ["regression", "regression_l1", "huber"] {
+            let parameters = REGRESSION_PARAMETERS
+                .replace("objective=regression", &format!("objective={objective}"));
+            assert_eq!(
+                validate_regression_parameters(&parameters, 10).unwrap().0,
+                objective
+            );
+        }
+        for parameters in [
+            TRAIN_PARAMETERS.to_owned(),
+            REGRESSION_PARAMETERS.replace("device_type=cpu", "device_type=gpu"),
+            REGRESSION_PARAMETERS.replace("deterministic=true", "deterministic=false"),
+            REGRESSION_PARAMETERS.replace("force_col_wise=true", "force_col_wise=false"),
+            REGRESSION_PARAMETERS.replace("objective=regression", "objective=none"),
+            REGRESSION_PARAMETERS.replace("metric=l2", "metric=multi_logloss"),
+            format!("{REGRESSION_PARAMETERS} num_class=1"),
+            format!("{REGRESSION_PARAMETERS} application=regression"),
+            format!("{REGRESSION_PARAMETERS} objective=huber"),
+            format!("{REGRESSION_PARAMETERS} init_model=arbitrary.txt"),
+            REGRESSION_PARAMETERS.replace("num_threads=4", "num_threads=0"),
+            REGRESSION_PARAMETERS.replace("learning_rate=0.05", "learning_rate=NaN"),
+        ] {
+            assert!(
+                validate_regression_parameters(&parameters, 10).is_err(),
+                "Accepted {parameters}"
+            );
+        }
+        assert!(validate_regression_parameters(REGRESSION_PARAMETERS, 0).is_err());
+        assert!(validate_regression_parameters(REGRESSION_PARAMETERS, 1001).is_err());
+        // A scalar regression API does not weaken the existing classifier contract.
+        assert!(
+            prepare_training(&vec![vec![0.]; MIN_TRAIN_ROWS], &vec![3; MIN_TRAIN_ROWS]).is_err()
+        );
+        assert!(validate_training_config(REGRESSION_PARAMETERS, 10).is_err());
+    }
+
+    fn regression_native_fixture() -> (Vec<Vec<f64>>, Vec<f64>) {
+        let mut features = Vec::new();
+        let mut targets = Vec::new();
+        for (class, target) in [-2., 0., 3.].into_iter().enumerate() {
+            for index in 0..120 {
+                features.push(vec![
+                    class as f64 * 10. + index as f64 / 120.,
+                    index as f64 / 120.,
+                ]);
+                targets.push(target);
+            }
+        }
+        (features, targets)
+    }
+
+    #[test]
+    #[ignore = "requires installed CPU LightGBM native runtime"]
+    fn native_regression_roundtrip_predicts_negative_zero_positive_for_all_objectives() {
+        let path = std::env::var_os("NOFX_LIGHTGBM_LIBRARY")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| DEFAULT_RUNTIME_PATH.into());
+        let runtime = LightGbmRuntime::load(&path).unwrap();
+        let (features, targets) = regression_native_fixture();
+        let probes = vec![vec![0.5, 0.5], vec![10.5, 0.5], vec![20.5, 0.5]];
+        let temp = tempfile::tempdir().unwrap();
+        for objective in ["regression", "regression_l1", "huber"] {
+            let parameters = REGRESSION_PARAMETERS
+                .replace("objective=regression", &format!("objective={objective}"))
+                .replace("learning_rate=0.05", "learning_rate=0.1");
+            let mut model = LightGbmRegressor::train_config(
+                runtime.clone(),
+                &features,
+                &targets,
+                &parameters,
+                100,
+            )
+            .unwrap();
+            let predictions = model.predict(&probes).unwrap();
+            assert_eq!(predictions.len(), probes.len());
+            assert!(
+                predictions[0] < -1.5 && predictions[1].abs() < 0.25 && predictions[2] > 2.5,
+                "{objective}: {predictions:?}"
+            );
+            let mut duplicate = LightGbmRegressor::train_config(
+                runtime.clone(),
+                &features,
+                &targets,
+                &parameters,
+                100,
+            )
+            .unwrap();
+            assert_eq!(duplicate.predict(&probes).unwrap(), predictions);
+            let saved = temp.path().join(format!("收益模型-{objective}.txt"));
+            model.save(&saved).unwrap();
+            let mut loaded = LightGbmRegressor::load(runtime.clone(), &saved).unwrap();
+            assert_eq!(loaded.predict(&probes).unwrap(), predictions);
+            assert_eq!(loaded.summary().feature_count, 2);
+            assert_eq!(loaded.summary().train_rows, 0);
+            assert!(loaded.early_stopping_summary().is_none());
+            assert!(loaded.predict(&[vec![0.]]).is_err());
+            assert!(loaded.predict(&[vec![f64::NAN, 0.]]).is_err());
+            assert!(loaded.predict(&[]).unwrap().is_empty());
+        }
+        assert!(
+            LightGbmRegressor::from_text(runtime.clone(), "objective=multiclass\nnum_class=3\n")
+                .is_err()
+        );
+        assert!(LightGbmRegressor::from_text(runtime, "objective=binary\n").is_err());
+    }
+
+    #[test]
+    #[ignore = "requires installed CPU LightGBM native runtime"]
+    fn native_regression_validation_restores_best_iteration_and_declares_real_loss_metric() {
+        let path = std::env::var_os("NOFX_LIGHTGBM_LIBRARY")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| DEFAULT_RUNTIME_PATH.into());
+        let runtime = LightGbmRuntime::load(&path).unwrap();
+        let (features, targets) = regression_native_fixture();
+        let validation_targets: Vec<_> = targets.iter().map(|target| -*target).collect();
+        for metric in ["l1", "l2"] {
+            let parameters = REGRESSION_PARAMETERS
+                .replace("metric=l2", &format!("metric={metric}"))
+                .replace("learning_rate=0.05", "learning_rate=0.2");
+            let mut model = LightGbmRegressor::train_config_with_validation(
+                runtime.clone(),
+                &features,
+                &targets,
+                &parameters,
+                100,
+                &features,
+                &validation_targets,
+                10,
+                2,
+            )
+            .unwrap();
+            let summary = model.early_stopping_summary().unwrap().clone();
+            assert_eq!(summary.metric, metric);
+            assert_eq!(summary.best_iteration, 2);
+            assert_eq!(summary.trained_iterations, 12);
+            assert!(summary.patience_exhausted && summary.stopped_early);
+            assert_eq!(model.summary().iterations, summary.best_iteration);
+            assert_eq!(model.summary().requested_iterations, 100);
+            assert_eq!(model.summary().train_rows, features.len());
+            let observed_loss = regression_validation_loss(
+                &model.predict(&features).unwrap(),
+                &validation_targets,
+                metric,
+            )
+            .unwrap();
+            assert!((observed_loss - summary.best_validation_log_loss).abs() < 1e-12);
+            let mut exact_best = LightGbmRegressor::train_config(
+                runtime.clone(),
+                &features,
+                &targets,
+                &parameters,
+                summary.best_iteration,
+            )
+            .unwrap();
+            assert_eq!(
+                exact_best.predict(&features).unwrap(),
+                model.predict(&features).unwrap()
+            );
+            let file = tempfile::NamedTempFile::new().unwrap();
+            model.save(file.path()).unwrap();
+            let mut loaded = LightGbmRegressor::load(runtime.clone(), file.path()).unwrap();
+            assert_eq!(
+                loaded.predict(&features).unwrap(),
+                model.predict(&features).unwrap()
+            );
+        }
+    }
 
     #[test]
     fn configurable_training_preserves_cpu_three_class_contract() {

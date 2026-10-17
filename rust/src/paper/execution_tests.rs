@@ -24,6 +24,9 @@ struct Remote {
     requests: Vec<(String, String, Value)>,
     orders: BTreeMap<String, Value>,
     algos: Vec<Value>,
+    /// Scripted rejections for POST /fapi/v1/algoOrder, consumed front to back. Anything
+    /// left over after the script is empty is accepted normally.
+    algo_reject: Vec<(StatusCode, Value)>,
 }
 struct Mock {
     state: Arc<Mutex<Remote>>,
@@ -43,6 +46,7 @@ async fn mock() -> Mock {
         requests: vec![],
         orders: BTreeMap::new(),
         algos: vec![],
+        algo_reject: vec![],
     }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client = Exchange::test_endpoint(&format!("http://{}", listener.local_addr().unwrap()));
@@ -93,10 +97,16 @@ async fn handle(
         ("GET", "/fapi/v1/openOrders") => json!([]),
         ("GET", "/fapi/v1/openAlgoOrders") => json!(r.algos),
         ("POST", "/fapi/v1/algoOrder") => {
-            let mut algo = p.clone();
-            algo["algoId"] = json!(r.algos.len() + 1);
-            r.algos.push(algo.clone());
-            algo
+            if r.algo_reject.is_empty() {
+                let mut algo = p.clone();
+                algo["algoId"] = json!(r.algos.len() + 1);
+                r.algos.push(algo.clone());
+                algo
+            } else {
+                let (code, body) = r.algo_reject.remove(0);
+                status = code;
+                body
+            }
         }
         ("DELETE", "/fapi/v1/algoOrder") => {
             r.algos
@@ -232,7 +242,40 @@ async fn run_execution(db: &Db) -> Result<()> {
     .await?;
     let first = lock_execution(db, "live", "BTCUSDT", "BOTH").await?;
     assert!(lock_execution(db, "live", "BTCUSDT", "BOTH").await.is_err());
+    assert!(
+        try_lock_execution(db, "live", "BTCUSDT", "BOTH")
+            .await?
+            .is_none(),
+        "a held slot must report as unavailable rather than error out"
+    );
+    // A user-initiated close waits for the slot instead of returning 409 straight away, but the
+    // wait must still be bounded so a stuck holder cannot hang the request forever.
+    assert!(
+        lock_execution_wait(
+            db,
+            "live",
+            "BTCUSDT",
+            "BOTH",
+            std::time::Duration::from_millis(400)
+        )
+        .await
+        .is_err(),
+        "waiting must time out while the holder keeps the slot"
+    );
     drop(first);
+    let handed_over = lock_execution_wait(
+        db,
+        "live",
+        "BTCUSDT",
+        "BOTH",
+        std::time::Duration::from_millis(400),
+    )
+    .await;
+    assert!(
+        handed_over.is_ok(),
+        "the slot must be handed over once the previous holder releases it"
+    );
+    drop(handed_over);
     assert!(
         sync_strategy_exit(db, &m.client, "live", &order, false)
             .await
@@ -300,5 +343,218 @@ async fn run_execution(db: &Db) -> Result<()> {
     m.state.lock().unwrap().mark = 89.;
     sync_protection(db, &m.client, "live", &second).await?;
     assert_eq!(m.state.lock().unwrap().quantity, 0.);
+
+    // A clientAlgoId the exchange still reserves must not block protection forever.
+    let mut fallback = json!({"id":"native-fallback","recordId":"test","symbol":"BTCUSDT","interval":"1m","status":"open","direction":"OPEN_LONG","marketProvider":"binance","entry":100.,"quantity":10.,"realizedQty":0.,"margin":500.,"notional":1000.,"leverage":2.,"createdAt":iso(now_ms()),"entryAt":iso(now_ms()),"plan":{"stopLoss":90.,"takeProfit":110.}});
+    ensure_links(&mut fallback);
+    fallback["exchangeSync"]["live"] =
+        json!({"executedQty":10.,"status":"filled","clientOrderId":"entry","closeOrders":[]});
+    db.mutate_account(|s| {
+        s["orders"].as_array_mut().unwrap().push(fallback.clone());
+        Ok(Value::Null)
+    })
+    .await?;
+    let base = client_id("protect", &["live", "native-fallback", "stopLoss", "90"]);
+    {
+        let mut r = m.state.lock().unwrap();
+        r.quantity = 10.;
+        r.mark = 100.;
+        r.algos.clear();
+        r.algo_reject = vec![(
+            StatusCode::BAD_REQUEST,
+            json!({"code":-4116,"msg":"ClientOrderId is duplicated."}),
+        )];
+    }
+    let before = m.state.lock().unwrap().requests.len();
+    sync_protection(db, &m.client, "live", &fallback).await?;
+    let attempts: Vec<String> = {
+        let r = m.state.lock().unwrap();
+        r.requests[before..]
+            .iter()
+            .filter(|(verb, path, p)| {
+                verb == "POST" && path == "/fapi/v1/algoOrder" && p["type"] == "STOP_MARKET"
+            })
+            .map(|(_, _, p)| p["clientAlgoId"].as_str().unwrap_or("").to_owned())
+            .collect()
+    };
+    assert_eq!(
+        attempts.len(),
+        2,
+        "a duplicate must be retried exactly once, never looped"
+    );
+    assert_eq!(attempts[0], base);
+    assert_ne!(
+        attempts[1], base,
+        "a burned client ID must be rotated so the replacement can land"
+    );
+    let stored = db.account(false, Some("native-fallback")).await?;
+    assert_eq!(
+        stored["orders"][0]["exchangeSync"]["live"]["protection"]["stopLoss"]["status"],
+        json!("submitted"),
+        "rotation must leave a real exchange-side stop, not a silent fallback"
+    );
+
+    // An exhausted conditional-order quota degrades to the in-process stop, not a hard error.
+    let mut quota = fallback.clone();
+    quota["id"] = json!("native-quota");
+    db.mutate_account(|s| {
+        s["orders"].as_array_mut().unwrap().push(quota.clone());
+        Ok(Value::Null)
+    })
+    .await?;
+    {
+        let mut r = m.state.lock().unwrap();
+        r.quantity = 10.;
+        r.mark = 100.;
+        r.algos.clear();
+        r.algo_reject = vec![
+            (
+                StatusCode::BAD_REQUEST,
+                json!({"code":-4045,"msg":"Reach max stop order limit."}),
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                json!({"code":-4045,"msg":"Reach max stop order limit."}),
+            ),
+        ];
+    }
+    sync_protection(db, &m.client, "live", &quota).await?;
+    let stored = db.account(false, Some("native-quota")).await?;
+    let protection = &stored["orders"][0]["exchangeSync"]["live"]["protection"];
+    assert_eq!(protection["stopLoss"]["status"], json!("local"));
+    assert_eq!(protection["takeProfit"]["status"], json!("local"));
+    assert_eq!(
+        stored["orders"][0]["exchangeSync"]["live"]["protectionError"],
+        json!(""),
+        "a documented fallback must not keep reporting as a hard error"
+    );
+    assert_eq!(
+        m.state.lock().unwrap().quantity,
+        10.,
+        "degrading protection must never touch the position"
+    );
     Ok(())
+}
+
+#[test]
+fn unaccepted_entries_release_their_reservation_after_the_ttl() {
+    let created = 1_700_000_000_000i64;
+    let order = json!({"status":"open","createdAt":iso(created),"entry":0.,
+        "exchange":{"status":"not_submitted"}});
+    assert!(!abandon_stale_entry(&order, created + 60 * 60_000));
+    assert!(abandon_stale_entry(&order, created + 121 * 60_000));
+
+    let ghost = json!({"status":"open","createdAt":iso(created),"entry":100.,
+        "exchange":{"status":"not_submitted","executedQty":0.}});
+    assert!(
+        abandon_stale_entry(&ghost, created + 10 * 60 * 60_000),
+        "a local fill without exchange execution is a ghost reservation"
+    );
+
+    let executed = json!({"status":"open","createdAt":iso(created),"entry":100.,
+        "exchange":{"status":"not_submitted","executedQty":10.}});
+    assert!(
+        !abandon_stale_entry(&executed, created + 10 * 60 * 60_000),
+        "an order the exchange actually filled must keep its reservation"
+    );
+
+    let working = json!({"status":"open","createdAt":iso(created),"entry":0.,
+        "exchange":{"status":"new"}});
+    assert!(
+        !abandon_stale_entry(&working, created + 10 * 60 * 60_000),
+        "an order still pending at the exchange must keep its reservation"
+    );
+}
+
+// These strings are copied verbatim from rows that failed in production, so the
+// classifiers are pinned to what Binance actually returned rather than to a guess.
+fn binance(message: &str) -> anyhow::Error {
+    anyhow::anyhow!("{}", message)
+}
+#[test]
+fn vanished_orders_count_as_already_cancelled() {
+    // -2011 arrives as plain text with no numeric code, which is exactly why matching on
+    // the code alone let every one of the 45 historical cancels abort the close.
+    assert!(missing_order(&binance("Binance 400: Unknown order sent.")));
+    assert!(missing_order(&binance(
+        "Binance 400: Unknown order sent. (code -2011)"
+    )));
+    assert!(missing_order(&binance(
+        "Binance HTTP 400: Order does not exist. (code -2013)"
+    )));
+    assert!(!missing_order(&binance(
+        "Binance HTTP 400: Invalid symbol. (code -1121)"
+    )));
+    assert!(!missing_order(&binance(
+        "error sending request for url (https://demo-fapi.binance.com)"
+    )));
+}
+#[test]
+fn duplicate_protection_ids_are_adopted_not_failed() {
+    assert!(duplicate_order(&binance(
+        "Binance HTTP 400: ClientOrderId is duplicated. (code -4116)"
+    )));
+    assert!(!duplicate_order(&binance(
+        "Binance 400: Unknown order sent."
+    )));
+    assert!(!duplicate_order(&binance(
+        "Binance HTTP 400: Reach max stop order limit. (code -4045)"
+    )));
+}
+#[test]
+fn exhausted_protection_quota_degrades_to_local_instead_of_failing() {
+    assert!(protection_quota_exhausted(&binance(
+        "Binance HTTP 400: Reach max stop order limit. (code -4045)"
+    )));
+    assert!(!protection_quota_exhausted(&binance(
+        "Binance HTTP 400: ClientOrderId is duplicated. (code -4116)"
+    )));
+}
+#[test]
+fn retry_backoff_starts_on_the_next_sweep_and_caps_at_five_minutes() {
+    let now = 1_700_000_000_000_i64;
+    let mut link = json!({});
+    let mut delays = vec![];
+    for _ in 0..8 {
+        let patch = retry_patch(&link, now);
+        let at = timestamp(&patch["retryAt"]).expect("retryAt must be an ISO timestamp");
+        delays.push(at - now);
+        // The window must actually hold the order back, then release it exactly on time.
+        assert!(
+            !retry_due(&patch, now),
+            "a fresh failure must not retry instantly"
+        );
+        assert!(!retry_due(&patch, now + delays[delays.len() - 1] - 1));
+        assert!(retry_due(&patch, now + delays[delays.len() - 1]));
+        link = patch;
+    }
+    assert_eq!(
+        delays,
+        vec![
+            15_000, 30_000, 60_000, 120_000, 240_000, 300_000, 300_000, 300_000
+        ],
+        "first retry must stay on the next 15s sweep so recovery never slows down, then decay"
+    );
+    assert_eq!(n(&link, "retryCount", 0.), 8.);
+    assert!(
+        retry_due(&json!({}), now),
+        "a never-failed order is always due"
+    );
+    assert!(retry_due(&json!({"retryAt":null}), now));
+}
+#[test]
+fn refresh_freshness_window_expires() {
+    LAST_REFRESH_AT.store(0, Ordering::Relaxed);
+    assert!(
+        !refresh_recent(),
+        "a process that has never refreshed must not look fresh"
+    );
+    LAST_REFRESH_AT.store(now_ms(), Ordering::Relaxed);
+    assert!(refresh_recent(), "a just-finished refresh is fresh");
+    LAST_REFRESH_AT.store(now_ms() - REFRESH_MAX_AGE_MS - 1, Ordering::Relaxed);
+    assert!(
+        !refresh_recent(),
+        "an aged snapshot must force the next user request to refresh for real"
+    );
+    LAST_REFRESH_AT.store(0, Ordering::Relaxed);
 }

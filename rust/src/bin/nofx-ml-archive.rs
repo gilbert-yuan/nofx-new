@@ -5,7 +5,7 @@ use clap::{Parser, ValueEnum};
 use futures::{StreamExt, stream};
 use nofx_core::{
     ml_archive,
-    ml_dataset::{self, DAY_MS, HOUR_MS},
+    ml_dataset::{self, CandleInterval, DAY_MS, HOUR_MS},
 };
 use quick_xml::{Reader, events::Event};
 use serde_json::{Value, json};
@@ -58,6 +58,15 @@ struct Args {
     /// Preserve real historical rows of contracts absent on the final UTC day.
     #[arg(long)]
     include_inactive: bool,
+    /// Native market cadence; 15m always downloads real quarter-hour archives.
+    #[arg(long, default_value = "1h", value_parser = CandleInterval::parse)]
+    interval: CandleInterval,
+    /// Freeze the eligible historical coin universe from an audited manifest.
+    #[arg(long)]
+    universe_manifest: Option<PathBuf>,
+    /// Reuse source histories verbatim after their original manifest SHA is checked.
+    #[arg(long)]
+    reuse_history_dir: Option<PathBuf>,
 }
 #[derive(Clone)]
 struct Archive {
@@ -67,6 +76,8 @@ struct Archive {
     raw_cache_dirs: Vec<PathBuf>,
     inventory: bool,
     include_inactive: bool,
+    interval: CandleInterval,
+    reused_histories: Option<std::sync::Arc<(PathBuf, BTreeMap<String, Value>)>>,
 }
 struct File {
     bytes: Vec<u8>,
@@ -109,6 +120,35 @@ async fn main() -> Result<()> {
     let raw_cache_fingerprints: Vec<Value> = raw_cache_dirs.iter().map(|root| -> Result<Value> {
         Ok(json!({"root":root,"manifest_sha256":ml_dataset::file_digest(&root.join("manifest.json"))?}))
     }).collect::<Result<_>>()?;
+    let universe_source = args
+        .universe_manifest
+        .as_ref()
+        .map(|path| -> Result<Value> {
+            Ok(json!({"path":fs::canonicalize(path)?,"sha256":ml_dataset::file_digest(path)?}))
+        })
+        .transpose()?;
+    let history_source = args.reuse_history_dir.as_ref().map(|path| -> Result<Value> {
+        Ok(json!({"root":fs::canonicalize(path)?,"manifest_sha256":ml_dataset::file_digest(&path.join("manifest.json"))?}))
+    }).transpose()?;
+    let reused_histories = args
+        .reuse_history_dir
+        .as_ref()
+        .map(|path| -> Result<_> {
+            let manifest = ml_dataset::read_json(&path.join("manifest.json"))?;
+            let rows = manifest["symbols"]
+                .as_array()
+                .context("Missing source history universe")?;
+            let entries = rows
+                .iter()
+                .map(|entry| -> Result<_> {
+                    let symbol = entry["symbol"].as_str().context("Missing history symbol")?;
+                    nofx_core::exchange::valid_symbol(symbol)?;
+                    Ok((symbol.to_string(), entry.clone()))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?;
+            Ok(std::sync::Arc::new((fs::canonicalize(path)?, entries)))
+        })
+        .transpose()?;
     let _writer = ml_dataset::collector_lock(&args.output_dir)?;
     let archive = Archive {
         client: reqwest::Client::builder()
@@ -122,6 +162,8 @@ async fn main() -> Result<()> {
         raw_cache_dirs,
         inventory: args.days > 90 || args.include_inactive,
         include_inactive: args.include_inactive,
+        interval: args.interval,
+        reused_histories,
     };
     if args.probe {
         let latest = archive.latest_day().await?;
@@ -144,6 +186,9 @@ async fn main() -> Result<()> {
                 && saved["days"] == args.days
                 && saved["warmup_hours"] == args.warmup_hours
                 && saved["provider"] == "Binance Public Data archives"
+                && saved["interval"].as_str().unwrap_or("1h") == args.interval.as_str()
+                && saved["universe_source"] == universe_source.clone().unwrap_or(Value::Null)
+                && saved["history_source"] == history_source.clone().unwrap_or(Value::Null)
                 && saved["include_inactive"].as_bool().unwrap_or(false) == args.include_inactive
                 && saved["raw_cache_dirs"]
                     .as_array()
@@ -185,14 +230,34 @@ async fn main() -> Result<()> {
             let latest = archive.latest_day().await?;
             (latest, day_ms(latest + Days::days(1)))
         };
-        let mut dirs = archive.list("data/futures/um/daily/klines/").await?;
-        if args.include_inactive {
-            dirs.extend(archive.list("data/futures/um/monthly/klines/").await?);
+        let symbols = if let Some(path) = &args.universe_manifest {
+            let source = ml_dataset::read_json(path)?;
+            ensure!(
+                source["start_ms"] == end - i64::from(args.days) * DAY_MS
+                    && source["end_ms"] == end,
+                "Frozen universe bounds differ from requested dataset"
+            );
+            frozen_universe(&source, &args.symbols)?
+        } else {
+            let mut dirs = archive.list("data/futures/um/daily/klines/").await?;
+            if args.include_inactive {
+                dirs.extend(archive.list("data/futures/um/monthly/klines/").await?);
+            }
+            universe(&dirs, &args.symbols)?
+        };
+        if let Some(path) = &args.reuse_history_dir {
+            let source = ml_dataset::read_json(&path.join("manifest.json"))?;
+            ensure!(
+                source["start_ms"] == end - i64::from(args.days) * DAY_MS
+                    && source["end_ms"] == end,
+                "Reused history bounds differ from requested dataset"
+            );
         }
-        let symbols = universe(&dirs, &args.symbols)?;
         json!({"schema_version":1,"status":"collecting","train_ready":false,"history_complete":false,"days":args.days,"warmup_hours":args.warmup_hours,
             "provider":"Binance Public Data archives","universe":if args.include_inactive {"Public USD-M daily/monthly archive USDT directory union; historical inactive rows preserved separately from current eligibility; current REST trading status unavailable; not all global coins"} else {"Public USD-M archive USDT directories; eligibility requires complete newest published UTC day; current REST trading status unavailable; not all global coins"},
             "include_inactive":args.include_inactive,"raw_cache_dirs":archive.raw_cache_dirs,"archive_inventory_enabled":archive.inventory,
+            "interval":args.interval.as_str(),"interval_ms":args.interval.millis(),"context_bars":256,
+            "universe_source":universe_source,"history_source":history_source,
             "raw_cache_fingerprints":raw_cache_fingerprints,"collector_code_sha256":hex::encode(Sha256::digest(include_bytes!("nofx-ml-archive.rs"))),
             "latest_published_utc_day":latest.to_string(),"start_ms":end-i64::from(args.days)*DAY_MS,"end_ms":end,"end_exclusive_ms":end,
             "lookback_start_ms":end-i64::from(args.days)*DAY_MS-i64::from(args.warmup_hours)*HOUR_MS,
@@ -794,6 +859,50 @@ fn universe(dirs: &[String], selected: &[String]) -> Result<Vec<Value>> {
     );
     Ok(rows)
 }
+fn frozen_universe(source: &Value, requested: &[String]) -> Result<Vec<Value>> {
+    let selected: BTreeSet<_> = requested
+        .iter()
+        .map(|s| s.trim().to_ascii_uppercase())
+        .collect();
+    ensure!(
+        selected.len() == requested.len(),
+        "Duplicate requested symbol"
+    );
+    let mut rows = BTreeMap::new();
+    for entry in source["symbols"]
+        .as_array()
+        .context("Missing source universe")?
+    {
+        if entry["training_eligible"] != true && entry["historical_training_eligible"] != true {
+            continue;
+        }
+        let symbol = entry["symbol"].as_str().context("Missing source symbol")?;
+        nofx_core::exchange::valid_symbol(symbol)?;
+        if !selected.is_empty() && !selected.contains(symbol) {
+            continue;
+        }
+        let source_path = candle_relative(entry, symbol)?;
+        let source_sha = entry["sha256"]
+            .as_str()
+            .context("Missing source candle SHA")?;
+        ensure!(source_sha.len() == 64, "Invalid source candle SHA");
+        ensure!(rows.insert(symbol.to_owned(), json!({"symbol":symbol,"status":"pending",
+            "training_eligible":false,"historical_training_eligible":false,"history_status":"pending",
+            "source_candle_path":source_path,"source_candle_sha256":source_sha,
+            "source_available_end_exclusive_ms":entry["available_end_exclusive_ms"],
+            "source_effective_start_ms":entry["effective_start_ms"]})).is_none(), "Duplicate source symbol");
+    }
+    ensure!(
+        !rows.is_empty(),
+        "No eligible symbols in frozen source universe"
+    );
+    ensure!(
+        selected.is_empty() || rows.len() == selected.len(),
+        "Requested symbol absent from eligible frozen universe"
+    );
+    Ok(rows.into_values().collect())
+}
+
 async fn candles(
     archive: &Archive,
     entry: &Value,
@@ -817,7 +926,9 @@ async fn candles(
             doc["symbol"] == symbol
                 && doc["metadata"]["training_start_ms"] == start
                 && doc["metadata"]["lookback_start_ms"] == lookback
-                && doc["metadata"]["end_exclusive_ms"] == end,
+                && doc["metadata"]["end_exclusive_ms"] == end
+                && doc["metadata"]["interval"].as_str().unwrap_or("1h")
+                    == archive.interval.as_str(),
             "Frozen bounds mismatch"
         );
         ensure!(
@@ -831,7 +942,7 @@ async fn candles(
                 .download(&daily_key(
                     "klines",
                     symbol,
-                    Some("1h"),
+                    Some(archive.interval.as_str()),
                     date(end - DAY_MS)?,
                 ))
                 .await?
@@ -840,70 +951,128 @@ async fn candles(
                     json!({"status":"unavailable_latest_day","rows":0,"training_eligible":false,"error":"Newest complete UTC day not published: stopped, delisted, or unavailable cannot be distinguished"}),
                 );
             };
-            let rows =
-                ml_archive::klines(&ml_archive::read_csv(&latest.bytes)?, end - DAY_MS, end)?;
+            let rows = ml_archive::native_klines(
+                &ml_archive::read_csv(&latest.bytes)?,
+                end - DAY_MS,
+                end,
+                archive.interval.millis(),
+            )?;
             ensure!(
-                ml_dataset::candle_coverage(&rows, end - DAY_MS, end)?.complete,
+                ml_dataset::interval_candle_coverage(
+                    &rows,
+                    end - DAY_MS,
+                    end,
+                    archive.interval.millis()
+                )?
+                .complete,
                 "Newest symbol day incomplete"
             );
         }
-        let (records, sources, missing) =
-            period(archive, "klines", symbol, Some("1h"), lookback, end, true).await?;
-        let rows = ml_archive::klines(&records, lookback, end)?;
+        let (records, sources, missing) = period(
+            archive,
+            "klines",
+            symbol,
+            Some(archive.interval.as_str()),
+            lookback,
+            end,
+            true,
+        )
+        .await?;
+        let rows = ml_archive::native_klines(&records, lookback, end, archive.interval.millis())?;
         if rows.is_empty() {
             return Ok(
                 json!({"status":"unavailable_requested_window","rows":0,"training_eligible":false,
-                "historical_training_eligible":false,"missing_archives":missing,"error":"No real hourly observations published in requested window"}),
+                "historical_training_eligible":false,"missing_archives":missing,"error":"No real native observations published in requested window"}),
             );
         }
         let first = rows[0]["openTime"].as_i64().unwrap();
-        let coverage = ml_dataset::candle_coverage(&rows, first, end)?;
-        let available_end = rows.last().unwrap()["openTime"].as_i64().unwrap() + HOUR_MS;
-        let historical_coverage = ml_dataset::candle_coverage(&rows, first, available_end)?;
-        let datasets = json!({"1h":rows});
+        let coverage = coverage_value(&rows, first, end, archive.interval.millis())?;
+        let available_end =
+            rows.last().unwrap()["openTime"].as_i64().unwrap() + archive.interval.millis();
+        let historical_coverage =
+            coverage_value(&rows, first, available_end, archive.interval.millis())?;
+        let datasets = json!({archive.interval.as_str():rows});
         let doc = json!({"symbol":symbol,"datasets":datasets,"samples":[],"metadata":{"schema_version":1,"source":"Binance Public Data USD-M archive ZIP/CSV",
             "collected_at_ms":nofx_core::now_ms(),"start_ms":first,"lookback_start_ms":lookback,"training_start_ms":start,"end_exclusive_ms":end,"coverage":coverage,
+            "interval":archive.interval.as_str(),"interval_ms":archive.interval.millis(),"native_candles":true,"interpolated":false,
             "content_sha256":ml_dataset::digest(&datasets)?,"closed_only":true,"immutable":true,"sources":sources,"missing_archives":missing,
             "available_end_exclusive_ms":available_end,"historical_coverage":historical_coverage,
+            "missing_suffix_bars":(end-available_end)/archive.interval.millis(),"missing_prefix_bars":(first-lookback)/archive.interval.millis(),
             "missing_suffix_hours":(end-available_end)/HOUR_MS,"inactive_at_window_end":available_end<end,
             "missing_prefix_hours":(first-lookback)/HOUR_MS,"short_prefix_reason":"New listing and unpublished earlier archive cannot be distinguished"}});
         ml_dataset::write_new(&path, &doc)?;
         doc
     };
-    let rows = doc["datasets"]["1h"]
+    let rows = doc["datasets"][archive.interval.as_str()]
         .as_array()
-        .context("Missing hourly rows")?;
+        .context("Missing native interval rows")?;
     let first = doc["metadata"]["start_ms"].as_i64().unwrap();
-    let mut fields = candle_eligibility(rows, lookback, start, end)?;
+    let mut fields =
+        candle_eligibility_interval(rows, lookback, start, end, archive.interval.millis())?;
     fields["path"] = json!(relative);
     fields["sha256"] = json!(ml_dataset::file_digest(&path)?);
     fields["effective_start_ms"] = json!(first);
     Ok(fields)
 }
 
+#[cfg(test)]
 fn candle_eligibility(rows: &[Value], lookback: i64, start: i64, end: i64) -> Result<Value> {
+    candle_eligibility_interval(rows, lookback, start, end, HOUR_MS)
+}
+
+fn coverage_value(rows: &[Value], start: i64, end: i64, interval_ms: i64) -> Result<Value> {
+    if interval_ms == HOUR_MS {
+        Ok(serde_json::to_value(ml_dataset::candle_coverage(
+            rows, start, end,
+        )?)?)
+    } else {
+        Ok(serde_json::to_value(ml_dataset::interval_candle_coverage(
+            rows,
+            start,
+            end,
+            interval_ms,
+        )?)?)
+    }
+}
+
+fn candle_eligibility_interval(
+    rows: &[Value],
+    lookback: i64,
+    start: i64,
+    end: i64,
+    interval_ms: i64,
+) -> Result<Value> {
     let first = rows
         .first()
         .and_then(|row| row["openTime"].as_i64())
-        .context("No hourly rows")?;
+        .context("No native rows")?;
     let available_end = rows
         .last()
         .and_then(|row| row["openTime"].as_i64())
         .context("Missing final openTime")?
-        + HOUR_MS;
-    let coverage = ml_dataset::candle_coverage(rows, first, end)?;
-    let historical_coverage = ml_dataset::candle_coverage(rows, first, available_end)?;
+        + interval_ms;
+    let coverage = ml_dataset::interval_candle_coverage(rows, first, end, interval_ms)?;
+    let historical_coverage =
+        ml_dataset::interval_candle_coverage(rows, first, available_end, interval_ms)?;
     let enough = rows.len() >= 256 + 12 + 24
-        && available_end > start.max(first + 256 * HOUR_MS) + 12 * HOUR_MS;
-    Ok(
-        json!({"status":if coverage.complete {"complete"} else if historical_coverage.complete && available_end<end {"historical_inactive"} else {"partial"},
+        && available_end > start.max(first + 256 * interval_ms) + 12 * interval_ms;
+    let mut fields = json!({"status":if coverage.complete {"complete"} else if historical_coverage.complete && available_end<end {"historical_inactive"} else {"partial"},
         "rows":rows.len(),"training_eligible":coverage.complete&&enough,
         "historical_training_eligible":historical_coverage.complete&&enough,"effective_start_ms":first,
         "available_end_exclusive_ms":available_end,"inactive_at_window_end":available_end<end,
-        "missing_hours":coverage.missing_hours,"missing_warmup_hours":(first-lookback)/HOUR_MS,"missing_suffix_hours":(end-available_end)/HOUR_MS,
+        "interval_ms":interval_ms,"missing_bars":coverage.missing_bars,"missing_warmup_bars":(first-lookback)/interval_ms,"missing_suffix_bars":(end-available_end)/interval_ms,
+        "missing_hours":(coverage.missing_bars as i64*interval_ms)as f64/HOUR_MS as f64,"missing_warmup_hours":(first-lookback)as f64/HOUR_MS as f64,"missing_suffix_hours":(end-available_end)as f64/HOUR_MS as f64,
         "requested_coverage_complete":first==lookback&&coverage.complete,"coverage":coverage,
-        "historical_coverage":historical_coverage,"error":Value::Null}),
-    )
+        "historical_coverage":historical_coverage,"error":Value::Null});
+    if interval_ms == HOUR_MS {
+        fields["missing_hours"] = json!(coverage.missing_bars);
+        fields["missing_warmup_hours"] = json!((first - lookback) / HOUR_MS);
+        fields["missing_suffix_hours"] = json!((end - available_end) / HOUR_MS);
+        fields["coverage"] = serde_json::to_value(ml_dataset::candle_coverage(rows, first, end)?)?;
+        fields["historical_coverage"] =
+            serde_json::to_value(ml_dataset::candle_coverage(rows, first, available_end)?)?;
+    }
+    Ok(fields)
 }
 async fn period(
     archive: &Archive,
@@ -1021,6 +1190,35 @@ async fn history(
         );
         return Ok(
             json!({"history_path":relative,"history_sha256":ml_dataset::file_digest(&path)?,"history_status":doc["status"],"history_errors":doc["errors"]}),
+        );
+    }
+    if let Some(source) = &archive.reused_histories {
+        let original = source
+            .1
+            .get(symbol)
+            .context("No audited source history for requested symbol")?;
+        let original_relative = history_relative(original, symbol, false)?;
+        let original_path = source.0.join(&original_relative);
+        let original_sha = original["history_sha256"]
+            .as_str()
+            .context("Missing source history SHA")?;
+        ensure!(
+            ml_dataset::file_digest(&original_path)? == original_sha,
+            "Audited source history bytes changed"
+        );
+        let doc = ml_dataset::read_json(&original_path)?;
+        validate_reused_history(&doc, symbol, start, end)?;
+        // Copy exact source bytes: never resample hourly context or shift
+        // available_at earlier simply because tradable candles now use 15m.
+        write_bytes(&path, &fs::read(&original_path)?)?;
+        ensure!(
+            ml_dataset::file_digest(&path)? == original_sha,
+            "Copied history SHA differs"
+        );
+        return Ok(
+            json!({"history_path":relative,"history_sha256":original_sha,
+            "history_status":doc["status"],"history_errors":doc["errors"],
+            "history_reused_from":original_path,"history_reused_verbatim":true}),
         );
     }
     let mut datasets: BTreeMap<String, Vec<Value>> = DATASETS
@@ -1170,6 +1368,57 @@ async fn history(
         json!({"history_path":relative,"history_sha256":ml_dataset::file_digest(&path)?,"history_status":result,"history_errors":errors}),
     )
 }
+fn validate_reused_history(doc: &Value, symbol: &str, start: i64, end: i64) -> Result<()> {
+    ensure!(
+        doc["symbol"] == symbol && doc["start_ms"] == start && doc["end_exclusive_ms"] == end,
+        "Audited source history identity/bounds differ"
+    );
+    ensure!(
+        doc["historical_training_eligible"] == true && doc["snapshots_included"] == false,
+        "Source history is not historical training data"
+    );
+    ensure!(
+        doc["content_sha256"] == ml_dataset::digest(&doc["datasets"])?,
+        "Audited history content SHA differs"
+    );
+    for (name, rows) in doc["datasets"]
+        .as_object()
+        .context("Missing source history datasets")?
+    {
+        let mut previous = None;
+        for row in rows.as_array().context("Malformed history dataset")? {
+            let event_key = if name == "funding" {
+                "fundingTime"
+            } else if name.ends_with("_1h") {
+                "openTime"
+            } else {
+                "timestamp"
+            };
+            let event = row[event_key]
+                .as_i64()
+                .context("Missing historical event timestamp")?;
+            let available = row["available_at_ms"]
+                .as_i64()
+                .context("Missing historical availability timestamp")?;
+            let minimum_available = if name == "funding" {
+                event
+            } else {
+                event + HOUR_MS
+            };
+            ensure!(
+                event >= start && event < end && available >= minimum_available,
+                "History contains future-looking availability or out-of-range event"
+            );
+            ensure!(
+                previous.is_none_or(|at| available > at),
+                "Unsorted or duplicate historical availability"
+            );
+            previous = Some(available);
+        }
+    }
+    Ok(())
+}
+
 fn daily_key(cat: &str, symbol: &str, interval: Option<&str>, day: NaiveDate) -> String {
     match interval {
         Some(i) => format!("data/futures/um/daily/{cat}/{symbol}/{i}/{symbol}-{i}-{day}.zip"),
@@ -1314,6 +1563,74 @@ fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_quarter_hour_cli_preserves_hourly_default_and_freezes_only_eligible_source_symbols() {
+        let defaults = Args::try_parse_from(["archive"]).unwrap();
+        assert_eq!(defaults.interval, CandleInterval::Hour);
+        let args = Args::try_parse_from([
+            "archive",
+            "--interval",
+            "15m",
+            "--warmup-hours",
+            "64",
+            "--universe-manifest",
+            "old/manifest.json",
+            "--reuse-history-dir",
+            "old",
+        ])
+        .unwrap();
+        assert_eq!(args.interval.millis(), 900_000);
+        assert_eq!(args.warmup_hours, 64);
+        let source = json!({"symbols":[
+            {"symbol":"BTCUSDT","training_eligible":true,"path":"symbols/BTCUSDT.json","sha256":"a".repeat(64)},
+            {"symbol":"OLDUSDT","historical_training_eligible":true,"path":"symbols/OLDUSDT.repaired.json","sha256":"b".repeat(64)},
+            {"symbol":"BADUSDT","training_eligible":false,"historical_training_eligible":false}
+        ]});
+        let rows = frozen_universe(&source, &[]).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[1]["source_candle_path"],
+            "symbols/OLDUSDT.repaired.json"
+        );
+        assert_eq!(rows[1]["status"], "pending");
+        assert!(frozen_universe(&source, &["BADUSDT".to_string()]).is_err());
+        let mut unsafe_source = source;
+        unsafe_source["symbols"][0]["path"] = json!("../untrusted.json");
+        assert!(frozen_universe(&unsafe_source, &[]).is_err());
+    }
+
+    #[test]
+    fn quarter_hour_inactive_coverage_counts_bars_without_fabricating_hours() {
+        let frame = 900_000;
+        let rows: Vec<_> = (0..300).map(|index| json!({"openTime":index*frame,
+            "closeTime":(index+1)*frame-1,"confirmed":true,"open":10.,"high":11.,"low":9.,"close":10.5,
+            "volume":100.,"quoteVolume":1000.,"takerBuyVolume":40.,"takerBuyQuoteVolume":400.,"tradeCount":7})).collect();
+        let fields =
+            candle_eligibility_interval(&rows, 0, 256 * frame, 360 * frame, frame).unwrap();
+        assert_eq!(fields["historical_training_eligible"], true);
+        assert_eq!(fields["missing_suffix_bars"], 60);
+        assert_eq!(fields["available_end_exclusive_ms"], 300 * frame);
+        assert_eq!(fields["coverage"]["expected_rows"], 360);
+        let mut gaps = rows;
+        gaps.remove(280);
+        assert_eq!(
+            candle_eligibility_interval(&gaps, 0, 256 * frame, 360 * frame, frame).unwrap()["historical_training_eligible"],
+            false
+        );
+    }
+
+    #[test]
+    fn reused_history_preserves_original_availability_and_rejects_earlier_retiming() {
+        let datasets = json!({"open_interest":[{"timestamp":0,"available_at_ms":HOUR_MS,"sumOpenInterest":12.}]});
+        let mut doc = json!({"symbol":"BTCUSDT","start_ms":0,"end_exclusive_ms":2*HOUR_MS,
+            "historical_training_eligible":true,"snapshots_included":false,
+            "content_sha256":ml_dataset::digest(&datasets).unwrap(),"datasets":datasets});
+        validate_reused_history(&doc, "BTCUSDT", 0, 2 * HOUR_MS).unwrap();
+        doc["datasets"]["open_interest"][0]["available_at_ms"] = json!(900_000);
+        doc["content_sha256"] = json!(ml_dataset::digest(&doc["datasets"]).unwrap());
+        assert!(validate_reused_history(&doc, "BTCUSDT", 0, 2 * HOUR_MS).is_err());
+        assert!(validate_reused_history(&doc, "ETHUSDT", 0, 2 * HOUR_MS).is_err());
+    }
     #[test]
     fn expanded_window_and_inventory_skip_old_years_and_include_boundary_month() {
         let args = Args::try_parse_from([

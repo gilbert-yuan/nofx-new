@@ -8,6 +8,38 @@ use std::{fs, io::Write, path::Path};
 pub const HOUR_MS: i64 = 3_600_000;
 pub const DAY_MS: i64 = 24 * HOUR_MS;
 
+/// Native data cadence. Changing cadence always creates a distinct dataset;
+/// hourly candles are never interpolated into quarter-hour observations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandleInterval {
+    Hour,
+    QuarterHour,
+}
+
+impl CandleInterval {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "1h" => Ok(Self::Hour),
+            "15m" => Ok(Self::QuarterHour),
+            _ => anyhow::bail!("Candle interval must be 1h or 15m"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hour => "1h",
+            Self::QuarterHour => "15m",
+        }
+    }
+
+    pub fn millis(self) -> i64 {
+        match self {
+            Self::Hour => HOUR_MS,
+            Self::QuarterHour => 900_000,
+        }
+    }
+}
+
 /// OS-managed lock: concurrent writers fail and crashed writers release it.
 pub fn collector_lock(directory: &Path) -> Result<fs::File> {
     fs::create_dir_all(directory)?;
@@ -51,6 +83,17 @@ pub struct Coverage {
     pub last_ms: Option<i64>,
     pub expected_rows: Option<usize>,
     pub missing_hours: usize,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntervalCoverage {
+    pub interval_ms: i64,
+    pub rows: usize,
+    pub first_ms: Option<i64>,
+    pub last_ms: Option<i64>,
+    pub expected_rows: Option<usize>,
+    pub missing_bars: usize,
     pub complete: bool,
 }
 
@@ -123,9 +166,30 @@ pub fn checkpoint(path: &Path, value: &impl Serialize) -> Result<()> {
 }
 
 pub fn candle_coverage(rows: &[Value], start: i64, end: i64) -> Result<Coverage> {
+    let coverage = interval_candle_coverage(rows, start, end, HOUR_MS)?;
+    Ok(Coverage {
+        rows: coverage.rows,
+        first_ms: coverage.first_ms,
+        last_ms: coverage.last_ms,
+        expected_rows: coverage.expected_rows,
+        missing_hours: coverage.missing_bars,
+        complete: coverage.complete,
+    })
+}
+
+pub fn interval_candle_coverage(
+    rows: &[Value],
+    start: i64,
+    end: i64,
+    interval_ms: i64,
+) -> Result<IntervalCoverage> {
     ensure!(
-        start < end && start % HOUR_MS == 0 && end % HOUR_MS == 0,
-        "Invalid hourly bounds"
+        interval_ms == HOUR_MS || interval_ms == 900_000,
+        "Candle interval must be 1h or 15m"
+    );
+    ensure!(
+        start < end && start % interval_ms == 0 && end % interval_ms == 0,
+        "Invalid candle interval bounds"
     );
     let mut previous = None;
     for row in rows {
@@ -133,15 +197,15 @@ pub fn candle_coverage(rows: &[Value], start: i64, end: i64) -> Result<Coverage>
             .as_i64()
             .context("Missing candle openTime")?;
         ensure!(
-            time >= start && time < end && time % HOUR_MS == 0,
-            "Out-of-range hourly candle"
+            time >= start && time < end && time % interval_ms == 0,
+            "Out-of-range candle"
         );
         ensure!(
             previous.is_none_or(|last| time > last),
             "Duplicate or unsorted candle"
         );
         ensure!(
-            row["closeTime"].as_i64() == Some(time + HOUR_MS - 1) && row["confirmed"] == true,
+            row["closeTime"].as_i64() == Some(time + interval_ms - 1) && row["confirmed"] == true,
             "Unclosed candle"
         );
         let number = |key: &str| -> Result<f64> {
@@ -175,14 +239,15 @@ pub fn candle_coverage(rows: &[Value], start: i64, end: i64) -> Result<Coverage>
         ensure!(row["tradeCount"].as_u64().is_some(), "Invalid tradeCount");
         previous = Some(time);
     }
-    let expected = ((end - start) / HOUR_MS) as usize;
-    ensure!(rows.len() <= expected, "Too many hourly candles");
-    Ok(Coverage {
+    let expected = ((end - start) / interval_ms) as usize;
+    ensure!(rows.len() <= expected, "Too many candles");
+    Ok(IntervalCoverage {
+        interval_ms,
         rows: rows.len(),
         first_ms: rows.first().and_then(|row| row["openTime"].as_i64()),
         last_ms: previous,
         expected_rows: Some(expected),
-        missing_hours: expected - rows.len(),
+        missing_bars: expected - rows.len(),
         complete: rows.len() == expected,
     })
 }
@@ -244,6 +309,35 @@ mod tests {
         assert_eq!(as_of(&rows, 10).unwrap()["timestamp"], 1);
         assert_eq!(as_of(&rows, 19).unwrap()["timestamp"], 1);
         assert_eq!(as_of(&rows, 20).unwrap()["timestamp"], 2);
+    }
+
+    #[test]
+    fn quarter_hour_coverage_rejects_hourly_substitution_and_detects_exact_bar_gaps() {
+        let frame = CandleInterval::parse("15m").unwrap();
+        assert_eq!(frame.millis(), 900_000);
+        assert_eq!(CandleInterval::parse("1h").unwrap(), CandleInterval::Hour);
+        assert!(CandleInterval::parse("5m").is_err());
+        let rows: Vec<_> = (0..4)
+            .map(|index| {
+                let mut row = candle(index * frame.millis());
+                row["closeTime"] = json!((index + 1) * frame.millis() - 1);
+                row
+            })
+            .collect();
+        assert!(
+            interval_candle_coverage(&rows, 0, HOUR_MS, frame.millis())
+                .unwrap()
+                .complete
+        );
+        let missing = vec![rows[0].clone(), rows[1].clone(), rows[3].clone()];
+        assert_eq!(
+            interval_candle_coverage(&missing, 0, HOUR_MS, frame.millis())
+                .unwrap()
+                .missing_bars,
+            1
+        );
+        assert!(interval_candle_coverage(&[candle(0)], 0, HOUR_MS, frame.millis()).is_err());
+        assert!(candle_coverage(&rows, 0, HOUR_MS).is_err());
     }
 
     #[test]

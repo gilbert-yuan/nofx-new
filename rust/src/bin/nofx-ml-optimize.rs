@@ -275,7 +275,7 @@ fn main() -> Result<()> {
         "data_manifest_sha256":digest(&fs::read(args.data_dir.join("manifest.json"))?),"software_sha256":software,
         "executable_sha256":digest(&fs::read(std::env::current_exe()?)?),
         "lightgbm_runtime_sha256":data.provenance()["lightgbm_runtime_sha256"],
-        "execution_defaults":nofx_core::strategies::exit_rules_for(&json!({})),
+        "execution_defaults":nofx_core::strategies::ml_horizon_exit_rules(),
         "original_training_report_sha256":digest(&fs::read(args.model_dir.join("training-report.json"))?),
         "symbols":symbols,"candidates":candidates,"baseline_index":baseline_index,"development":development,
         "confirmation":confirmation,"costs":nofx_core::research::costs(),"min_trades":args.min_trades,"min_symbols":args.min_symbols,"workers":args.workers,

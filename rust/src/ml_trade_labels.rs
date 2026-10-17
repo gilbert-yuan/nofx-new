@@ -1,4 +1,4 @@
-//! Causal, execution-aware labels for the existing hourly paper replay.
+//! Causal, execution-aware labels for the shared candle-based paper replay.
 //!
 //! Features and protection levels stop at `origin_ms`. Each counterfactual
 //! direction then gets its own finite-capital account in the shared Rust replay;
@@ -21,8 +21,8 @@ pub const LABEL_CLASSES: [&str; 3] = ["SELL", "HOLD", "BUY"];
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TradeLabelConfig {
-    /// Includes the shared 24h pending TTL, 11 held bars and entry delay.
-    /// Forty-eight hours is the default; values below 36h are rejected.
+    /// Absolute hours covering 24 pending candles, 11 held candles and entry delay.
+    /// Existing 1h configurations default to 48h; 15m training uses 12h (48 bars).
     pub observation_hours: usize,
     /// A direction must make strictly more than this positive, net USDT edge.
     pub min_net_edge_usdt: f64,
@@ -46,9 +46,14 @@ impl Default for TradeLabelConfig {
 
 impl TradeLabelConfig {
     fn validate(&self) -> Result<()> {
+        self.replay.candle_interval()?;
+        let observation_ms = (self.observation_hours as i64)
+            .checked_mul(HOUR)
+            .context("Trade label observation overflow")?;
         ensure!(
-            (36..=168).contains(&self.observation_hours),
-            "Trade label observation must be between 36 and 168 hours"
+            (36 * self.replay.candle_interval_ms..=168 * self.replay.candle_interval_ms)
+                .contains(&observation_ms),
+            "Trade label observation must cover between 36 and 168 source candles"
         );
         ensure!(
             self.min_net_edge_usdt.is_finite() && self.min_net_edge_usdt > 0.,
@@ -183,6 +188,7 @@ fn frozen_signal(
     closed_prefix: &[Value],
     origin_ms: i64,
     decision: &str,
+    config: &ReplayConfig,
 ) -> Result<ReplaySignal> {
     let price = number(
         &closed_prefix.last().context("Missing label prefix")?["close"],
@@ -200,7 +206,7 @@ fn frozen_signal(
         "stopLoss":price-direction*2.*atr, "takeProfit":price+direction*5.*atr,
         "riskUnit":2.*atr, "maxHoldBars":11
     });
-    plan["exitRules"] = strategies::exit_rules_for(&plan);
+    plan["exitRules"] = strategies::ml_horizon_exit_rules();
     let mut signal = ReplaySignal {
         origin_ms,
         decision: decision.into(),
@@ -214,7 +220,8 @@ fn frozen_signal(
             "stop_atr":2, "target_atr":5, "max_hold_bars":11}),
         plan: Some(plan),
     };
-    let normalized = ml_replay::normalize_signal(symbol, closed_prefix, &signal)?;
+    let normalized =
+        ml_replay::normalize_signal_with_config(symbol, closed_prefix, &signal, config)?;
     if normalized["plan"].is_object() {
         signal.plan = Some(normalized["plan"].clone());
     }
@@ -305,7 +312,7 @@ fn direction_outcome(
 
 /// Produce a training target from two independent executions at a causal origin.
 ///
-/// `observed_through_ms` must be an hourly closed boundary. Rows after it or after
+/// `observed_through_ms` must be a configured candle close. Rows after it or after
 /// the observation deadline are not even validated or passed to the simulator.
 /// An incomplete window, unfilled order, invalid plan or unresolved position is
 /// an excluded sample with `class_index=None`. HOLD is reserved for two complete,
@@ -318,10 +325,11 @@ pub fn label_origin(
     config: &TradeLabelConfig,
 ) -> Result<TradeLabel> {
     config.validate()?;
+    let interval_ms = config.replay.candle_interval_ms;
     crate::exchange::valid_symbol(symbol)?;
     ensure!(
-        origin_ms.rem_euclid(HOUR) == 0 && observed_through_ms.rem_euclid(HOUR) == 0,
-        "Trade label origin and observed-through boundaries must be hourly aligned"
+        origin_ms.rem_euclid(interval_ms) == 0 && observed_through_ms.rem_euclid(interval_ms) == 0,
+        "Trade label origin and observed-through boundaries must align to the configured interval"
     );
     ensure!(
         observed_through_ms >= origin_ms,
@@ -338,16 +346,16 @@ pub fn label_origin(
     for row in rows {
         let close = timestamp(&row["openTime"])
             .context("Invalid label candle openTime")?
-            .checked_add(HOUR)
+            .checked_add(interval_ms)
             .context("Label candle timestamp overflow")?;
         if close > upper {
             break;
         }
         ensure!(simulator::valid_candle(row), "Invalid label candle");
-        ensure!(close.rem_euclid(HOUR) == 0, "Unaligned label candle");
+        ensure!(close.rem_euclid(interval_ms) == 0, "Unaligned label candle");
         if let Some(previous) = previous_close {
             ensure!(
-                close == previous + HOUR,
+                close == previous + interval_ms,
                 "Missing or duplicate label candle"
             );
         }
@@ -366,9 +374,10 @@ pub fn label_origin(
     let mut label = TradeLabel {
         schema_version: LABEL_SCHEMA_VERSION,
         symbol: symbol.into(),
-        execution_scope:
-            "paper_hourly_replay; independent counterfactual accounts; not Demo execution parity"
-                .into(),
+        execution_scope: format!(
+            "paper_{}_replay; independent counterfactual accounts; not Demo execution parity",
+            config.replay.candle_interval()?
+        ),
         origin_ms,
         feature_cutoff_ms: origin_ms,
         mature_by_ms,
@@ -398,8 +407,8 @@ pub fn label_origin(
         end_ms: actual_end,
         ..config.replay.clone()
     };
-    let long = frozen_signal(symbol, closed_prefix, origin_ms, "BUY")?;
-    let short = frozen_signal(symbol, closed_prefix, origin_ms, "SELL")?;
+    let long = frozen_signal(symbol, closed_prefix, origin_ms, "BUY", &replay_config)?;
+    let short = frozen_signal(symbol, closed_prefix, origin_ms, "SELL", &replay_config)?;
     label.long = direction_outcome(
         symbol,
         &rows[..used_end],
@@ -463,6 +472,45 @@ mod tests {
             &TradeLabelConfig::default(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn quarter_hour_labels_use_twelve_hour_maturity_and_causal_bar_plans() {
+        let quarter = 900_000;
+        let mut rows = candles(152);
+        for (index, row) in rows.iter_mut().enumerate() {
+            row["openTime"] = json!(index as i64 * quarter);
+        }
+        let config = TradeLabelConfig {
+            observation_hours: 12,
+            replay: ReplayConfig {
+                candle_interval_ms: quarter,
+                ..ReplayConfig::default()
+            },
+            ..TradeLabelConfig::default()
+        };
+        let original =
+            label_origin("BTCUSDT", &rows, 96 * quarter, 144 * quarter, &config).unwrap();
+        assert!(original.eligible);
+        assert_eq!(original.class_index, Some(1));
+        assert_eq!(original.mature_by_ms, 144 * quarter);
+        assert_eq!(original.long.entry_at_ms, Some(97 * quarter));
+        assert_eq!(original.long.exit_at_ms, Some(108 * quarter));
+        assert_eq!(original.long.plan["maxHoldBars"], 11);
+        let partial = label_origin("BTCUSDT", &rows, 96 * quarter, 143 * quarter, &config).unwrap();
+        assert_eq!(partial.class_index, None);
+        assert_eq!(
+            partial.exclusion_reason.as_deref(),
+            Some("observation_incomplete")
+        );
+        assert_eq!(partial.mature_by_ms, original.mature_by_ms);
+        rows[144]["close"] = json!(-1.);
+        let ignored_future =
+            label_origin("BTCUSDT", &rows, 96 * quarter, 152 * quarter, &config).unwrap();
+        assert_eq!(
+            serde_json::to_value(original).unwrap(),
+            serde_json::to_value(ignored_future).unwrap()
+        );
     }
 
     #[test]

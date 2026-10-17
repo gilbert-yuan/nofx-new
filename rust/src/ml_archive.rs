@@ -272,6 +272,27 @@ pub fn klines(records: &[Vec<String>], start: i64, end: i64) -> Result<Vec<Value
     parse_klines(records, start, end, false, HOUR_MS)
 }
 
+/// Parse original native candles without interpolating or aggregating them.
+pub fn native_klines(
+    records: &[Vec<String>],
+    start: i64,
+    end: i64,
+    interval_ms: i64,
+) -> Result<Vec<Value>> {
+    ensure!(
+        interval_ms == HOUR_MS || interval_ms == 900_000,
+        "Native candle interval must be 1h or 15m"
+    );
+    let mut rows = parse_klines(records, start, end, false, interval_ms)?;
+    if interval_ms == 900_000 {
+        for row in &mut rows {
+            row["available_at_ms"] =
+                json!(row["closeTime"].as_i64().context("Missing close time")? + 1);
+        }
+    }
+    Ok(rows)
+}
+
 /// Mark/index/premium candles share the leading Binance kline fields.
 /// Premium prices may be negative and are never treated as tradable prices.
 pub fn reference_klines(records: &[Vec<String>], start: i64, end: i64) -> Result<Vec<Value>> {
@@ -661,6 +682,20 @@ mod tests {
         assert_eq!(rows[0]["close"], -0.005);
         assert!(rows[0].get("volume").is_none());
         assert!(klines(&records, 0, HOUR_MS).is_err());
+    }
+
+    #[test]
+    fn native_quarter_hour_source_keeps_flow_fields_and_true_close_availability() {
+        let records = csv_records(
+            "0,100,110,90,105,10,899999,1000,7,4,400,0\n900000,105,115,95,110,11,1799999,1100,8,5,500,0\n",
+        );
+        let rows = native_klines(&records, 0, 1_800_000, 900_000).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["tradeCount"], 7);
+        assert_eq!(rows[1]["available_at_ms"], 1_800_000);
+        assert_eq!(rows[1]["takerBuyQuoteVolume"], 500.0);
+        assert!(native_klines(&records, 0, HOUR_MS, HOUR_MS).is_err());
+        assert!(native_klines(&records, 0, HOUR_MS, 300_000).is_err());
     }
 
     fn repair_bars(interval_ms: i64) -> Vec<Value> {

@@ -131,6 +131,15 @@ pub fn signal(prediction: &Value, market: &Value, now: i64) -> Result<Value> {
         "reason":"Chronos-Bolt-Tiny 预测，LightGBM 分类，Demo 账户风控",
         "plan":prediction["risk_management"]["plan"]});
     let mut signal = research::normalize_plan(&raw, market, now);
+    // The ML candidate keeps trailing and partial take-profit but must never use the
+    // 0-bar MA exit of enhanced-trend-v1. Enforce it at the execution boundary so a
+    // stale predictor binary cannot silently reintroduce that rule through its plan.
+    if let Some(plan) = signal["plan"].as_object_mut() {
+        plan.insert(
+            "exitRules".into(),
+            crate::strategies::ml_horizon_exit_rules(),
+        );
+    }
     signal["strategyId"] = json!(STRATEGY_ID);
     signal["analysisEngine"] = json!("monthly-ml");
     signal["confidenceType"] = json!("classifier_probability");
@@ -138,6 +147,21 @@ pub fn signal(prediction: &Value, market: &Value, now: i64) -> Result<Value> {
     signal["mlRiskPolicy"] = serde_json::to_value(policy(prediction))?;
     signal["executionEnvironment"] = json!("demo");
     Ok(signal)
+}
+
+fn ensure_capacity(funds: &Value) -> Result<()> {
+    // Position count is bounded only by margin here, so a broad scan can fill the
+    // whole equity and leave `available` negative. Keep a reserve for fees, funding
+    // and adverse moves instead of opening until the ledger refuses.
+    let committed = number(&funds["committed"], 0.);
+    let equity = number(&funds["equity"], 0.);
+    let ceiling = crate::automation_guards::env_num("NOFX_ML_MAX_COMMITTED_PCT", 0.80, 0.1, 1.0);
+    ensure!(
+        equity > 0. && committed <= equity * ceiling + 1e-8,
+        "持仓占用已达权益的 {:.0}% 缓冲上限，暂停新增订单",
+        ceiling * 100.
+    );
+    Ok(())
 }
 
 fn authorize(
@@ -157,6 +181,7 @@ fn authorize(
         funds["canOpen"] == true,
         "Demo 资金或挂单占用不允许新增订单"
     );
+    ensure_capacity(&funds)?;
     ensure!(signal["eligible"] == true, "模型未生成有效新仓计划");
     ensure!(
         number(&signal["confidence"], 0.) >= number(&config["trader"]["minConfidence"], 0.45),
@@ -280,6 +305,41 @@ mod tests {
     fn fresh(state: &mut Value, now: i64) {
         state["exchangeAccounts"]["demo"]["syncedAt"] = json!(iso(now));
         state["exchangeAccounts"]["demo"]["metricsSyncedAt"] = json!(iso(now));
+    }
+
+    #[test]
+    fn capacity_buffer_blocks_entries_before_margin_is_exhausted() {
+        assert!(ensure_capacity(&json!({"committed":700.,"equity":1000.})).is_ok());
+        assert!(ensure_capacity(&json!({"committed":800.,"equity":1000.})).is_ok());
+        assert!(ensure_capacity(&json!({"committed":801.,"equity":1000.})).is_err());
+        assert!(ensure_capacity(&json!({"committed":1000.,"equity":1000.})).is_err());
+        assert!(ensure_capacity(&json!({"committed":0.,"equity":0.})).is_err());
+    }
+
+    #[test]
+    fn stale_predictor_exit_rules_are_replaced_at_the_execution_boundary() {
+        let now = 300 * HOUR + 1000;
+        let (_, _, mut prediction) = fixture(now);
+        prediction["risk_management"]["plan"]["exitRules"] =
+            crate::strategies::exit_rules_for(&json!({}));
+        assert_eq!(
+            prediction["risk_management"]["plan"]["exitRules"]["smartExit"]["enabled"],
+            true
+        );
+        let signal = normalized(&prediction, now);
+        assert_eq!(
+            signal["plan"]["exitRules"],
+            crate::strategies::ml_horizon_exit_rules()
+        );
+        assert_eq!(signal["plan"]["exitRules"]["smartExit"]["enabled"], false);
+        assert_eq!(
+            signal["plan"]["exitRules"]["smartExit"]["barLevelEnabled"],
+            false
+        );
+        assert_eq!(
+            signal["plan"]["exitRules"]["partialTp"]["enabled"], true,
+            "partial take-profit must survive the override"
+        );
     }
 
     #[test]

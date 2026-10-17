@@ -176,6 +176,36 @@ pub fn feature_names() -> Vec<String> {
         .map(|x| (*x).to_owned())
         .collect()
 }
+/// A distinct ordered schema for each candle interval. Technical and market
+/// lookbacks count bars; contract-history lookbacks continue to count real hours.
+pub fn feature_names_for_interval(interval: &str) -> Result<Vec<String>> {
+    crate::chronos::interval_ms(interval)?;
+    if interval == "1h" {
+        return Ok(feature_names());
+    }
+    let mut names = ml_features::base_feature_names_for_interval(interval)?;
+    names.extend(MICRO_FEATURE_NAMES.iter().map(|name| {
+        if *name == "trade_count_change24" {
+            format!("15m_{name}_bars")
+        } else {
+            format!("15m_{name}")
+        }
+    }));
+    names.extend(HISTORY_FEATURE_NAMES.iter().map(|name| match *name {
+        "oi_change24" => "oi_change24h".into(),
+        "oi_change24_available" => "oi_change24h_available".into(),
+        _ => (*name).into(),
+    }));
+    names.extend(MARKET_FEATURE_NAMES.iter().map(|name| {
+        if name.ends_with("available") {
+            format!("15m_{name}")
+        } else {
+            format!("15m_{name}_bars")
+        }
+    }));
+    names.extend(ml_features::chronos_feature_names_for_interval(interval)?);
+    Ok(names)
+}
 pub fn schema_sha256() -> String {
     let mut hash = Sha256::new();
     // Persisted features and source digests require the exact decoder enabled
@@ -185,6 +215,17 @@ pub fn schema_sha256() -> String {
     hash.update(include_bytes!("ml_features.rs"));
     hash.update(include_bytes!("chronos.rs"));
     hex::encode(hash.finalize())
+}
+pub fn schema_sha256_for_interval(interval: &str) -> Result<String> {
+    crate::chronos::interval_ms(interval)?;
+    if interval == "1h" {
+        return Ok(schema_sha256());
+    }
+    let mut hash = Sha256::new();
+    hash.update(schema_sha256().as_bytes());
+    hash.update(interval.as_bytes());
+    hash.update(serde_json::to_vec(&feature_names_for_interval(interval)?)?);
+    Ok(hex::encode(hash.finalize()))
 }
 pub fn validate_manifest(manifest: &MonthlyManifest) -> Result<()> {
     ensure!(
@@ -231,7 +272,14 @@ pub fn validate_manifest(manifest: &MonthlyManifest) -> Result<()> {
     Ok(())
 }
 pub fn extended_features(rows: &[Value], end: usize) -> Result<Vec<f64>> {
-    let mut output = ml_features::base_features(rows, end)?;
+    extended_features_for_interval(rows, end, "1h")
+}
+pub fn extended_features_for_interval(
+    rows: &[Value],
+    end: usize,
+    interval: &str,
+) -> Result<Vec<f64>> {
+    let mut output = ml_features::base_features_for_interval(rows, end, interval)?;
     let last = &rows[end - 1];
     let quote = number(&last["quoteVolume"], f64::NAN);
     let count = number(&last["tradeCount"], f64::NAN);
@@ -361,27 +409,41 @@ pub fn market_features(
     btc_rows: &[Value],
     eth_rows: &[Value],
 ) -> Vec<f64> {
+    market_features_for_interval(rows, end, btc_rows, eth_rows, "1h")
+        .unwrap_or_else(|_| vec![0.; MARKET_FEATURE_NAMES.len()])
+}
+pub fn market_features_for_interval(
+    rows: &[Value],
+    end: usize,
+    btc_rows: &[Value],
+    eth_rows: &[Value],
+    interval: &str,
+) -> Result<Vec<f64>> {
+    let step_ms = crate::chronos::interval_ms(interval)?;
     if end < 73 || end > rows.len() {
-        return vec![0.; MARKET_FEATURE_NAMES.len()];
+        return Ok(vec![0.; MARKET_FEATURE_NAMES.len()]);
     }
     let Some(origin) = rows
         .get(end.wrapping_sub(1))
         .and_then(|r| timestamp(&r["openTime"]))
-        .and_then(|t| t.checked_add(ml_features::HOUR))
+        .and_then(|t| t.checked_add(step_ms))
     else {
-        return vec![0.; MARKET_FEATURE_NAMES.len()];
+        return Ok(vec![0.; MARKET_FEATURE_NAMES.len()]);
     };
     let own = &rows[end - 73..end];
+    if ml_features::validate_interval(own, interval).is_err() {
+        return Ok(vec![0.; MARKET_FEATURE_NAMES.len()]);
+    }
     let one = |reference: &[Value]| -> [f64; 5] {
         let boundary = reference.partition_point(|r| {
-            timestamp(&r["openTime"]).is_some_and(|open| open + ml_features::HOUR <= origin)
+            timestamp(&r["openTime"]).is_some_and(|open| open + step_ms <= origin)
         });
         if boundary < 73 {
             return [0.; 5];
         }
         let prefix = &reference[boundary - 73..boundary];
-        if ml_features::validate_hourly(prefix).is_err()
-            || timestamp(&prefix[72]["openTime"]) != Some(origin - ml_features::HOUR)
+        if ml_features::validate_interval(prefix, interval).is_err()
+            || timestamp(&prefix[72]["openTime"]) != Some(origin - step_ms)
         {
             return [0.; 5];
         }
@@ -411,7 +473,7 @@ pub fn market_features(
             1.,
         ]
     };
-    one(btc_rows).into_iter().chain(one(eth_rows)).collect()
+    Ok(one(btc_rows).into_iter().chain(one(eth_rows)).collect())
 }
 pub fn calibrate_forecast(
     forecast: &ForecastRecord,
@@ -451,22 +513,53 @@ pub fn combined_features_with_market(
     btc_rows: &[Value],
     eth_rows: &[Value],
 ) -> Result<Vec<f64>> {
+    combined_features_with_market_for_interval(
+        rows,
+        end,
+        history,
+        forecast,
+        calibration,
+        btc_rows,
+        eth_rows,
+        "1h",
+    )
+}
+pub fn combined_features_with_market_for_interval(
+    rows: &[Value],
+    end: usize,
+    history: &Value,
+    forecast: &ForecastRecord,
+    calibration: &Calibration,
+    btc_rows: &[Value],
+    eth_rows: &[Value],
+    interval: &str,
+) -> Result<Vec<f64>> {
+    let step_ms = crate::chronos::interval_ms(interval)?;
+    ensure!(
+        end >= ml_features::CONTEXT && end <= rows.len(),
+        "Need a valid closed-prefix feature boundary"
+    );
     let origin = timestamp(&rows[end - 1]["openTime"])
         .ok_or_else(|| anyhow::anyhow!("Missing candle timestamp"))?
-        + ml_features::HOUR;
+        + step_ms;
     ensure!(
-        forecast.origin_ms == origin,
+        forecast.origin_ms == origin
+            && forecast.interval == interval
+            && forecast.context_end_open_ms == origin - step_ms,
         "Forecast origin does not match closed history"
     );
-    let mut output = extended_features(rows, end)?;
+    let mut output = extended_features_for_interval(rows, end, interval)?;
     output.extend(historical_features(history, origin));
-    output.extend(market_features(rows, end, btc_rows, eth_rows));
+    output.extend(market_features_for_interval(
+        rows, end, btc_rows, eth_rows, interval,
+    )?);
     output.extend(ml_features::chronos_features(&calibrate_forecast(
         forecast,
         calibration,
     )?)?);
     ensure!(
-        output.len() == feature_names().len() && output.iter().all(|x| x.is_finite()),
+        output.len() == feature_names_for_interval(interval)?.len()
+            && output.iter().all(|x| x.is_finite()),
         "Invalid monthly feature vector"
     );
     Ok(output)
@@ -613,6 +706,103 @@ mod tests {
                     bias_by_hour: vec![],
                     shrink: 1.
                 }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn quarter_hour_combined_schema_uses_closed_quarters_and_real_history_availability() {
+        let step = crate::chronos::QUARTER_HOUR_MS;
+        let mut rows = candles();
+        for (index, row) in rows.iter_mut().enumerate() {
+            row["openTime"] = json!(index as i64 * step);
+        }
+        let origin = 257 * step;
+        let current = number(&rows[256]["close"], 0.);
+        let forecast = ForecastRecord {
+            symbol: "BTCUSDT".into(),
+            origin_ms: origin,
+            context_end_open_ms: origin - step,
+            history_sha256: None,
+            current_price: current,
+            interval: "15m".into(),
+            horizon_hours: 3,
+            q10: vec![current * 0.99; 12],
+            q50: vec![current; 12],
+            q90: vec![current * 1.01; 12],
+            quantile_crossings: 0,
+            inference_ms: 0.,
+        };
+        let history = json!({"datasets":{"funding":[
+            {"available_at_ms":origin - step,"fundingRate":0.001},
+            {"available_at_ms":origin + step,"fundingRate":0.9}
+        ]}});
+        let features = combined_features_with_market_for_interval(
+            &rows,
+            257,
+            &history,
+            &forecast,
+            &Calibration::default(),
+            &rows,
+            &rows,
+            "15m",
+        )
+        .unwrap();
+        let names = feature_names_for_interval("15m").unwrap();
+        assert_eq!(features.len(), 69);
+        assert_eq!(names.len(), features.len());
+        assert_eq!(
+            features[names
+                .iter()
+                .position(|name| name == "funding_rate")
+                .unwrap()],
+            0.001
+        );
+        assert_eq!(
+            features[names
+                .iter()
+                .position(|name| name == "15m_btc_available")
+                .unwrap()],
+            1.
+        );
+        assert!(names.contains(&"15m_btc_return24_bars".to_owned()));
+        assert!(names.contains(&"oi_change24h".to_owned()));
+        assert!(names.contains(&"15m_chronos_q50_return12_steps".to_owned()));
+        assert_ne!(schema_sha256_for_interval("15m").unwrap(), schema_sha256());
+        assert_eq!(feature_names_for_interval("1h").unwrap(), feature_names());
+        let hourly_reference = candles();
+        assert_eq!(
+            market_features_for_interval(&rows, 257, &hourly_reference, &[], "15m").unwrap()[4],
+            0.
+        );
+        let mut future = rows.clone();
+        for row in &mut future[257..] {
+            row["close"] = json!(1e9);
+        }
+        assert_eq!(
+            features,
+            combined_features_with_market_for_interval(
+                &future,
+                257,
+                &history,
+                &forecast,
+                &Calibration::default(),
+                &future,
+                &future,
+                "15m"
+            )
+            .unwrap()
+        );
+        assert!(
+            combined_features_with_market(
+                &rows,
+                257,
+                &history,
+                &forecast,
+                &Calibration::default(),
+                &rows,
+                &rows
             )
             .is_err()
         );

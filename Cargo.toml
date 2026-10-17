@@ -96,9 +96,25 @@ path = "rust/src/bin/nofx-ml-direction-check.rs"
 name = "nofx-ml-rolling-train"
 path = "rust/src/bin/nofx-ml-rolling-train.rs"
 
+[[bin]]
+name = "nofx-ml-diagnose"
+path = "rust/src/bin/nofx-ml-diagnose.rs"
+
 [[test]]
 name = "backend-integration"
 path = "rust/tests/backend.rs"
+
+[[bin]]
+name = "nofx-ml-profit-train"
+path = "rust/src/bin/nofx-ml-profit-train.rs"
+
+[[bin]]
+name = "nofx-ml-exit-compare"
+path = "rust/src/bin/nofx-ml-exit-compare.rs"
+
+[[bin]]
+name = "nofx-ml-multiframe-train"
+path = "rust/src/bin/nofx-ml-multiframe-train.rs"
 
 [dependencies]
 anyhow = "1"

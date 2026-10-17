@@ -3,7 +3,7 @@ use clap::{Parser, ValueEnum};
 use futures::{StreamExt, stream};
 use nofx_core::{
     exchange::Exchange,
-    ml_dataset::{self, DAY_MS, HOUR_MS},
+    ml_dataset::{self, CandleInterval, DAY_MS, HOUR_MS},
 };
 use serde_json::{Value, json};
 use std::{
@@ -43,6 +43,9 @@ struct Args {
     /// Retry previously unavailable optional histories, preserving successful endpoint files.
     #[arg(long)]
     retry_failed: bool,
+    /// Native market candles; optional contract histories retain their real cadence.
+    #[arg(long, default_value = "1h", value_parser = CandleInterval::parse)]
+    interval: CandleInterval,
 }
 
 #[tokio::main]
@@ -63,7 +66,8 @@ async fn main() -> Result<()> {
         ensure!(
             saved["schema_version"] == 1
                 && saved["days"] == args.days
-                && saved["warmup_hours"] == args.warmup_hours,
+                && saved["warmup_hours"] == args.warmup_hours
+                && saved["interval"].as_str().unwrap_or("1h") == args.interval.as_str(),
             "Resume parameters differ; use a new output directory"
         );
         ensure!(
@@ -95,6 +99,7 @@ async fn main() -> Result<()> {
             ml_dataset::write_new(&info_path, &frozen_info)?;
         }
         json!({"schema_version":1,"status":"collecting","train_ready":false,"days":args.days,"warmup_hours":args.warmup_hours,
+            "interval":args.interval.as_str(),"interval_ms":args.interval.millis(),"context_bars":256,
             "start_ms":end-i64::from(args.days)*DAY_MS,"end_ms":end,"end_exclusive_ms":end,
             "lookback_start_ms":end-i64::from(args.days)*DAY_MS-i64::from(args.warmup_hours)*HOUR_MS,
             "collected_at_ms":nofx_core::now_ms(),"provider":"Binance USD-M public REST API",
@@ -120,7 +125,17 @@ async fn main() -> Result<()> {
             let exchange = exchange.clone();
             async move {
                 let mut result = entry.clone();
-                match collect_candles(&exchange, directory, &entry, lookback, start, end).await {
+                match collect_candles(
+                    &exchange,
+                    directory,
+                    &entry,
+                    lookback,
+                    start,
+                    end,
+                    args.interval,
+                )
+                .await
+                {
                     Ok(data) => {
                         for (key, value) in data.as_object().unwrap() {
                             result[key] = value.clone();
@@ -258,6 +273,7 @@ async fn collect_candles(
     lookback: i64,
     start: i64,
     end: i64,
+    interval: CandleInterval,
 ) -> Result<Value> {
     let symbol = entry["symbol"].as_str().context("Missing symbol")?;
     nofx_core::exchange::valid_symbol(symbol)?;
@@ -269,7 +285,8 @@ async fn collect_candles(
             doc["symbol"] == symbol
                 && doc["metadata"]["end_exclusive_ms"] == end
                 && doc["metadata"]["training_start_ms"] == start
-                && doc["metadata"]["lookback_start_ms"] == lookback,
+                && doc["metadata"]["lookback_start_ms"] == lookback
+                && doc["metadata"]["interval"].as_str().unwrap_or("1h") == interval.as_str(),
             "Frozen symbol has different bounds"
         );
         ensure!(
@@ -282,13 +299,13 @@ async fn collect_candles(
         let mut cursor = lookback;
         while cursor < end {
             let page = exchange
-                .klines(symbol, "1h", 1000, Some(cursor), Some(end - 1))
+                .klines(symbol, interval.as_str(), 1000, Some(cursor), Some(end - 1))
                 .await?;
             if page.is_empty() {
                 break;
             }
             let mut last = cursor - 1;
-            for row in page {
+            for mut row in page {
                 let time = row["openTime"]
                     .as_i64()
                     .context("Invalid candle openTime")?;
@@ -297,48 +314,69 @@ async fn collect_candles(
                     "Binance candle outside requested page"
                 );
                 last = last.max(time);
+                if interval == CandleInterval::QuarterHour {
+                    row["available_at_ms"] = json!(time + interval.millis());
+                }
                 ensure!(rows.insert(time, row).is_none(), "Duplicate Binance candle");
             }
             ensure!(last >= cursor, "Candle pagination made no progress");
-            cursor = last + HOUR_MS;
+            cursor = last + interval.millis();
         }
         let rows: Vec<_> = rows.into_values().collect();
-        ensure!(!rows.is_empty(), "No closed hourly candles");
+        ensure!(!rows.is_empty(), "No closed native candles");
         let effective = rows[0]["openTime"].as_i64().unwrap();
-        let coverage = ml_dataset::candle_coverage(&rows, effective, end)?;
-        let datasets = json!({"1h":rows});
+        let coverage = if interval == CandleInterval::Hour {
+            serde_json::to_value(ml_dataset::candle_coverage(&rows, effective, end)?)?
+        } else {
+            serde_json::to_value(ml_dataset::interval_candle_coverage(
+                &rows,
+                effective,
+                end,
+                interval.millis(),
+            )?)?
+        };
+        let datasets = json!({interval.as_str():rows});
         let doc = json!({"symbol":symbol,"datasets":datasets,"samples":[],"metadata":{"schema_version":1,
             "source":"Binance public /fapi/v1/klines","source_base":std::env::var("BINANCE_FUTURES_BASE").unwrap_or_else(|_|"https://fapi.binance.com".into()),
             "collected_at_ms":nofx_core::now_ms(),"start_ms":effective,"lookback_start_ms":lookback,"training_start_ms":start,"end_exclusive_ms":end,
+            "interval":interval.as_str(),"interval_ms":interval.millis(),"native_candles":true,"interpolated":false,
             "content_sha256":ml_dataset::digest(&datasets)?,"coverage":coverage,"closed_only":true,"immutable":true}});
         ml_dataset::write_new(&path, &doc)?;
         doc
     };
-    let rows = doc["datasets"]["1h"]
+    let rows = doc["datasets"][interval.as_str()]
         .as_array()
-        .context("Missing hourly rows")?;
+        .context("Missing native rows")?;
     let effective = doc["metadata"]["start_ms"]
         .as_i64()
         .context("Missing start")?;
     let onboard = entry["onboard_ms"].as_i64().unwrap_or(0);
     // Older contracts must cover the requested left edge. Only a listing in
     // this interval can explain a shorter history (allow its first full hour).
-    let expected_start =
-        if onboard >= lookback && effective <= ((onboard + HOUR_MS - 1) / HOUR_MS + 1) * HOUR_MS {
-            effective
-        } else {
-            lookback
-        };
-    let coverage = ml_dataset::candle_coverage(rows, expected_start, end)?;
+    let expected_start = if onboard >= lookback
+        && effective
+            <= ((onboard + interval.millis() - 1) / interval.millis() + 1) * interval.millis()
+    {
+        effective
+    } else {
+        lookback
+    };
+    let coverage =
+        ml_dataset::interval_candle_coverage(rows, expected_start, end, interval.millis())?;
     // A newly listed asset may be usable once a full context and future label exist.
     let eligible = coverage.complete
         && rows.len() >= 256 + 12 + 24
-        && end > start.max(effective + 256 * HOUR_MS) + 12 * HOUR_MS;
-    Ok(
-        json!({"path":relative,"sha256":ml_dataset::file_digest(&path)?,"rows":rows.len(),"effective_start_ms":effective,
-        "status":if coverage.complete {"complete"} else {"partial"},"training_eligible":eligible,"missing_hours":coverage.missing_hours,
-        "missing_warmup_hours":((effective-lookback)/HOUR_MS).max(0),"coverage":coverage,"error":Value::Null}),
-    )
+        && end > start.max(effective + 256 * interval.millis()) + 12 * interval.millis();
+    let mut fields = json!({"path":relative,"sha256":ml_dataset::file_digest(&path)?,"rows":rows.len(),"effective_start_ms":effective,
+        "status":if coverage.complete {"complete"} else {"partial"},"training_eligible":eligible,"missing_bars":coverage.missing_bars,"interval_ms":interval.millis(),
+        "missing_hours":coverage.missing_bars as f64*interval.millis()as f64/HOUR_MS as f64,
+        "missing_warmup_hours":((effective-lookback)/HOUR_MS).max(0),"coverage":coverage,"error":Value::Null});
+    if interval == CandleInterval::Hour {
+        fields["missing_hours"] = json!(coverage.missing_bars);
+        fields["coverage"] =
+            serde_json::to_value(ml_dataset::candle_coverage(rows, expected_start, end)?)?;
+    }
+    Ok(fields)
 }
 
 const HISTORIES: [(&str, &str, &str); 9] = [

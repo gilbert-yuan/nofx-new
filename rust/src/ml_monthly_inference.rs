@@ -51,6 +51,7 @@ pub struct MonthlyPredictor {
     earliest_origin_ms: i64,
     historical_features_used: bool,
     market_features_used: bool,
+    interval: String,
     frozen: Option<FrozenSource>,
 }
 
@@ -60,6 +61,7 @@ struct FrozenSource {
     directory: PathBuf,
     manifest_sha256: String,
     origin_ms: i64,
+    interval: String,
     manifest: Value,
 }
 
@@ -68,6 +70,7 @@ impl FrozenSource {
         directory: &Path,
         expected_sha256: &str,
         model_symbols: &BTreeSet<String>,
+        interval: &str,
     ) -> Result<Self> {
         let directory = directory
             .canonicalize()
@@ -85,8 +88,9 @@ impl FrozenSource {
             .as_i64()
             .or_else(|| manifest["end_ms"].as_i64())
             .context("Frozen collector cutoff missing")?;
+        let step_ms = crate::chronos::interval_ms(interval)?;
         ensure!(
-            origin_ms > 0 && origin_ms % HOUR_MS == 0,
+            origin_ms > 0 && origin_ms % step_ms == 0,
             "Invalid frozen collector cutoff"
         );
         let items = manifest["symbols"]
@@ -116,6 +120,7 @@ impl FrozenSource {
             directory,
             manifest_sha256: digest(&bytes),
             origin_ms,
+            interval: interval.to_owned(),
             manifest,
         })
     }
@@ -146,23 +151,24 @@ impl FrozenSource {
 
     fn candles(&self, symbol: &str, now_ms: i64) -> Result<Vec<Value>> {
         let document = self.document(symbol, false)?;
-        let rows = document["datasets"]["1h"]
+        let rows = document["datasets"][&self.interval]
             .as_array()
-            .context("Frozen document lacks hourly candles")?;
+            .with_context(|| format!("Frozen document lacks {} candles", self.interval))?;
         ensure!(
             rows.len() >= CONTEXT_LENGTH,
             "Frozen symbol lacks Chronos context"
         );
         let prefix = rows[rows.len() - CONTEXT_LENGTH..].to_vec();
-        validate_candles(symbol, &prefix, self.origin_ms, now_ms)?;
+        validate_candles_for_interval(symbol, &prefix, self.origin_ms, now_ms, &self.interval)?;
         Ok(prefix)
     }
 
     fn info(&self, now_ms: i64) -> Value {
-        let target_end = self.origin_ms + crate::ml_features::HORIZON as i64 * HOUR_MS;
-        json!({"manifest_sha256":self.manifest_sha256,"origin_ms":self.origin_ms,"observed_at_ms":now_ms,
+        let step_ms = crate::chronos::interval_ms(&self.interval).unwrap_or(HOUR_MS);
+        let target_end = self.origin_ms + crate::ml_features::HORIZON as i64 * step_ms;
+        json!({"manifest_sha256":self.manifest_sha256,"origin_ms":self.origin_ms,"observed_at_ms":now_ms,"interval":self.interval,
             "provider":self.manifest["provider"],"status":self.manifest["status"],"history_all_available":self.manifest["history_all_available"],
-            "stale":self.origin_ms<now_ms.div_euclid(HOUR_MS)*HOUR_MS,"forecast_target_end_ms":target_end,"forecast_target_still_future":target_end>now_ms,
+            "stale":self.origin_ms<now_ms.div_euclid(step_ms)*step_ms,"forecast_target_end_ms":target_end,"forecast_target_still_future":target_end>now_ms,
             "live_eligible":false,"notice":"Verified frozen historical snapshot review; this is not a current-market signal"})
     }
 }
@@ -209,17 +215,26 @@ fn model_path(directory: &Path, relative: &str) -> Result<PathBuf> {
 }
 
 fn manifest_symbols(manifest: &Value) -> Result<BTreeSet<String>> {
-    let typed: ml_monthly::MonthlyManifest = serde_json::from_value(manifest.clone())?;
-    ml_monthly::validate_manifest(&typed)?;
-    ensure!(
-        manifest["schema_version"] == 2
-            && manifest["pipeline"] == "chronos-bolt-tiny-lightgbm-monthly",
-        "Unsupported monthly candidate schema"
-    );
-    ensure!(
-        manifest["feature_schema_sha256"] == ml_monthly::schema_sha256(),
-        "Monthly feature code differs from the trained artifact"
-    );
+    let interval = manifest_interval(manifest)?;
+    if interval == "1h" {
+        let typed: ml_monthly::MonthlyManifest = serde_json::from_value(manifest.clone())?;
+        ml_monthly::validate_manifest(&typed)?;
+    } else {
+        ensure!(
+            manifest["schema_version"] == 2
+                && manifest["pipeline"] == "chronos-bolt-tiny-lightgbm-monthly",
+            "Unsupported monthly candidate schema"
+        );
+        ensure!(
+            manifest["chronos_retained"] == true
+                && manifest["forecast"]["weights_updated"] == false,
+            "Monthly model must retain unmodified Chronos-Bolt-Tiny"
+        );
+        ensure!(
+            manifest["feature_schema_sha256"] == ml_monthly::schema_sha256_for_interval(interval)?,
+            "Monthly feature code differs from the trained artifact"
+        );
+    }
     ensure!(
         manifest["selection_gate"]["status"] == "research_only"
             && manifest["selection_gate"]["real_trading_enabled"] == false,
@@ -240,7 +255,7 @@ fn manifest_symbols(manifest: &Value) -> Result<BTreeSet<String>> {
     }
     let names: Vec<String> = serde_json::from_value(manifest["model"]["feature_names"].clone())?;
     ensure!(
-        names == ml_monthly::feature_names(),
+        names == ml_monthly::feature_names_for_interval(interval)?,
         "Candidate feature names/order differ from this build"
     );
     ensure!(
@@ -254,23 +269,40 @@ fn manifest_symbols(manifest: &Value) -> Result<BTreeSet<String>> {
     Ok(symbols)
 }
 
+fn manifest_interval(manifest: &Value) -> Result<&str> {
+    let interval = manifest["interval"].as_str().unwrap_or("1h");
+    crate::chronos::interval_ms(interval)?;
+    Ok(interval)
+}
+
 pub fn validate_candles(symbol: &str, rows: &[Value], origin_ms: i64, now_ms: i64) -> Result<()> {
+    validate_candles_for_interval(symbol, rows, origin_ms, now_ms, "1h")
+}
+
+pub fn validate_candles_for_interval(
+    symbol: &str,
+    rows: &[Value],
+    origin_ms: i64,
+    now_ms: i64,
+    interval: &str,
+) -> Result<()> {
     valid_symbol(symbol)?;
+    let step_ms = crate::chronos::interval_ms(interval)?;
     ensure!(
         (CONTEXT_LENGTH..=MAX_INPUT_ROWS).contains(&rows.len()),
-        "Require 256 to 1080 closed hourly candles"
+        "Require 256 to 1080 closed {interval} candles"
     );
     ensure!(
         origin_ms > 0
-            && origin_ms % HOUR_MS == 0
-            && origin_ms <= now_ms.div_euclid(HOUR_MS) * HOUR_MS,
-        "origin_ms must be a past or current closed hour"
+            && origin_ms % step_ms == 0
+            && origin_ms <= now_ms.div_euclid(step_ms) * step_ms,
+        "origin_ms must be a past or current closed {interval} boundary"
     );
     let first = origin_ms
-        .checked_sub(rows.len() as i64 * HOUR_MS)
+        .checked_sub(rows.len() as i64 * step_ms)
         .context("Candle time overflow")?;
     for (index, row) in rows.iter().enumerate() {
-        let open = first + index as i64 * HOUR_MS;
+        let open = first + index as i64 * step_ms;
         ensure!(
             open >= 0 && row["openTime"].as_i64() == Some(open),
             "Candles must be consecutive and end at origin_ms"
@@ -280,8 +312,8 @@ pub fn validate_candles(symbol: &str, rows: &[Value], origin_ms: i64, now_ms: i6
             "Only explicitly confirmed closed candles are accepted"
         );
         ensure!(
-            row["closeTime"].as_i64() == Some(open + HOUR_MS - 1),
-            "Candle closeTime differs from the hourly boundary"
+            row["closeTime"].as_i64() == Some(open + step_ms - 1),
+            "Candle closeTime differs from the {interval} boundary"
         );
         ensure!(
             simulator::valid_candle(row),
@@ -321,20 +353,29 @@ pub fn validate_candles(symbol: &str, rows: &[Value], origin_ms: i64, now_ms: i6
 }
 
 pub fn request_origin(request: &SignalRequest, now_ms: i64) -> Result<i64> {
-    let current = now_ms.div_euclid(HOUR_MS) * HOUR_MS;
+    request_origin_for_interval(request, now_ms, "1h")
+}
+
+pub fn request_origin_for_interval(
+    request: &SignalRequest,
+    now_ms: i64,
+    interval: &str,
+) -> Result<i64> {
+    let step_ms = crate::chronos::interval_ms(interval)?;
+    let current = now_ms.div_euclid(step_ms) * step_ms;
     if let Some(rows) = &request.candles {
         let inferred = rows
             .last()
             .and_then(|row| row["openTime"].as_i64())
-            .and_then(|time| time.checked_add(HOUR_MS))
-            .context("Provided candles lack a final hourly boundary")?;
+            .and_then(|time| time.checked_add(step_ms))
+            .with_context(|| format!("Provided candles lack a final {interval} boundary"))?;
         let origin = request.origin_ms.unwrap_or(inferred);
-        validate_candles(&request.symbol, rows, origin, now_ms)?;
+        validate_candles_for_interval(&request.symbol, rows, origin, now_ms, interval)?;
         Ok(origin)
     } else {
         ensure!(
             request.origin_ms.is_none_or(|origin| origin == current),
-            "Symbol-only inference requires the latest closed hour"
+            "Symbol-only inference requires the latest closed {interval} boundary"
         );
         Ok(current)
     }
@@ -355,9 +396,11 @@ impl MonthlyPredictor {
         let baseline_path = model_path(&directory, required_string(baseline_meta, "path")?)?;
         verified_bytes(&baseline_path, required_string(baseline_meta, "sha256")?)?;
         let runtime = LightGbmRuntime::load(lightgbm_runtime)?;
+        let interval = manifest_interval(&manifest)?.to_owned();
+        let names = ml_monthly::feature_names_for_interval(&interval)?;
         let model = LightGbmModel::load(runtime, std::str::from_utf8(&model_bytes)?)?;
         ensure!(
-            model.summary().feature_count == ml_monthly::feature_names().len(),
+            model.summary().feature_count == names.len(),
             "Native LightGBM feature count mismatch"
         );
         let forecast = &manifest["forecast"];
@@ -377,9 +420,10 @@ impl MonthlyPredictor {
         let earliest_origin_ms = manifest["split"]["validation_end_ms"]
             .as_i64()
             .context("Missing validation cutoff")?;
+        let step_ms = crate::chronos::interval_ms(&interval)?;
         ensure!(
-            earliest_origin_ms > 0 && earliest_origin_ms % HOUR_MS == 0,
-            "Validation cutoff must be a closed hour"
+            earliest_origin_ms > 0 && earliest_origin_ms % step_ms == 0,
+            "Validation cutoff must be a closed {interval} boundary"
         );
         let historical_features_used = manifest["historical_features_used"]
             .as_bool()
@@ -399,8 +443,13 @@ impl MonthlyPredictor {
             earliest_origin_ms,
             historical_features_used,
             market_features_used,
+            interval,
             frozen: None,
         })
+    }
+
+    pub fn interval(&self) -> &str {
+        &self.interval
     }
 
     pub fn supports(&self, symbol: &str) -> bool {
@@ -412,6 +461,7 @@ impl MonthlyPredictor {
             directory,
             required_string(&self.manifest, "source_manifest_sha256")?,
             &self.symbols,
+            &self.interval,
         )?);
         Ok(())
     }
@@ -476,7 +526,7 @@ impl MonthlyPredictor {
             self.supports(symbol),
             "Symbol is outside the trained universe"
         );
-        validate_candles(symbol, rows, origin_ms, now_ms)?;
+        validate_candles_for_interval(symbol, rows, origin_ms, now_ms, &self.interval)?;
         ensure!(
             origin_ms >= self.earliest_origin_ms,
             "Inference predates the calibration/policy validation cutoff and would leak future information"
@@ -496,14 +546,27 @@ impl MonthlyPredictor {
             "All trained historical auxiliary data are missing or stale at the requested origin"
         );
         if self.market_features_used {
-            validate_candles("BTCUSDT", &market.btc, origin_ms, now_ms)?;
-            validate_candles("ETHUSDT", &market.eth, origin_ms, now_ms)?;
+            validate_candles_for_interval(
+                "BTCUSDT",
+                &market.btc,
+                origin_ms,
+                now_ms,
+                &self.interval,
+            )?;
+            validate_candles_for_interval(
+                "ETHUSDT",
+                &market.eth,
+                origin_ms,
+                now_ms,
+                &self.interval,
+            )?;
         }
+        let step_ms = crate::chronos::interval_ms(&self.interval)?;
         let recent = &rows[rows.len() - CONTEXT_LENGTH..];
         let input = ContextRecord {
             symbol: symbol.into(),
             origin_ms,
-            context_end_open_ms: origin_ms - HOUR_MS,
+            context_end_open_ms: origin_ms - step_ms,
             context: recent
                 .iter()
                 .map(|row| crate::number(&row["close"], f64::NAN) as f32)
@@ -516,9 +579,9 @@ impl MonthlyPredictor {
             ),
             history_sha256: Some(digest(&serde_json::to_vec(recent)?)),
         };
-        let raw = self.chronos.forecast(&input)?;
+        let raw = self.chronos.forecast_for_interval(&input, &self.interval)?;
         let forecast = ml_monthly::calibrate_forecast(&raw, &self.calibration)?;
-        let features = ml_monthly::combined_features_with_market(
+        let features = ml_monthly::combined_features_with_market_for_interval(
             rows,
             rows.len(),
             history,
@@ -526,19 +589,20 @@ impl MonthlyPredictor {
             &self.calibration,
             &market.btc,
             &market.eth,
+            &self.interval,
         )?;
         let probabilities = self.model.predict(&[features.clone()])?[0];
         let action = ml_monthly::decide(&probabilities, &self.policy);
         let target_end = origin_ms
-            .checked_add(crate::ml_features::HORIZON as i64 * HOUR_MS)
+            .checked_add(crate::ml_features::HORIZON as i64 * step_ms)
             .context("Forecast target time overflow")?;
-        let mut output = json!({"schema_version":2,"symbol":symbol,"interval":"1h","origin_ms":origin_ms,"data_as_of_ms":origin_ms,"observed_at_ms":now_ms,
+        let mut output = json!({"schema_version":2,"symbol":symbol,"interval":self.interval,"origin_ms":origin_ms,"data_as_of_ms":origin_ms,"observed_at_ms":now_ms,
             "model_fingerprint":self.fingerprint,"model_variant":"chronos-bolt-tiny-lightgbm-global-calibrated","candidate_status":"research_only",
             "trained_before_ms":self.earliest_origin_ms,"evaluation_end_ms":self.manifest["split"]["test_end_ms"],
             "action":action,"probabilities":{"SELL":probabilities[0],"HOLD":probabilities[1],"BUY":probabilities[2]},
-            "feature_names":ml_monthly::feature_names(),"features":features,"forecast":forecast,"raw_forecast":raw,"calibration":self.calibration,"policy":self.policy,
+            "feature_names":ml_monthly::feature_names_for_interval(&self.interval)?,"features":features,"forecast":forecast,"raw_forecast":raw,"calibration":self.calibration,"policy":self.policy,
             "historical_source_errors":history["errors"],"historical_available_feature_count":historical.iter().skip(10).filter(|mask| **mask > 0.0).count(),
-            "data_mode":"provided_closed_candles","stale":origin_ms<now_ms.div_euclid(HOUR_MS)*HOUR_MS,"forecast_target_end_ms":target_end,"forecast_target_still_future":target_end>now_ms,"live_eligible":false,
+            "data_mode":"provided_closed_candles","stale":origin_ms<now_ms.div_euclid(step_ms)*step_ms,"forecast_target_end_ms":target_end,"forecast_target_still_future":target_end>now_ms,"live_eligible":false,
             "decision_semantics":{"BUY":"OPEN_LONG candidate","SELL":"OPEN_SHORT candidate","HOLD":"no new order candidate"},
             "advisory_only":true,"real_trading_enabled":false,"account_credentials_loaded":false,"trade_execution_permitted":false,"orders_enabled":false});
         let risk = serde_json::from_value(self.manifest["risk"].clone())
@@ -553,17 +617,27 @@ pub async fn fetch_live_candles(
     symbol: &str,
     origin_ms: i64,
 ) -> Result<Vec<Value>> {
-    let start = origin_ms - CONTEXT_LENGTH as i64 * HOUR_MS;
+    fetch_live_candles_for_interval(exchange, symbol, origin_ms, "1h").await
+}
+
+pub async fn fetch_live_candles_for_interval(
+    exchange: &Exchange,
+    symbol: &str,
+    origin_ms: i64,
+    interval: &str,
+) -> Result<Vec<Value>> {
+    let step_ms = crate::chronos::interval_ms(interval)?;
+    let start = origin_ms - CONTEXT_LENGTH as i64 * step_ms;
     let rows = exchange
         .klines(
             symbol,
-            "1h",
+            interval,
             CONTEXT_LENGTH,
             Some(start),
             Some(origin_ms - 1),
         )
         .await?;
-    validate_candles(symbol, &rows, origin_ms, crate::now_ms())?;
+    validate_candles_for_interval(symbol, &rows, origin_ms, crate::now_ms(), interval)?;
     Ok(rows)
 }
 
@@ -777,7 +851,7 @@ mod tests {
         fs::write(directory.path().join("manifest.json"), &manifest).unwrap();
         let universe = BTreeSet::from(["BTCUSDT".to_owned()]);
         let mut source =
-            FrozenSource::load(directory.path(), &digest(&manifest), &universe).unwrap();
+            FrozenSource::load(directory.path(), &digest(&manifest), &universe, "1h").unwrap();
         assert_eq!(
             source
                 .candles("BTCUSDT", origin + 13 * HOUR_MS)
@@ -790,7 +864,10 @@ mod tests {
         assert_eq!(info["forecast_target_still_future"], false);
         assert_eq!(info["live_eligible"], false);
         assert!(source.document("DOGEUSDT", false).is_err());
-        assert!(FrozenSource::load(directory.path(), &digest(b"wrong source"), &universe).is_err());
+        assert!(
+            FrozenSource::load(directory.path(), &digest(b"wrong source"), &universe, "1h")
+                .is_err()
+        );
         assert!(source.candles("BTCUSDT", origin - HOUR_MS).is_err());
         fs::write(directory.path().join("symbols/BTCUSDT.json"), b"tampered").unwrap();
         assert!(source.candles("BTCUSDT", origin).is_err());

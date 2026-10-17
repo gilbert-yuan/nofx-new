@@ -9,12 +9,11 @@ use axum::{
 };
 use clap::Parser;
 use nofx_core::{
-    chronos::HOUR_MS,
     exchange::Exchange,
     ml_lightgbm::DEFAULT_RUNTIME_PATH,
     ml_monthly_inference::{
-        MarketContext, MonthlyPredictor, SignalRequest, fetch_live_candles, fetch_live_history,
-        request_origin,
+        MarketContext, MonthlyPredictor, SignalRequest, fetch_live_candles_for_interval,
+        fetch_live_history, request_origin_for_interval,
     },
 };
 use serde_json::{Value, json};
@@ -82,18 +81,24 @@ fn load_json(path: &Path) -> Result<Value> {
     serde_json::from_slice(&fs::read(path)?)
         .with_context(|| format!("Read JSON {}", path.display()))
 }
-fn closed_prefix(document: &Value, origin: Option<i64>) -> Result<Vec<Value>> {
-    let all = document["datasets"]["1h"]
+fn closed_prefix(document: &Value, origin: Option<i64>, interval: &str) -> Result<Vec<Value>> {
+    let step_ms = nofx_core::chronos::interval_ms(interval)?;
+    let all = document["datasets"][interval]
         .as_array()
+        .or_else(|| {
+            document["datasets"]["1h"]
+                .as_array()
+                .filter(|_| interval == "1h")
+        })
         .or_else(|| document.as_array())
-        .context("Input requires datasets.1h or a candle array")?;
+        .with_context(|| format!("Input requires datasets.{interval} or a candle array"))?;
     let mut rows: Vec<Value> = all
         .iter()
         .filter(|row| {
             origin.is_none_or(|at| {
                 row["openTime"]
                     .as_i64()
-                    .is_some_and(|open| open + HOUR_MS <= at)
+                    .is_some_and(|open| open + step_ms <= at)
             })
         })
         .cloned()
@@ -142,7 +147,14 @@ async fn run_request(app: Arc<App>, request: SignalRequest) -> Result<Value> {
         .await
         .context("Frozen candidate inference task failed")?;
     }
-    let origin = request_origin(&request, nofx_core::now_ms())?;
+    let interval = app
+        .predictor
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Model lock poisoned"))?
+        .interval()
+        .to_owned();
+    let step_ms = nofx_core::chronos::interval_ms(&interval)?;
+    let origin = request_origin_for_interval(&request, nofx_core::now_ms(), &interval)?;
     let live_input = request.candles.is_none();
     let (rows, history, market) = if let Some(rows) = request.candles {
         (
@@ -152,14 +164,14 @@ async fn run_request(app: Arc<App>, request: SignalRequest) -> Result<Value> {
         )
     } else {
         let (rows, history, btc, eth) = tokio::join!(
-            fetch_live_candles(&app.exchange, &request.symbol, origin),
+            fetch_live_candles_for_interval(&app.exchange, &request.symbol, origin, &interval),
             fetch_live_history(&app.exchange, &request.symbol, origin),
-            fetch_live_candles(&app.exchange, "BTCUSDT", origin),
-            fetch_live_candles(&app.exchange, "ETHUSDT", origin)
+            fetch_live_candles_for_interval(&app.exchange, "BTCUSDT", origin, &interval),
+            fetch_live_candles_for_interval(&app.exchange, "ETHUSDT", origin, &interval)
         );
         ensure!(
-            origin == nofx_core::now_ms().div_euclid(HOUR_MS) * HOUR_MS,
-            "Collection crossed an hour; retry with new closed inputs"
+            origin == nofx_core::now_ms().div_euclid(step_ms) * step_ms,
+            "Collection crossed a {interval} boundary; retry with new closed inputs"
         );
         (
             rows?,
@@ -269,10 +281,19 @@ async fn main() -> Result<()> {
     let symbol = args
         .symbol
         .context("--symbol required for CLI prediction")?;
+    let interval = app
+        .predictor
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Model lock poisoned"))?
+        .interval()
+        .to_owned();
+    let step_ms = nofx_core::chronos::interval_ms(&interval)?;
     let candles = args
         .input
         .as_ref()
-        .map(|path| load_json(path).and_then(|document| closed_prefix(&document, args.origin_ms)))
+        .map(|path| {
+            load_json(path).and_then(|document| closed_prefix(&document, args.origin_ms, &interval))
+        })
         .transpose()?;
     ensure!(
         args.input.is_some() || (args.history.is_none() && args.market_data_dir.is_none()),
@@ -287,15 +308,23 @@ async fn main() -> Result<()> {
         .as_ref()
         .and_then(|rows| rows.last())
         .and_then(|row| row["openTime"].as_i64())
-        .map(|time| time + HOUR_MS);
+        .map(|time| time + step_ms);
     let origin = args.origin_ms.or(inferred);
     let market = args
         .market_data_dir
         .as_ref()
         .map(|directory| -> Result<MarketContext> {
             Ok(MarketContext {
-                btc: closed_prefix(&load_json(&directory.join("BTCUSDT.json"))?, origin)?,
-                eth: closed_prefix(&load_json(&directory.join("ETHUSDT.json"))?, origin)?,
+                btc: closed_prefix(
+                    &load_json(&directory.join("BTCUSDT.json"))?,
+                    origin,
+                    &interval,
+                )?,
+                eth: closed_prefix(
+                    &load_json(&directory.join("ETHUSDT.json"))?,
+                    origin,
+                    &interval,
+                )?,
             })
         })
         .transpose()?;
