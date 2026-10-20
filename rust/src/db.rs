@@ -491,6 +491,12 @@ impl Db {
             .bind(id).bind(signal).bind(context).execute(&self.pool).await?;
         Ok(())
     }
+    /// Drop a research record unless an order already references it. Used when an
+    /// order submission fails: research_records must only hold order-linked rows.
+    pub async fn delete_record_if_unreferenced(&self, id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM research_records WHERE id=$1 AND id NOT IN(SELECT record_id FROM simulated_orders WHERE record_id IS NOT NULL)").bind(id).execute(&self.pool).await?;
+        Ok(())
+    }
     pub async fn records(
         &self,
         date: &str,
@@ -544,6 +550,109 @@ impl Db {
     {
         self.mutate_account_mode(false, Some(id), f).await
     }
+    /// Decode extension rows stored under one `[parent, key]` path prefix into the nested
+    /// value they describe. Mirrors what `hydrate` does for the same rows, minus the tables
+    /// this caller filters out.
+    async fn read_extension_prefix(&self, parent: &str, key: &str) -> Result<Value> {
+        let mut tx = self.pool.begin().await?;
+        let rows = sqlx::query_as::<_, ExtensionRow>(
+            "SELECT NULL::TEXT,t.path,t.value_kind,t.text_value,to_jsonb(t.number_value),t.boolean_value FROM simulated_account_extensions t WHERE t.account_id=1 AND t.path[1]=$1 AND t.path[2]=$2 ORDER BY t.path",
+        )
+        .bind(parent)
+        .bind(key)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let mut root = json!({});
+        for (_, path, kind, text, number, boolean) in rows {
+            let value = match kind.as_str() {
+                "object" => json!({}),
+                "array" => json!([]),
+                "string" => text.map(Value::String).unwrap_or(Value::Null),
+                "number" => number.unwrap_or(Value::Null),
+                "boolean" => boolean.map(Value::Bool).unwrap_or(Value::Null),
+                _ => Value::Null,
+            };
+            put(&mut root, &path, value);
+        }
+        Ok(get(&root, &[parent.to_owned(), key.to_owned()])
+            .cloned()
+            .unwrap_or(Value::Null))
+    }
+    /// One durable execution intent. The close path reconciles it between exchange round
+    /// trips; a full account read there cost more than the round trip itself once the order
+    /// archive grew past a thousand orders.
+    pub async fn manual_execution(&self, key: &str) -> Result<Value> {
+        self.read_extension_prefix("manualExecutions", key).await
+    }
+    /// Just the two snapshot fields the remote close validates: the enabled flag and the
+    /// account key the last sync observed. Exact-path reads hit the primary-key index; reading
+    /// the whole environment subtree hydrates ~22k rows of accumulated order metrics, which
+    /// measured 3.9s on the close's critical path.
+    pub async fn exchange_snapshot_key(&self, env: &str) -> Result<(bool, String)> {
+        // `t.path` is `text[]`, so it compares against another array literal — never against
+        // `ANY(...)` of scalars, which PostgreSQL rejects with "text[] = text".
+        let rows: Vec<(Vec<String>, Option<String>, Option<bool>)> = sqlx::query_as(
+            "SELECT t.path,t.text_value,t.boolean_value FROM simulated_account_extensions t \
+             WHERE t.account_id=1 AND ( \
+               t.path = ARRAY['exchangeAccounts'::text,$1,'enabled'::text] \
+               OR t.path = ARRAY['exchangeAccounts'::text,$1,'accountKey'::text])",
+        )
+        .bind(env)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut enabled = false;
+        let mut account_key = String::new();
+        for (path, text, boolean) in rows {
+            match path.last().map(String::as_str) {
+                Some("enabled") => enabled = boolean.unwrap_or(false),
+                Some("accountKey") => account_key = text.unwrap_or_default(),
+                _ => {}
+            }
+        }
+        Ok((enabled, account_key))
+    }
+    /// Replace one durable execution intent in place. Takes the same write gate and advisory
+    /// lock as the full account mutate, but only rewrites the intent's own rows instead of
+    /// diffing the entire state on every close.
+    pub async fn put_manual_execution(&self, key: &str, value: &Value) -> Result<()> {
+        let _write_guard = tokio::time::timeout(
+            self.pool.options().get_acquire_timeout(),
+            self.write_gate.lock(),
+        )
+        .await
+        .map_err(|_| AccountWriteBusy)?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(790217)")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM simulated_account_extensions WHERE account_id=1 AND path[1]='manualExecutions' AND path[2]=$1")
+            .bind(key)
+            .execute(&mut *tx)
+            .await?;
+        // flatten() emits the shared container row alongside the children; only the intent's
+        // own descendants may be rewritten.
+        let mut rows: Vec<Value> = vec![];
+        flatten(
+            value,
+            &["manualExecutions".to_owned(), key.to_owned()],
+            None,
+            &BTreeSet::new(),
+            &mut rows,
+        );
+        rows.retain(|row| row["path"].as_array().is_some_and(|path| path.len() > 2));
+        for row in &rows {
+            // jsonb_populate_record performs the same JSON -> typed column conversion the
+            // full-account write path uses (notably path: text[]), so a targeted insert lands
+            // byte-identical rows.
+            sqlx::query("INSERT INTO simulated_account_extensions SELECT * FROM jsonb_populate_record(NULL::simulated_account_extensions,$1) ON CONFLICT DO NOTHING")
+                .bind(row)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
     async fn mutate_account_mode<F>(
         &self,
         light: bool,
@@ -569,7 +678,29 @@ impl Db {
         let mut after = before.clone();
         let result = f(&mut after)?;
         let previous = project(&before)?;
-        let next = project(&after)?;
+        let mut next = project(&after)?;
+        // An order-scoped hydrate holds a single order at array index 0, so project() would
+        // renumber the archive to 0. Restore the persisted positions before diffing, otherwise
+        // an order-scoped mutate that changes a mapped field rewrites order_position.
+        if order_id.is_some()
+            && let Some(rows) = next.get_mut("simulated_orders")
+        {
+            // order_position is int4 in the schema; keep the read typed to it so no cast is
+            // needed and the value round-trips unchanged.
+            let positions: Vec<(String, i32)> = sqlx::query_as(
+                "SELECT order_id,order_position FROM simulated_orders WHERE account_id=1",
+            )
+            .fetch_all(&mut *tx)
+            .await?;
+            for row in rows.iter_mut() {
+                if let Some((_, position)) = positions
+                    .iter()
+                    .find(|(id, _)| Some(id.as_str()) == row["order_id"].as_str())
+                {
+                    row["order_position"] = json!(position);
+                }
+            }
+        }
         // Compare rows by primary key; historical rows are left untouched.
         let mut names: Vec<String> = definitions().iter().map(|d| d.name.to_owned()).collect();
         names.extend([

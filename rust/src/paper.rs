@@ -8,6 +8,7 @@ use crate::{
     timestamp,
 };
 use anyhow::{Context, Result, bail};
+use futures::StreamExt;
 use serde_json::{Value, json};
 use sqlx::{Postgres, Transaction};
 use std::collections::{BTreeMap, BTreeSet};
@@ -488,18 +489,30 @@ pub fn account_summary(state: &Value, now: i64) -> Value {
         .sum::<f64>();
     let equity = initial + realized + floating;
     let committed = used + fee_reserve + reservations;
-    if rows.iter().any(|o| o["reconciliationPending"] == true)
-        || orders.iter().any(|o| {
-            ["live", "demo"].iter().any(|env| {
-                accounts[env]["enabled"] == true
-                    && n(binding(o, env), "executedQty", 0.) > 0.
-                    && n(
-                        &accounts[env]["orderMetrics"][o["id"].as_str().unwrap_or("")],
-                        "filledQty",
-                        0.,
-                    ) <= 0.
-            })
+    // The exchange reports a fill but metrics never mirrored it. Only orders that can still
+    // move gate new entries: a *closed* order in this state is unrecoverable — once the trade
+    // ages out of the exchange's lookup window there is nothing left to reconcile against, so
+    // waiting on it would stall every new order forever. Those gaps are reported through
+    // `accountingComplete` / `incompleteHistory` (history accounting) instead of `syncReady`.
+    let unfilled = |o: &Value| {
+        ["live", "demo"].iter().any(|env| {
+            accounts[env]["enabled"] == true
+                && n(binding(o, env), "executedQty", 0.) > 0.
+                && n(
+                    &accounts[env]["orderMetrics"][o["id"].as_str().unwrap_or("")],
+                    "filledQty",
+                    0.,
+                ) <= 0.
         })
+    };
+    let unreconciled_closed = orders
+        .iter()
+        .filter(|o| o["status"] == "closed" && unfilled(o))
+        .count();
+    if rows.iter().any(|o| o["reconciliationPending"] == true)
+        || orders
+            .iter()
+            .any(|o| o["status"] != "closed" && unfilled(o))
     {
         ready = false;
         warnings.insert("持仓与成交记录正在对账，保留保证金占用并暂停新增订单。".into());
@@ -512,11 +525,22 @@ pub fn account_summary(state: &Value, now: i64) -> Value {
     if state["entriesPaused"] == true {
         warnings.insert("已暂停新增订单。".into());
     }
-    let incomplete = closed
+    // History incompleteness: closed rows the exchange could not fully explain. A closed order
+    // with an observed fill but no mirrored metrics belongs here too — it is an accounting gap,
+    // not a reason to halt trading.
+    let mut incomplete_ids: BTreeSet<&str> = closed
         .iter()
         .filter(|o| o["accountingIncomplete"] == true)
-        .count();
-    json!({"fused":true,"unlimitedCapital":false,"unit":"USDT","initialBalance":initial,"realized":realized,"unrealized":floating,"net":realized+floating,"balance":initial+realized,"equity":equity,"available":equity-committed,"usedMargin":used,"entryFees":entry_fees,"feeReserve":fee_reserve,"reservationMargin":reservations,"committed":committed,"totalBuyAmount":rows.iter().map(|o|n(o,"buyAmount",0.)).sum::<f64>(),"positions":rows.iter().filter(|o|o["status"]=="open").count(),"pending":rows.iter().filter(|o|o["status"]=="pending").count(),"openCount":rows.len(),"investedMargin":orders.iter().filter(|o|n(o,"entry",0.)>0.).map(|o|n(o,"margin",0.)).sum::<f64>(),"closedMargin":closed.iter().map(|o|n(o,"margin",0.)).sum::<f64>(),"syncReady":ready,"accountingComplete":incomplete==0,"incompleteHistory":incomplete,"canOpen":ready&&state["entriesPaused"]!=true&&equity>committed,"warnings":warnings.into_iter().collect::<Vec<_>>(),"poolStartedAt":state["fusedPoolStartedAt"]})
+        .filter_map(|o| o["id"].as_str())
+        .collect();
+    incomplete_ids.extend(
+        orders
+            .iter()
+            .filter(|o| o["status"] == "closed" && unfilled(o))
+            .filter_map(|o| o["id"].as_str()),
+    );
+    let incomplete = incomplete_ids.len();
+    json!({"fused":true,"unlimitedCapital":false,"unit":"USDT","initialBalance":initial,"realized":realized,"unrealized":floating,"net":realized+floating,"balance":initial+realized,"equity":equity,"available":equity-committed,"usedMargin":used,"entryFees":entry_fees,"feeReserve":fee_reserve,"reservationMargin":reservations,"committed":committed,"totalBuyAmount":rows.iter().map(|o|n(o,"buyAmount",0.)).sum::<f64>(),"positions":rows.iter().filter(|o|o["status"]=="open").count(),"pending":rows.iter().filter(|o|o["status"]=="pending").count(),"openCount":rows.len(),"investedMargin":orders.iter().filter(|o|n(o,"entry",0.)>0.).map(|o|n(o,"margin",0.)).sum::<f64>(),"closedMargin":closed.iter().map(|o|n(o,"margin",0.)).sum::<f64>(),"syncReady":ready,"accountingComplete":incomplete==0,"incompleteHistory":incomplete,"unreconciledClosed":unreconciled_closed,"canOpen":ready&&state["entriesPaused"]!=true&&equity>committed,"warnings":warnings.into_iter().collect::<Vec<_>>(),"poolStartedAt":state["fusedPoolStartedAt"]})
 }
 fn legacy_entry_id(o: &Value, env: &str) -> String {
     format!(
@@ -1538,12 +1562,7 @@ async fn symbol_info(client: &Exchange, symbol: &str) -> Result<Value> {
     client.info(symbol).await
 }
 async fn mode(client: &Exchange, direction: &str) -> Result<(bool, String)> {
-    let mode = client
-        .signed("GET", "/fapi/v1/positionSide/dual", &json!({}))
-        .await?;
-    let dual = mode["dualSidePosition"]
-        .as_bool()
-        .context("未能确认持仓模式，暂缓执行")?;
+    let dual = client.position_mode().await?;
     Ok((
         dual,
         if dual {
@@ -1870,12 +1889,65 @@ pub async fn sync_entries(db: &Db, store: &Store, only: Option<&str>) -> Result<
                     }
                     let fresh = db.account(false, Some(id)).await?;
                     let updated = &fresh["orders"][0];
+                    // The exchange answered that this entry is dead and never filled. Retire the
+                    // local row now instead of leaving it `pending` until the 2h submit TTL: while
+                    // it stays pending it keeps its margin reservation, keeps showing up as an
+                    // active row, and every bulk close tries to cancel an order that no longer
+                    // exists — which is what makes a close look like it did nothing.
+                    if dormant_exchange_entry(updated, binding(updated, env)) {
+                        let symbol = updated["symbol"].as_str().unwrap_or("");
+                        db.mutate_order(id, |state| {
+                            if let Some(order) = state["orders"]
+                                .as_array_mut()
+                                .and_then(|a| a.iter_mut().find(|o| o["id"] == id))
+                            {
+                                if order["status"] == "pending" {
+                                    patch(
+                                        order,
+                                        &json!({"status":"cancelled","reason":"entry_order_cancelled","expiredAt":iso(now_ms()),"error":"交易所已撤销该入场挂单且无成交，释放保证金占用。"}),
+                                    );
+                                }
+                            }
+                            Ok(Value::Null)
+                        })
+                        .await?;
+                        tracing::info!(
+                            symbol,
+                            environment = env,
+                            order_id = id,
+                            "Retired entry cancelled on the exchange"
+                        );
+                        continue;
+                    }
                     if n(binding(updated, env), "executedQty", 0.) > 0. {
                         if updated["manualCloseRequested"] == true {
                             let target = json!({"environment":env,"symbol":updated["symbol"],"direction":updated["direction"],"positionSide":binding(updated,env)["positionSide"],"kind":"position","localOrders":[ref_order(updated)]});
-                            if let Err(error) = execute_remote_close(db, store, &target, None).await
-                            {
-                                results.push(json!({"orderId":id,"environment":env,"error":error.to_string()}));
+                            match execute_remote_close(db, store, &target, None).await {
+                                Ok(result) if result["complete"] == true => {
+                                    // Nothing clears this flag today, so every later sync
+                                    // cycle reads it as "still asked to close" and closes the
+                                    // exchange position again — 191 finished rows were doing
+                                    // that forever, burning rate limit and the account write
+                                    // lock with it. The request is served once it completes.
+                                    let symbol = updated["symbol"].as_str().unwrap_or("");
+                                    db.mutate_order(id, |state| {
+                                        if let Some(order) = state["orders"]
+                                            .as_array_mut()
+                                            .and_then(|a| a.iter_mut().find(|o| o["id"] == id))
+                                        {
+                                            order["manualCloseRequested"] = json!(false);
+                                        }
+                                        Ok(Value::Null)
+                                    })
+                                    .await?;
+                                    tracing::info!(symbol, environment = env, order_id = id, "Cleared served close request");
+                                }
+                                Ok(result) => results.push(
+                                    json!({"orderId":id,"environment":env,"status":result["status"],"incomplete":true}),
+                                ),
+                                Err(error) => {
+                                    results.push(json!({"orderId":id,"environment":env,"error":error.to_string()}));
+                                }
                             }
                         } else {
                             if let Err(error) =
@@ -1962,6 +2034,18 @@ fn desired_exit_quantity(order: &Value, link: &Value, emergency: bool) -> f64 {
     }
 }
 
+/// True when the exchange itself retired this entry order and filled none of it, so the
+/// local pending row can never turn into a position. Judge by the exchange's own answer and
+/// require an `orderId`: a row that never reached the exchange is still a local reservation.
+fn dormant_exchange_entry(order: &Value, link: &Value) -> bool {
+    order["status"] == "pending"
+        && !link["orderId"].is_null()
+        && matches!(
+            link["status"].as_str(),
+            Some("canceled" | "expired" | "rejected")
+        )
+        && n(&link, "executedQty", 0.) <= 0.
+}
 fn needs_exchange_sync(order: &Value, env: &str) -> bool {
     if active(order) {
         return true;
@@ -2296,23 +2380,56 @@ async fn sync_protection(db: &Db, client: &Exchange, env: &str, order: &Value) -
 }
 
 async fn record_execution(db: &Db, target: &Value, intent: &Value, remote: &Value) -> Result<()> {
-    db.mutate_account_light(|state|{let env=target["environment"].as_str().context("执行环境缺失")?;let key=intent["key"].as_str().context("执行键缺失")?;
-        if !state["manualExecutions"].is_object(){state["manualExecutions"]=json!({});}let mut result=intent.clone();patch(&mut result,&json!({"status":remote["status"].as_str().unwrap_or("NEW").to_lowercase(),"orderId":remote["orderId"],"executedQty":n(remote,"executedQty",0.),"exchangeUpdatedAt":if remote["updateTime"].is_null(){intent["exchangeUpdatedAt"].clone()}else{remote["updateTime"].clone()},"updatedAt":iso(now_ms())}));state["manualExecutions"][key]=result;
-        for reference in arr(&target["localOrders"]){if let Some(order)=state["orders"].as_array_mut().and_then(|a|a.iter_mut().find(|o|o["id"]==reference["id"])){ensure_links(order);let link=&mut order["exchangeSync"][env];if target["kind"]=="entry_order"{patch(link,&response_link(remote));}else{if !link["closeOrders"].is_array(){link["closeOrders"]=json!([]);}let action=json!({"id":intent["id"],"manual":true,"status":remote["status"].as_str().unwrap_or("NEW").to_lowercase(),"orderId":remote["orderId"],"clientOrderId":intent["clientOrderId"],"executedQty":n(remote,"executedQty",0.),"avgPrice":n(remote,"avgPrice",0.),"lastSyncedAt":iso(now_ms()),"reason":"manual"});let actions=link["closeOrders"].as_array_mut().unwrap();if let Some(existing)=actions.iter_mut().find(|a|a["id"]==intent["id"]){*existing=action;}else{actions.push(action);}}mirror(order);}}
-        Ok(Value::Null)
-    }).await?;
+    let env = target["environment"].as_str().context("执行环境缺失")?;
+    let key = intent["key"].as_str().context("执行键缺失")?;
+    // The durable intent is one account-level row set: writing it directly avoids diffing a
+    // thousand orders to record a fill. Everything else this records lives under the order's
+    // exchangeSync link, and those are extension paths only, so the per-order mutate below
+    // leaves the order's own row (and its archive position) untouched.
+    let mut result = intent.clone();
+    patch(
+        &mut result,
+        &json!({"status":remote["status"].as_str().unwrap_or("NEW").to_lowercase(),"orderId":remote["orderId"],"executedQty":n(remote,"executedQty",0.),"exchangeUpdatedAt":if remote["updateTime"].is_null(){intent["exchangeUpdatedAt"].clone()}else{remote["updateTime"].clone()},"updatedAt":iso(now_ms())}),
+    );
+    db.put_manual_execution(key, &result).await?;
+    for reference in arr(&target["localOrders"]) {
+        let id = reference["id"].as_str().context("执行引用缺失订单 ID")?;
+        db.mutate_order(id, |state| {
+            // The order may have ended between the exchange call and this write; the intent
+            // above is already durable, so skipping the link keeps the original semantics.
+            let Some(order) = state["orders"]
+                .as_array_mut()
+                .and_then(|a| a.iter_mut().find(|o| o["id"] == id))
+            else {
+                return Ok(Value::Null);
+            };
+            ensure_links(order);
+            let link = &mut order["exchangeSync"][env];
+            if target["kind"] == "entry_order" {
+                patch(link, &response_link(remote));
+            } else {
+                if !link["closeOrders"].is_array() {
+                    link["closeOrders"] = json!([]);
+                }
+                let action = json!({"id":intent["id"],"manual":true,"status":remote["status"].as_str().unwrap_or("NEW").to_lowercase(),"orderId":remote["orderId"],"clientOrderId":intent["clientOrderId"],"executedQty":n(remote,"executedQty",0.),"avgPrice":n(remote,"avgPrice",0.),"lastSyncedAt":iso(now_ms()),"reason":"manual"});
+                let actions = link["closeOrders"].as_array_mut().unwrap();
+                if let Some(existing) = actions.iter_mut().find(|a| a["id"] == intent["id"]) {
+                    *existing = action;
+                } else {
+                    actions.push(action);
+                }
+            }
+            mirror(order);
+            Ok(Value::Null)
+        })
+        .await?;
+    }
     Ok(())
 }
 async fn write_execution(db: &Db, key: &str, intent: &Value) -> Result<()> {
-    db.mutate_account_light(|state| {
-        if !state["manualExecutions"].is_object() {
-            state["manualExecutions"] = json!({});
-        }
-        state["manualExecutions"][key] = intent.clone();
-        Ok(Value::Null)
-    })
-    .await?;
-    Ok(())
+    // Same durable record as the full-account mutate below, without diffing a thousand
+    // orders to change one intent.
+    db.put_manual_execution(key, intent).await
 }
 
 fn close_position_awaits_update(
@@ -2346,18 +2463,41 @@ async fn execute_remote_close(
     let symbol = target["symbol"].as_str().context("币种缺失")?;
     crate::exchange::valid_symbol(symbol)?;
     let dir = target["direction"].as_str().context("持仓方向缺失")?;
+    // Phase timings ride the close log so a slow close can be attributed to a section
+    // instead of guessed at from the total.
+    let close_started = tokio::time::Instant::now();
+    let mut phases: Vec<(&'static str, u128)> = vec![];
+    let mut write_ms: u128 = 0;
+    let mark = tokio::time::Instant::now();
     let client = Exchange::new(&store.read("config").await?, env)?;
-    let snapshot = db.account(true, None).await?;
-    let snapshot = &snapshot["exchangeAccounts"][env];
-    if !client.credentials()
-        || snapshot["enabled"] != true
-        || snapshot["accountKey"] != client.account_key()
-    {
+    let (snapshot_enabled, snapshot_key) = db.exchange_snapshot_key(env).await?;
+    if !client.credentials() || !snapshot_enabled || snapshot_key != client.account_key() {
         bail!("执行环境或凭证已变更，请重新同步。");
     }
+    phases.push(("cred", mark.elapsed().as_millis()));
+    let mark = tokio::time::Instant::now();
     let (dual, ps) = mode(&client, dir).await?;
-    let _guard = lock_execution_wait(db, env, symbol, &ps, MANUAL_LOCK_WAIT).await?;
+    phases.push(("mode", mark.elapsed().as_millis()));
     let key = format!("nofx-execution:{env}:{symbol}:{ps}");
+    // Overlap the open-order listing with the lock wait on the close path: on a busy symbol
+    // that hides a full exchange round trip behind the wait. The entry-cancel path addresses
+    // its order by id and never lists.
+    let open_orders_params = json!({"symbol":symbol});
+    let listing = (!matches!(target["kind"].as_str(), Some("entry_order")))
+        .then(|| client.signed("GET", "/fapi/v1/openOrders", &open_orders_params));
+    let (guard, pending) = tokio::join!(
+        lock_execution_wait(db, env, symbol, &ps, MANUAL_LOCK_WAIT),
+        async {
+            match listing {
+                Some(future) => future.await,
+                None => Ok(json!([])),
+            }
+        }
+    );
+    let _guard = guard?;
+    let pending = pending?;
+    phases.push(("lock_list", mark.elapsed().as_millis()));
+    let mark = tokio::time::Instant::now();
     if let Some(minimum) = target["minimumCloseMargin"].as_f64() {
         if let Some(position) = current_position(&client, symbol, &ps, dir).await? {
             let margin = n(&position, "positionAmt", 0.).abs() * n(&position, "entryPrice", 0.)
@@ -2372,21 +2512,29 @@ async fn execute_remote_close(
     // Filtered closes reconcile their durable client ID on explicit retry; a global
     // request flag would also close a smaller holding in the other environment.
     if target["minimumCloseMargin"].is_null() {
-        let refs = arr(&target["localOrders"]);
-        db.mutate_account_light(|state| {
-            for order in state["orders"].as_array_mut().into_iter().flatten() {
-                if refs.iter().any(|r| r["id"] == order["id"]) {
-                    order[if target["kind"] == "entry_order" {
-                        "manualEntryCancelled"
-                    } else {
-                        "manualCloseRequested"
-                    }] = json!(true);
+        // The request flag lives in the order's extension rows, so an order-scoped mutate
+        // records it without projecting the whole archive.
+        let field = if target["kind"] == "entry_order" {
+            "manualEntryCancelled"
+        } else {
+            "manualCloseRequested"
+        };
+        for reference in arr(&target["localOrders"]) {
+            let id = reference["id"].as_str().context("执行引用缺失订单 ID")?;
+            db.mutate_order(id, |state| {
+                if let Some(order) = state["orders"]
+                    .as_array_mut()
+                    .and_then(|a| a.iter_mut().find(|o| o["id"] == id))
+                {
+                    order[field] = json!(true);
                 }
-            }
-            Ok(Value::Null)
-        })
-        .await?;
+                Ok(Value::Null)
+            })
+            .await?;
+        }
     }
+    phases.push(("flag", mark.elapsed().as_millis()));
+    let mark = tokio::time::Instant::now();
     if target["kind"] == "entry_order" {
         let params = json!({"symbol":symbol,"orderId":target["orderId"]});
         // The order may have filled or expired between the reconcile read and this call; either
@@ -2415,9 +2563,6 @@ async fn execute_remote_close(
         );
     }
     let entry_side = if dir == "OPEN_LONG" { "BUY" } else { "SELL" };
-    let pending = client
-        .signed("GET", "/fapi/v1/openOrders", &json!({"symbol":symbol}))
-        .await?;
     for order in pending
         .as_array()
         .context("未能确认待入场订单，暂缓平仓。")?
@@ -2444,10 +2589,19 @@ async fn execute_remote_close(
             }
         }
     }
+    phases.push(("cancel", mark.elapsed().as_millis()));
+    let mark = tokio::time::Instant::now();
     let mut final_order = json!({});
     let mut remaining_limit = quantity_limit;
     for _ in 0..32 {
-        let position = current_position(&client, symbol, &ps, dir).await?;
+        // The position read and the durable-intent read are independent exchange/DB calls;
+        // running them together removes the slower of the two from the close's critical path.
+        let (position, previous) = tokio::join!(
+            current_position(&client, symbol, &ps, dir),
+            db.manual_execution(&key)
+        );
+        let position = position?;
+        let previous = previous?;
         let amount = position
             .as_ref()
             .map(|p| n(p, "positionAmt", 0.).abs())
@@ -2458,12 +2612,19 @@ async fn execute_remote_close(
             } else {
                 Ok(())
             };
+            phases.push(("loop", mark.elapsed().as_millis()));
+            phases.push(("write", write_ms));
+            tracing::info!(
+                symbol = symbol,
+                environment = env,
+                total_ms = close_started.elapsed().as_millis() as i64,
+                phases = ?phases,
+                "Remote close phases"
+            );
             return Ok(
                 json!({"ok":true,"complete":true,"environment":env,"symbol":symbol,"status":"closed","avgPrice":n(&final_order,"avgPrice",0.),"warning":cleanup.err().map(|e|e.to_string())}),
             );
         }
-        let state = db.account(true, None).await?;
-        let previous = &state["manualExecutions"][&key];
         let account_key = client.account_key();
         if previous["accountKey"] == account_key
             && matches!(
@@ -2479,7 +2640,7 @@ async fn execute_remote_close(
                 )
                 .await
                 .context("上次平仓结果尚未确认，请稍后同步重试；未重复发送订单。")?;
-            record_execution(db, target, previous, &existing).await?;
+            record_execution(db, target, &previous, &existing).await?;
             if !matches!(
                 existing["status"].as_str(),
                 Some("FILLED" | "CANCELED" | "EXPIRED" | "REJECTED")
@@ -2492,7 +2653,7 @@ async fn execute_remote_close(
         if previous["accountKey"] == account_key
             && previous["status"] == "filled"
             && !previous["remainingBefore"].is_null()
-            && close_position_awaits_update(previous, position.as_ref().unwrap(), &Value::Null)
+            && close_position_awaits_update(&previous, position.as_ref().unwrap(), &Value::Null)
         {
             let confirmed = if timestamp(&previous["exchangeUpdatedAt"])
                 .filter(|t| *t > 0)
@@ -2509,7 +2670,7 @@ async fn execute_remote_close(
             } else {
                 Value::Null
             };
-            if close_position_awaits_update(previous, position.as_ref().unwrap(), &confirmed) {
+            if close_position_awaits_update(&previous, position.as_ref().unwrap(), &confirmed) {
                 return Ok(
                     json!({"ok":true,"complete":false,"environment":env,"symbol":symbol,"status":"awaiting_position"}),
                 );
@@ -2521,7 +2682,9 @@ async fn execute_remote_close(
         let action_id = uuid::Uuid::new_v4().to_string();
         let cid = client_id("close", &[env, symbol, &ps, &action_id]);
         let mut intent = json!({"key":key,"id":action_id,"accountKey":account_key,"status":"submitting","quantity":quantity,"remainingBefore":amount,"clientOrderId":cid,"createdAt":iso(now_ms())});
+        let wrote = tokio::time::Instant::now();
         write_execution(db, &key, &intent).await?;
+        write_ms += wrote.elapsed().as_millis();
         let mut request = json!({"symbol":symbol,"side":if entry_side=="BUY"{"SELL"}else{"BUY"},"type":"MARKET","quantity":formatted(quantity),"newClientOrderId":cid,"newOrderRespType":"RESULT"});
         if dual {
             request["positionSide"] = json!(ps);
@@ -2551,7 +2714,9 @@ async fn execute_remote_close(
                     .context("币安平仓响应未确认，请稍后同步重试；未重复发送订单。")?
             }
         };
+        let wrote = tokio::time::Instant::now();
         record_execution(db, target, &intent, &final_order).await?;
+        write_ms += wrote.elapsed().as_millis();
         if final_order["status"] != "FILLED" {
             return Ok(
                 json!({"ok":true,"complete":false,"environment":env,"symbol":symbol,"status":final_order["status"],"orderId":final_order["orderId"]}),
@@ -2597,21 +2762,9 @@ fn margin_close_row(row: &Value, minimum: f64) -> Option<Value> {
     Some(selected_row)
 }
 
-async fn close_internal(
-    db: &Db,
-    store: &Store,
-    id: &str,
-    synchronize: bool,
-    minimum_margin: Option<f64>,
-) -> Result<Value> {
-    if synchronize {
-        // Only pay for the full cycle when the snapshot has aged out. The close itself re-reads
-        // the position from the exchange, so a stale cache cannot cause a wrong close.
-        refresh_if_stale(db, store, "close").await?;
-    }
-    let state = db.account(true, None).await?;
-    let rows = fused_orders(&state);
-    let row = arr(&rows["activeOrders"])
+/// Locate the fused activity row a close targets, by fused id or by any of its local orders.
+fn find_active_row<'a>(state: &'a Value, id: &str) -> Option<Value> {
+    arr(&fused_orders(state)["activeOrders"])
         .into_iter()
         .find(|r| {
             r["id"] == id
@@ -2619,7 +2772,29 @@ async fn close_internal(
                     .iter()
                     .any(|reference| reference["id"] == id)
         })
-        .context("订单已结束或列表已更新，请同步后重试。")?;
+}
+async fn close_internal(
+    db: &Db,
+    store: &Store,
+    id: &str,
+    synchronize: bool,
+    minimum_margin: Option<f64>,
+    include_account: bool,
+) -> Result<Value> {
+    // The close itself re-reads positions and orders from the exchange, so a stale snapshot
+    // cannot cause a wrong close; only a row the snapshot no longer lists needs a refresh.
+    // Paying for a full cycle on every close (2.7s idle, ~30s with a dozen live positions)
+    // was the stall the trading view felt whenever the sweep had fallen behind.
+    let close_started = tokio::time::Instant::now();
+    let mut state = db.account(true, None).await?;
+    let mut row = find_active_row(&state, id);
+    if row.is_none() && synchronize {
+        refresh_if_stale(db, store, "close").await?;
+        state = db.account(true, None).await?;
+        row = find_active_row(&state, id);
+    }
+    let prelude_ms = close_started.elapsed().as_millis();
+    let row = row.context("订单已结束或列表已更新，请同步后重试。")?;
     let row = if let Some(minimum) = minimum_margin {
         let Some(selected) = margin_close_row(&row, minimum) else {
             return Ok(
@@ -2713,13 +2888,18 @@ async fn close_internal(
             .iter()
             .all(|r| r["ok"] == true && r["complete"] == true && r["skipped"] != true)
         {
-            db.mutate_account_light(|state| {
-                for order in state["orders"]
-                    .as_array_mut()
-                    .into_iter()
-                    .flatten()
-                    .filter(|o| refs.iter().any(|r| r["id"] == o["id"]))
-                {
+            // Per-order scoped writes: the mapped fields this changes live in the order's own
+            // row, and an order-scoped mutate projects one order instead of the whole archive.
+            // `mutate_account_mode` restores persisted positions, so the archive order is safe.
+            for reference in &refs {
+                let id = reference["id"].as_str().unwrap_or("");
+                db.mutate_order(id, |state| {
+                    let Some(order) = state["orders"]
+                        .as_array_mut()
+                        .and_then(|a| a.iter_mut().find(|o| o["id"] == id))
+                    else {
+                        return Ok(Value::Null);
+                    };
                     ensure_links(order);
                     let filled = ["live", "demo"].iter().find_map(|env| {
                         let l = &order["exchangeSync"][env];
@@ -2756,23 +2936,80 @@ async fn close_internal(
                             .map(|r| r["avgPrice"].clone())
                             .unwrap_or_else(|| row["markPrice"].clone());
                     }
-                }
-                Ok(Value::Null)
-            })
-            .await?;
+                    Ok(Value::Null)
+                })
+                .await?;
+            }
         }
     }
     // Deliberately no post-close refresh. The position is already closed and the local order
     // records it, so `status` below is accurate; spending another ~30s (or risking an error that
     // masks a successful close) only delays the answer. The next sweep reconciles the snapshot.
-    Ok(
-        json!({"ok":results.iter().all(|r|r["ok"]!=false),"results":results,"account":status(db).await?}),
-    )
+    // The embedded account snapshot is only built for callers that render it; bulk closes and
+    // the background review loop drop it and read the account once at the end, if at all.
+    let account = if include_account {
+        status(db).await?
+    } else {
+        Value::Null
+    };
+    tracing::info!(
+        %id,
+        prelude_ms = prelude_ms as i64,
+        tail_ms = close_started.elapsed().as_millis() as i64 - prelude_ms as i64,
+        include_account,
+        "Close phases"
+    );
+    Ok(json!({"ok":results.iter().all(|r|r["ok"]!=false),"results":results,"account":account}))
 }
+/// User-facing close: the response carries the refreshed account because the trading view
+/// renders it directly instead of re-fetching.
 pub async fn close(db: &Db, store: &Store, id: &str) -> Result<Value> {
-    close_internal(db, store, id, true, None).await
+    close_internal(db, store, id, true, None, true).await
+}
+/// Background close (automation review): the caller only checks for errors, so building the
+/// account snapshot would be wasted work on the sweep's critical path.
+pub async fn close_for_review(db: &Db, store: &Store, id: &str) -> Result<Value> {
+    close_internal(db, store, id, true, None, false).await
 }
 
+/// How many symbols a bulk close works on at once. Symbols hold independent execution locks,
+/// so this only bounds the shared Binance weight budget and the account write gate.
+const CLOSE_CONCURRENCY: usize = 4;
+/// Fan a bulk close out over its rows. Each row is one symbol with its own execution lock, so
+/// the closes run concurrently instead of paying the full exchange round trip per position one
+/// after another. The per-row account snapshot is dropped: the caller builds one shared
+/// snapshot at the end.
+async fn close_rows(
+    db: &Db,
+    store: &Store,
+    rows: Vec<Value>,
+    minimum_margin: Option<f64>,
+) -> Vec<Value> {
+    futures::stream::iter(rows.into_iter().map(|row| async move {
+        let outcome = close_internal(
+            db,
+            store,
+            row["id"].as_str().unwrap_or(""),
+            false,
+            minimum_margin,
+            false,
+        )
+        .await;
+        (row, outcome)
+    }))
+    .buffer_unordered(CLOSE_CONCURRENCY)
+    .map(|(row, outcome)| {
+        let mut result = outcome.unwrap_or_else(|e| json!({"ok":false,"error":e.to_string()}));
+        if let Some(object) = result.as_object_mut() {
+            object.insert("id".to_owned(), row["id"].clone());
+            object.insert("symbol".to_owned(), row["symbol"].clone());
+            object.remove("account");
+        }
+        result
+    })
+    .collect()
+    .await
+}
 pub async fn close_above_margin(db: &Db, store: &Store, input: &Value) -> Result<Value> {
     let minimum = n(input, "minimumMargin", 50.);
     if !minimum.is_finite() || minimum < 0. {
@@ -2781,20 +3018,11 @@ pub async fn close_above_margin(db: &Db, store: &Store, input: &Value) -> Result
     let _guard = lock_execution(db, "system", "close-all", "ALL").await?;
     refresh_if_stale(db, store, "close_above_margin").await?;
     let state = db.account(true, None).await?;
-    let mut results = vec![];
-    for row in arr(&fused_orders(&state)["activeOrders"])
+    let rows: Vec<Value> = arr(&fused_orders(&state)["activeOrders"])
         .into_iter()
         .filter(|row| margin_close_row(row, minimum).is_some())
-    {
-        let id = row["id"].as_str().context("活动订单无 ID")?;
-        let mut result = close_internal(db, store, id, false, Some(minimum))
-            .await
-            .unwrap_or_else(|e| json!({"ok":false,"error":e.to_string()}));
-        result["id"] = row["id"].clone();
-        result["symbol"] = row["symbol"].clone();
-        result.as_object_mut().unwrap().remove("account");
-        results.push(result);
-    }
+        .collect();
+    let results = close_rows(db, store, rows, Some(minimum)).await;
     refresh_if_stale(db, store, "close_above_margin").await?;
     Ok(
         json!({"ok":results.iter().all(|r|r["ok"]==true),"minimumMargin":minimum,"results":results,"account":status(db).await?}),
@@ -2808,24 +3036,19 @@ pub async fn close_all(db: &Db, store: &Store) -> Result<Value> {
     })
     .await?;
     refresh_if_stale(db, store, "close_all").await?;
-    let mut results = vec![];
+    let state = db.account(true, None).await?;
+    // Pending orders are cancelled before open positions so a resting entry cannot refill a
+    // slot that is about to close; every row then closes concurrently.
+    let mut rows: Vec<Value> = vec![];
     for status in ["pending", "open"] {
-        let state = db.account(true, None).await?;
-        for row in arr(&fused_orders(&state)["activeOrders"])
-            .into_iter()
-            .filter(|r| r["status"] == status)
-        {
-            let id = row["id"].as_str().context("活动订单无 ID")?;
-            let mut result = close_internal(db, store, id, false, None)
-                .await
-                .unwrap_or_else(|e| json!({"ok":false,"error":e.to_string()}));
-            result["id"] = row["id"].clone();
-            result["symbol"] = row["symbol"].clone();
-            result.as_object_mut().unwrap().remove("account");
-            results.push(result);
-        }
-        refresh_if_stale(db, store, "close_all").await?;
+        rows.extend(
+            arr(&fused_orders(&state)["activeOrders"])
+                .into_iter()
+                .filter(|r| r["status"] == status),
+        );
     }
+    let results = close_rows(db, store, rows, None).await;
+    refresh_if_stale(db, store, "close_all").await?;
     Ok(
         json!({"ok":results.iter().all(|r|r["ok"]==true),"entriesPaused":true,"results":results,"account":status(db).await?}),
     )

@@ -30,8 +30,47 @@ pub struct Exchange {
     key: String,
     secret: String,
     pub demo: bool,
-    offset: Arc<Mutex<Option<i64>>>,
+    /// (fetched_at, offset_ms) shared per venue; see `shared_offset`.
+    offset: Arc<Mutex<Option<(i64, i64)>>>,
     market_cache: market_context::Cache,
+}
+/// Connection pools, the calibrated server clock and the market-context cache describe the
+/// venue, not a request. `Exchange::new` runs per close, per sweep order and per API call, so
+/// per-instance transport made every one of them pay a TLS handshake plus a redundant
+/// `/fapi/v1/time` before the first signed request. On this link a demo round trip measures
+/// ~0.44s on a reused connection versus ~1.6s on a cold one.
+fn shared_client(demo: bool) -> &'static reqwest::Client {
+    static DEMO: OnceLock<reqwest::Client> = OnceLock::new();
+    static LIVE: OnceLock<reqwest::Client> = OnceLock::new();
+    (if demo { &DEMO } else { &LIVE })
+        .get_or_init(|| http_client(true).expect("Binance client must build"))
+}
+fn shared_retry_client(demo: bool) -> &'static reqwest::Client {
+    static DEMO: OnceLock<reqwest::Client> = OnceLock::new();
+    static LIVE: OnceLock<reqwest::Client> = OnceLock::new();
+    (if demo { &DEMO } else { &LIVE })
+        .get_or_init(|| http_client(false).expect("Binance retry client must build"))
+}
+fn shared_market_cache(demo: bool) -> &'static market_context::Cache {
+    static DEMO: OnceLock<market_context::Cache> = OnceLock::new();
+    static LIVE: OnceLock<market_context::Cache> = OnceLock::new();
+    (if demo { &DEMO } else { &LIVE }).get_or_init(Default::default)
+}
+/// A clock can drift over a long-running process, so the offset is re-calibrated at most this
+/// often; ordinary calls never pay for the round trip.
+const SERVER_OFFSET_MAX_AGE_MS: i64 = 600_000;
+fn shared_offset(demo: bool) -> &'static Arc<Mutex<Option<(i64, i64)>>> {
+    static DEMO: OnceLock<Arc<Mutex<Option<(i64, i64)>>>> = OnceLock::new();
+    static LIVE: OnceLock<Arc<Mutex<Option<(i64, i64)>>>> = OnceLock::new();
+    (if demo { &DEMO } else { &LIVE }).get_or_init(Default::default)
+}
+/// Hedge/one-way position mode changes are rare and user-initiated. A short TTL keeps close
+/// and sweep paths from paying a round trip for it on every call; a stale value can only make
+/// Binance reject a mismatched order, never mis-fill one.
+const POSITION_MODE_TTL_MS: i64 = 60_000;
+fn position_mode_cache() -> &'static Mutex<BTreeMap<String, (i64, bool)>> {
+    static CACHE: OnceLock<Mutex<BTreeMap<String, (i64, bool)>>> = OnceLock::new();
+    CACHE.get_or_init(Default::default)
 }
 impl Exchange {
     #[cfg(test)]
@@ -96,6 +135,31 @@ impl Exchange {
         cache.insert(base, (now, contracts.clone()));
         contracts.remove(symbol).context("目标交易环境不支持该合约")
     }
+    /// Hedge/one-way position mode, cached per venue for `POSITION_MODE_TTL_MS`. Every close
+    /// and every strategy-exit sync needs it to address the position side; querying it per
+    /// call added a full round trip to each of them.
+    pub async fn position_mode(&self) -> Result<bool> {
+        let now = crate::now_ms();
+        {
+            let cache = position_mode_cache().lock().await;
+            if let Some((at, dual)) = cache.get(&self.base)
+                && now.saturating_sub(*at) < POSITION_MODE_TTL_MS
+            {
+                return Ok(*dual);
+            }
+        }
+        let mode = self
+            .signed("GET", "/fapi/v1/positionSide/dual", &json!({}))
+            .await?;
+        let dual = mode["dualSidePosition"]
+            .as_bool()
+            .context("未能确认持仓模式，暂缓执行")?;
+        position_mode_cache()
+            .lock()
+            .await
+            .insert(self.base.clone(), (now, dual));
+        Ok(dual)
+    }
     pub fn new(config: &Value, environment: &str) -> Result<Self> {
         let b = &config["binance"];
         let demo = environment == "demo";
@@ -118,15 +182,15 @@ impl Exchange {
                 .to_owned()
         };
         Ok(Self {
-            client: http_client(true)?,
-            retry_client: http_client(false)?,
+            client: shared_client(demo).clone(),
+            retry_client: shared_retry_client(demo).clone(),
             budget: rate_limit::shared(demo),
             base: futures_base(demo, std::env::var("BINANCE_FUTURES_BASE").ok().as_deref()),
             key: credential("apiKey"),
             secret: credential("secretKey"),
             demo,
-            offset: Arc::new(Mutex::new(None)),
-            market_cache: Default::default(),
+            offset: Arc::clone(shared_offset(demo)),
+            market_cache: Arc::clone(shared_market_cache(demo)),
         })
     }
     pub fn credentials(&self) -> bool {
@@ -279,8 +343,11 @@ impl Exchange {
         unreachable!()
     }
     async fn server_offset(&self, refresh: bool) -> Result<i64> {
-        let mut offset = self.offset.lock().await;
-        if refresh || offset.is_none() {
+        let mut state = self.offset.lock().await;
+        let stale = state
+            .as_ref()
+            .is_none_or(|(at, _)| crate::now_ms().saturating_sub(*at) > SERVER_OFFSET_MAX_AGE_MS);
+        if refresh || stale {
             let time = self.public_request("/fapi/v1/time", &json!({})).await?;
             let server = time["serverTime"]
                 .as_i64()
@@ -288,9 +355,10 @@ impl Exchange {
                 .context("Binance 未返回有效服务器时间")?;
             // Queueing, retries and proxy latency must not push timestamps ahead of the server.
             // Anchor to receipt rather than the midpoint of the entire public request.
-            *offset = Some(server - crate::now_ms() - 500);
+            let at = crate::now_ms();
+            *state = Some((at, server - at - 500));
         }
-        Ok(offset.unwrap_or(0))
+        Ok(state.map(|(_, offset)| offset).unwrap_or(0))
     }
     pub async fn spot_signed(&self, path: &str, params: &Value) -> Result<Value> {
         if !self.demo {

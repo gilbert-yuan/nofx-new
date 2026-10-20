@@ -56,6 +56,47 @@ fn buy(market: &Value, context: &Value) -> Value {
     signal
 }
 
+#[test]
+fn martin_luk_entry_band_atr_widens_the_allowed_entry_zone() {
+    // The allowed entry zone is [price - band, price + band] with
+    // band = min(ATR * entryBandAtr, (price - stop) * 0.1). Widening the
+    // parameter must widen the zone symmetrically and move the risk/target
+    // geometry with it, which is what unblocks drifted entries in replay.
+    let (market, context, _now) = fixture();
+    let narrow = buy(&market, &context);
+    let reference = number(&narrow["plan"]["entryReference"], 0.);
+    let narrow_band = number(&narrow["plan"]["entryMax"], 0.) - reference;
+    assert!(narrow_band > 0., "{narrow:#}");
+    assert!(
+        (reference - number(&narrow["plan"]["entryMin"], 0.) - narrow_band).abs() < 1e-9,
+        "{narrow:#}"
+    );
+
+    let mut wide_context = context.clone();
+    wide_context["params"]["entryBandAtr"] = json!(1.0);
+    let wide = buy(&market, &wide_context);
+    let wide_band = number(&wide["plan"]["entryMax"], 0.) - reference;
+    assert!(
+        wide_band > narrow_band,
+        "expected a wider zone, narrow={narrow_band} wide={wide_band}"
+    );
+    // A wider entry raises the reference risk distance and therefore the target.
+    assert!(
+        number(&wide["plan"]["riskUnit"], 0.) > number(&narrow["plan"]["riskUnit"], 0.),
+        "{wide:#}"
+    );
+    assert!(
+        number(&wide["plan"]["takeProfit"], 0.) > number(&narrow["plan"]["takeProfit"], 0.),
+        "{wide:#}"
+    );
+    // buy() already asserts every shared guard (chase, stop distance, net R:R)
+    // still passes, so a widened zone must keep the stop below the entry.
+    assert!(
+        number(&wide["plan"]["entryMax"], 0.) > number(&wide["plan"]["stopLoss"], 0.),
+        "{wide:#}"
+    );
+}
+
 fn wait_with(signal: &Value, reason: &str) {
     assert_eq!(signal["action"], "WAIT", "{signal:#}");
     assert!(signal["plan"].is_null(), "{signal:#}");
@@ -155,8 +196,16 @@ fn martin_luk_repeated_separate_support_contacts_are_not_a_first_pullback() {
         [167.9, 169., 167.8, 168.8],
     ]);
     let signal = analyze(&market, &context);
-    wait_with(&signal, "重复回调不入场");
+    wait_with(&signal, "已超出允许上限");
     assert_eq!(signal["metrics"]["pullbackEpisodes"], 2);
+
+    // 放开上限后同一个形态应当可以入场（其余闸门不变）。
+    let mut relaxed = context.clone();
+    relaxed["params"]["maxPullbackEpisodes"] = json!(2);
+    let signal = analyze(&market, &relaxed);
+    assert_eq!(signal["action"], "BUY", "{signal:#}");
+    assert_eq!(signal["metrics"]["pullbackEpisodes"], 2);
+    assert_eq!(signal["metrics"]["maxPullbackEpisodes"], 2);
 }
 
 #[test]

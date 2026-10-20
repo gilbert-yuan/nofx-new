@@ -464,7 +464,7 @@ async fn run_cached_manual_close(db: &Db) -> Result<()> {
         Ok(Value::Null)
     })
     .await?;
-    let result = close_internal(db, &store, "previously-failed", false, None).await?;
+    let result = close_internal(db, &store, "previously-failed", false, None, false).await?;
     assert_eq!(result["ok"], true);
     let state = db.account(false, None).await?;
     let requested = arr(&state["orders"])
@@ -520,4 +520,50 @@ async fn run_cached_manual_close(db: &Db) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// An entry the exchange cancelled with no fill has to stop counting as an active order:
+/// otherwise it holds its margin reservation and re-appears in every bulk close.
+#[test]
+fn dormant_exchange_entry_only_matches_remote_dead_entries_without_fills() {
+    let link = |status: &str, executed: f64, order_id: Option<u64>| json!({"status":status,"executedQty":executed,"orderId":order_id});
+    let pending = json!({"status":"pending"});
+    assert!(dormant_exchange_entry(
+        &pending,
+        &link("canceled", 0., Some(343935677))
+    ));
+    assert!(dormant_exchange_entry(
+        &pending,
+        &link("expired", 0., Some(343935677))
+    ));
+    assert!(dormant_exchange_entry(
+        &pending,
+        &link("rejected", 0., Some(343935677))
+    ));
+    // A cancelled entry that partially filled is a position, not a dead row.
+    assert!(!dormant_exchange_entry(
+        &pending,
+        &link("canceled", 12.5, Some(343935677))
+    ));
+    // Still resting on the book.
+    assert!(!dormant_exchange_entry(
+        &pending,
+        &link("new", 0., Some(343935677))
+    ));
+    // Never reached the exchange: nothing there to retire.
+    assert!(!dormant_exchange_entry(
+        &pending,
+        &link("canceled", 0., None)
+    ));
+    assert!(!dormant_exchange_entry(
+        &pending,
+        &json!({"status":"not_submitted"})
+    ));
+    // Rows that already moved on are somebody else's business.
+    for status in ["open", "closed", "expired", "cancelled"] {
+        assert!(!dormant_exchange_entry(
+            &json!({"status":status}),
+            &link("canceled", 0., Some(343935677))
+        ));
+    }
 }

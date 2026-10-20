@@ -33,8 +33,20 @@ name = "nofx-order-export"
 path = "rust/src/bin/nofx-order-export.rs"
 
 [[bin]]
+name = "nofx-martin-collect"
+path = "rust/src/bin/nofx-martin-collect.rs"
+
+[[bin]]
 name = "nofx-martin-audit"
 path = "rust/src/bin/nofx-martin-audit.rs"
+
+[[bin]]
+name = "nofx-yao-research"
+path = "rust/src/bin/nofx-yao-research.rs"
+
+[[bin]]
+name = "nofx-yao-micro"
+path = "rust/src/bin/nofx-yao-micro.rs"
 
 [[bin]]
 name = "nofx-orphan-audit"

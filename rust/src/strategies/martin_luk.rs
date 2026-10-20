@@ -225,6 +225,11 @@ pub fn analyze(m: &Value, ctx: &Value) -> Value {
             }
             last_touch = Some(j);
             reclaimed_level = levels.iter().copied().fold(0., f64::max);
+        } else if touching {
+            // 离开支撑簇：下一段回踩从这里重新起算。否则允许多次回踩后
+            // pullback_low 会累计整段结构的最低点，止损越拖越宽，反被
+            // "深度跌穿"/"止损距离" 闸门吃掉。
+            pullback_low = f64::INFINITY;
         }
         touching = contact;
         if episodes > 0 {
@@ -238,11 +243,23 @@ pub fn analyze(m: &Value, ctx: &Value) -> Value {
     if !latest_atr.is_finite() || !latest_avwap.is_finite() {
         return hold("回调 ATR 或峰值锚定 AVWAP 无效，等待有效成交量。", metrics);
     }
-    if episodes != 1 || last_touch.is_none_or(|j| j + 2 < entry.len()) {
-        return hold(
-            "等待首次连续支撑接触及紧邻的转强确认；重复回调不入场。",
-            metrics,
-        );
+    // 原版只允许"恰好一次"支撑接触，只要回踩过一次就永久失效；真实趋势里常见的
+    // "回踩→反弹失败→再回踩→才启动"会整段错过。改为允许第 N 次回踩，但"最后接触
+    // 必须紧邻"这条保留——它才是保证入场及时性的部分。
+    let max_episodes = period(p, "maxPullbackEpisodes").max(1);
+    metrics["maxPullbackEpisodes"] = json!(max_episodes);
+    if episodes == 0 {
+        return hold("尚未出现连续支撑接触，等待首次回调。", metrics);
+    }
+    if episodes > max_episodes {
+        let reason = format!("回踩次数 {episodes} 已超出允许上限 {max_episodes}，放弃本轮。");
+        return hold(&reason, metrics.clone());
+    }
+    // 支撑接触后必须在 confirmWithinBars 根内给出转强确认，否则这次接触作废。
+    // 原版硬编码 2 根（30 分钟），对"接触后横盘一两小时再启动"的走法过于苛刻。
+    let confirm = period(p, "confirmWithinBars").max(1);
+    if last_touch.is_none_or(|j| j + confirm < entry.len()) {
+        return hold("支撑接触已不紧邻，等待新的转强确认。", metrics);
     }
     let bar = entry.last().unwrap();
     let price = n(bar, "close");
@@ -262,7 +279,7 @@ pub fn analyze(m: &Value, ctx: &Value) -> Value {
     }
     let stop =
         (pullback_low - n(p, "stopBufferAtr") * latest_atr).min(price * (1. - n(p, "minStopPct")));
-    let band = (latest_atr * 0.1).min((price - stop) * 0.1);
+    let band = (latest_atr * n(p, "entryBandAtr")).min((price - stop) * 0.1);
     let entry_max = price + band;
     let risk = entry_max - stop;
     let stop_pct = risk / entry_max;

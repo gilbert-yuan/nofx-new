@@ -309,8 +309,34 @@ pub fn analyze(m: &Value, ctx: &Value) -> Value {
     let amplitude = n(&tk, "priceChangePercent")
         .abs()
         .max((n(&tk, "highPrice") - n(&tk, "lowPrice")) / n(&tk, "openPrice") * 100.);
+    // v2 研究闸门输入：15m 窗口上的近 6h 振幅与 24h 高点距离（防未来函数：只用已收盘 15m）
+    let r15_all = rows(aux);
+    let price_now = n(&tk, "lastPrice");
+    let range6h = if r15_all.len() >= 25 && price_now > 0. {
+        let w = &r15_all[r15_all.len() - 24..];
+        let h = w
+            .iter()
+            .map(|x| n(x, "high"))
+            .fold(f64::NEG_INFINITY, f64::max);
+        let l = w.iter().map(|x| n(x, "low")).fold(f64::INFINITY, f64::min);
+        (h - l) / price_now * 100.
+    } else {
+        f64::NAN
+    };
+    let dist_high_24h = if r15_all.len() >= 97 && price_now > 0. {
+        let h = r15_all[r15_all.len() - 96..]
+            .iter()
+            .map(|x| n(x, "high"))
+            .fold(f64::NEG_INFINITY, f64::max);
+        (h / price_now - 1.) * 100.
+    } else {
+        f64::NAN
+    };
     let snap = json!({"direction":prediction["direction"],"stage":prediction["stage"],"probabilityPct":prediction["probabilityPct"],"rawProbabilityPct":prediction["rawProbabilityPct"],"calibratedDirectionProbabilityPct":prediction["calibratedDirectionProbabilityPct"],"calibratedTargetProbabilityPct":prediction["calibratedTargetProbabilityPct"],"predictedMovePct":prediction["predictedMovePct"],"predictedTargetPrice":prediction["predictedTargetPrice"],"observedAmplitudePct":amplitude,"currentPrice":tk["lastPrice"],"features":prediction["features"]});
-    let mut trend = merge(json!({"source":"yao-coin-prediction-v1"}), snap.clone());
+    let mut trend = merge(
+        json!({"source":"yao-coin-prediction-v1","range6hPct":range6h,"distHigh24hPct":dist_high_24h}),
+        snap.clone(),
+    );
     let long = prediction["direction"] == "UP";
     let sign = if long { 1. } else { -1. };
     let feat = &prediction["features"];
@@ -332,8 +358,14 @@ pub fn analyze(m: &Value, ctx: &Value) -> Value {
         Some("波动比低于埋伏门槛。".into())
     } else if n(feat, "trendConsistencyPct").abs() < n(p, "minTrendConsistencyPct") {
         Some("同向 K 线净占比不足。".into())
+    } else if !(range6h >= n(p, "minRange6hPct")) {
+        Some("近 6h 振幅未达启动前活跃门槛（高波动体制才出妖）。".into())
+    } else if !(dist_high_24h >= n(p, "minDistHigh24hPct")) {
+        Some("价格不在回撤位，距 24h 高点过近，追高风险。".into())
     } else if sign * n(feat, "recentReturnPct") < n(p, "minRecentReturnPct") {
         Some("最近动量未与预测方向一致。".into())
+    } else if sign * n(feat, "recentReturnPct") > n(p, "maxRecentReturnPct") {
+        Some("短线动量过热，属于追高而非埋伏。".into())
     } else if long && b(p, "shortOnly") || !long && b(p, "longOnly") {
         Some("预测方向被策略方向开关拦截。".into())
     } else {

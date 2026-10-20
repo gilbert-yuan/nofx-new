@@ -606,6 +606,40 @@ mod tests {
     }
 
     #[test]
+    fn closed_fills_without_metrics_stop_blocking_new_entries() {
+        let now = 300 * HOUR + 1000;
+        let (config, mut state, prediction) = fixture(now);
+        seed_edge(&mut state, now);
+        let signal = normalized(&prediction, now);
+        // The exchange reported a fill but metrics never mirrored it, and the order is already
+        // closed. That gap can never be reconciled — the trade ages out of the exchange's lookup
+        // window — so it must not hold every new order hostage forever.
+        state["orders"].as_array_mut().unwrap().push(json!({
+            "id":"stale-closed","symbol":"SOLUSDT","status":"closed","direction":"OPEN_LONG",
+            "entry":100.,"margin":100.,"notional":100.,"net":0.,
+            "exchange":{"executedQty":280.1,"status":"filled"}
+        }));
+        let funds = paper::account_summary(&state, now);
+        assert_eq!(
+            funds["syncReady"], true,
+            "a closed order's unmapped fill must not gate entries"
+        );
+        assert_eq!(funds["unreconciledClosed"], 1);
+        assert_eq!(
+            funds["accountingComplete"], false,
+            "the gap stays visible as history incompleteness"
+        );
+        assert!(authorize(&state, &config, &signal, now, None).is_ok());
+
+        // The identical gap on an order that can still move must keep blocking.
+        state["orders"].as_array_mut().unwrap().push(json!({
+            "id":"live-gap","symbol":"ETHUSDT","status":"open","direction":"OPEN_LONG",
+            "entry":100.,"margin":100.,"notional":100.,"exchange":{"executedQty":1.}
+        }));
+        assert_eq!(paper::account_summary(&state, now)["syncReady"], false);
+    }
+
+    #[test]
     fn shared_daily_pause_survives_recovery_and_drawdown_survives_rollover() {
         let now = 300 * HOUR + 1000;
         let (config, mut state, _) = fixture(now);

@@ -681,7 +681,7 @@ mod tests {
     fn yao_optional_trend_gate_can_be_disabled_without_disabling_entries() {
         let dataset = json!({"count":260,"drift":0.035,"mode":"surge"});
         let m = market(&dataset, "1m");
-        let mut ctx = json!({"params":{"require15mTrend":false,"minProbabilityPct":40,"minRawProbabilityPct":50,"minCurrentAmplitudePct":0,"minVolumeRatio":0,"minRangeRatio":0,"minTrendConsistencyPct":0,"minRecentReturnPct":0,"minNetRr":0.1},"auxMarkets":{"15m":market(&dataset,"15m")}});
+        let mut ctx = json!({"params":{"require15mTrend":false,"minProbabilityPct":40,"minRawProbabilityPct":50,"minCurrentAmplitudePct":0,"minVolumeRatio":0,"minRangeRatio":0,"minTrendConsistencyPct":0,"minRecentReturnPct":0,"minNetRr":0.1,"minRange6hPct":0,"minDistHigh24hPct":0,"maxRecentReturnPct":30},"auxMarkets":{"15m":market(&dataset,"15m")}});
         let result = analyze("yao-coin-ambush-v1", &m, &ctx).unwrap();
         assert_eq!(result["action"], "BUY", "{result}");
         assert_eq!(result["trend"]["trend15"]["enabled"], false);

@@ -857,7 +857,8 @@ impl Automation {
                     );
                     record["automationRunId"] = json!(run_id);
                     record["analysisEngine"] = strategy["engine"].clone();
-                    self.db.save_record(&record).await?;
+                    // Not persisted here: the row is written by the execution loop
+                    // only once an order actually references it.
                     record
                 };
                 candidates.push(json!({"symbol":symbol,"signal":signal,"record":record,"strategy":strategy,"market":plan_market}));
@@ -944,10 +945,23 @@ impl Automation {
                     report["indicators"] = indicators;
                     report["evidence"] = json!(evidence);
                 }
-                if !data_only && let Some(id) = candidate["record"]["id"].as_str() {
-                    self.db
-                        .record_market_context(id, &candidate["signal"], raw)
-                        .await?;
+                if !data_only && candidate["record"]["id"].is_string() {
+                    // Fold the market context into the in-memory record; the row is
+                    // written only when an order references it, so the enrichment
+                    // must travel with the record until then.
+                    let signal = candidate["signal"].clone();
+                    let record = &mut candidate["record"];
+                    if !record["analyses"].is_array() {
+                        record["analyses"] = json!([]);
+                    }
+                    if let Some(analyses) = record["analyses"].as_array_mut() {
+                        if analyses.is_empty() {
+                            analyses.push(signal);
+                        } else {
+                            analyses[0] = signal;
+                        }
+                    }
+                    record["marketContext"] = raw.clone();
                 }
             }
         }
@@ -1168,6 +1182,11 @@ impl Automation {
                     }
                 }
             }
+            // Persist the record at the last moment before the order that will
+            // reference it: research_records only ever holds order-linked rows.
+            if c["record"]["id"].is_string() {
+                self.db.save_record(&c["record"]).await?;
+            }
             let input = json!({"recordId":c["record"]["id"],"symbol":c["symbol"],"strategyId":c["strategy"]["id"],"automatic":true,"margin":margin,"autoMarginPct":margin_pct,"leverage":leverage,"executionPlan":strategies::execution_plan(signal)});
             match crate::paper::submit(&self.db, &self.store, &input).await {
                 Ok(order) => {
@@ -1188,6 +1207,11 @@ impl Automation {
                 Err(e) => {
                     errors.push(format!("{}: {e}", c["symbol"]));
                     execution.push(execution_skip(c, &e.to_string()));
+                    // Submission failed before any order referenced the record:
+                    // remove it again (atomic guard in case an order appeared).
+                    if let Some(id) = c["record"]["id"].as_str() {
+                        let _ = self.db.delete_record_if_unreferenced(id).await;
+                    }
                 }
             }
         }
@@ -1304,7 +1328,7 @@ impl Automation {
                 }
             };
             if proposal["action"] == "CLOSE" && order["status"] == "open" {
-                if let Err(e) = crate::paper::close(&self.db, &self.store, id).await {
+                if let Err(e) = crate::paper::close_for_review(&self.db, &self.store, id).await {
                     errors.push(format!("{symbol}: {e}"));
                 } else {
                     reviewed += 1;

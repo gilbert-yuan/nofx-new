@@ -230,6 +230,155 @@ async fn verify_pool_contract(options: &PgConnectOptions) -> Result<()> {
     Ok(())
 }
 
+/// The close path reconciles durable execution intents through targeted prefix reads and
+/// writes; verify they round-trip exactly like the whole-account path writes them, that a
+/// replace fully overwrites, and that neighboring intents stay independent.
+async fn verify_manual_execution_round_trip(options: &PgConnectOptions) -> Result<()> {
+    let db = Db::connect_with(
+        options.clone(),
+        PoolConfig {
+            max_connections: 4,
+            min_connections: 1,
+            ..PoolConfig::default()
+        },
+    )
+    .await
+    .context("create round-trip test pool")?;
+    let key = "nofx-execution:demo:ROUNDTRIPUSDT:BOTH";
+    assert!(
+        db.manual_execution(key).await?.is_null(),
+        "an absent intent must read as null"
+    );
+    let intent = json!({
+        "key": key,
+        "id": "action-1",
+        "accountKey": "abc",
+        "status": "submitting",
+        "quantity": 12.5,
+        "remainingBefore": 12.5,
+        "clientOrderId": "cid-1",
+        "createdAt": iso(now_ms()),
+        "nested": {"deep": [1, 2, {"flag": true}]}
+    });
+    db.put_manual_execution(key, &intent).await?;
+    let stored = db.manual_execution(key).await?;
+    assert_eq!(stored["id"], "action-1");
+    assert_eq!(stored["status"], "submitting");
+    assert_eq!(stored["quantity"], 12.5);
+    assert_eq!(stored["clientOrderId"], "cid-1");
+    assert_eq!(stored["nested"]["deep"][2]["flag"], true);
+    // A replace must fully overwrite the previous intent, not merge into it.
+    let updated = json!({
+        "key": key,
+        "id": "action-1",
+        "accountKey": "abc",
+        "status": "filled",
+        "executedQty": 12.5,
+        "avgPrice": 1.25
+    });
+    db.put_manual_execution(key, &updated).await?;
+    let replaced = db.manual_execution(key).await?;
+    assert_eq!(replaced["status"], "filled");
+    assert_eq!(replaced["executedQty"], 12.5);
+    assert!(
+        replaced["clientOrderId"].is_null(),
+        "stale fields must not survive a replace: {replaced}"
+    );
+    // The full-account read must observe the same rows the targeted write produced.
+    let state = db.account(true, None).await?;
+    assert_eq!(state["manualExecutions"][key]["status"], "filled");
+    assert_eq!(state["manualExecutions"][key]["avgPrice"], 1.25);
+    // A neighboring intent must coexist without disturbing this one.
+    let other = format!("{key}-2");
+    db.put_manual_execution(&other, &json!({"key": other, "status": "submitting"}))
+        .await?;
+    assert_eq!(db.manual_execution(key).await?["status"], "filled");
+    assert_eq!(db.manual_execution(&other).await?["status"], "submitting");
+    // Exact-path snapshot reads decode the two fields the close validates without
+    // hydrating the ~22k accumulated metric rows the full environment subtree carries.
+    let before = db.account(false, None).await?;
+    let previous = before["exchangeAccounts"].get("demo").cloned();
+    db.mutate_account_light(|state| {
+        state["exchangeAccounts"]["demo"]["enabled"] = json!(true);
+        state["exchangeAccounts"]["demo"]["accountKey"] = json!("probe-account-key");
+        Ok(Value::Null)
+    })
+    .await?;
+    let (enabled, key) = db.exchange_snapshot_key("demo").await?;
+    assert!(enabled);
+    assert_eq!(key, "probe-account-key");
+    // Restore the environment: this helper runs before the HTTP contract checks against
+    // the same database, and leaving an enabled exchange descendant with no credentials
+    // drops syncReady, which makes every later order creation fail with 422.
+    db.mutate_account_light(|state| {
+        match previous.as_ref().and_then(Value::as_object) {
+            Some(previous) => {
+                let demo = state["exchangeAccounts"]["demo"]
+                    .as_object_mut()
+                    .expect("demo subtree");
+                for field in ["enabled", "accountKey"] {
+                    if let Some(value) = previous.get(field) {
+                        demo.insert((*field).to_owned(), value.clone());
+                    } else {
+                        demo.remove(field);
+                    }
+                }
+            }
+            None => {
+                state["exchangeAccounts"]
+                    .as_object_mut()
+                    .expect("exchange subtree")
+                    .remove("demo");
+            }
+        }
+        Ok(Value::Null)
+    })
+    .await?;
+    let restored = db.account(false, None).await?;
+    for field in ["enabled", "accountKey"] {
+        assert_eq!(
+            restored["exchangeAccounts"]["demo"][field], before["exchangeAccounts"]["demo"][field],
+            "{field} residue would change later contract checks"
+        );
+    }
+    db.pool.close().await;
+    Ok(())
+}
+
+/// An order-scoped mutate that changes a mapped field must not renumber the archive:
+/// project() derives order_position from the hydrated array index, which is 0 for a
+/// single-order read, so the persisted positions have to be restored before the diff.
+async fn verify_order_scoped_writes(db: &Db) -> Result<()> {
+    db.mutate_account(|state| {
+        state["orders"] = json!([
+            {"id": "probe-order-a", "symbol": "PROBEUSDT", "status": "open"},
+            {"id": "probe-order-b", "symbol": "PROBEUSDT", "status": "open"}
+        ]);
+        Ok(Value::Null)
+    })
+    .await?;
+    db.mutate_order("probe-order-b", |state| {
+        state["orders"][0]["error"] = json!("probe");
+        Ok(Value::Null)
+    })
+    .await?;
+    let positions: Vec<(String, i32)> = sqlx::query_as(
+        "SELECT order_id,order_position FROM simulated_orders WHERE account_id=1 ORDER BY order_position",
+    )
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(
+        positions,
+        vec![
+            ("probe-order-a".to_owned(), 0),
+            ("probe-order-b".to_owned(), 1)
+        ]
+    );
+    let stored = db.account(false, None).await?;
+    assert_eq!(stored["orders"][1]["error"], "probe");
+    Ok(())
+}
+
 async fn run(options: &PgConnectOptions) -> Result<()> {
     verify_pool_contract(options).await?;
     let root = tempfile::tempdir()?;
@@ -260,6 +409,7 @@ async fn run(options: &PgConnectOptions) -> Result<()> {
     .await?;
     assert_eq!(health["runtime"], "rust");
     assert_eq!(health["databasePool"]["config"]["maxConnections"], 4);
+    verify_manual_execution_round_trip(options).await?;
     let pool = request(
         &client,
         &base,
@@ -626,6 +776,7 @@ async fn run(options: &PgConnectOptions) -> Result<()> {
     assert!(initialized["fusedPoolStartedAt"].is_string());
     expected["fusedPoolStartedAt"] = initialized["fusedPoolStartedAt"].clone();
     assert_eq!(initialized, expected);
+    verify_order_scoped_writes(&db).await?;
     db.pool.close().await;
     drop(server);
     Ok(())
