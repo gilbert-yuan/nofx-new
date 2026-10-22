@@ -2,10 +2,10 @@
 /**
  * StrategiesView · 策略管理
  *
- * 多策略体系的前端入口（对应数据源 /api/strategies）：
- *   - 勾选参与自动化的策略（可多选，按优先级依次扫描）
- *   - 按分组编辑每个策略的量化参数（越界会被后端拒绝并回退默认值）
- *   - 单个策略参数一键恢复默认
+ * 当前趋势突破策略的前端入口（对应数据源 /api/strategies）：
+ *   - 启用或暂停自动化扫描
+ *   - 按分组编辑量化参数（越界会被后端拒绝并回退默认值）
+ *   - 参数一键恢复默认
  *
  * 关键语义：订单在下单时会**快照所属策略与参数**（analysisContext.strategyId /
  * strategyParams），之后持仓复核与逐根出场结算都只读订单上的这份快照 ——
@@ -13,7 +13,6 @@
  */
 import { ref, onMounted, computed } from 'vue';
 import { strategiesApi } from '../api/client.js';
-import IndicatorBacktest from './IndicatorBacktest.vue';
 
 const data = ref(null);
 const drafts = ref({});
@@ -23,7 +22,8 @@ const busy = ref({});
 const error = ref('');
 const notice = ref('');
 
-const strategies = computed(() => data.value?.strategies || []);
+const LIVE_ID = 'altcoin-trend-breakout-live-v1';
+const strategies = computed(() => (data.value?.strategies || []).filter((item) => item.id === LIVE_ID));
 const groupLabels = computed(() => data.value?.groupLabels || {});
 const enabledCount = computed(() => strategies.value.filter((s) => s.enabled).length);
 
@@ -37,10 +37,6 @@ function groupOf(item) {
     byGroup.get(key).push(spec);
   }
   return order.map((key) => ({ key, label: groupLabels.value[key] || key, specs: byGroup.get(key) }));
-}
-
-function draft(item) {
-  return drafts.value[item.id] || item.params;
 }
 
 function isDirty(item) {
@@ -89,8 +85,8 @@ async function load() {
 const toggle = (item) => guard(item.id, async () => {
   notice.value = '';
   const res = await strategiesApi.update(item.id, { enabled: !item.enabled });
-  applyStrategy(res.strategy);
-  notice.value = `${res.strategy.name} 已${res.strategy.enabled ? '加入' : '移出'}自动化扫描（当前启用 ${enabledCount.value} 个）。`;
+  applyStrategy(res);
+  notice.value = `${res.name} 已${res.enabled ? '启用' : '暂停'}自动化扫描。`;
 });
 
 /** 只提交改过的参数：没动的项不进落盘文件，避免 data/strategies.json 被默认值塞满 */
@@ -105,7 +101,7 @@ function dirtyParams(item) {
 const save = (item) => guard(item.id, async () => {
   notice.value = '';
   const res = await strategiesApi.update(item.id, { params: dirtyParams(item) });
-  applyStrategy(res.strategy);
+  applyStrategy(res);
   if (res.rejected?.length) {
     error.value = `${item.name} 有 ${res.rejected.length} 项参数越界已被回退默认值：`
       + res.rejected.map((r) => `${r.key}（${r.reason}）`).join('；');
@@ -117,7 +113,7 @@ const save = (item) => guard(item.id, async () => {
 const reset = (item) => guard(item.id, async () => {
   notice.value = '';
   const res = await strategiesApi.reset(item.id);
-  applyStrategy(res.strategy);
+  applyStrategy(res);
   notice.value = `${item.name} 参数已恢复默认值。`;
 });
 
@@ -127,10 +123,10 @@ const saveNotes = (item) => guard(item.id, async () => {
   if (!notesDirty(item)) return;
   notice.value = '';
   const res = await strategiesApi.update(item.id, { notes: notesDrafts.value[item.id] ?? '' });
-  applyStrategy(res.strategy);
-  notice.value = res.strategy.notes
-    ? `${res.strategy.name} 备注已保存：${res.strategy.notes}`
-    : `${res.strategy.name} 备注已清除。`;
+  applyStrategy(res);
+  notice.value = res.notes
+    ? `${res.name} 备注已保存：${res.notes}`
+    : `${res.name} 备注已清除。`;
 });
 
 const discard = (item) => { drafts.value = { ...drafts.value, [item.id]: { ...item.params } }; };
@@ -145,9 +141,9 @@ onMounted(() => { load().catch((e) => { error.value = e.message; }); });
         <span class="eyebrow">STRATEGIES</span>
         <h2>策略管理</h2>
         <p>
-          勾选参与自动化的策略（可多选）。勾选后自动化会按优先级依次用这些策略扫描全市场；
-          <strong>每个订单在下单时记录自己所属的策略与参数</strong>，之后持仓复核与出场结算
-          （移动止损 / 智能退出 / 分批止盈）均按该订单自己的策略规则执行。
+          配置当前山寨趋势突破策略的扫描开关与参数。
+          <strong>每个订单在下单时记录策略与参数</strong>，已有订单按各自快照复核保护和出场；
+          新参数在后续扫描生效。
         </p>
       </div>
     </div>
@@ -157,7 +153,7 @@ onMounted(() => { load().catch((e) => { error.value = e.message; }); });
 
     <section v-if="data" class="history-panel strategies-panel">
       <div class="section-head">
-        <h3>策略清单</h3>
+        <h3>当前策略</h3>
         <span class="muted">启用 {{ enabledCount }} / {{ strategies.length }}</span>
       </div>
 
@@ -168,8 +164,6 @@ onMounted(() => { load().catch((e) => { error.value = e.message; }); });
             <span class="strategy-name">{{ item.name }}</span>
           </label>
           <div class="strategy-tags">
-            <span class="tag">引擎 {{ item.engine }}</span>
-            <span class="tag">优先级 {{ item.engine === 'ai' ? '—' : item.priority }}</span>
             <span v-if="item.builtin" class="tag tag-soft">内置</span>
             <span v-if="item.needsAux?.length" class="tag tag-soft">需辅助周期 {{ item.needsAux.join('/') }}</span>
           </div>
@@ -194,7 +188,7 @@ onMounted(() => { load().catch((e) => { error.value = e.message; }); });
           <span class="notes-hint">{{ notesDirty(item) ? '回车或失焦保存' : '仅作说明，不影响任何计算' }}</span>
         </div>
 
-        <p class="muted strategy-id">ID <code>{{ item.id }}</code> · 模型 <code>{{ item.modelId }}</code> · 参数 {{ item.paramSchema.length }} 项</p>
+        <p class="muted strategy-id">ID <code>{{ item.id }}</code> · 参数 {{ item.paramSchema.length }} 项</p>
 
         <div class="strategy-actions">
           <button class="ghost" @click="expanded = { ...expanded, [item.id]: !expanded[item.id] }">
@@ -233,7 +227,6 @@ onMounted(() => { load().catch((e) => { error.value = e.message; }); });
             </div>
           </fieldset>
         </div>
-        <IndicatorBacktest v-if="expanded[item.id]" :strategy="item" :params="draft(item)" />
       </article>
 
       <p class="muted strategies-foot">

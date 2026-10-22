@@ -17,6 +17,9 @@ use tokio::sync::{Mutex, Semaphore};
 
 const SYNC_INTERVALS: [&str; 6] = ["1m", "5m", "15m", "1h", "4h", "1d"];
 
+#[path = "automation/altcoin_live.rs"]
+mod altcoin_live;
+
 fn record_market_error(
     errors: &mut Vec<String>,
     waiting: &mut Vec<Value>,
@@ -100,7 +103,7 @@ impl Automation {
             active: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             state: Mutex::new(
-                json!({"tasks":{"klineSync":{"enabled":true,"interval":6000,"lastRun":null,"running":false},"positionReview":{"enabled":true,"interval":1000,"lastRun":null,"running":false}},"stats":{"totalAnalyzed":0,"totalOrders":0,"totalReviews":0,"errors":[]},"opportunities":[],"opportunitiesAt":null,"analysisMeta":{"phase":"idle","asOf":null,"analyzed":0},"yaoCoins":[],"yaoCoinsAt":null,"yaoCoinError":""}),
+                json!({"tasks":{"klineSync":{"enabled":true,"interval":6000,"lastRun":null,"running":false},"positionReview":{"enabled":true,"interval":1000,"lastRun":null,"running":false}},"stats":{"totalAnalyzed":0,"totalOrders":0,"totalReviews":0,"errors":[]},"opportunities":[],"opportunitiesAt":null,"analysisMeta":{"phase":"idle","asOf":null,"analyzed":0}}),
             ),
             sync_gate: Semaphore::new(1),
             review_gate: Semaphore::new(1),
@@ -112,9 +115,6 @@ impl Automation {
     }
     pub async fn start(self: &Arc<Self>) -> Result<()> {
         let config = self.store.read("config").await?;
-        if crate::ml_execution::demo_enabled(&config) {
-            crate::ml_execution::validate_config(&config)?;
-        }
         let data_only = config["marketSync"]["dataOnly"] == true;
         if self.active.swap(true, Ordering::SeqCst) {
             return Ok(());
@@ -203,7 +203,6 @@ impl Automation {
         );
         state["uptime"] = json!(self.started.elapsed().as_secs_f64());
         state["databasePool"] = self.db.pool_status();
-        state["yaoCoinMeta"] = json!({"targetAmplitudePct":50,"asOf":state["yaoCoinsAt"],"total":state["yaoCoins"].as_array().map(Vec::len).unwrap_or(0),"evaluated":state["analysisMeta"]["marketReady"],"error":state["yaoCoinError"]});
         Ok(state)
     }
     pub async fn sync_status(&self) -> Result<Value> {
@@ -463,9 +462,6 @@ impl Automation {
     }
     async fn scan(&self, token: u64) -> Result<Value> {
         let config = self.store.read("config").await?;
-        if crate::ml_execution::demo_enabled(&config) {
-            return crate::ml_demo::scan(self, token, &config).await;
-        }
         let data_only = config["marketSync"]["dataOnly"] == true;
         let registry = strategies::list(&config, &self.store.read("strategies").await?);
         let enabled: Vec<Value> = registry["strategies"]
@@ -518,6 +514,15 @@ impl Automation {
         if self.generation.load(Ordering::SeqCst) != token {
             return Ok(json!({"cancelled":true,"sync":sync}));
         }
+        // Rank before the generic liquidity/adaptive screens so these safeguards
+        // can only narrow the strategy's declared historical-turnover universe.
+        let altcoin_universe = if enabled.iter().any(|s| s["id"] == altcoin_live::STRATEGY_ID) {
+            let ranked = altcoin_live::universe(&self.db, &contracts, now_ms()).await?;
+            self.state.lock().await["analysisMeta"]["altcoinUniverse"] = ranked.clone();
+            Some(ranked)
+        } else {
+            None
+        };
         let state = self.db.account(true, None).await?;
         let mut query = HashMap::new();
         query.insert("symbols".to_owned(), symbols.join(","));
@@ -556,7 +561,7 @@ impl Automation {
             let mut status = self.state.lock().await;
             status["analysisMeta"]["phase"] = json!("analyzing");
             status["analysisMeta"]["symbols"] = json!(symbols.len());
-            status["tasks"]["klineSync"]["progress"]["stage"] = json!("生成机会分析与妖币预测");
+            status["tasks"]["klineSync"]["progress"]["stage"] = json!("生成山寨突破机会分析");
         }
         let run_id = uuid::Uuid::new_v4().to_string();
         let mut candidates = vec![];
@@ -588,36 +593,8 @@ impl Automation {
                 prepared[symbol] = market.clone();
             }
         }
-        {
-            let mut predictions = strategies::yao_predictions(
-                &symbols.iter().map(|s| json!(s)).collect::<Vec<_>>(),
-                &prepared,
-                &ticker_map,
-                now_ms(),
-                &json!({}),
-            );
-            for prediction in predictions.as_array_mut().into_iter().flatten() {
-                let symbol = prediction["symbol"].as_str().unwrap_or("").to_owned();
-                let market = &prepared[&symbol];
-                prediction["dataAsOf"] = market["dataAsOf"].clone();
-                prediction["cacheOnly"] = json!(
-                    market["cacheOnly"] == true
-                        || !ticker_available
-                        || timestamp(&market["dataAsOf"])
-                            != Some(research::candle_open(now_ms(), "1m")?)
-                );
-                prediction["indicators"] = crate::market_indicators::summarize(
-                    &json!({"symbol":symbol}),
-                    market,
-                    now_ms(),
-                );
-            }
-            let mut status = self.state.lock().await;
-            status["yaoCoins"] = predictions;
-            status["yaoCoinsAt"] = json!(iso(now_ms()));
-            status["yaoCoinError"] = json!("");
-            status["analysisMeta"]["marketReady"] = json!(prepared.as_object().unwrap().len());
-        }
+        self.state.lock().await["analysisMeta"]["marketReady"] =
+            json!(prepared.as_object().unwrap().len());
         for (index, (symbol, main)) in markets.into_iter().enumerate() {
             if self.generation.load(Ordering::SeqCst) != token {
                 break;
@@ -646,6 +623,15 @@ impl Automation {
             let mut shared_indicators = None;
             for strategy in &enabled {
                 let id = strategy["id"].as_str().unwrap();
+                if id == altcoin_live::STRATEGY_ID
+                    && !altcoin_universe.as_ref().is_some_and(|u| {
+                        u["symbols"]
+                            .as_array()
+                            .is_some_and(|s| s.iter().any(|s| s == &symbol))
+                    })
+                {
+                    continue;
+                }
                 let config = self.store.read("config").await?;
                 let mut context = json!({"params":strategy["params"],"config":config,"state":state,"costs":research::costs(),"auxMarkets":{},"planInterval":strategy["planInterval"],"skillContext":{"requireFiveMinute":strategy["marketContext"]["requireFiveMinute"]}});
                 let mut incomplete = false;
@@ -840,13 +826,13 @@ impl Automation {
                 let record = if data_only {
                     json!({"id":null,"at":iso(now)})
                 } else {
-                    let scope =
-                        json!({"interval":plan_interval,"limit":80,"engine":strategy["engine"]});
-                    let mut legacy = self.store.read("strategy").await?;
-                    legacy["interval"] = json!(plan_interval);
+                    let window = plan_market["klines"].as_array().map_or(0, Vec::len);
+                    let scope = json!({"interval":plan_interval,"limit":window,"engine":strategy["engine"]});
+                    let declaration = json!({"name":strategy["name"],
+                        "interval":plan_interval,"klineLimit":window});
                     let mut record = research::create_record(
                         &config,
-                        &legacy,
+                        &declaration,
                         &[plan_market.clone()],
                         &[signal.clone()],
                         &scope,
@@ -898,12 +884,11 @@ impl Automation {
                 candidate["signal"]["opportunityReport"] = report;
             }
         }
-        // Collect extended metrics for a bounded union of opportunity and prediction candidates.
+        // Collect extended metrics for a bounded set of current opportunities.
         // Baseline confirmation and execution guards continue to cover every eligible candidate.
-        let predictions = self.state.lock().await["yaoCoins"].clone();
         let indicator_limit =
             env_num("NOFX_INDICATOR_SYMBOLS_PER_CYCLE", 30.).clamp(0., 50.) as usize;
-        let targets = indicator_symbols(&selected, &predictions, indicator_limit);
+        let targets = indicator_symbols(&selected, indicator_limit);
         {
             let mut status = self.state.lock().await;
             status["analysisMeta"]["phase"] = json!("enriching");
@@ -967,21 +952,9 @@ impl Automation {
         }
         {
             let mut status = self.state.lock().await;
-            for prediction in status["yaoCoins"].as_array_mut().into_iter().flatten() {
-                let symbol = prediction["symbol"].as_str().unwrap_or("").to_owned();
-                if let Some(raw) = contexts.get(&symbol) {
-                    let indicators =
-                        crate::market_indicators::summarize(raw, &prepared[&symbol], now_ms());
-                    prediction["evidence"] = json!(crate::market_indicators::evidence(
-                        &indicators,
-                        prediction["direction"] == "UP"
-                    ));
-                    prediction["indicators"] = indicators;
-                }
-            }
             status["analysisMeta"]["indicators"] = json!({"requested":targets.len(),"collected":contexts.len(),"symbolLimit":indicator_limit,"timeLimitSeconds":15,"mode":"advisory","asOf":iso(now_ms())});
         }
-        // Also retain prediction-only samples, with their actual availability times.
+        // Retain the samples with their actual availability times.
         for (symbol, raw) in &contexts {
             self.db
                 .save_indicator_samples(symbol, &crate::indicator_history::samples(raw))
@@ -1228,13 +1201,7 @@ impl Automation {
         )
     }
     async fn review(&self) -> Result<Value> {
-        let ml_only = crate::ml_execution::demo_enabled(&self.store.read("config").await?);
-        if ml_only {
-            crate::paper::refresh_strategy(&self.db, &self.store, crate::ml_execution::STRATEGY_ID)
-                .await?;
-        } else {
-            crate::paper::refresh(&self.db, &self.store).await?;
-        }
+        crate::paper::refresh(&self.db, &self.store).await?;
         let snapshot = self.db.account(true, None).await?;
         let orders = snapshot["orders"].as_array().unwrap();
         let mut reviewed = 0;
@@ -1242,7 +1209,6 @@ impl Automation {
         for order in orders
             .iter()
             .filter(|o| o["status"] == "pending" || o["status"] == "open")
-            .filter(|o| !ml_only || crate::ml_execution::is_model_order(o))
         {
             let id = order["id"].as_str().unwrap();
             let symbol = order["symbol"].as_str().unwrap_or("");
@@ -1250,19 +1216,23 @@ impl Automation {
             let strategy_id = order["analysisContext"]["strategyId"]
                 .as_str()
                 .or(order["strategyId"].as_str())
-                .unwrap_or("enhanced-trend-v1");
-            let Some(def) = strategies::definition(strategy_id) else {
-                errors.push(format!("{symbol}: 未知订单策略 {strategy_id}"));
-                continue;
+                .unwrap_or("");
+            let def = review_definition(order, strategy_id);
+            let market = match research::fresh_market(
+                &self.db,
+                &self.market,
+                symbol,
+                interval,
+                review_market_window(order, &def, interval, false),
+            )
+            .await
+            {
+                Ok(m) => m,
+                Err(e) => {
+                    errors.push(format!("{symbol}: {e}"));
+                    continue;
+                }
             };
-            let market =
-                match research::fresh_market(&self.db, &self.market, symbol, interval, 80).await {
-                    Ok(m) => m,
-                    Err(e) => {
-                        errors.push(format!("{symbol}: {e}"));
-                        continue;
-                    }
-                };
             let mut context = json!({"params":order["analysisContext"]["strategyParams"],"auxMarkets":{},"costs":order["costs"]});
             context["planInterval"] = def["planInterval"].clone();
             context["skillContext"] =
@@ -1279,7 +1249,7 @@ impl Automation {
                     &self.market,
                     symbol,
                     aux,
-                    number(&def["marketWindows"][aux], 80.).clamp(30., 1000.) as usize,
+                    review_market_window(order, &def, aux, true),
                 )
                 .await
                 {
@@ -1294,16 +1264,7 @@ impl Automation {
                 continue;
             }
             let now = now_ms();
-            if strategy_id == crate::ml_execution::STRATEGY_ID && order["status"] == "pending" {
-                let (status, prediction) = crate::ml_gateway::Gateway::from_env()?
-                    .request("POST", "/api/ml/pipeline", &json!({"symbol":symbol}))
-                    .await;
-                if !status.is_success() {
-                    errors.push(format!("{symbol}: {}", prediction["error"]));
-                    continue;
-                }
-                context["mlPrediction"] = prediction;
-            }
+            context["evaluationAt"] = json!(iso(now));
             if order["status"] == "pending"
                 && crate::market_filters::needs_remote(&context["params"])
             {
@@ -1328,6 +1289,34 @@ impl Automation {
                 }
             };
             if proposal["action"] == "CLOSE" && order["status"] == "open" {
+                if order["plan"]["altcoinTrend"].is_object() {
+                    let accepted = self
+                        .db
+                        .mutate_account_light(|state| {
+                            let accepted = state["orders"]
+                                .as_array_mut()
+                                .into_iter()
+                                .flatten()
+                                .find(|o| o["id"] == id && o["status"] == "open")
+                                .is_some_and(|o| {
+                                    if !persist_altcoin_review_state(o, &proposal, now) {
+                                        return false;
+                                    }
+                                    let mut report = proposal.clone();
+                                    report["at"] = json!(iso(now));
+                                    history(o, report);
+                                    true
+                                });
+                            Ok(json!({"accepted":accepted}))
+                        })
+                        .await?;
+                    if accepted["accepted"] != true {
+                        errors.push(format!(
+                            "{symbol}: 4h 退出复核状态已过期或无效，等待重新复核"
+                        ));
+                        continue;
+                    }
+                }
                 if let Err(e) = crate::paper::close_for_review(&self.db, &self.store, id).await {
                     errors.push(format!("{symbol}: {e}"));
                 } else {
@@ -1554,30 +1543,16 @@ fn select_candidates(candidates: &[Value]) -> Vec<Value> {
     }
     selected.into_values().collect()
 }
-fn indicator_symbols(selected: &[Value], predictions: &Value, limit: usize) -> Vec<String> {
+fn indicator_symbols(selected: &[Value], limit: usize) -> Vec<String> {
     if limit == 0 {
         return vec![];
     }
     let mut symbols = vec![];
-    for candidate in selected
-        .iter()
-        .filter(|c| c["signal"]["cacheOnly"] != true)
-        .take((limit * 2 / 3).max(1))
-    {
-        if let Some(symbol) = candidate["symbol"].as_str() {
-            symbols.push(symbol.to_owned());
-        }
-    }
-    for prediction in predictions
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|p| p["cacheOnly"] != true)
-    {
+    for candidate in selected.iter().filter(|c| c["signal"]["cacheOnly"] != true) {
         if symbols.len() >= limit {
             break;
         }
-        if let Some(symbol) = prediction["symbol"].as_str()
+        if let Some(symbol) = candidate["symbol"].as_str()
             && !symbols.iter().any(|s| s == symbol)
         {
             symbols.push(symbol.to_owned());
@@ -1608,6 +1583,9 @@ pub fn entry_guard_at(state: &Value, c: &Value, config: &Value, now: i64) -> Opt
     }
     if state["entriesPaused"] == true {
         return Some("开仓已暂停".into());
+    }
+    if let Some(reason) = altcoin_live::entry_block(state, c) {
+        return Some(reason);
     }
     let orders = state["orders"].as_array()?;
     let active: Vec<&Value> = orders
@@ -1650,6 +1628,90 @@ fn history(order: &mut Value, report: Value) {
         list.drain(..list.len() - 50);
     }
 }
+fn review_definition(order: &Value, strategy_id: &str) -> Value {
+    strategies::definition(strategy_id).unwrap_or_else(|| {
+        // Historical positions remain manageable from their frozen plans even
+        // after their entry algorithm is no longer registered.
+        if order["plan"]["altcoinTrend"].is_object() {
+            json!({"engine":"altcoin-trend","planInterval":"4h",
+                "needsAux":["4h"],"marketWindows":{"4h":1000}})
+        } else {
+            json!({"planInterval":order["interval"].as_str().unwrap_or("1m"),
+                "needsAux":[],"marketWindows":{}})
+        }
+    })
+}
+fn review_market_window(
+    order: &Value,
+    definition: &Value,
+    interval: &str,
+    auxiliary: bool,
+) -> usize {
+    let configured = if auxiliary {
+        number(&definition["marketWindows"][interval], 80.).clamp(30., 1000.) as usize
+    } else {
+        80
+    };
+    if interval != "4h"
+        || !(order["plan"]["altcoinTrend"].is_object() || definition["engine"] == "altcoin-trend")
+    {
+        return configured;
+    }
+    let frozen = &order["plan"]["altcoinTrend"]["parameters"];
+    let params = if frozen.is_object() {
+        frozen
+    } else {
+        &order["analysisContext"]["strategyParams"]
+    };
+    configured
+        .max(number(&definition["marketWindows"]["4h"], 180.) as usize)
+        .max(number(&definition["minBars"], 0.) as usize)
+        .max(number(&params["minBars"], 0.) as usize)
+        .max(number(&params["emaSlow"], 0.) as usize)
+        .max((number(&params["channelPeriod"], 0.) as usize).saturating_add(1))
+        .clamp(180, 1000)
+}
+
+fn persist_altcoin_review_state(order: &mut Value, proposal: &Value, now: i64) -> bool {
+    if !order["plan"]["altcoinTrend"].is_object() {
+        return false;
+    }
+    let state = &proposal["altcoinTrendState"];
+    let (Some(at), Some(entry)) = (
+        timestamp(&state["lastReviewAt"]),
+        timestamp(&order["entryAt"]),
+    ) else {
+        return false;
+    };
+    let high = number(&state["highestClose"], f64::NAN);
+    let low = number(&state["lowestClose"], f64::NAN);
+    let step = 14_400_000;
+    if at <= entry
+        || at > now.div_euclid(step) * step
+        || at.rem_euclid(step) != 0
+        || !high.is_finite()
+        || !low.is_finite()
+        || low <= 0.
+        || high < low
+    {
+        return false;
+    }
+    let previous = &order["altcoinTrendState"];
+    if let Some(previous_at) = timestamp(&previous["lastReviewAt"]) {
+        let previous_high = number(&previous["highestClose"], f64::NAN);
+        let previous_low = number(&previous["lowestClose"], f64::NAN);
+        if at < previous_at
+            || (previous_high.is_finite() && high < previous_high)
+            || (previous_low.is_finite() && low > previous_low)
+            || (at == previous_at && (high != previous_high || low != previous_low))
+        {
+            return false;
+        }
+    }
+    order["altcoinTrendState"] = state.clone();
+    true
+}
+
 fn pending_grace_minutes(order: &Value, global: f64) -> f64 {
     order["plan"]["pendingGraceMinutes"]
         .as_f64()
@@ -1712,6 +1774,16 @@ pub fn apply_protection(
 ) -> Result<()> {
     let mut report = proposal.clone();
     report["at"] = json!(iso(now));
+    let altcoin = order["plan"]["altcoinTrend"].is_object();
+    if altcoin
+        && (proposal["altcoinTrendState"].is_object() || proposal["action"] == "UPDATE_PROTECTION")
+        && !persist_altcoin_review_state(order, proposal, now)
+    {
+        report["action"] = json!("HOLD");
+        report["reason"] = json!("4h 复核状态已过期或无效，保留当前保护与收盘极值");
+        history(order, report);
+        return Ok(());
+    }
     if proposal["action"] == "UPDATE_PROTECTION" {
         let long = order["direction"] == "OPEN_LONG";
         let price = market["klines"]
@@ -1720,22 +1792,38 @@ pub fn apply_protection(
             .map(|r| number(&r["close"], 0.))
             .unwrap_or(0.);
         let stop = number(&proposal["stopLoss"], 0.);
-        let tp = number(&proposal["takeProfit"], 0.);
-        let old = strategies::tightest_stop(order, long);
-        if stop <= 0.
-            || tp <= 0.
-            || if long {
-                !(stop >= old && stop < price && tp > price)
+        let tp = number(
+            &proposal["takeProfit"],
+            if altcoin {
+                number(&order["plan"]["takeProfit"], 0.)
             } else {
-                !(stop <= old && stop > price && tp < price)
+                0.
+            },
+        );
+        let old = strategies::tightest_stop(order, long);
+        let target_enabled = !altcoin || order["plan"]["takeProfitEnabled"] != false;
+        if !stop.is_finite()
+            || !tp.is_finite()
+            || !price.is_finite()
+            || stop <= 0.
+            || tp <= 0.
+            || price <= 0.
+            || if long {
+                !(stop >= old && stop < price && (!target_enabled || tp > price))
+            } else {
+                !(stop <= old && stop > price && (!target_enabled || tp < price))
             }
         {
             report["action"] = json!("HOLD");
             report["reason"] = json!("保护价格无效或止损松动，保留当前保护价");
         } else {
             let interval = order["interval"].as_str().unwrap_or("1m");
-            let effective = research::candle_open(now, interval)?
-                + interval_ms(interval).context("无效周期")?;
+            let effective = if altcoin {
+                timestamp(&order["altcoinTrendState"]["lastReviewAt"])
+                    .context("缺少已收盘 4h 复核时间")?
+            } else {
+                research::candle_open(now, interval)? + interval_ms(interval).context("无效周期")?
+            };
             report["previous"] = json!({"stopLoss":order["plan"]["stopLoss"],"takeProfit":order["plan"]["takeProfit"]});
             report["effectiveFrom"] = json!(effective);
             order["plan"]["stopLoss"] = json!(stop);
@@ -1743,9 +1831,15 @@ pub fn apply_protection(
             if !order["protectionRevisions"].is_array() {
                 order["protectionRevisions"] = json!([]);
             }
-            order["protectionRevisions"].as_array_mut().unwrap().push(
-                json!({"at":iso(now),"stopLoss":stop,"takeProfit":tp,"effectiveFrom":effective}),
-            );
+            let mut revision =
+                json!({"at":iso(now),"stopLoss":stop,"takeProfit":tp,"effectiveFrom":effective});
+            if altcoin {
+                revision["actualAt"] = json!(iso(now));
+            }
+            order["protectionRevisions"]
+                .as_array_mut()
+                .unwrap()
+                .push(revision);
         }
     }
     history(order, report);
@@ -1755,6 +1849,10 @@ pub fn apply_protection(
 #[cfg(test)]
 #[path = "automation/sync_tests.rs"]
 mod sync_tests;
+
+#[cfg(test)]
+#[path = "automation/altcoin_review_tests.rs"]
+mod altcoin_review_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1964,9 +2062,9 @@ mod tests {
     #[test]
     fn opportunity_cards_expose_confirmation_fields_to_the_frontend() {
         let now = now_ms();
-        let strategy = json!({"id":"enhanced-trend-v1","name":"增强趋势 v1"});
+        let strategy = json!({"id":strategies::ACTIVE_STRATEGY_ID,"name":"山寨趋势突破"});
         let market = json!({"symbol":"TESTUSDT","interval":"1m","klines":[{"close":100.}],"dataAsOf":iso(now)});
-        let signal = json!({"symbol":"TESTUSDT","action":"BUY","strategyId":"enhanced-trend-v1","confidence":0.8,"plan":{"entryMin":99.,"entryMax":101.,"entryLimit":100.,"stopLoss":95.,"takeProfit":110.}});
+        let signal = json!({"symbol":"TESTUSDT","action":"BUY","strategyId":strategies::ACTIVE_STRATEGY_ID,"confidence":0.8,"plan":{"entryMin":99.,"entryMax":101.,"entryLimit":100.,"stopLoss":95.,"takeProfit":110.}});
         let report = strategies::opportunity_report(&signal, &market, &json!({}), &strategy, now);
         let card = opportunity_card(&json!({"signal":{"opportunityReport":report},"record":{"id":"record-1","at":iso(now)}})).unwrap();
         assert_eq!(card["symbol"], "TESTUSDT");
@@ -1985,13 +2083,9 @@ mod tests {
             json!({"symbol":"BUSDT"}),
             json!({"symbol":"CUSDT","signal":{"cacheOnly":true}}),
         ];
-        let predictions = json!([{"symbol":"AUSDT"},{"symbol":"DUSDT","cacheOnly":true},{"symbol":"EUSDT"},{"symbol":"FUSDT"}]);
-        assert_eq!(
-            indicator_symbols(&selected, &predictions, 3),
-            vec!["AUSDT", "BUSDT", "EUSDT"]
-        );
-        assert!(indicator_symbols(&selected, &predictions, 0).is_empty());
-        assert_eq!(indicator_symbols(&selected, &predictions, 1), vec!["AUSDT"]);
+        assert_eq!(indicator_symbols(&selected, 3), vec!["AUSDT", "BUSDT"]);
+        assert!(indicator_symbols(&selected, 0).is_empty());
+        assert_eq!(indicator_symbols(&selected, 1), vec!["AUSDT"]);
     }
     #[test]
     fn sync_covers_standard_intervals_without_enabled_strategies() {

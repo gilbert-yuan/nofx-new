@@ -1,0 +1,47 @@
+{
+  "id": "A-ccb2c6805339",
+  "strategy": "altcoin-trend-breakout-v1",
+  "params": {
+    "channelPeriod": 10,
+    "emaFast": 10,
+    "emaSlow": 40,
+    "retestBandAtr": 0.25,
+    "retestBars": 3,
+    "stopAtr": 1.5,
+    "trailAtr": 4.0,
+    "useEmaFilter": true
+  },
+  "portfolio_policy": {
+    "leverage": 1,
+    "max_active": 3,
+    "max_notional_fraction": 0.5,
+    "max_same_direction": 2,
+    "risk_fraction": 0.003
+  },
+  "researchOnly": true,
+  "enabled": false,
+  "resolved_rules": {
+    "atrPeriod": 14,
+    "atrSmoothing": "Wilder",
+    "channelPeriod": 10,
+    "emaFast": 10,
+    "emaSlow": 40,
+    "entryExecution": "next_open",
+    "exitExecution": "next_open",
+    "interval": "4h",
+    "minBars": 180,
+    "retestBandAtr": 0.25,
+    "retestBars": 3,
+    "stopAtr": 1.5,
+    "trailAtr": 4.0,
+    "useEmaFilter": true
+  },
+  "selection_objective": "maximum net return; tie lower maximum drawdown then stable candidate id",
+  "selection_period": {
+    "end_ms": 1787990400000,
+    "label": "training",
+    "start_ms": 1782345600000
+  },
+  "source_report": "reports/altcoin-parameter-search-20261022.md",
+  "source_candidate_sha256": "70e9bcdb1579ab60153de6622d14d80d55d82891ac05f89667af772b799b588c"
+}

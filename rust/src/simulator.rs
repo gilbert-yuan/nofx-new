@@ -148,19 +148,39 @@ struct State {
     margin: f64,
     leverage: f64,
     costs: Costs,
+    // Explicit history opts into signed exchange settlements. Missing history
+    // retains the shared legacy estimate; an empty history means no settlements.
+    funding_history: Option<Vec<(i64, f64, f64)>>,
+    queued_close: Option<(i64, String)>,
     long: bool,
 }
 impl State {
     fn checkpoint(&self) -> Value {
-        json!({"nextTime":self.time,"entry":self.entry,"entryAt":self.entry_time.map(iso),
+        let mut value = json!({"nextTime":self.time,"entry":self.entry,"entryAt":self.entry_time.map(iso),
         "heldBars":self.held,"quantity":self.quantity,"entryFee":self.entry_fee,"liquidationPrice":self.liquidation,
         "markPrice":self.mark,"markAt":self.mark_at,"unrealized":self.unrealized,"tpStage":self.stage,"tpStopFloor":self.floor,
-        "realizedGross":self.gross,"realizedFee":self.fee,"realizedFunding":self.funding,"realizedNet":self.net,"realizedQty":self.realized_qty})
+        "realizedGross":self.gross,"realizedFee":self.fee,"realizedFunding":self.funding,"realizedNet":self.net,"realizedQty":self.realized_qty});
+        if self.plan["reanchorToFill"] == true {
+            value["plan"] = self.plan.clone();
+            value["initialPlan"] = self.initial.clone();
+        }
+        value
     }
     fn direction(&self) -> f64 {
         if self.long { 1. } else { -1. }
     }
     fn funding_for(&self, notional: f64, exit: i64) -> f64 {
+        if let Some(history) = &self.funding_history {
+            let Some(entry_at) = self.entry_time else {
+                return 0.;
+            };
+            let quantity = notional / self.entry.unwrap_or(1.);
+            return history
+                .iter()
+                .filter(|(at, _, _)| *at > entry_at && *at <= exit)
+                .map(|(_, rate, mark)| quantity * mark * rate * self.direction())
+                .sum();
+        }
         notional * self.costs.funding / 10000. * (exit - self.entry_time.unwrap_or(exit)) as f64
             / 28_800_000.
     }
@@ -223,6 +243,42 @@ fn state(input: &Value, config: &Value) -> Result<State> {
     };
     let ttl = n(config, "pendingOrderTtlMs", 86_400_000.);
     let ttl = if ttl > 0. { ttl as i64 } else { 86_400_000 };
+    let funding_history = if let Some(raw) = input.get("fundingHistory") {
+        let rows = raw.as_array().context("fundingHistory must be an array")?;
+        let mut parsed = Vec::with_capacity(rows.len());
+        let mut previous = None;
+        for row in rows {
+            let at = timestamp(&row["fundingTime"]).context("Invalid funding settlement time")?;
+            let rate = n(row, "fundingRate", f64::NAN);
+            let mark = n(row, "markPrice", f64::NAN);
+            if !rate.is_finite()
+                || !mark.is_finite()
+                || mark <= 0.
+                || previous.is_some_and(|last| at <= last)
+            {
+                bail!(
+                    "Funding history must have finite rates, positive marks and unique ascending times"
+                );
+            }
+            parsed.push((at, rate, mark));
+            previous = Some(at);
+        }
+        Some(parsed)
+    } else {
+        None
+    };
+    let queued_close = if input["pendingStrategyClose"].is_object() {
+        Some((
+            timestamp(&input["pendingStrategyClose"]["effectiveFrom"])
+                .context("Queued strategy close requires effectiveFrom")?,
+            input["pendingStrategyClose"]["reason"]
+                .as_str()
+                .unwrap_or("strategy_close")
+                .to_owned(),
+        ))
+    } else {
+        None
+    };
     Ok(State {
         plan: input["plan"].clone(),
         initial: input["initialPlan"].clone(),
@@ -257,6 +313,8 @@ fn state(input: &Value, config: &Value) -> Result<State> {
         },
         leverage,
         costs: Costs::from(costs),
+        funding_history,
+        queued_close,
         long,
     })
 }
@@ -304,6 +362,7 @@ pub fn normalize_close_reason(reason: &str) -> &str {
         | "smart_exit_rsi"
         | "smart_exit_macd"
         | "manual"
+        | "backtest_end"
         | "strategy_cancelled" => return reason,
         _ => {}
     }
@@ -370,6 +429,73 @@ fn settle(
         "gross":gross+s.gross,"fee":entry_fee+exit_fee+s.fee,"fees":entry_fee+exit_fee+s.fee,"fundingReserve":funding+s.funding,"funding":funding+s.funding,
         "net":net,"netReturn":net/s.notional,"roi":net/s.margin,"heldBars":s.held,"adverseReturnUpperBound":adverse,"isolatedLossAdjustment":net-raw,
         "ambiguousBar":ambiguous,"partialFills":s.stage})
+}
+
+// Queued exits use the same settlement arithmetic as every other exit.
+fn queued_open_result(
+    s: &State,
+    quote: (f64, f64),
+    reason: &str,
+    flags: (bool, bool),
+    adverse: f64,
+) -> Value {
+    let (open, mark_open) = quote;
+    let (liquidate, isolated) = flags;
+    let liquidated = liquidate
+        && s.liquidation.is_some_and(|level| {
+            if s.long {
+                mark_open <= level
+            } else {
+                mark_open >= level
+            }
+        });
+    let reason = if liquidated {
+        "liquidation"
+    } else if reason == "strategy_close" {
+        "strategy_close"
+    } else {
+        normalize_close_reason(reason)
+    };
+    merge(
+        s.checkpoint(),
+        settle(s, open, s.time, reason, false, adverse, isolated),
+    )
+}
+
+/// Execute a previously decided exit using only the quote available at this
+/// boundary. No future candle range is needed, so the shared account can release
+/// capital before considering a simultaneous replacement entry.
+pub fn close_queued_at_open(
+    input: &Value,
+    open: f64,
+    mark_open: Option<f64>,
+    at: i64,
+    config: &Value,
+) -> Result<Value> {
+    let mark = mark_open.unwrap_or(open);
+    if !open.is_finite() || open <= 0. || !mark.is_finite() || mark <= 0. {
+        bail!("Queued close requires a valid current quote");
+    }
+    let mut s = state(input, config)?;
+    let (effective, reason) = s.queued_close.clone().context("No queued strategy close")?;
+    if s.entry_time.is_none_or(|entry| at < entry) || at < effective {
+        bail!("Queued close is not effective or position is unfilled");
+    }
+    s.time = at;
+    let account = config["mode"] == "account";
+    let mut result = queued_open_result(
+        &s,
+        (open, mark),
+        &reason,
+        (
+            flag(config, "enableLiquidation", account),
+            flag(config, "enableIsolatedMargin", account),
+        ),
+        0.,
+    );
+    result["unrealized"] = json!(0.);
+    result["error"] = json!("");
+    Ok(result)
 }
 
 /// Force an existing position closed at the current mark (manual / strategy review / backtest end).
@@ -501,12 +627,108 @@ pub fn evaluate(input: &Value, rows: &[Value], now: i64, config: &Value) -> Resu
         let high = n(row, "high", 0.);
         let low = n(row, "low", 0.);
         let close = n(row, "close", 0.);
-        let stop = n(&p, "stopLoss", f64::NAN);
-        let target = n(&p, "takeProfit", f64::NAN);
+        let mut stop = n(&p, "stopLoss", f64::NAN);
+        let target = if flag(&p, "takeProfitEnabled", true) {
+            n(&p, "takeProfit", f64::NAN)
+        } else if s.long {
+            f64::INFINITY
+        } else {
+            0.
+        };
+        // A valid directional mark extreme explicitly opts into the separate
+        // mark-price path. Older trade-only fixtures retain their old priority.
+        let mark_extreme = row
+            .get(if s.long { "markLow" } else { "markHigh" })
+            .map(|value| number(value, f64::NAN))
+            .filter(|value| value.is_finite() && *value > 0.);
+        let mark_path = mark_extreme.is_some();
+        let mark_open = if mark_path {
+            n(row, "markOpen", open)
+        } else {
+            open
+        };
+        if s.entry.is_some()
+            && let Some((effective, reason)) = &s.queued_close
+            && *effective <= s.time
+        {
+            let mark_open = n(row, "markOpen", open);
+            return Ok(queued_open_result(
+                &s,
+                (open, mark_open),
+                reason,
+                (liquidate, isolated),
+                adverse,
+            ));
+        }
+        if s.entry.is_some() && (s.funding_history.is_some() || mark_path) {
+            let opening_stop = if let Some(floor) = s.floor.filter(|value| *value > 0.) {
+                if s.long {
+                    stop.max(floor)
+                } else {
+                    stop.min(floor)
+                }
+            } else {
+                stop
+            };
+            let open_liquidated = liquidate
+                && s.liquidation.is_some_and(|level| {
+                    if s.long {
+                        mark_open <= level
+                    } else {
+                        mark_open >= level
+                    }
+                });
+            let open_stopped = if s.long {
+                open <= opening_stop
+            } else {
+                open >= opening_stop
+            };
+            let open_target = if s.long {
+                open >= target
+            } else {
+                open <= target
+            };
+            let reason = if open_liquidated {
+                Some("liquidation")
+            } else if open_stopped {
+                Some(stop_reason(
+                    &s,
+                    opening_stop,
+                    if partial.breakeven {
+                        s.entry.unwrap() * be_bps / 10000.
+                    } else {
+                        0.
+                    },
+                ))
+            } else if open_target {
+                Some(if s.stage > 0 {
+                    "partial_take_profit"
+                } else {
+                    "take_profit"
+                })
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                // Opening events precede this candle's unknown range. In the
+                // historical-funding path an exit at this quote cannot pay or
+                // receive a settlement even one millisecond after the open.
+                let exit_at = if s.funding_history.is_some() || open_liquidated && mark_path {
+                    s.time
+                } else {
+                    end
+                };
+                let result = settle(&s, open, exit_at, reason, false, adverse, isolated);
+                s.time = end;
+                return Ok(merge(s.checkpoint(), result));
+            }
+        }
         if s.entry.is_none() {
             let limit = n(&p, "entryLimit", f64::NAN);
             let is_limit = p["entryStyle"] != "market" && limit.is_finite() && limit > 0.;
-            let touched = if is_limit {
+            let touched = if p["reanchorToFill"] == true && p["entryExecution"] == "next_open" {
+                open.is_finite() && open > 0.
+            } else if is_limit {
                 if s.long { low <= limit } else { high >= limit }
             } else {
                 open >= n(&p, "entryMin", f64::NAN) && open <= n(&p, "entryMax", f64::NAN)
@@ -514,15 +736,32 @@ pub fn evaluate(input: &Value, rows: &[Value], now: i64, config: &Value) -> Resu
             if touched {
                 let price = (if is_limit { limit } else { open })
                     * (1. + s.direction() * s.costs.slip / 10000.);
-                if if s.long {
-                    price > stop && price < target
-                } else {
-                    price < stop && price > target
-                } {
+                if (p["reanchorToFill"] == true && p["entryExecution"] == "next_open")
+                    || if s.long {
+                        price > stop && price < target
+                    } else {
+                        price < stop && price > target
+                    }
+                {
                     s.entry = Some(price);
                     s.entry_time = Some(s.time);
                     s.quantity = s.notional / price;
                     s.entry_fee = s.notional * s.costs.fee / 10000.;
+                    if p["reanchorToFill"] == true {
+                        let risk = n(&p, "riskUnit", 0.);
+                        if !risk.is_finite() || risk <= 0. {
+                            bail!("Fill-anchored stop requires a positive riskUnit");
+                        }
+                        stop = price - s.direction() * risk;
+                        if !stop.is_finite() || stop <= 0. {
+                            bail!("Fill-anchored stop must remain positive");
+                        }
+                        if !s.initial.is_object() {
+                            s.initial = s.plan.clone();
+                        }
+                        s.plan["stopLoss"] = json!(stop);
+                        s.initial["stopLoss"] = json!(stop);
+                    }
                     entry_via_limit = is_limit;
                     if liquidate && s.leverage > 1. {
                         s.liquidation =
@@ -559,7 +798,13 @@ pub fn evaluate(input: &Value, rows: &[Value], now: i64, config: &Value) -> Resu
             };
             let liq = liquidate
                 && s.liquidation
-                    .map(|p| if s.long { low <= p } else { high >= p })
+                    .map(|p| {
+                        if s.long {
+                            mark_extreme.unwrap_or(low) <= p
+                        } else {
+                            mark_extreme.unwrap_or(high) >= p
+                        }
+                    })
                     .unwrap_or(false);
             if levels.is_none() {
                 let risk = n(&s.plan, "riskUnit", 0.);
@@ -661,13 +906,20 @@ pub fn evaluate(input: &Value, rows: &[Value], now: i64, config: &Value) -> Resu
             let mut exit = None;
             if liq {
                 let price = s.liquidation.unwrap();
-                let beyond = if s.long { open <= price } else { open >= price };
+                let beyond = if s.long {
+                    mark_open <= price
+                } else {
+                    mark_open >= price
+                };
                 let stop_before = if s.long {
                     working > price
                 } else {
                     working < price
                 };
-                if beyond || !stop_before {
+                // A mark-only liquidation cannot be suppressed by an untouched
+                // trade-price stop. When both intrabar paths touch, retain the
+                // legacy stop-before geometry: OHLC cannot order those events.
+                if beyond || !stop_before || mark_path && !hit_stop {
                     exit = Some(("liquidation", if beyond { open } else { price }, hit_tp));
                 }
             }
@@ -758,7 +1010,17 @@ pub fn evaluate(input: &Value, rows: &[Value], now: i64, config: &Value) -> Resu
                 }
             }
             if let Some((reason, price, ambiguous)) = exit {
-                let result = settle(&s, price, end, reason, ambiguous, adverse, isolated);
+                let mark_open_liquidated = reason == "liquidation"
+                    && mark_path
+                    && s.liquidation.is_some_and(|level| {
+                        if s.long {
+                            mark_open <= level
+                        } else {
+                            mark_open >= level
+                        }
+                    });
+                let exit_at = if mark_open_liquidated { s.time } else { end };
+                let result = settle(&s, price, exit_at, reason, ambiguous, adverse, isolated);
                 s.time = end;
                 return Ok(merge(s.checkpoint(), result));
             }
@@ -778,6 +1040,275 @@ mod tests {
     fn row(t: i64, o: f64, h: f64, l: f64, c: f64) -> Value {
         json!({"openTime":t,"open":o,"high":h,"low":l,"close":c,"volume":1,"confirmed":true})
     }
+    #[test]
+    fn historical_funding_is_signed_and_uses_each_settlement_mark() {
+        for (long, expected) in [(true, -1.2), (false, 1.2)] {
+            let mut o = order();
+            o["fundingHistory"] = json!([
+                {"fundingTime":0,"fundingRate":0.9,"markPrice":100.},
+                {"fundingTime":60000,"fundingRate":0.001,"markPrice":100.},
+                {"fundingTime":180000,"fundingRate":-0.002,"markPrice":110.}
+            ]);
+            if !long {
+                o["direction"] = json!("OPEN_SHORT");
+                o["plan"]["stopLoss"] = json!(110.);
+                o["plan"]["takeProfit"] = json!(50.);
+            }
+            let opened = evaluate(
+                &o,
+                &[row(0, 100., 101., 99., 100.)],
+                60000,
+                &json!({"mode":"account"}),
+            )
+            .unwrap();
+            o.as_object_mut()
+                .unwrap()
+                .extend(opened.as_object().unwrap().clone());
+            let closed = close_order(
+                &o,
+                100.,
+                180000,
+                "strategy_close",
+                &json!({"mode":"account"}),
+            )
+            .unwrap();
+            assert!((n(&closed, "funding", 0.) - expected).abs() < 1e-9);
+            assert!((n(&closed, "net", 0.) + expected).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn explicit_empty_funding_disables_legacy_reserve_and_rejects_bad_history() {
+        let mut o = order();
+        o["costs"]["fundingBpsPer8h"] = json!(1000.);
+        o["fundingHistory"] = json!([]);
+        let opened = evaluate(
+            &o,
+            &[row(0, 100., 101., 99., 100.)],
+            60000,
+            &json!({"mode":"account"}),
+        )
+        .unwrap();
+        assert_eq!(opened["unrealized"], 0.);
+        o["fundingHistory"] = json!([{"fundingTime":60000,"fundingRate":0.001,"markPrice":0.}]);
+        assert!(evaluate(&o, &[], 0, &json!({})).is_err());
+        o["fundingHistory"] = json!([
+            {"fundingTime":60000,"fundingRate":0.001,"markPrice":100.},
+            {"fundingTime":60000,"fundingRate":0.001,"markPrice":100.}
+        ]);
+        assert!(evaluate(&o, &[], 0, &json!({})).is_err());
+    }
+
+    #[test]
+    fn fill_anchored_stop_and_disabled_target_survive_incremental_replay() {
+        let mut o = order();
+        o["leverage"] = json!(1.);
+        o["plan"]["reanchorToFill"] = json!(true);
+        o["plan"]["takeProfitEnabled"] = json!(false);
+        o["plan"]["entryMax"] = json!(130.);
+        let opened = evaluate(
+            &o,
+            &[row(0, 110., 150., 105., 120.)],
+            60000,
+            &json!({"mode":"account"}),
+        )
+        .unwrap();
+        assert_eq!(opened["status"], "open");
+        assert_eq!(opened["plan"]["stopLoss"], 100.);
+        assert_eq!(opened["initialPlan"]["riskUnit"], 10.);
+        o.as_object_mut()
+            .unwrap()
+            .extend(opened.as_object().unwrap().clone());
+        let closed = evaluate(
+            &o,
+            &[row(60000, 99., 101., 98., 100.)],
+            120000,
+            &json!({"mode":"account"}),
+        )
+        .unwrap();
+        assert_eq!(closed["reason"], "stop_loss");
+        assert_eq!(closed["exit"], 99.);
+    }
+
+    #[test]
+    fn queued_strategy_close_executes_at_next_open_before_intrabar_events() {
+        let mut o = order();
+        let opened = evaluate(
+            &o,
+            &[row(0, 100., 101., 99., 100.)],
+            60000,
+            &json!({"mode":"account"}),
+        )
+        .unwrap();
+        o.as_object_mut()
+            .unwrap()
+            .extend(opened.as_object().unwrap().clone());
+        o["pendingStrategyClose"] = json!({"effectiveFrom":60000,"reason":"strategy_close"});
+        assert!(close_queued_at_open(&o, 97., None, 59999, &json!({"mode":"account"})).is_err());
+        let immediate =
+            close_queued_at_open(&o, 97., None, 60000, &json!({"mode":"account"})).unwrap();
+        assert_eq!(immediate["reason"], "strategy_close");
+        assert_eq!(immediate["exit"], 97.);
+        assert_eq!(immediate["unrealized"], 0.);
+        let closed = evaluate(
+            &o,
+            &[row(60000, 97., 145., 70., 100.)],
+            120000,
+            &json!({"mode":"account"}),
+        )
+        .unwrap();
+        assert_eq!(closed["reason"], "strategy_close");
+        assert_eq!(closed["exit"], 97.);
+        assert_eq!(timestamp(&closed["exitAt"]), Some(60000));
+    }
+
+    #[test]
+    fn mark_candle_can_trigger_liquidation_even_when_trade_candle_does_not() {
+        let mut o = order();
+        o["plan"]["stopLoss"] = json!(80.);
+        let mut r = row(0, 100., 101., 99., 100.);
+        r["markLow"] = json!(89.);
+        let closed = evaluate(&o, &[r], 60000, &json!({"mode":"account"})).unwrap();
+        assert_eq!(closed["reason"], "liquidation");
+    }
+
+    fn existing_position(long: bool, leverage: f64) -> Value {
+        let mut o = order();
+        o["direction"] = json!(if long { "OPEN_LONG" } else { "OPEN_SHORT" });
+        o["status"] = json!("open");
+        o["entry"] = json!(100.);
+        o["entryAt"] = json!(iso(0));
+        o["entryFee"] = json!(0.);
+        o["quantity"] = json!(10.);
+        o["heldBars"] = json!(1);
+        o["nextTime"] = json!(60000);
+        o["leverage"] = json!(leverage);
+        o["margin"] = json!(1000. / leverage);
+        o["plan"]["stopLoss"] = json!(if long { 95. } else { 105. });
+        o["plan"]["takeProfit"] = json!(if long { 140. } else { 60. });
+        o["plan"]["riskUnit"] = json!(5.);
+        o["initialPlan"] = o["plan"].clone();
+        if leverage > 1. {
+            o["liquidationPrice"] = json!(if long { 90.5 } else { 109.5 });
+        }
+        o
+    }
+
+    #[test]
+    fn historical_funding_excludes_settlements_after_an_existing_open_gap_stop() {
+        for long in [true, false] {
+            let mut o = existing_position(long, 1.);
+            o["fundingHistory"] = json!([
+                {"fundingTime":60001,"fundingRate":0.001,"markPrice":100.}
+            ]);
+            let open = if long { 90. } else { 110. };
+            // The later range crosses both protections; only the already
+            // observable opening stop determines this exit.
+            let r = row(60000, open, 150., 50., 100.);
+            let closed = evaluate(&o, &[r], 120000, &json!({"mode":"account"})).unwrap();
+            assert_eq!(closed["reason"], "stop_loss");
+            assert_eq!(closed["exit"], open);
+            assert_eq!(timestamp(&closed["exitAt"]), Some(60000));
+            assert_eq!(closed["funding"], 0.);
+        }
+    }
+
+    #[test]
+    fn historical_funding_keeps_end_of_bar_approximation_for_intrabar_stops() {
+        for long in [true, false] {
+            let mut o = existing_position(long, 1.);
+            o["fundingHistory"] = json!([
+                {"fundingTime":60001,"fundingRate":0.001,"markPrice":100.}
+            ]);
+            let r = if long {
+                row(60000, 100., 101., 94., 96.)
+            } else {
+                row(60000, 100., 106., 99., 104.)
+            };
+            let closed = evaluate(&o, &[r], 120000, &json!({"mode":"account"})).unwrap();
+            assert_eq!(closed["reason"], "stop_loss");
+            assert_eq!(timestamp(&closed["exitAt"]), Some(120000));
+            let expected = if long { 1. } else { -1. };
+            assert!((n(&closed, "funding", f64::NAN) - expected).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn historical_funding_open_target_fills_at_open_before_later_price_range() {
+        for long in [true, false] {
+            let mut o = existing_position(long, 1.);
+            o["fundingHistory"] = json!([
+                {"fundingTime":60001,"fundingRate":0.001,"markPrice":100.}
+            ]);
+            let open = if long { 150. } else { 50. };
+            let r = row(60000, open, 151., 49., 100.);
+            let closed = evaluate(&o, &[r], 120000, &json!({"mode":"account"})).unwrap();
+            assert_eq!(closed["reason"], "take_profit");
+            assert_eq!(closed["exit"], open);
+            assert_eq!(timestamp(&closed["exitAt"]), Some(60000));
+            assert_eq!(closed["funding"], 0.);
+        }
+    }
+
+    #[test]
+    fn mark_only_intrabar_liquidation_is_not_blocked_by_an_untouched_trade_stop() {
+        for long in [true, false] {
+            let o = existing_position(long, 10.);
+            let mut r = row(60000, 100., 101., 99., 100.);
+            r["markOpen"] = json!(100.);
+            r[if long { "markLow" } else { "markHigh" }] = json!(if long { 89. } else { 111. });
+            let closed = evaluate(&o, &[r], 120000, &json!({"mode":"account"})).unwrap();
+            assert_eq!(closed["reason"], "liquidation");
+            assert_eq!(closed["exit"], if long { 90.5 } else { 109.5 });
+            assert_eq!(timestamp(&closed["exitAt"]), Some(120000));
+        }
+    }
+
+    #[test]
+    fn mark_open_gap_liquidation_precedes_trade_protection_and_future_funding() {
+        for long in [true, false] {
+            let mut o = existing_position(long, 10.);
+            o["fundingHistory"] = json!([
+                {"fundingTime":60001,"fundingRate":0.001,"markPrice":100.}
+            ]);
+            let mut r = row(60000, 100., 150., 50., 100.);
+            r["markOpen"] = json!(if long { 89. } else { 111. });
+            r[if long { "markLow" } else { "markHigh" }] = json!(if long { 88. } else { 112. });
+            let closed = evaluate(&o, &[r], 120000, &json!({"mode":"account"})).unwrap();
+            assert_eq!(closed["reason"], "liquidation");
+            assert_eq!(closed["exit"], 100.);
+            assert_eq!(timestamp(&closed["exitAt"]), Some(60000));
+            assert_eq!(closed["funding"], 0.);
+        }
+    }
+
+    #[test]
+    fn simultaneous_intrabar_mark_and_trade_hits_retain_stop_before_geometry() {
+        for long in [true, false] {
+            let o = existing_position(long, 10.);
+            let mut r = if long {
+                row(60000, 100., 101., 94., 96.)
+            } else {
+                row(60000, 100., 106., 99., 104.)
+            };
+            r["markOpen"] = json!(100.);
+            r[if long { "markLow" } else { "markHigh" }] = json!(if long { 89. } else { 111. });
+            let closed = evaluate(&o, &[r], 120000, &json!({"mode":"account"})).unwrap();
+            assert_eq!(closed["reason"], "stop_loss");
+            assert_eq!(closed["exit"], if long { 95. } else { 105. });
+            assert_eq!(timestamp(&closed["exitAt"]), Some(120000));
+        }
+    }
+
+    #[test]
+    fn mark_open_without_directional_extreme_does_not_change_legacy_priority() {
+        let o = existing_position(true, 10.);
+        let mut r = row(60000, 100., 101., 99., 100.);
+        r["markOpen"] = json!(89.);
+        let output = evaluate(&o, &[r], 120000, &json!({"mode":"account"})).unwrap();
+        assert_eq!(output["status"], "open");
+    }
+
     #[test]
     fn smart_min_hold_delays_ma_exit_but_never_the_hard_stop() {
         let mut o = order();

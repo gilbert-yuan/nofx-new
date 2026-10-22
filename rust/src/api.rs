@@ -35,7 +35,6 @@ struct App {
     contracts: Mutex<(i64, Vec<Value>, String)>,
     analysis_gate: Semaphore,
     performance_gate: Semaphore,
-    monthly_ml: crate::ml_gateway::Gateway,
 }
 pub async fn serve(root: PathBuf, host: String, port: u16) -> Result<()> {
     let data = std::env::var("DATA_DIR").unwrap_or("data".into());
@@ -53,7 +52,6 @@ pub async fn serve(root: PathBuf, host: String, port: u16) -> Result<()> {
         contracts: Mutex::new((0, vec![], String::new())),
         analysis_gate: Semaphore::new(1),
         performance_gate: Semaphore::new(1),
-        monthly_ml: crate::ml_gateway::Gateway::from_env()?,
     });
     let cors = if let Ok(origin) = std::env::var("CORS_ORIGIN") {
         CorsLayer::new()
@@ -257,28 +255,6 @@ async fn dispatch(
     input: &Value,
 ) -> Result<(StatusCode, Value)> {
     match (method, path) {
-        ("GET", "/api/ml/health")
-        | ("GET", "/api/ml/models")
-        | ("POST", "/api/ml/signal" | "/api/ml/pipeline") => {
-            let (status, mut output) = app.monthly_ml.request(method, path, input).await;
-            if status.is_success() {
-                let config = app.store.read("config").await?;
-                if crate::ml_execution::demo_enabled(&config) {
-                    let account = app.db.account(true, None).await?;
-                    crate::ml_execution::describe(
-                        &mut output,
-                        &account,
-                        &config,
-                        now_ms(),
-                        app.automation.active(),
-                    );
-                } else {
-                    output["operating_mode"] = json!("research");
-                    output["research_mode"] = json!(true);
-                }
-            }
-            return Ok((status, output));
-        }
         ("GET", "/api/health") => {
             return ok(
                 json!({"ok":true,"name":"nofx-lite","runtime":"rust","version":env!("CARGO_PKG_VERSION"),"databasePool":app.db.pool_status()}),
@@ -299,15 +275,6 @@ async fn dispatch(
             }
             return ok(masked(&next));
         }
-        ("GET", "/api/strategy") => return ok(app.store.read("strategy").await?),
-        ("PUT", "/api/strategy") => {
-            let interval = input["interval"].as_str().unwrap_or("15m");
-            interval_ms(interval).context("不支持的周期")?;
-            let symbols = research::symbols(input);
-            let strategy = json!({"name":input["name"].as_str().unwrap_or("Binance strategy"),"symbols":if symbols.is_empty(){vec!["BTCUSDT".to_owned(),"ETHUSDT".to_owned()]}else{symbols},"interval":interval,"klineLimit":number(&input["klineLimit"],80.).clamp(20.,1000.),"systemPrompt":input["systemPrompt"].as_str().or(input["systemPrompt"]["content"].as_str()).unwrap_or(""),"rules":input["rules"].as_str().or(input["rules"]["content"].as_str()).or(input["rules"]["rules"].as_str()).unwrap_or("")});
-            app.store.write("strategy", &strategy).await?;
-            return ok(strategy);
-        }
         ("GET", "/api/strategies") => {
             return ok(strategies::list(
                 &app.store.read("config").await?,
@@ -320,17 +287,6 @@ async fn dispatch(
                 .try_acquire()
                 .map_err(|_| anyhow::anyhow!("409: 历史研究任务正在运行，请稍后重试"))?;
             return ok(crate::indicator_history::fetch(&app.db, &app.market, input).await?);
-        }
-        ("POST", "/api/research/backtest") => {
-            let _permit = app
-                .performance_gate
-                .try_acquire()
-                .map_err(|_| anyhow::anyhow!("409: 历史研究任务正在运行，请稍后重试"))?;
-            let config = app.store.read("config").await?;
-            let account = app.db.account(false, None).await?;
-            return ok(
-                crate::backtest::run(&app.db, input, &config, &account["adaptiveConfig"]).await?,
-            );
         }
         ("GET", "/api/market/symbols") => {
             let contracts = contracts(app, false).await?;
@@ -504,12 +460,6 @@ async fn dispatch(
             let state = app.automation.state.lock().await;
             return ok(
                 json!({"asOf":state["opportunitiesAt"],"analysis":state["analysisMeta"],"opportunities":state["opportunities"].as_array().unwrap().iter().take(qn(query,"limit",20.,1.,50.)as usize).collect::<Vec<_>>()}),
-            );
-        }
-        ("GET", "/api/automation/yao-coins") => {
-            let state = app.automation.state.lock().await;
-            return ok(
-                json!({"asOf":state["yaoCoinsAt"],"analysis":state["analysisMeta"],"targetAmplitudePct":50,"candidates":state["yaoCoins"].as_array().unwrap().iter().take(qn(query,"limit",20.,1.,50.)as usize).collect::<Vec<_>>(),"error":state["yaoCoinError"]}),
             );
         }
         ("POST", "/api/automation/start") => {

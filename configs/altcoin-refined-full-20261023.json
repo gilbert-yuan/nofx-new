@@ -1,0 +1,49 @@
+{
+  "id": "A-7191f22c929c",
+  "strategy": "altcoin-trend-breakout-v1",
+  "params": {
+    "channelPeriod": 8,
+    "emaFast": 25,
+    "emaSlow": 75,
+    "retestBandAtr": 0.25,
+    "retestBars": 3,
+    "stopAtr": 1.0,
+    "trailAtr": 3.0,
+    "useEmaFilter": true
+  },
+  "portfolio_policy": {
+    "leverage": 1,
+    "max_active": 3,
+    "max_notional_fraction": 0.5,
+    "max_same_direction": 2,
+    "risk_fraction": 0.003
+  },
+  "researchOnly": true,
+  "enabled": false,
+  "resolved_rules": {
+    "atrPeriod": 14,
+    "atrSmoothing": "Wilder",
+    "channelPeriod": 8,
+    "emaFast": 25,
+    "emaSlow": 75,
+    "entryExecution": "next_open",
+    "exitExecution": "next_open",
+    "interval": "4h",
+    "minBars": 180,
+    "retestBandAtr": 0.25,
+    "retestBars": 3,
+    "stopAtr": 1.0,
+    "trailAtr": 3.0,
+    "useEmaFilter": true
+  },
+  "selection_objective": "maximum net return; tie lower maximum drawdown then stable candidate id",
+  "selection_period": {
+    "end_ms": 1790812800000,
+    "start_ms": 1782345600000,
+    "label": "full"
+  },
+  "source_report": "reports/altcoin-local-refinement-20261023.md",
+  "source_search": "output/altcoin-local-refinement-20261023/optimization.json",
+  "source_grid_sha256": "cf8897c0f3e02fdb47c242aad3676772e328720dcb4ed50f5ff29458da6cbf63",
+  "frozen_before_new_window_evaluation_utc": "2026-10-22T21:26:09.8561248Z"
+}

@@ -17,76 +17,8 @@ name = "nofx-diagnostics"
 path = "rust/src/bin/nofx-diagnostics.rs"
 
 [[bin]]
-name = "nofx-optimize"
-path = "rust/src/bin/nofx-optimize.rs"
-
-[[bin]]
-name = "nofx-campaign"
-path = "rust/src/bin/nofx-campaign.rs"
-
-[[bin]]
-name = "nofx-replay"
-path = "rust/src/bin/nofx-replay.rs"
-
-[[bin]]
-name = "nofx-order-export"
-path = "rust/src/bin/nofx-order-export.rs"
-
-[[bin]]
-name = "nofx-martin-collect"
-path = "rust/src/bin/nofx-martin-collect.rs"
-
-[[bin]]
-name = "nofx-martin-audit"
-path = "rust/src/bin/nofx-martin-audit.rs"
-
-[[bin]]
-name = "nofx-yao-research"
-path = "rust/src/bin/nofx-yao-research.rs"
-
-[[bin]]
-name = "nofx-yao-micro"
-path = "rust/src/bin/nofx-yao-micro.rs"
-
-[[bin]]
 name = "nofx-orphan-audit"
 path = "rust/src/bin/nofx-orphan-audit.rs"
-
-[[bin]]
-name = "nofx-confidence-audit"
-path = "rust/src/bin/nofx-confidence-audit.rs"
-
-[[bin]]
-name = "nofx-local-model-eval"
-path = "rust/src/bin/nofx-local-model-eval.rs"
-
-[[bin]]
-name = "nofx-chronos"
-path = "rust/src/bin/nofx-chronos.rs"
-
-[[bin]]
-name = "nofx-chronos-eval"
-path = "rust/src/bin/nofx-chronos-eval.rs"
-
-[[bin]]
-name = "nofx-ml-data"
-path = "rust/src/bin/nofx-ml-data.rs"
-
-[[bin]]
-name = "nofx-ml-eval"
-path = "rust/src/bin/nofx-ml-eval.rs"
-
-[[bin]]
-name = "nofx-ml-server"
-path = "rust/src/bin/nofx-ml-server.rs"
-
-[[bin]]
-name = "nofx-ml-strategies"
-path = "rust/src/bin/nofx-ml-strategies.rs"
-
-[[bin]]
-name = "nofx-ml-train"
-path = "rust/src/bin/nofx-ml-train.rs"
 
 [[bin]]
 name = "nofx-ml-collect"
@@ -101,52 +33,16 @@ name = "nofx-ml-archive-repair"
 path = "rust/src/bin/nofx-ml-archive-repair.rs"
 
 [[bin]]
-name = "nofx-ml-monthly-train"
-path = "rust/src/bin/nofx-ml-monthly-train.rs"
+name = "nofx-altcoin-backtest"
+path = "rust/src/bin/nofx-altcoin-backtest.rs"
 
 [[bin]]
-name = "nofx-ml-monthly-predict"
-path = "rust/src/bin/nofx-ml-monthly-predict.rs"
-
-[[bin]]
-name = "nofx-ml-optimize"
-path = "rust/src/bin/nofx-ml-optimize.rs"
-
-[[bin]]
-name = "nofx-ml-direction-check"
-path = "rust/src/bin/nofx-ml-direction-check.rs"
-
-[[bin]]
-name = "nofx-ml-rolling-train"
-path = "rust/src/bin/nofx-ml-rolling-train.rs"
-
-[[bin]]
-name = "nofx-ml-rolling-benchmark"
-path = "rust/src/bin/nofx-ml-rolling-benchmark.rs"
-
-[[bin]]
-name = "nofx-ml-forecast-sweep"
-path = "rust/src/bin/nofx-ml-forecast-sweep.rs"
-
-[[bin]]
-name = "nofx-ml-diagnose"
-path = "rust/src/bin/nofx-ml-diagnose.rs"
+name = "nofx-altcoin-verify"
+path = "rust/src/bin/nofx-altcoin-verify.rs"
 
 [[test]]
 name = "backend-integration"
 path = "rust/tests/backend.rs"
-
-[[bin]]
-name = "nofx-ml-profit-train"
-path = "rust/src/bin/nofx-ml-profit-train.rs"
-
-[[bin]]
-name = "nofx-ml-exit-compare"
-path = "rust/src/bin/nofx-ml-exit-compare.rs"
-
-[[bin]]
-name = "nofx-ml-multiframe-train"
-path = "rust/src/bin/nofx-ml-multiframe-train.rs"
 
 [dependencies]
 anyhow = "1"
@@ -158,8 +54,6 @@ dotenvy = "0.15"
 futures = "0.3"
 hex = "0.4"
 hmac = "0.12"
-libloading = "0.8"
-ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "ndarray", "load-dynamic"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 quick-xml = "0.38"
 serde = { version = "1", features = ["derive"] }

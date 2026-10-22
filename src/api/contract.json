@@ -1,11 +1,5 @@
 {
   "health": "/api/health",
-  "ml": {
-    "health": "/api/ml/health",
-    "models": "/api/ml/models",
-    "signal": "/api/ml/signal",
-    "pipeline": "/api/ml/pipeline"
-  },
   "database": {
     "pool": "/api/database/pool"
   },
@@ -25,16 +19,8 @@
     "positions": "/api/binance/positions",
     "smoke": "/api/binance/smoke"
   },
-  "strategy": {
-    "get": "/api/strategy",
-    "put": "/api/strategy"
-  },
   "strategies": {
     "base": "/api/strategies"
-  },
-  "research": {
-    "indicatorHistoryFetch": "/api/research/indicator-history/fetch",
-    "backtest": "/api/research/backtest"
   },
   "paper": {
     "dailyTrend": "/api/paper/daily-trend"

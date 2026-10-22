@@ -18,12 +18,105 @@ use std::time::Duration;
 #[cfg(test)]
 mod execution_tests;
 mod strategy_risk;
+pub use strategy_risk::constrain as constrain_strategy_risk;
 
 fn n(v: &Value, k: &str, d: f64) -> f64 {
     number(&v[k], d)
 }
 fn active(order: &Value) -> bool {
     matches!(order["status"].as_str(), Some("pending" | "open"))
+}
+fn next_open_trend(plan: &Value) -> bool {
+    plan["altcoinTrend"].is_object()
+        && plan["reanchorToFill"] == true
+        && plan["entryExecution"] == "next_open"
+}
+fn online_trend(value: &Value) -> bool {
+    next_open_trend(&value["plan"])
+        && (value["strategyId"] == crate::strategies::ACTIVE_STRATEGY_ID
+            || value["analysisContext"]["strategyId"] == crate::strategies::ACTIVE_STRATEGY_ID)
+}
+const TREND_ENTRY_WINDOW_MS: i64 = 15 * 60_000;
+fn trend_entry_window(first: i64, now: i64) -> Result<()> {
+    anyhow::ensure!(
+        now >= first && now < first.saturating_add(TREND_ENTRY_WINDOW_MS),
+        "突破信号仅可在下一根 K 线开始后的 15 分钟内执行，过时信号不补单。"
+    );
+    Ok(())
+}
+fn trend_quote_plan(plan: &Value, quote: f64, long: bool) -> Result<Value> {
+    let risk = n(plan, "riskUnit", f64::NAN);
+    let stop = quote - if long { risk } else { -risk };
+    anyhow::ensure!(
+        quote.is_finite()
+            && quote > 0.
+            && risk.is_finite()
+            && risk > 0.
+            && stop.is_finite()
+            && stop > 0.,
+        "实时价格或冻结 ATR 止损距离无效。"
+    );
+    let mut anchored = plan.clone();
+    anchored["entryReference"] = json!(quote);
+    anchored["entryMin"] = json!(quote);
+    anchored["entryMax"] = json!(quote);
+    anchored["stopLoss"] = json!(stop);
+    Ok(anchored)
+}
+fn protection_leg_enabled(plan: &Value, key: &str) -> bool {
+    key != "takeProfit" || plan["takeProfitEnabled"] != false
+}
+fn anchor_trend_exchange_fill(order: &mut Value, env: &str, fields: &Value) -> Result<()> {
+    if !active(order) || !online_trend(order) || n(fields, "executedQty", 0.) <= 0. {
+        return Ok(());
+    }
+    let fill = n(fields, "avgPrice", 0.);
+    if !fill.is_finite() || fill <= 0. {
+        return Ok(());
+    }
+    // One local projection cannot represent different fills in two accounts.
+    // Keep the first execution environment authoritative for this projection.
+    if order["exchangeFillAnchor"]["environment"]
+        .as_str()
+        .is_some_and(|previous| previous != env)
+    {
+        return Ok(());
+    }
+    let long = order["direction"] == "OPEN_LONG";
+    let anchored = trend_quote_plan(&order["plan"], fill, long)?;
+    let initial_stop = n(&anchored, "stopLoss", 0.);
+    let previous_stop = n(&order["plan"], "stopLoss", initial_stop);
+    let already_anchored = order["exchangeFillAnchor"].is_object();
+    if !order["initialPlan"].is_object() {
+        order["initialPlan"] = order["plan"].clone();
+    }
+    order["initialPlan"]["stopLoss"] = json!(initial_stop);
+    order["plan"]["stopLoss"] = json!(if already_anchored {
+        if long {
+            previous_stop.max(initial_stop)
+        } else {
+            previous_stop.min(initial_stop)
+        }
+    } else {
+        initial_stop
+    });
+    order["entry"] = json!(fill);
+    order["quantity"] = fields["executedQty"].clone();
+    let filled_notional = fill * n(fields, "executedQty", 0.);
+    order["notional"] = json!(filled_notional);
+    order["entryFee"] = json!(filled_notional * n(&order["costs"], "feeBps", 6.) / 10000.);
+    if order["entryAt"].is_null() {
+        order["entryAt"] = fields["fillAt"]
+            .as_str()
+            .map(|at| json!(at))
+            .unwrap_or_else(|| json!(iso(now_ms())));
+    }
+    if order["status"] == "pending" {
+        order["status"] = json!("open");
+    }
+    order["exchangeFillAnchor"] =
+        json!({"environment":env,"avgPrice":fill,"executedQty":fields["executedQty"]});
+    Ok(())
 }
 fn abandon_stale_entry(order: &Value, now: i64) -> bool {
     // Judge by the exchange, not by the local fill: a simulated local entry with no
@@ -368,7 +461,8 @@ pub fn fused_orders(state: &Value) -> Value {
     json!({"activeOrders":active_rows,"closedOrders":closed})
 }
 pub fn account_summary(state: &Value, now: i64) -> Value {
-    let orders = arr(&state["orders"]);
+    // Summaries inspect orders without copying frozen plans or funding history.
+    let orders = state["orders"].as_array().map(Vec::as_slice).unwrap_or(&[]);
     let initial = n(state, "initialBalance", 10000.);
     if state["fusedPoolStartedAt"].is_null() {
         let realized = orders
@@ -420,7 +514,7 @@ pub fn account_summary(state: &Value, now: i64) -> Value {
     let mut ready = true;
     let mut realized = 0.;
     let mut entry_fees = 0.;
-    for o in &orders {
+    for o in orders {
         if let Some((m, _)) = preferred(o, accounts) {
             realized += n(m, "realized", 0.);
         } else if o["status"] == "closed" {
@@ -603,6 +697,21 @@ pub(crate) fn submit_paper_order_inner(
         candidates.first().copied()
     }
     .context("未找到对应币种与策略的分析信号")?;
+    let strategy_id = requested.or(signal["strategyId"].as_str());
+    // The executable backtest calls this helper without runtime configuration.
+    // An API-supplied record or input cannot opt into historical execution.
+    let offline = config.is_none()
+        && record["analysisEngine"] == "offline_altcoin_portfolio"
+        && strategy_id.is_some_and(crate::strategies::is_current_strategy);
+    let mut execution_signal = signal.clone();
+    if online_trend(&execution_signal) && !offline {
+        // normalize_plan's generic timestamp is the following interval. This
+        // strategy freezes the just-closed decision boundary in its own plan.
+        let boundary = timestamp(&execution_signal["plan"]["altcoinTrend"]["signalAt"])
+            .context("突破信号缺少冻结的决策时间")?;
+        execution_signal["firstEntryAt"] = json!(iso(boundary));
+    }
+    let signal = &execution_signal;
     let existing = state["orders"].as_array().into_iter().flatten().find(|o| {
         o["recordId"] == record["id"]
             && o["symbol"] == symbol
@@ -613,15 +722,18 @@ pub(crate) fn submit_paper_order_inner(
     if let Some(o) = existing {
         return Ok(o.clone());
     }
-    if signal["strategyId"] == crate::ml_execution::STRATEGY_ID {
-        crate::ml_execution::authorize_new(
-            state,
-            config.context("模型订单须通过已配置的 Demo 执行入口")?,
-            signal,
-            input,
-            now,
-        )?;
-    }
+    let recorded_id = record["strategyId"]
+        .as_str()
+        .or(signal["strategyId"].as_str());
+    anyhow::ensure!(
+        recorded_id == strategy_id
+            && signal["strategyId"]
+                .as_str()
+                .is_none_or(|id| Some(id) == strategy_id)
+            && (strategy_id == Some(crate::strategies::ACTIVE_STRATEGY_ID)
+                || offline && strategy_id == Some(crate::strategies::RESEARCH_STRATEGY_ID)),
+        "新建订单仅允许当前山寨趋势突破策略；其他策略的历史记录不能重新开仓。"
+    );
     if signal["eligible"] != true
         || !signal["plan"].is_object()
         || !matches!(
@@ -640,8 +752,8 @@ pub(crate) fn submit_paper_order_inner(
     }
     let tf = signal["interval"].as_str().unwrap_or("1m");
     let duration = interval_ms(tf).context("无效计划周期")?;
-    // Offline model policies may tighten the frozen pending window to 24
-    // source candles. Older signals/orders retain their existing 24h TTL.
+    // The pending lifetime is frozen with the signal. Older signals/orders
+    // without an explicit lifetime retain their existing 24h TTL.
     let pending_ttl_ms = if signal["pendingOrderTtlMs"].is_null() {
         86_400_000
     } else {
@@ -653,9 +765,28 @@ pub(crate) fn submit_paper_order_inner(
         }
         ttl
     };
-    let first = timestamp(&signal["firstEntryAt"])
-        .context("分析计划入场时间无效")?
-        .max((now.div_euclid(duration) + 1) * duration);
+    let signal_first = timestamp(&signal["firstEntryAt"]).context("分析计划入场时间无效")?;
+    let trend = online_trend(signal) && !offline;
+    let first = if trend {
+        trend_entry_window(signal_first, now)?;
+        let duplicate = state["orders"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|order| {
+                order["symbol"] == symbol
+                    && order["strategyId"] == signal["strategyId"]
+                    && timestamp(&order["analysisContext"]["signal"]["firstEntryAt"])
+                        == Some(signal_first)
+            });
+        anyhow::ensure!(
+            !duplicate,
+            "该策略与币种的同一收盘信号已经提交，禁止重复开仓。"
+        );
+        signal_first
+    } else {
+        signal_first.max((now.div_euclid(duration) + 1) * duration)
+    };
     let equity = n(&account_summary(state, now), "equity", 0.);
     let automatic_pct = input["autoMarginPct"].as_f64();
     let margin = if !input["margin"].is_null() && input["margin"] != "" {
@@ -704,7 +835,9 @@ pub(crate) fn submit_paper_order_inner(
     {
         bail!("该币种存在反向持仓或挂单，请先平仓。");
     }
-    let mut plan = if input["executionPlan"].is_object() {
+    let mut plan = if trend {
+        signal["plan"].clone()
+    } else if input["executionPlan"].is_object() {
         input["executionPlan"].clone()
     } else {
         signal["plan"].clone()
@@ -716,11 +849,19 @@ pub(crate) fn submit_paper_order_inner(
         plan["riskSizing"] = sizing.clone();
     }
     for k in ["stopLoss", "takeProfit"] {
-        if !input[k].is_null() {
+        if !trend && !input[k].is_null() {
             plan[k] = json!(n(input, k, f64::NAN));
         }
     }
     let long = signal["positionRecommendation"] == "OPEN_LONG";
+    if trend {
+        let quote = n(
+            &signal["opportunityReport"]["current"],
+            "price",
+            n(&plan, "entryReference", 0.),
+        );
+        plan = trend_quote_plan(&plan, quote, long)?;
+    }
     let lo = n(&plan, "entryMin", f64::NAN);
     let hi = n(&plan, "entryMax", f64::NAN);
     let stop = n(&plan, "stopLoss", f64::NAN);
@@ -738,7 +879,7 @@ pub(crate) fn submit_paper_order_inner(
         bail!("止盈止损必须位于入场区间两侧，且符合多空方向。");
     }
     let limit = n(&plan, "entryLimit", 0.);
-    if plan["entryStyle"] == "market" || limit <= 0. {
+    if (plan["entryStyle"] == "market" || limit <= 0.) && !trend {
         let current = n(&signal["opportunityReport"]["current"], "price", 0.);
         if current > 0.
             && (current < lo
@@ -782,6 +923,11 @@ pub(crate) fn submit_paper_order_inner(
         bail!("共享资金池可用余额不足：保证金和手续费预留不能超过总权益。");
     }
     let strategy_id = requested.or(signal["strategyId"].as_str());
+    let pending_ttl_ms = if trend {
+        first + TREND_ENTRY_WINDOW_MS - now
+    } else {
+        pending_ttl_ms
+    };
     let order = json!({"id":uuid::Uuid::new_v4().to_string(),"recordId":record["id"],"symbol":symbol,"interval":tf,"marketProvider":provider,"direction":signal["positionRecommendation"],"status":"pending","margin":margin,"leverage":leverage,"notional":notional,"plan":plan,"initialPlan":plan,"costs":costs,"automatic":input["automatic"]==true,"protectionRevisions":[],"reviewHistory":[],"strategyId":strategy_id,"analysisContext":{"signal":signal,"strategyVersion":record["strategyVersion"],"strategyModel":record["snapshot"]["model"],"strategyId":strategy_id,"strategyName":record["strategyName"].as_str().or(record["snapshot"]["strategyName"].as_str()),"strategyParams":record["strategyParams"].as_object().or(record["snapshot"]["strategyParams"].as_object()),"analysisEngine":record["analysisEngine"].as_str().or(signal["analysisEngine"].as_str()),"scope":record["scope"],"confidence":signal["confidence"],"confidenceType":signal["confidenceType"],"reason":signal["reason"],"risk":signal["risk"],"validationIssues":signal["validationIssues"],"automationRunId":record["automationRunId"],"dataAsOf":signal["dataAsOf"]},"exchangeSync":{"demo":sync_state("demo"),"live":sync_state("live")},"exchange":sync_state("demo"),"createdAt":iso(now),"pendingOrderTtlMs":pending_ttl_ms,"expiresAt":iso(now+pending_ttl_ms),"nextTime":first,"heldBars":0,"error":""});
     if !state["orders"].is_array() {
         state["orders"] = json!([]);
@@ -1080,19 +1226,10 @@ fn should_refresh_order(order: &Value, manual_close_id: Option<&str>) -> bool {
 }
 
 pub async fn refresh(db: &Db, store: &Store) -> Result<Value> {
-    refresh_internal(db, store, None, None).await
+    refresh_internal(db, store, None).await
 }
 
-pub async fn refresh_strategy(db: &Db, store: &Store, strategy: &str) -> Result<Value> {
-    refresh_internal(db, store, None, Some(strategy)).await
-}
-
-async fn refresh_internal(
-    db: &Db,
-    store: &Store,
-    manual_close_id: Option<&str>,
-    strategy: Option<&str>,
-) -> Result<Value> {
+async fn refresh_internal(db: &Db, store: &Store, manual_close_id: Option<&str>) -> Result<Value> {
     let _guard = lock_execution(db, "system", "paper-refresh", "ALL").await?;
     let state = db.account(true, None).await?;
     let client = Exchange::public()?;
@@ -1106,10 +1243,6 @@ async fn refresh_internal(
     for original in arr(&state["orders"])
         .into_iter()
         .filter(|o| should_refresh_order(o, manual_close_id))
-        .filter(|o| {
-            strategy
-                .is_none_or(|id| o["strategyId"] == id || o["analysisContext"]["strategyId"] == id)
-        })
     {
         let id = original["id"]
             .as_str()
@@ -1127,11 +1260,6 @@ async fn refresh_internal(
             }
             if original["marketProvider"] != "binance" { bail!("行情来源已经切换为 Binance；旧订单不能使用其他交易所行情推进，请取消并重新分析。"); }
             let mut order=original.clone();
-            // Legacy model plans keep the 0-bar MA exit that was measured closing 54% of
-            // positions on their first bar. Re-apply the frozen horizon protection on every
-            // refresh so an order created before the rule existed converges without a migration script.
-            let migrated=crate::ml_execution::enforce_exit_rules(&mut order);
-            if migrated { tracing::info!(order=%id, symbol=%symbol, "Migrated model order to the frozen 11-bar exit rules"); }
             if order["status"]=="pending" && timestamp(&order["createdAt"]).map(|t|now>=t+86400000).unwrap_or(false){advance_paper_order(&mut order,&[],now)?;return Ok::<Value,anyhow::Error>(order);}
             let next=timestamp(&order["nextTime"]).context("Order checkpoint missing")?;let smart=&order["plan"]["exitRules"]["smartExit"];let history=n(smart,"maPeriod",20.).max(n(smart,"atrPeriod",14.)).max(80.) as i64+2;let start=next-history*ms;
             let namespaced=storage_symbol(symbol,original["marketProvider"].as_str().unwrap_or("binance"))?;let mut rows=db.candles(&namespaced,tf,100000,Some(start),Some(now)).await?;
@@ -1173,9 +1301,6 @@ async fn refresh_internal(
                         processed += 1;
                     }
                     Err(ref error) => {
-                        // Persist the protection migration even when market data failed,
-                        // otherwise a flaky refresh silently keeps the legacy exit rules.
-                        crate::ml_execution::enforce_exit_rules(order);
                         order["error"] = json!(error.to_string());
                     }
                 }
@@ -1641,13 +1766,18 @@ async fn update_link(db: &Db, id: &str, env: &str, fields: &Value) -> Result<Val
             .context("订单不存在")?;
         ensure_links(order);
         patch(&mut order["exchangeSync"][env], fields);
+        anchor_trend_exchange_fill(order, env, fields)?;
         mirror(order);
         Ok(order.clone())
     })
     .await
 }
 fn response_link(response: &Value) -> Value {
-    json!({"status":response["status"].as_str().unwrap_or("NEW").to_lowercase(),"orderId":response["orderId"],"clientOrderId":response["clientOrderId"],"origQty":n(response,"origQty",0.),"executedQty":n(response,"executedQty",0.),"avgPrice":n(response,"avgPrice",0.),"price":n(response,"price",0.),"positionSide":response["positionSide"].as_str().unwrap_or("BOTH"),"lastSyncedAt":iso(now_ms()),"lastError":""})
+    let fill_at = timestamp(&response["updateTime"])
+        .or_else(|| timestamp(&response["transactTime"]))
+        .or_else(|| timestamp(&response["time"]))
+        .unwrap_or_else(now_ms);
+    json!({"status":response["status"].as_str().unwrap_or("NEW").to_lowercase(),"orderId":response["orderId"],"clientOrderId":response["clientOrderId"],"origQty":n(response,"origQty",0.),"executedQty":n(response,"executedQty",0.),"avgPrice":n(response,"avgPrice",0.),"price":n(response,"price",0.),"positionSide":response["positionSide"].as_str().unwrap_or("BOTH"),"fillAt":iso(fill_at),"lastSyncedAt":iso(now_ms()),"lastError":""})
 }
 
 async fn sync_entry(
@@ -1657,9 +1787,6 @@ async fn sync_entry(
     env: &str,
     order: &Value,
 ) -> Result<()> {
-    if crate::ml_execution::is_model_order(order) {
-        anyhow::ensure!(env == "demo", "模型订单禁止路由到实盘");
-    }
     let id = order["id"].as_str().context("Order id")?;
     let symbol = order["symbol"].as_str().context("Order symbol")?;
     let dir = order["direction"].as_str().context("Order direction")?;
@@ -1739,14 +1866,6 @@ async fn sync_entry(
         bail!("开仓暂停、持仓未同步或资金池超限，暂不执行。");
     }
     // Querying before the first send recovers a crash after the server accepted a prior request.
-    if crate::ml_execution::is_model_order(order) {
-        crate::ml_execution::recheck_pending(
-            &db.account(true, None).await?,
-            config,
-            order,
-            now_ms(),
-        )?;
-    }
     match client
         .signed(
             "GET",
@@ -1762,11 +1881,20 @@ async fn sync_entry(
         Err(error) if missing_order(&error) => {}
         Err(error) => return Err(error),
     }
+    let trend = online_trend(order);
+    let trend_first = if trend {
+        let first = timestamp(&order["analysisContext"]["signal"]["firstEntryAt"])
+            .context("突破订单缺少冻结的首次入场时间")?;
+        trend_entry_window(first, now_ms())?;
+        Some(first)
+    } else {
+        None
+    };
     let info = symbol_info(client, symbol).await?;
     let actual = set_leverage(client, symbol, n(order, "leverage", 1.)).await?;
-    let plan = &order["plan"];
-    let limit = n(plan, "entryLimit", 0.);
-    let market = plan["entryStyle"] == "market" || limit <= 0.;
+    let original_plan = &order["plan"];
+    let limit = n(original_plan, "entryLimit", 0.);
+    let market = original_plan["entryStyle"] == "market" || limit <= 0.;
     let mark = client
         .public_request("/fapi/v1/premiumIndex", &json!({"symbol":symbol}))
         .await?;
@@ -1776,22 +1904,46 @@ async fn sync_entry(
     } else {
         aligned_price(&info, limit)?
     };
+    let quoted_plan = if trend {
+        trend_quote_plan(original_plan, price, dir == "OPEN_LONG")?
+    } else {
+        original_plan.clone()
+    };
+    let plan = &quoted_plan;
     let stop = n(plan, "stopLoss", 0.);
     let target = n(plan, "takeProfit", 0.);
     if current <= 0.
-        || !(if dir == "OPEN_LONG" {
-            price > stop && price < target
-        } else {
-            price < stop && price > target
-        })
+        || (!trend
+            && !(if dir == "OPEN_LONG" {
+                price > stop && price < target
+            } else {
+                price < stop && price > target
+            }))
     {
         bail!("计划价格已被穿越，等待重新分析。");
     }
-    if market && (current < n(plan, "entryMin", 0.) || current > n(plan, "entryMax", f64::INFINITY))
+    if !trend
+        && market
+        && (current < n(plan, "entryMin", 0.) || current > n(plan, "entryMax", f64::INFINITY))
     {
         bail!("市价已超出原信号入场区间，禁止追价。");
     }
-    let quantity = aligned_quantity(&info, n(order, "margin", 0.) * actual / price, market)?;
+    let margin = if trend {
+        strategy_risk::constrain(
+            &plan["riskSizing"],
+            plan,
+            &order["costs"],
+            n(&funds, "equity", f64::NAN),
+            n(order, "margin", 0.),
+            actual,
+            dir == "OPEN_LONG",
+            interval_ms(order["interval"].as_str().unwrap_or("4h")).context("无效策略周期")?,
+        )?
+        .0
+    } else {
+        n(order, "margin", 0.)
+    };
+    let quantity = aligned_quantity(&info, margin * actual / price, market)?;
     for f in arr(&info["filters"]) {
         if matches!(f["filterType"].as_str(), Some("MIN_NOTIONAL" | "NOTIONAL"))
             && quantity * price < n(&f, "notional", n(&f, "minNotional", 0.))
@@ -1814,6 +1966,20 @@ async fn sync_entry(
         request["price"] = json!(formatted(price));
         request["timeInForce"] = json!("GTC");
     }
+    if trend {
+        db.mutate_order(id, |state| {
+            let row = state["orders"]
+                .as_array_mut()
+                .and_then(|orders| orders.iter_mut().find(|row| row["id"] == id))
+                .context("Order missing")?;
+            row["margin"] = json!(margin.min(n(row, "margin", margin)));
+            row["notional"] = json!(n(row, "margin", margin) * actual);
+            row["plan"] = quoted_plan.clone();
+            row["initialPlan"] = quoted_plan.clone();
+            Ok(Value::Null)
+        })
+        .await?;
+    }
     update_link(db,id,env,&json!({"status":"submitting","clientOrderId":existing_id,"actualLeverage":actual,"positionSide":ps,"submittedAt":iso(now_ms()),"accountKey":client.account_key(),"requestedQuantity":quantity})).await?;
     // Re-check cancellation immediately before sending; no retry is permitted after an ambiguous POST.
     let latest = db.account(true, Some(id)).await?;
@@ -1828,6 +1994,32 @@ async fn sync_entry(
         )
         .await?;
         return Ok(());
+    }
+    if let Some(first) = trend_first {
+        if let Err(error) = trend_entry_window(first, now_ms()) {
+            // No POST has happened: this intent can safely be retired without
+            // entering the ambiguous-request recovery path.
+            update_link(
+                db,
+                id,
+                env,
+                &json!({"status":"cancelled","lastError":error.to_string()}),
+            )
+            .await?;
+            db.mutate_order(id, |state| {
+                if let Some(row) = state["orders"]
+                    .as_array_mut()
+                    .and_then(|rows| rows.iter_mut().find(|row| row["id"] == id))
+                    && row["status"] == "pending"
+                {
+                    row["status"] = json!("expired");
+                    row["reason"] = json!("pending_expired");
+                }
+                Ok(Value::Null)
+            })
+            .await?;
+            return Err(error);
+        }
     }
     match client.signed("POST", "/fapi/v1/order", &request).await {
         Ok(remote) => {
@@ -1867,9 +2059,6 @@ pub async fn sync_entries(db: &Db, store: &Store, only: Option<&str>) -> Result<
         }
         let client = Exchange::new(&config, env)?;
         for order in arr(&state["orders"]) {
-            if crate::ml_execution::is_model_order(&order) && env != "demo" {
-                continue;
-            }
             if only.is_none() && !needs_exchange_sync(&order, env) {
                 continue;
             }
@@ -2279,6 +2468,38 @@ async fn sync_protection(db: &Db, client: &Exchange, env: &str, order: &Value) -
         ("stopLoss", "STOP_MARKET"),
         ("takeProfit", "TAKE_PROFIT_MARKET"),
     ] {
+        if !protection_leg_enabled(&order["plan"], key) {
+            for previous in existing.iter().filter(|row| {
+                row["symbol"] == symbol
+                    && row["positionSide"].as_str().unwrap_or("BOTH") == ps
+                    && row["type"] == kind
+                    && row["clientAlgoId"]
+                        .as_str()
+                        .unwrap_or("")
+                        .starts_with("nofx")
+            }) {
+                client
+                    .signed(
+                        "DELETE",
+                        "/fapi/v1/algoOrder",
+                        &json!({"algoId":previous["algoId"]}),
+                    )
+                    .await?;
+            }
+            db.mutate_order(id, |state| {
+                let row = state["orders"]
+                    .as_array_mut()
+                    .and_then(|rows| rows.iter_mut().find(|row| row["id"] == id))
+                    .context("Order missing")?;
+                ensure_links(row);
+                row["exchangeSync"][env]["protection"][key] =
+                    json!({"type":kind,"status":"disabled","lastError":""});
+                mirror(row);
+                Ok(Value::Null)
+            })
+            .await?;
+            continue;
+        }
         let raw = n(&order["plan"], key, 0.);
         let trigger = aligned_price(&info, raw)?;
         let crossed = if key == "stopLoss" {
@@ -2824,7 +3045,7 @@ async fn close_internal(
         })
         .await?;
         if row["status"] == "open" {
-            refresh_internal(db, store, row["id"].as_str(), None).await?;
+            refresh_internal(db, store, row["id"].as_str()).await?;
         }
         let order = db
             .mutate_account_light(|state| {
@@ -3219,3 +3440,160 @@ pub async fn cancel_exchange_order(db: &Db, store: &Store, input: &Value) -> Res
 
 #[cfg(test)]
 mod manual_close_tests;
+
+#[cfg(test)]
+mod online_trend_tests {
+    use super::*;
+
+    fn plan() -> Value {
+        json!({"entryStyle":"market","entryExecution":"next_open","reanchorToFill":true,
+            "entryReference":100.,"entryMin":100.,"entryMax":100.,"stopLoss":98.,"riskUnit":2.,
+            "takeProfit":10000.,"takeProfitEnabled":false,"maxHoldBars":1_000_000,
+            "riskSizing":{"riskFraction":0.003,"maxNotionalFraction":0.5,"maxLeverage":1,"fundingReserveHours":24},
+            "altcoinTrend":{"signalAt":0,"parameters":{"stopAtr":1.5}}})
+    }
+    fn record() -> Value {
+        json!({"id":"online-first","strategyId":"altcoin-trend-breakout-live-v1","marketProvider":"binance",
+            "analyses":[{"symbol":"SOLUSDT","strategyId":"altcoin-trend-breakout-live-v1","eligible":true,
+                "interval":"4h","positionRecommendation":"OPEN_LONG","firstEntryAt":14_400_000,
+                "plan":plan(),"opportunityReport":{"current":{"price":110.}}}]})
+    }
+    #[test]
+    fn online_entry_uses_frozen_boundary_live_quote_and_rejects_expired_or_repeated_signals() {
+        let mut state = json!({"initialBalance":10000.,"orders":[]});
+        let input = json!({"symbol":"SOLUSDT","margin":50.,"leverage":1});
+        let order = submit_paper_order(&mut state, &record(), &input, 300_000).unwrap();
+        assert_eq!(order["nextTime"], 0);
+        assert_eq!(
+            timestamp(&order["analysisContext"]["signal"]["firstEntryAt"]),
+            Some(0)
+        );
+        assert_eq!(timestamp(&order["expiresAt"]), Some(TREND_ENTRY_WINDOW_MS));
+        assert_eq!(order["plan"]["entryReference"], 110.);
+        assert_eq!(order["plan"]["stopLoss"], 108.);
+        state["orders"][0]["status"] = json!("closed");
+        let mut later_record = record();
+        later_record["id"] = json!("online-later");
+        assert!(submit_paper_order(&mut state, &later_record, &input, 400_000).is_err());
+        let mut empty = json!({"initialBalance":10000.,"orders":[]});
+        assert!(submit_paper_order(&mut empty, &record(), &input, TREND_ENTRY_WINDOW_MS).is_err());
+        assert!(submit_paper_order(&mut empty, &record(), &input, -1).is_err());
+    }
+    #[test]
+    fn offline_current_breakout_keeps_its_frozen_next_open_timestamp() {
+        let input = json!({"symbol":"SOLUSDT","margin":50.,"leverage":1});
+        let mut sample = record();
+        sample["analyses"][0]["opportunityReport"]["current"]["price"] = json!(100.);
+        sample["analysisEngine"] = json!("offline_altcoin_portfolio");
+        let mut state = json!({"initialBalance":10000.,"orders":[]});
+        let order = submit_paper_order(&mut state, &sample, &input, 300_000).unwrap();
+        assert_eq!(order["nextTime"], 14_400_000);
+        assert_eq!(order["plan"]["entryReference"], 100.);
+        sample["strategyId"] = json!(crate::strategies::RESEARCH_STRATEGY_ID);
+        sample["analyses"][0]["strategyId"] = json!(crate::strategies::RESEARCH_STRATEGY_ID);
+        let mut research_state = json!({"initialBalance":10000.,"orders":[]});
+        let research = submit_paper_order(&mut research_state, &sample, &input, 300_000).unwrap();
+        assert_eq!(research["nextTime"], 14_400_000);
+        assert_eq!(research["plan"]["entryReference"], 100.);
+        let config = json!({});
+        let error = submit_paper_order_inner(
+            &mut json!({"initialBalance":10000.,"orders":[]}),
+            &sample,
+            &input,
+            300_000,
+            Some(&config),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("仅允许当前山寨趋势突破"));
+    }
+    #[test]
+    fn deleted_or_unlabelled_records_cannot_create_orders_even_with_an_offline_marker() {
+        let input = json!({"symbol":"SOLUSDT","margin":50.,"leverage":1});
+        for old_id in ["legacy-trend", "removed-model", ""] {
+            for engine in [Value::Null, json!("offline_altcoin_portfolio")] {
+                let mut sample = record();
+                sample["analysisEngine"] = engine;
+                let id = if old_id.is_empty() {
+                    Value::Null
+                } else {
+                    json!(old_id)
+                };
+                sample["strategyId"] = id.clone();
+                sample["analyses"][0]["strategyId"] = id;
+                for canonical_override in [false, true] {
+                    let mut request = input.clone();
+                    if canonical_override {
+                        request["strategyId"] = json!(crate::strategies::ACTIVE_STRATEGY_ID);
+                    }
+                    let mut state = json!({"initialBalance":10000.,"orders":[]});
+                    assert!(submit_paper_order(&mut state, &sample, &request, 300_000).is_err());
+                    assert!(state["orders"].as_array().unwrap().is_empty());
+                }
+            }
+        }
+        let mut sample = record();
+        sample["strategyId"] = json!("legacy-trend");
+        sample["analyses"][0]["strategyId"] = Value::Null;
+        let mut request = input.clone();
+        request["strategyId"] = json!(crate::strategies::ACTIVE_STRATEGY_ID);
+        assert!(
+            submit_paper_order(
+                &mut json!({"initialBalance":10000.,"orders":[]}),
+                &sample,
+                &request,
+                300_000,
+            )
+            .is_err()
+        );
+        sample["analyses"][0]["strategyId"] = json!("legacy-trend");
+        let existing = json!({"id":"historical","recordId":sample["id"],
+            "symbol":"SOLUSDT","strategyId":"legacy-trend","status":"closed"});
+        let mut state = json!({"initialBalance":10000.,"orders":[existing.clone()]});
+        assert_eq!(
+            submit_paper_order(&mut state, &sample, &input, 300_000).unwrap(),
+            existing
+        );
+        assert_eq!(state["orders"].as_array().unwrap().len(), 1);
+    }
+    #[test]
+    fn actual_exchange_fill_anchors_stop_and_later_fills_cannot_relax_protection() {
+        let mut order = json!({"status":"pending","strategyId":"altcoin-trend-breakout-live-v1",
+            "direction":"OPEN_LONG","plan":plan(),"costs":{"feeBps":6},"leverage":1});
+        anchor_trend_exchange_fill(
+            &mut order,
+            "demo",
+            &json!({"executedQty":2.,"avgPrice":111.,"fillAt":"2026-10-22T00:00:01Z"}),
+        )
+        .unwrap();
+        assert_eq!(order["status"], "open");
+        assert_eq!(order["entry"], 111.);
+        assert_eq!(order["plan"]["stopLoss"], 109.);
+        assert_eq!(order["initialPlan"]["stopLoss"], 109.);
+        assert_eq!(order["quantity"], 2.);
+        assert_eq!(order["entryAt"], "2026-10-22T00:00:01Z");
+        order["plan"]["stopLoss"] = json!(110.5);
+        anchor_trend_exchange_fill(
+            &mut order,
+            "demo",
+            &json!({"executedQty":3.,"avgPrice":112.}),
+        )
+        .unwrap();
+        assert_eq!(order["plan"]["stopLoss"], 110.5);
+        assert_eq!(order["initialPlan"]["stopLoss"], 110.);
+        order["status"] = json!("closed");
+        let closed = order.clone();
+        anchor_trend_exchange_fill(
+            &mut order,
+            "demo",
+            &json!({"executedQty":3.,"avgPrice":112.}),
+        )
+        .unwrap();
+        assert_eq!(order, closed);
+    }
+    #[test]
+    fn disabled_profit_leg_keeps_stop_and_legacy_profit_protection_enabled() {
+        assert!(!protection_leg_enabled(&plan(), "takeProfit"));
+        assert!(protection_leg_enabled(&plan(), "stopLoss"));
+        assert!(protection_leg_enabled(&json!({}), "takeProfit"));
+    }
+}

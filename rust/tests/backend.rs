@@ -486,7 +486,7 @@ async fn run(options: &PgConnectOptions) -> Result<()> {
     })
     .await?;
     assert_eq!(initial, db.account(false, None).await?);
-    // Historical research must never modify the real simulated account.
+    // Public indicator persistence remains causal and never modifies the account.
     let time = (now_ms() - 5 * 86_400_000).div_euclid(60_000) * 60_000;
     let history_samples = vec![nofx_core::indicator_history::Sample {
         kind: "oi5m".into(),
@@ -512,24 +512,10 @@ async fn run(options: &PgConnectOptions) -> Result<()> {
     assert!(
         nofx_core::indicator_history::context("BTCUSDT", &loaded, time + 60_000)["oi5m"].is_null()
     );
-    let empty=request(&client,&base,"POST",api["research"]["backtest"].as_str().unwrap(),Some(json!({"symbol":"BTCUSDT","strategyId":"enhanced-trend-v1","startTime":time,"endTime":time+3_600_000})),400).await?;
-    assert!(empty["error"].as_str().unwrap().contains("历史"));
-    for tf in ["1m", "15m"] {
-        let dt = if tf == "1m" { 60_000 } else { 900_000 };
-        let start = time.div_euclid(dt) * dt;
-        let rows:Vec<_>=(-1600..120).map(|i|json!({"openTime":start+i*dt,"open":100.,"high":101.,"low":99.,"close":100.,"volume":1000.,"quoteVolume":100000.,"tradeCount":100,"takerBuyQuoteVolume":60000.,"closeTime":start+(i+1)*dt-1})).collect();
-        db.save_klines("BINANCE_BTCUSDT", tf, &rows).await?;
-    }
-    let replay=request(&client,&base,"POST",api["research"]["backtest"].as_str().unwrap(),Some(json!({"symbol":"BTCUSDT","strategyId":"enhanced-trend-v1","startTime":time,"endTime":time+3_600_000,"grid":{"marketFlowEnabled":[false,true]}})),200).await?;
-    assert_eq!(replay["researchOnly"], true);
-    assert_eq!(replay["combinations"].as_array().unwrap().len(), 2);
-    assert!(replay["baseline"]["training"]["analyzed"].as_u64().unwrap() > 0);
-    assert_eq!(initial, db.account(false, None).await?);
-    verify_campaign_resume(options, &db, time).await?;
     assert_eq!(initial, db.account(false, None).await?);
     assert!(!initial["fusedPoolStartedAt"].is_null());
     assert_eq!(initial["unlimitedCapital"], false);
-    let config=request(&client,&base,"PUT",api["config"]["put"].as_str().unwrap(),Some(json!({"model":{"apiKey":"test-secret"},"trader":{"syncPaperOrdersToDemo":false,"syncPaperOrdersToLive":false}})),200).await?;
+    let config=request(&client,&base,"PUT",api["config"]["put"].as_str().unwrap(),Some(json!({"binance":{"apiKey":"test-secret","apiSecret":"test-secret"},"trader":{"syncPaperOrdersToDemo":false,"syncPaperOrdersToLive":false}})),200).await?;
     assert!(!config.to_string().contains("test-secret"));
     let strategies = request(
         &client,
@@ -540,23 +526,49 @@ async fn run(options: &PgConnectOptions) -> Result<()> {
         200,
     )
     .await?;
+    assert_eq!(strategies["strategies"].as_array().unwrap().len(), 1);
     assert_eq!(
-        strategies["strategies"].as_array().unwrap().len(),
-        nofx_core::strategies::definitions().len()
+        strategies["strategies"][0]["id"],
+        "altcoin-trend-breakout-live-v1"
     );
-    let martin = request(
+    let current = request(
         &client,
         &base,
         "GET",
-        "/api/strategies/martin-luk-pullback-v1",
+        "/api/strategies/altcoin-trend-breakout-live-v1",
         None,
         200,
     )
     .await?;
-    assert_eq!(martin["id"], "martin-luk-pullback-v1");
-    assert_eq!(martin["enabled"], false);
-    assert_eq!(martin["params"]["riskPerTrade"], 0.005);
-    assert_eq!(martin["params"]["maxNotionalPct"], 0.35);
+    assert_eq!(current["id"], "altcoin-trend-breakout-live-v1");
+    assert_eq!(current["params"]["emaFast"], 25);
+    assert_eq!(current["params"]["emaSlow"], 75);
+    assert_eq!(current["params"]["channelPeriod"], 8);
+    let updated = request(
+        &client,
+        &base,
+        "PUT",
+        "/api/strategies/altcoin-trend-breakout-live-v1",
+        Some(
+            json!({"enabled":false,"params":{"emaFast":26},"notes":"native strategy persistence"}),
+        ),
+        200,
+    )
+    .await?;
+    assert_eq!(updated["params"]["emaFast"], 26);
+    assert_eq!(updated["params"]["emaSlow"], 75);
+    assert_eq!(updated["enabled"], false);
+    let persisted_strategy = request(
+        &client,
+        &base,
+        "GET",
+        "/api/strategies/altcoin-trend-breakout-live-v1",
+        None,
+        200,
+    )
+    .await?;
+    assert_eq!(persisted_strategy["params"], updated["params"]);
+    assert_eq!(persisted_strategy["notes"], "native strategy persistence");
     let opportunities = request(
         &client,
         &base,
@@ -568,17 +580,6 @@ async fn run(options: &PgConnectOptions) -> Result<()> {
     .await?;
     assert!(opportunities["asOf"].is_null());
     assert_eq!(opportunities["analysis"]["phase"], "idle");
-    let predictions = request(
-        &client,
-        &base,
-        "GET",
-        "/api/automation/yao-coins",
-        None,
-        200,
-    )
-    .await?;
-    assert!(predictions["asOf"].is_null());
-    assert_eq!(predictions["analysis"]["phase"], "idle");
     for path in [
         "/api/paper/account",
         "/api/paper/statistics",
@@ -586,11 +587,9 @@ async fn run(options: &PgConnectOptions) -> Result<()> {
         api["stats"]["base"].as_str().unwrap(),
         api["binance"]["status"].as_str().unwrap(),
         api["config"]["get"].as_str().unwrap(),
-        api["strategy"]["get"].as_str().unwrap(),
         api["market"]["status"].as_str().unwrap(),
         "/api/automation/status",
         "/api/automation/opportunities",
-        "/api/automation/yao-coins",
         api["history"]["summary"].as_str().unwrap(),
         api["history"]["syncStatus"].as_str().unwrap(),
         "/api/analyses",
@@ -599,6 +598,19 @@ async fn run(options: &PgConnectOptions) -> Result<()> {
         request(&client, &base, "GET", path, None, 200).await?;
     }
     request(&client, &base, "GET", "/api/not-a-route", None, 404).await?;
+    for (method, path) in [
+        ("GET", "/api/strategy"),
+        ("PUT", "/api/strategy"),
+        ("POST", "/api/research/backtest"),
+        ("GET", "/api/ml/health"),
+        ("GET", "/api/ml/models"),
+        ("POST", "/api/ml/signal"),
+        ("POST", "/api/ml/pipeline"),
+        ("GET", "/api/automation/yao-coins"),
+        ("GET", "/api/strategies/martin-luk-pullback-v1"),
+    ] {
+        request(&client, &base, method, path, Some(json!({})), 404).await?;
+    }
     request(
         &client,
         &base,
@@ -636,7 +648,8 @@ async fn run(options: &PgConnectOptions) -> Result<()> {
     )
     .await?;
     let now = now_ms();
-    let record = json!({"id":"rust-http-record","at":iso(now),"marketProvider":"binance","strategyId":"enhanced-trend-v1","strategyVersion":"test-native","analysisEngine":"local","scope":{"interval":"1m"},"snapshot":{"costs":{"feeBps":6,"slippageBps":5,"fundingBpsPer8h":3}},"analyses":[{"symbol":"BTCUSDT","interval":"1m","marketProvider":"binance","strategyId":"enhanced-trend-v1","positionRecommendation":"OPEN_LONG","eligible":true,"firstEntryAt":iso((now.div_euclid(60000)+1)*60000),"expiresAt":iso(now+86400000),"confidence":0.8,"plan":{"entryMin":99,"entryMax":100,"entryLimit":99.5,"stopLoss":90,"takeProfit":110,"maxHoldBars":30}}]});
+    // A manually frozen plan exercises generic order persistence without running signal analysis.
+    let record = json!({"id":"rust-http-record","at":iso(now),"marketProvider":"binance","strategyId":"altcoin-trend-breakout-live-v1","strategyVersion":"test-native","analysisEngine":"manual_frozen_fixture","scope":{"interval":"1m"},"snapshot":{"costs":{"feeBps":6,"slippageBps":5,"fundingBpsPer8h":3}},"analyses":[{"symbol":"BTCUSDT","interval":"1m","marketProvider":"binance","strategyId":"altcoin-trend-breakout-live-v1","positionRecommendation":"OPEN_LONG","eligible":true,"firstEntryAt":iso((now.div_euclid(60000)+1)*60000),"expiresAt":iso(now+86400000),"confidence":0.8,"plan":{"entryMin":99,"entryMax":100,"entryLimit":99.5,"stopLoss":90,"takeProfit":110,"maxHoldBars":30}}]});
     db.save_record(&record).await?;
     let original_persisted = db.record("rust-http-record").await?.unwrap();
     let mut enriched = record["analyses"][0].clone();
@@ -672,7 +685,7 @@ async fn run(options: &PgConnectOptions) -> Result<()> {
         400,
     )
     .await?;
-    let order=request(&client,&base,"POST","/api/paper/orders",Some(json!({"recordId":"rust-http-record","symbol":"BTCUSDT","strategyId":"enhanced-trend-v1","margin":10,"leverage":2})),200).await?;
+    let order=request(&client,&base,"POST","/api/paper/orders",Some(json!({"recordId":"rust-http-record","symbol":"BTCUSDT","strategyId":"altcoin-trend-breakout-live-v1","margin":10,"leverage":2})),200).await?;
     assert_eq!(order["status"], "pending");
     let probe_id = order["id"].as_str().unwrap();
     db.mutate_order(probe_id, |state| {
@@ -684,7 +697,7 @@ async fn run(options: &PgConnectOptions) -> Result<()> {
         db.account(false, Some(probe_id)).await?["orders"][0]["poolExtensionProbe"],
         extension_probe
     );
-    let same=request(&client,&base,"POST","/api/paper/orders",Some(json!({"recordId":"rust-http-record","symbol":"BTCUSDT","strategyId":"enhanced-trend-v1","margin":10,"leverage":2})),200).await?;
+    let same=request(&client,&base,"POST","/api/paper/orders",Some(json!({"recordId":"rust-http-record","symbol":"BTCUSDT","strategyId":"altcoin-trend-breakout-live-v1","margin":10,"leverage":2})),200).await?;
     assert_eq!(order["id"], same["id"]);
     db.mutate_account(|state| {
         let o = state["orders"]
@@ -740,7 +753,7 @@ async fn run(options: &PgConnectOptions) -> Result<()> {
     let trend = request(&client, &base, "GET", "/api/paper/daily-trend", None, 200).await?;
     assert!(trend.to_string().contains("2026-10-08"));
     let stats = request(&client, &base, "GET", "/api/strategy-stats", None, 200).await?;
-    assert!(stats.to_string().contains("enhanced-trend-v1"));
+    assert!(stats.to_string().contains("altcoin-trend-breakout-live-v1"));
     let static_response = client
         .get(format!("{base}/nested/frontend/route"))
         .send()
@@ -779,130 +792,5 @@ async fn run(options: &PgConnectOptions) -> Result<()> {
     verify_order_scoped_writes(&db).await?;
     db.pool.close().await;
     drop(server);
-    Ok(())
-}
-
-async fn verify_campaign_resume(options: &PgConnectOptions, db: &Db, start: i64) -> Result<()> {
-    use nofx_core::{backtest, campaign, strategies};
-    let root = tempfile::tempdir()?;
-    let directory = root.path().join("research");
-    let id = "enhanced-trend-v1";
-    let base = strategies::defaults(id);
-    let settings = json!({"maxTrials":2,"seed":7,"initialBalance":1000,
-        "optimization":{"minTrades":10,"minValidationTrades":5,"minTradingSymbols":1}});
-    campaign::write_json(&root.path().join("settings.json"), &settings)?;
-    campaign::write_json(
-        &root.path().join("ecosystem.config.json"),
-        &json!({"apps":[{"env":{}}]}),
-    )?;
-    let manifest = json!({"startTime":start,"endTime":start+3_600_000,
-        "engineVersion":campaign::engine_version(),"environment":campaign::environment_snapshot(),
-        "strategies":{id:{"params":base,"space":campaign::search_space(id,&base)?}},
-        "symbols":["BTCUSDT"],"config":{"trader":{"minConfidence":0.65,"maxLeverage":5}},
-        "adaptive":{},"settings":settings,"costs":nofx_core::research::costs()});
-    campaign::write_json(&directory.join("manifest.json"), &manifest)?;
-    let history = backtest::load_history(db, "BTCUSDT", id, start, start + 3_600_000).await?;
-    campaign::write_json(
-        &directory.join("data/BTCUSDT.json"),
-        &serde_json::to_value(history)?,
-    )?;
-    let command = || -> Result<()> {
-        let result = Command::new(env!("CARGO_BIN_EXE_nofx-campaign"))
-            .args([
-                "--root",
-                root.path().to_str().unwrap(),
-                "--campaign",
-                "settings.json",
-                "--output",
-                "research",
-                "--max-units",
-                "1",
-            ])
-            .env("DATABASE_URL", options.to_url_lossy().as_str())
-            .output()?;
-        if !result.status.success() {
-            bail!(
-                "campaign CLI failed: {}",
-                String::from_utf8_lossy(&result.stderr)
-            );
-        }
-        Ok(())
-    };
-    command()?;
-    let first = directory.join("trials/0000-enhanced-trend-v1-BTCUSDT.json");
-    let before = std::fs::read(&first)?;
-    assert_eq!(
-        campaign::read_json(&directory.join("summary.json"))?["completedUnits"],
-        1
-    );
-    command()?;
-    assert_eq!(
-        std::fs::read(&first)?,
-        before,
-        "resume must never replace completed trials"
-    );
-    assert_eq!(
-        campaign::read_json(&directory.join("summary.json"))?["completedUnits"],
-        2
-    );
-    // A new focused study reuses raw data, freezes current config, and resumes
-    // independently without reading or creating final-test results.
-    let store = nofx_core::store::Store::new(root.path().join("data")).await?;
-    store
-        .write(
-            "strategies",
-            &json!({"initialized":true,"strategies":{
-        id:{"enabled":true,"params":base}}}),
-        )
-        .await?;
-    let focused_settings = json!({"sourceResearch":"research","strategyIds":[id],
-        "symbols":["BTCUSDT"],"maxTrials":2,"holdoutMode":"deferred",
-        "candidates":{id:[{"requireMacdConfirm":true,"pendingGraceMinutes":5}]},"optimization":settings["optimization"]});
-    campaign::write_json(&root.path().join("focused.json"), &focused_settings)?;
-    let account_before = db.account(true, None).await?;
-    let focused = root.path().join("focused");
-    let focused_command = || -> Result<()> {
-        let result = Command::new(env!("CARGO_BIN_EXE_nofx-campaign"))
-            .args([
-                "--root",
-                root.path().to_str().unwrap(),
-                "--campaign",
-                "focused.json",
-                "--output",
-                "focused",
-                "--max-units",
-                "1",
-            ])
-            .env("DATABASE_URL", options.to_url_lossy().as_str())
-            .output()?;
-        if !result.status.success() {
-            bail!(
-                "focused campaign failed: {}",
-                String::from_utf8_lossy(&result.stderr)
-            );
-        }
-        Ok(())
-    };
-    focused_command()?;
-    let manifest = campaign::read_json(&focused.join("manifest.json"))?;
-    let candidates = &manifest["strategies"][id]["candidates"];
-    assert_eq!(candidates[0]["requireMacdConfirm"], false);
-    assert_eq!(candidates[0]["pendingGraceMinutes"], 0.);
-    assert_eq!(candidates[1]["requireMacdConfirm"], true);
-    assert_eq!(candidates[1]["pendingGraceMinutes"], 5.);
-    let first = focused.join("trials/0000-enhanced-trend-v1-BTCUSDT.json");
-    let before = std::fs::read(&first)?;
-    focused_command()?;
-    assert_eq!(std::fs::read(&first)?, before);
-    assert_eq!(
-        campaign::read_json(&focused.join("summary.json"))?["completedUnits"],
-        2
-    );
-    assert!(!focused.join(format!("holdout-{id}.json")).exists());
-    assert_eq!(
-        campaign::read_json(&focused.join("downloads/BTCUSDT.json"))?["marketRequests"],
-        0
-    );
-    assert_eq!(db.account(true, None).await?, account_before);
     Ok(())
 }

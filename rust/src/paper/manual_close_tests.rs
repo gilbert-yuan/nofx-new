@@ -25,10 +25,10 @@ fn local_position(id: &str, margin: f64) -> Value {
 fn manual_paper_submission_has_no_total_order_limit_and_keeps_funding_and_symbol_guards() {
     let now = 1_800_000_000_000_i64;
     let record = json!({
-        "id": "manual-entry", "marketProvider": "binance", "strategyId": "manual-test",
+        "id": "manual-entry", "marketProvider": "binance", "strategyId": crate::strategies::ACTIVE_STRATEGY_ID,
         "analyses": [{
             "symbol": "ETHUSDT", "eligible": true, "positionRecommendation": "OPEN_LONG",
-            "firstEntryAt": iso(now), "interval": "1m", "strategyId": "manual-test",
+            "firstEntryAt": iso(now), "interval": "1m", "strategyId": crate::strategies::ACTIVE_STRATEGY_ID,
             "plan": {"entryMin": 99., "entryMax": 101., "entryLimit": 100., "stopLoss": 90., "takeProfit": 120.}
         }]
     });

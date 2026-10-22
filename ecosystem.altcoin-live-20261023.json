@@ -1,0 +1,29 @@
+{
+  "apps": [
+    {
+      "name": "nofx-api",
+      "cwd": "D:/UGit/nofx-new",
+      "script": "data/ml/runtime-altcoin-20261023/bin/nofx-server.exe",
+      "args": "--root D:/UGit/nofx-new --host 127.0.0.1 --port 3100",
+      "interpreter": "none",
+      "autorestart": true,
+      "watch": false,
+      "log_date_format": "YYYY-MM-DD HH:mm:ss",
+      "max_restarts": 10,
+      "min_uptime": "10s",
+      "exp_backoff_restart_delay": 2000,
+      "env": {
+        "NODE_ENV": "production",
+        "PORT": "3100",
+        "NOFX_AUTOSTART": "true",
+        "NOFX_HTTP_PROXY": "http://127.0.0.1:7890",
+        "NOFX_MIN_QUOTE_VOL_24H": "50000000",
+        "NOFX_MIN_LISTING_DAYS": "30",
+        "NOFX_ML_MAX_POSITIONS": "18",
+        "NOFX_ML_MAX_COMMITTED_PCT": "0.80",
+        "NOFX_ML_MIN_EDGE_BPS": "25",
+        "NOFX_SCORE_SIZING": "false"
+      }
+    }
+  ]
+}

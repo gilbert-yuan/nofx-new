@@ -64,14 +64,12 @@ fn compare(actual: &Value, expected: &Value, path: &str) {
     }
 }
 #[test]
-fn flow_local_replay_and_fill_accounting_match_legacy() {
+fn flow_replay_and_fill_accounting_match_legacy() {
     let cases: Vec<Value> = serde_json::from_str(include_str!("backend_oracles.json")).unwrap();
     for (i, c) in cases.iter().enumerate() {
         let input = &c["input"];
         let actual = match c["kind"].as_str().unwrap() {
             "flow" => crate::flow::analyze(input),
-            "local" => crate::analytics::local_analysis(input),
-            "local_multi" => crate::analytics::local_multi(input, &c["aux"], &c["adaptive"]),
             "replay" => crate::analytics::replay(input, c["rows"].as_array().unwrap()),
             "ledger" => crate::ledger::derive(
                 input["orders"].as_array().unwrap(),

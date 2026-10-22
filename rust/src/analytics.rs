@@ -1,10 +1,8 @@
 //! Account reports and adaptive rules. All computations use persisted order snapshots.
 mod adaptive;
-mod local;
 mod optimizer;
 mod replay;
 pub use adaptive::*;
-pub use local::*;
 pub use optimizer::*;
 pub use replay::*;
 

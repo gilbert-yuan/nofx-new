@@ -1,59 +1,22 @@
-//! Native strategy registry and deterministic analysis. All parameter schemas are
-//! embedded data, shared by live analysis and replay; no JavaScript is executed.
+//! The active altcoin strategy and shared order protection helpers.
 use crate::number;
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 use std::sync::OnceLock;
-#[path = "strategies/enhanced.rs"]
-mod enhanced;
-#[path = "strategies/h4.rs"]
-mod h4;
+#[path = "strategies/altcoin_breakout.rs"]
+pub mod altcoin_breakout;
 #[path = "strategies/indicators.rs"]
 pub mod indicators;
-#[path = "strategies/martin_luk.rs"]
-mod martin_luk;
 #[path = "strategies/opportunity.rs"]
 mod opportunity;
-#[path = "strategies/structure.rs"]
-mod structure;
-#[path = "strategies/yao.rs"]
-mod yao;
 pub use indicators::{atr, ema, rsi};
-pub use opportunity::{execution_plan, opportunity_report};
-pub use opportunity::{is_market_plan, market_entry_block};
-pub use yao::{
-    calibrate as yao_calibrate, features as yao_features, predict as yao_prediction,
-    profile as yao_market_profile, universe as yao_universe,
-};
+pub use opportunity::{execution_plan, is_market_plan, market_entry_block, opportunity_report};
 
-pub fn yao_predictions(
-    symbols: &[Value],
-    markets: &Value,
-    tickers: &Value,
-    now: i64,
-    options: &Value,
-) -> Value {
-    let mut results: Vec<Value> = symbols
-        .iter()
-        .filter_map(|s| {
-            let key = s.as_str()?;
-            let p = yao_prediction(&markets[key], &tickers[key], now, options);
-            if p.is_null() { None } else { Some(p) }
-        })
-        .collect();
-    results.sort_by(|a, b| {
-        (b["stage"] == "TRIGGERED")
-            .cmp(&(a["stage"] == "TRIGGERED"))
-            .then_with(|| n(b, "probabilityPct").total_cmp(&n(a, "probabilityPct")))
-            .then_with(|| {
-                n(b, "predictedMovePct")
-                    .abs()
-                    .total_cmp(&n(a, "predictedMovePct").abs())
-            })
-            .then_with(|| a["symbol"].as_str().cmp(&b["symbol"].as_str()))
-    });
-    results.truncate(number(&options["maxCandidates"], 50.).trunc().max(1.) as usize);
-    json!(results)
+pub const ACTIVE_STRATEGY_ID: &str = "altcoin-trend-breakout-live-v1";
+/// Historical input alias for the same algorithm, never an online registration.
+pub const RESEARCH_STRATEGY_ID: &str = "altcoin-trend-breakout-v1";
+pub fn is_current_strategy(id: &str) -> bool {
+    matches!(id, ACTIVE_STRATEGY_ID | RESEARCH_STRATEGY_ID)
 }
 
 fn registry() -> &'static Value {
@@ -74,7 +37,15 @@ pub fn definitions() -> Vec<Value> {
     definitions
 }
 pub fn definition(id: &str) -> Option<Value> {
-    definitions().into_iter().find(|d| d["id"] == id)
+    if !is_current_strategy(id) {
+        return None;
+    }
+    let mut item = definitions().into_iter().next()?;
+    if id == RESEARCH_STRATEGY_ID {
+        item["id"] = json!(id);
+        item["researchOnly"] = json!(true);
+    }
+    Some(item)
 }
 pub fn defaults(id: &str) -> Value {
     definition(id)
@@ -134,12 +105,7 @@ pub fn resolve_params(id: &str, overrides: &Value) -> Result<Value> {
     Ok(json!({"params":params,"rejected":rejected}))
 }
 pub fn list(config: &Value, state: &Value) -> Value {
-    let engine = config["analysis"]["engine"].as_str().unwrap_or("enhanced");
-    let default_id = match engine {
-        "h4-breakout" => "h4-trend-breakout-v1",
-        "h4-reversion" => "h4-mean-reversion-v1",
-        _ => "enhanced-trend-v1",
-    };
+    let default_id = ACTIVE_STRATEGY_ID;
     let initialized = state["initialized"].as_bool().unwrap_or_else(|| {
         state["strategies"]
             .as_object()
@@ -190,50 +156,37 @@ pub fn list(config: &Value, state: &Value) -> Value {
     json!({"enabled":enabled,"strategies":all,"updatedAt":state["updatedAt"],"groupLabels":labels})
 }
 pub fn analyze(id: &str, market: &Value, context: &Value) -> Result<Value> {
-    let p = resolve_params(id, &context["params"])?["params"].clone();
-    let mut ctx = context.clone();
-    if !ctx.is_object() {
-        ctx = json!({});
+    if !is_current_strategy(id) {
+        bail!("未知策略：{id}");
     }
-    ctx["params"] = p;
-    let mut signal = match id {
-        "h4-trend-breakout-v1" | "h4-mean-reversion-v1" | "h4-chandelier-breakout-v1" => {
-            h4::analyze(id, market, &ctx)
-        }
-        "structure-long-v1" => structure::analyze(true, market, &ctx),
-        "structure-short-v1" => structure::analyze(false, market, &ctx),
-        "enhanced-trend-v1" => enhanced::analyze(market, &ctx),
-        "yao-coin-ambush-v1" => yao::analyze(market, &ctx),
-        "martin-luk-pullback-v1" => martin_luk::analyze(market, &ctx),
-        crate::ml_execution::STRATEGY_ID => {
-            if ctx["mlPrediction"].is_object() {
-                crate::ml_execution::signal(&ctx["mlPrediction"], market, crate::now_ms())?
-            } else {
-                wait(
-                    market,
-                    "等待 Chronos/LightGBM 实时模型服务",
-                    &Value::Null,
-                    json!({}),
-                )
-            }
-        }
-        _ => bail!("未知策略：{id}"),
+    if id == RESEARCH_STRATEGY_ID && context["allowResearchOnly"] != true {
+        return Ok(wait(
+            market,
+            "历史研究别名仅供离线回测。",
+            &Value::Null,
+            json!({"researchOnly":true}),
+        ));
+    }
+    let mut ctx = if context.is_object() {
+        context.clone()
+    } else {
+        json!({})
     };
+    ctx["params"] = resolve_params(id, &context["params"])?["params"].clone();
+    let mut signal = altcoin_breakout::analyze(market, &ctx);
     if ctx["deferMarketFilters"] != true {
         crate::market_filters::apply(&mut signal, market, &ctx);
     }
     Ok(signal)
 }
 pub fn review(id: &str, order: &Value, market: &Value, context: &Value) -> Result<Value> {
-    if definition(id).is_none() {
-        bail!("未知策略：{id}");
+    if is_current_strategy(id) || order["plan"]["altcoinTrend"]["variant"] == "breakout" {
+        Ok(altcoin_breakout::review(order, market, context))
+    } else {
+        // Historical orders retain their frozen shared protection and can still
+        // be inspected or closed after their former strategy was removed.
+        Ok(local_review(order, market))
     }
-    Ok(match id {
-        "h4-chandelier-breakout-v1" => h4::chandelier_review(order, market),
-        "enhanced-trend-v1" => enhanced::review(order, market, context),
-        "martin-luk-pullback-v1" => martin_luk::review(order, market),
-        _ => local_review(order, market),
-    })
 }
 pub(crate) fn n(p: &Value, key: &str) -> f64 {
     number(&p[key], 0.)
@@ -260,7 +213,9 @@ pub fn exit_rules(p: &Value) -> Value {
     json!({"trailing":{"triggerR":p["trailingTriggerR"],"profitTriggerPct":p["trailingProfitTriggerPct"],"extendTpAtr":p["trailingExtendTpAtr"],"lockMinRoomAtr":p["trailingLockMinRoomAtr"],"useBreakEven":p["trailingUseBreakEven"],"breakEvenFloorAtr":p["trailingBreakEvenFloorAtr"],"breakEvenCostBufferBps":p["trailingBreakEvenCostBufferBps"],"ladder":[{"atR":0,"trailR":p["trailingL0TrailR"],"lockR":p["trailingL0LockR"]},{"atR":p["trailingL1AtR"],"trailR":p["trailingL1TrailR"],"lockR":p["trailingL1LockR"]},{"atR":p["trailingL2AtR"],"trailR":p["trailingL2TrailR"],"lockR":p["trailingL2LockR"]}]},"smartExit":{"enabled":p["smartExitEnabled"],"barLevelEnabled":p["smartExitBarLevelEnabled"].as_bool().unwrap_or(b(p,"smartExitEnabled")),"barLevel":p["smartExitBarLevel"],"maPeriod":p["smartExitMaPeriod"],"atrPeriod":p["smartExitAtrPeriod"],"maBreakAtr":p["smartExitMaAtr"],"maExitMaxProfitR":p["smartExitMaExitMaxR"],"tpMinR":p["smartExitTpMinR"],"minHoldBars":p["smartExitMinHold"]},"partialTp":{"enabled":p["partialTpEnabled"],"tp1R":p["partialTp1R"],"tp2R":p["partialTp2R"],"tp1ClosePct":p["partialTp1ClosePct"],"tp2ClosePct":p["partialTp2ClosePct"],"moveStopToBreakEven":p["partialTpMoveStopToBreakeven"]}})
 }
 pub fn exit_rules_for(plan: &Value) -> Value {
-    let mut rules = exit_rules(&defaults("enhanced-trend-v1"));
+    let defaults: Value = serde_json::from_str(include_str!("strategies/exit_defaults.json"))
+        .expect("shared exit defaults");
+    let mut rules = exit_rules(&defaults);
     for key in ["trailing", "smartExit", "partialTp"] {
         let snap = if key == "smartExit" && !plan["exitRules"][key].is_object() {
             &plan["smartExit"]
@@ -275,16 +230,6 @@ pub fn exit_rules_for(plan: &Value) -> Value {
             }
         }
     }
-    rules
-}
-/// Frozen 11-bar Chronos/LightGBM protection. Keep trailing and partial take
-/// profit, but do not inherit the enhanced-trend 0-bar MA exit: that rule is
-/// sized for ~120 one-minute bars, not an 11-hour forecast hold.
-pub fn ml_horizon_exit_rules() -> Value {
-    let mut rules = exit_rules_for(&json!({}));
-    rules["smartExit"]["enabled"] = json!(false);
-    rules["smartExit"]["barLevelEnabled"] = json!(false);
-    rules["smartExit"]["minHoldBars"] = json!(11);
     rules
 }
 pub fn tightest_stop(order: &Value, long: bool) -> f64 {
@@ -383,462 +328,73 @@ pub(crate) fn local_review_with_atr(order: &Value, market: &Value, range: f64) -
     };
     json!({"action":"UPDATE_PROTECTION","stopLoss":stop,"takeProfit":tp,"confidence":0.75,"reason":format!("浮盈 {profit_r:.2}R 启用移动止损。")})
 }
-pub const FEATURE_NAMES: [&str; 9] = [
-    "trendReturn",
-    "trendEfficiency",
-    "atrPct",
-    "returnVolatility",
-    "volumeRatio",
-    "volumeTrend",
-    "upperWickRatio",
-    "lowerWickRatio",
-    "rangePosition",
-];
-pub fn kline_features(raw: &[Value], options: &Value) -> Option<Value> {
-    let period = |k: &str, d: usize| number(&options[k], d as f64).max(1.) as usize;
-    let look = period("lookbackBars", 72);
-    let trend_n = period("trendBars", 24);
-    let ap = period("atrPeriod", 14);
-    let vp = period("volumePeriod", 20);
-    let w = &raw[raw.len().saturating_sub(look)..];
-    if w.len() < trend_n.max(ap).max(vp) + 1
-        || w.iter().any(|r| {
-            ["openTime", "open", "high", "low", "close", "volume"]
-                .iter()
-                .any(|k| !number(&r[k], f64::NAN).is_finite())
-        })
-    {
-        return None;
-    }
-    let last = w.last()?;
-    let trend = &w[w.len() - trend_n - 1..];
-    let ret: Vec<f64> = trend
-        .windows(2)
-        .map(|r| (n(&r[1], "close") / n(&r[0], "close")).ln())
-        .collect();
-    let mean = indicators::mean(&ret);
-    let travel = trend
-        .windows(2)
-        .map(|r| (n(&r[1], "close") - n(&r[0], "close")).abs())
-        .sum::<f64>();
-    let volume_mean = |s: &[Value]| s.iter().map(|r| n(r, "volume")).sum::<f64>() / s.len() as f64;
-    let base = volume_mean(&w[w.len() - vp - 1..w.len() - 1]);
-    let previous = &w[w.len().saturating_sub(2 * vp)..w.len() - vp];
-    let high = trend
-        .iter()
-        .map(|r| n(r, "high"))
-        .fold(f64::NEG_INFINITY, f64::max);
-    let low = trend
-        .iter()
-        .map(|r| n(r, "low"))
-        .fold(f64::INFINITY, f64::min);
-    let range = n(last, "high") - n(last, "low");
-    let close = n(last, "close");
-    Some(
-        json!({"trendReturn":close/n(&trend[0],"close")-1.,"trendEfficiency":if travel>0.{(close-n(&trend[0],"close")).abs()/travel}else{0.},"atrPct":atr(w,ap)/close,"returnVolatility":(ret.iter().map(|x|(x-mean).powi(2)).sum::<f64>()/ret.len()as f64).sqrt(),"volumeRatio":if base>0.{Some(n(last,"volume")/base)}else{None},"volumeTrend":if previous.len()==vp&&volume_mean(previous)>0.{Some(volume_mean(&w[w.len()-vp..])/volume_mean(previous))}else{None},"upperWickRatio":if range>0.{(n(last,"high")-n(last,"open").max(close))/range}else{0.},"lowerWickRatio":if range>0.{(n(last,"open").min(close)-n(last,"low"))/range}else{0.},"rangePosition":if high>low{(close-low)/(high-low)}else{0.5}}),
-    )
-}
-pub fn match_feature_rules(features: &Value, rules: &Value, missing: &str) -> Result<Value> {
-    let list = rules
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!("feature rules 必须为数组"))?;
-    let mut failures = vec![];
-    for r in list {
-        let key = r["feature"].as_str().unwrap_or("");
-        let min = number(&r["min"], f64::NAN);
-        let max = number(&r["max"], f64::NAN);
-        if !FEATURE_NAMES.contains(&key) || !min.is_finite() || !max.is_finite() || min > max {
-            bail!("无效特征规则 {r}");
-        }
-        let x = number(&features[key], f64::NAN);
-        if !x.is_finite() {
-            if missing != "pass" {
-                failures.push(format!("{key}:missing"));
-            }
-        } else if x < min || x > max {
-            failures.push(format!("{key}:{x} not in [{min},{max}]"));
-        }
-    }
-    Ok(json!({"passed":failures.is_empty(),"failures":failures}))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn oracle() -> Value {
-        serde_json::from_str(include_str!("strategies/fixtures.json")).unwrap()
-    }
-    fn market(dataset: &Value, interval: &str) -> Value {
-        let count = dataset["count"].as_u64().unwrap() as usize;
-        let drift = n(dataset, "drift");
-        let mode = dataset["mode"].as_str().unwrap();
-        let dt = crate::interval_ms(interval).unwrap();
-        let base = 1_760_000_000_000_i64;
-        let mut candles = vec![];
-        for i in 0..count {
-            let x = i as f64;
-            let mut close = 100. + drift * x + (x / 4.).sin() * 0.8;
-            let mut open = close - ((x / 3.).cos() * 0.25 + 0.03);
-            let mut high = open.max(close) + 0.6;
-            let mut low = open.min(close) - 0.6;
-            let mut volume = 1000. + (x / 6.).sin() * 120.;
-            if mode == "flat" {
-                close = 100.;
-                open = 100.;
-                high = 100.5;
-                low = 99.5;
-            }
-            if i >= count - 12 && mode == "surge" {
-                close += (i as f64 - count as f64 + 13.) * 0.8;
-                high = open.max(close) + 0.6;
-                low = open.min(close) - 0.6;
-                volume *= 4.;
-            }
-            if i == count - 1 && mode == "break" {
-                close += if drift < 0. { -4. } else { 4. };
-                high = open.max(close) + 0.6;
-                low = open.min(close) - 0.6;
-                volume *= 2.;
-            }
-            if i == count - 1 && mode == "dip" {
-                close -= 10.;
-                high = open.max(close) + 0.6;
-                low = open.min(close) - 0.6;
-            }
-            candles.push(json!({"openTime":base+i as i64*dt,"open":open,"high":high,"low":low,"close":close,"volume":volume,"quoteVolume":volume*close}));
-        }
-        json!({"symbol":"TESTUSDT","interval":interval,"klines":candles,"dataAsOf":crate::iso(base+count as i64*dt)})
-    }
-    fn compatible(expected: &Value, actual: &Value, path: &str) {
-        if let Some(a) = expected.as_f64() {
-            let b = actual
-                .as_f64()
-                .unwrap_or_else(|| panic!("{path}: expected numeric {a}, got {actual}"));
-            assert!(
-                (a - b).abs() <= 1e-8 * (1. + a.abs()),
-                "{path}: expected {a}, got {b}"
-            );
-            return;
-        }
-        match expected {
-            Value::Object(obj) => {
-                for (k, v) in obj {
-                    if [
-                        "reason",
-                        "risk",
-                        "suggestion",
-                        "summary",
-                        "description",
-                        "invalidation",
-                        "generatedAt",
-                        "suggestedRisk",
-                        "dataSource",
-                    ]
-                    .contains(&k.as_str())
-                    {
-                        continue;
-                    }
-                    compatible(v, &actual[k], &format!("{path}.{k}"));
-                }
-            }
-            Value::Array(arr) => {
-                let got = actual
-                    .as_array()
-                    .unwrap_or_else(|| panic!("{path}: expected array, got {actual}"));
-                assert_eq!(arr.len(), got.len(), "{path} array length");
-                for (i, v) in arr.iter().enumerate() {
-                    if v.is_string() {
-                        continue;
-                    }
-                    compatible(v, &got[i], &format!("{path}[{i}]"));
-                }
-            }
-            _ => assert_eq!(expected, actual, "{path}"),
-        }
-    }
     #[test]
-    fn registered_strategy_decisions_and_prices_match_legacy_oracles() {
-        let f = oracle();
-        for case in f["cases"].as_array().unwrap() {
-            let index = case["dataset"].as_u64().unwrap() as usize;
-            let dataset = &f["datasets"][index];
-            let m = market(dataset, "1m");
-            let ctx = json!({"auxMarkets":{"15m":market(dataset,"15m"),"1h":market(dataset,"1h"),"4h":market(dataset,"4h"),"5m":market(dataset,"15m")},"params":case["params"],"account":{"equity":10000},"costs":{"feeBps":6,"slippageBps":5,"fundingBpsPer8h":3}});
-            let id = case["id"].as_str().unwrap();
-            let got = analyze(id, &m, &ctx).unwrap();
-            let mut expected = case["expected"].clone();
-            // The migration snapshot captured the bug: breakout plans stored zero
-            // even though the same snapshot's signal had a nonzero score.
-            // Retain the immutable fixture and compare every other field as before.
-            if matches!(id, "h4-trend-breakout-v1" | "h4-chandelier-breakout-v1")
-                && expected["plan"].is_object()
-            {
-                expected["plan"]["signalScore"] = expected["score"].clone();
-            }
-            compatible(&expected, &got, &format!("{id}:{index}"));
-        }
-    }
-    #[test]
-    fn h4_breakout_carries_its_score_into_position_sizing() {
-        let dataset = json!({"count":260,"drift":0.035,"mode":"break"});
-        for id in ["h4-trend-breakout-v1", "h4-chandelier-breakout-v1"] {
-            for drift in [0.035, -0.035] {
-                let m = market(&merge(dataset.clone(), json!({"drift":drift})), "4h");
-                let signal = analyze(
-                    id,
-                    &m,
-                    &json!({"params":{"longOnly":false,"rsiLongMax":100,"rsiShortMin":0}}),
-                )
-                .unwrap();
-                assert!(
-                    matches!(signal["action"].as_str(), Some("BUY" | "SELL")),
-                    "{signal}"
-                );
-                assert!(n(&signal, "score") > 0.);
-                assert_eq!(signal["plan"]["signalScore"], signal["score"]);
-            }
-        }
-    }
-    #[test]
-    fn h4_reversion_requires_ready_adx_when_filter_is_enabled() {
-        let m = market(&json!({"count":80,"drift":0.035,"mode":"dip"}), "4h");
-        let mut ctx = json!({"params":{"adxPeriod":60,"adxMax":50,"entryExtAtr":0.2,"rsiOversold":60,"rsiOverbought":90,"minNetRr":0.1,"minAtrPct":0,"maxAtrPct":0.2}});
-        let signal = analyze("h4-mean-reversion-v1", &m, &ctx).unwrap();
-        assert_eq!(signal["action"], "WAIT", "{signal}");
-        assert_eq!(signal["dataGap"], true);
-        ctx["params"]["adxMax"] = json!(0);
-        assert_eq!(
-            analyze("h4-mean-reversion-v1", &m, &ctx).unwrap()["action"],
-            "BUY"
-        );
-    }
-    #[test]
-    fn enhanced_conflicting_periods_never_bypass_momentum_confirmation() {
-        let m = market(&json!({"count":80,"drift":0.035,"mode":"normal"}), "1m");
-        for params in [
-            json!({"macdFastPeriod":26,"macdSlowPeriod":12}),
-            json!({"maFastPeriod":50,"maSlowPeriod":20}),
-            json!({"volumeRecentPeriod":20,"volumeLookbackPeriod":20}),
-            json!({"trend15Enabled":true,"trend15EmaFast":50,"trend15EmaSlow":20}),
+    fn registry_exposes_only_current_strategy_and_current_reset_defaults() {
+        let snapshot = list(&json!({}), &json!({}));
+        assert_eq!(snapshot["strategies"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["enabled"], json!([ACTIVE_STRATEGY_ID]));
+        let p = defaults(ACTIVE_STRATEGY_ID);
+        for (key, value) in [
+            ("emaFast", 25.),
+            ("emaSlow", 75.),
+            ("channelPeriod", 8.),
+            ("stopAtr", 1.),
+            ("trailAtr", 3.),
+            ("riskPerTrade", 0.003),
+            ("maxNotionalPct", 0.5),
+            ("maxPositions", 3.),
         ] {
-            let result = analyze("enhanced-trend-v1", &m, &json!({"params":params})).unwrap();
-            assert_eq!(result["action"], "WAIT");
-            assert!(
-                result["reason"].as_str().unwrap().starts_with("参数冲突"),
-                "{result}"
-            );
+            assert_eq!(number(&p[key], f64::NAN), value, "{key}");
         }
-    }
-    #[test]
-    fn enhanced_macd_gate_blocks_high_score_conflicts_in_both_directions() {
-        let mut conflicts = [false; 2];
-        let mut aligned = [false; 2];
-        for count in 80..140 {
-            for drift in [0.02, 0.035, 0.05, -0.02, -0.035, -0.05] {
-                let mut m = market(&json!({"count":count,"drift":drift,"mode":"normal"}), "1m");
-                for candle in m["klines"].as_array_mut().unwrap().iter_mut().rev().take(5) {
-                    candle["volume"] = json!(2500);
-                }
-                let mut ctx = json!({"params":{"maxVolumeRatio":0}});
-                let baseline = analyze("enhanced-trend-v1", &m, &ctx).unwrap();
-                let direction = match baseline["action"].as_str() {
-                    Some("BUY") => 0,
-                    Some("SELL") => 1,
-                    _ => continue,
-                };
-                let histogram = n(&baseline["plan"]["indicators"]["macd"], "histogram");
-                let same_direction = if direction == 0 {
-                    histogram > 0.
-                } else {
-                    histogram < 0.
-                };
-                ctx["params"]["requireMacdConfirm"] = json!(true);
-                ctx["params"]["pendingGraceMinutes"] = json!(5);
-                let confirmed = analyze("enhanced-trend-v1", &m, &ctx).unwrap();
-                if same_direction {
-                    assert_eq!(confirmed["action"], baseline["action"]);
-                    assert_eq!(confirmed["plan"]["pendingGraceMinutes"], 5.);
-                    aligned[direction] = true;
-                } else {
-                    assert!(n(&baseline["plan"], "trendStrengthScore") >= 70.);
-                    assert_eq!(confirmed["action"], "WAIT", "{confirmed}");
-                    conflicts[direction] = true;
-                }
-            }
-        }
-        assert_eq!(
-            conflicts,
-            [true, true],
-            "fixtures must exercise both score bypasses"
-        );
-        assert_eq!(
-            aligned,
-            [true, true],
-            "valid momentum must still permit entries"
-        );
-    }
-    #[test]
-    fn yao_optional_trend_gate_can_be_disabled_without_disabling_entries() {
-        let dataset = json!({"count":260,"drift":0.035,"mode":"surge"});
-        let m = market(&dataset, "1m");
-        let mut ctx = json!({"params":{"require15mTrend":false,"minProbabilityPct":40,"minRawProbabilityPct":50,"minCurrentAmplitudePct":0,"minVolumeRatio":0,"minRangeRatio":0,"minTrendConsistencyPct":0,"minRecentReturnPct":0,"minNetRr":0.1,"minRange6hPct":0,"minDistHigh24hPct":0,"maxRecentReturnPct":30},"auxMarkets":{"15m":market(&dataset,"15m")}});
-        let result = analyze("yao-coin-ambush-v1", &m, &ctx).unwrap();
-        assert_eq!(result["action"], "BUY", "{result}");
-        assert_eq!(result["trend"]["trend15"]["enabled"], false);
-        ctx["params"]["require15mTrend"] = json!(true);
-        ctx["params"]["trend15EmaFast"] = json!(50);
-        ctx["params"]["trend15EmaSlow"] = json!(20);
-        assert_eq!(
-            analyze("yao-coin-ambush-v1", &m, &ctx).unwrap()["action"],
-            "WAIT"
-        );
-    }
-    #[test]
-    fn enhanced_volume_upper_bound_is_configurable_and_conflicts_are_explicit() {
-        let mut m = market(&json!({"count":260,"drift":0.035,"mode":"normal"}), "1m");
-        for row in m["klines"].as_array_mut().unwrap().iter_mut().rev().take(5) {
-            row["volume"] = json!(n(row, "volume") * 1.6);
-        }
-        let id = "enhanced-trend-v1";
-        assert_eq!(analyze(id, &m, &json!({})).unwrap()["action"], "WAIT");
-        let conflict = analyze(id, &m, &json!({"params":{"minVolumeRatio":1.3}})).unwrap();
-        assert!(conflict["reason"].as_str().unwrap().starts_with("参数冲突"));
-        for upper in [1.8, 0.] {
-            let signal = analyze(
-                id,
-                &m,
-                &json!({"params":{"minVolumeRatio":1.3,"maxVolumeRatio":upper}}),
-            )
-            .unwrap();
-            assert_eq!(signal["action"], "BUY", "{signal}");
-        }
-    }
-    #[test]
-    fn order_review_matches_legacy_protection_and_smart_exit() {
-        let f = oracle();
-        for case in f["reviews"].as_array().unwrap() {
-            let idx = case["market"]["dataset"].as_u64().unwrap() as usize;
-            let interval = case["market"]["interval"].as_str().unwrap();
-            let mut m = market(&f["datasets"][idx], interval);
-            let last = m["klines"].as_array_mut().unwrap().last_mut().unwrap();
-            let close = n(&case["market"], "close");
-            *last = merge(
-                last.clone(),
-                json!({"open":close,"close":close,"high":close+0.6,"low":close-0.6}),
-            );
-            let id = case["id"].as_str().unwrap();
-            let got = review(id, &case["order"], &m, &json!({})).unwrap();
-            compatible(&case["expected"], &got, id);
-        }
-    }
-    #[test]
-    fn yao_features_predictions_and_feature_filters_match_legacy() {
-        let f = oracle();
-        for (i, expected) in f["predictions"].as_array().unwrap().iter().enumerate() {
-            let m = market(&f["datasets"][i], "1m");
-            compatible(
-                &expected["features"],
-                &yao_features(&m, &expected["ticker"], &json!({})),
-                &format!("yao-features:{i}"),
-            );
-            compatible(
-                &expected["prediction"],
-                &yao_prediction(
-                    &m,
-                    &expected["ticker"],
-                    1_760_000_000_000,
-                    &json!({"minRawProbabilityPct":40}),
-                ),
-                &format!("yao-prediction:{i}"),
-            );
-            compatible(
-                &expected["klineFeatures"],
-                &kline_features(m["klines"].as_array().unwrap(), &json!({})).unwrap(),
-                &format!("features:{i}"),
-            );
-        }
-    }
-    #[test]
-    fn ml_horizon_exit_keeps_partial_tp_and_disables_zero_bar_ma_exit() {
-        let legacy = exit_rules_for(&json!({}));
-        let horizon = ml_horizon_exit_rules();
-        assert_eq!(legacy["smartExit"]["enabled"], true);
-        assert_eq!(legacy["smartExit"]["minHoldBars"], 0.);
-        assert_eq!(horizon["smartExit"]["enabled"], false);
-        assert_eq!(horizon["smartExit"]["barLevelEnabled"], false);
-        assert_eq!(horizon["smartExit"]["minHoldBars"], 11.);
-        assert_eq!(horizon["partialTp"], legacy["partialTp"]);
-        assert_eq!(horizon["trailing"], legacy["trailing"]);
-        let overridden = exit_rules_for(&json!({"exitRules":{"smartExit":{"enabled":false}}}));
-        assert_eq!(overridden["smartExit"]["enabled"], false);
-        assert_eq!(overridden["smartExit"]["minHoldBars"], 0.);
-    }
-    #[test]
-    fn registration_preserves_schemas_and_validation() {
-        assert_eq!(definitions().len(), 9);
-        let model = definition(crate::ml_execution::STRATEGY_ID).unwrap();
-        assert_eq!(model["engine"], "monthly-ml");
-        assert_eq!(model["planInterval"], "1h");
-        let p = resolve_params(
-            "h4-mean-reversion-v1",
-            &json!({"longOnly":"yes","maxLeverage":9000,"atrPeriod":14}),
-        )
-        .unwrap();
-        assert_eq!(p["params"]["longOnly"], true);
-        assert_eq!(number(&p["params"]["maxLeverage"], 0.), 2.);
-        assert_eq!(number(&p["params"]["atrPeriod"], 0.), 14.);
-        assert_eq!(p["rejected"].as_array().unwrap().len(), 1);
-        let l = list(&json!({}), &json!({}));
-        assert_eq!(l["enabled"], json!(["enhanced-trend-v1"]));
-        let reversion = defaults("h4-mean-reversion-v1");
-        assert_eq!(number(&reversion["maxAtrPct"], 0.), 0.06);
-        assert_eq!(number(&reversion["minNetRr"], 0.), 1.625);
-        assert_eq!(number(&reversion["maxHoldBars"], 0.), 17.);
-        assert_eq!(number(&reversion["autoMarginPct"], 0.), 0.015);
-        assert_eq!(number(&reversion["maxPositions"], 0.), 50.);
-        assert_eq!(number(&reversion["rsiOversold"], 0.), 35.);
-        assert_eq!(number(&reversion["rsiOverbought"], 0.), 70.);
-        assert_eq!(reversion["longOnly"], false);
-        assert_eq!(reversion["tpToMean"], true);
-    }
-    #[test]
-    fn market_opportunity_preserves_market_execution() {
-        let p = json!({"entryStyle":"market","entryMin":99,"entryMax":101,"entryReference":100,"stopLoss":95,"takeProfit":110,"riskUnit":5});
-        let mut signal = json!({"symbol":"TESTUSDT","action":"BUY","plan":p});
-        let m = json!({"symbol":"TESTUSDT","interval":"4h","klines":[{"close":100}]});
-        signal["opportunityReport"] = opportunity_report(
-            &signal,
-            &m,
-            &json!({"ticker24h":{"lastPrice":100}}),
+        assert_eq!(p["useEmaFilter"], true);
+        let off = list(
             &json!({}),
-            0,
+            &json!({"initialized":true,
+            "strategies":{"altcoin-trend-breakout-live-v1":{"enabled":false}}}),
         );
-        assert_eq!(signal["opportunityReport"]["canProceed"], true);
-        assert!(execution_plan(&signal)["entryLimit"].is_null());
-        signal["opportunityReport"] = opportunity_report(
-            &signal,
-            &m,
-            &json!({"ticker24h":{"lastPrice":102}}),
-            &json!({}),
-            0,
-        );
-        assert_eq!(
-            signal["opportunityReport"]["decision"]["code"],
-            "WAIT_REANALYSIS"
-        );
+        assert!(off["enabled"].as_array().unwrap().is_empty());
     }
     #[test]
-    fn oi_notional_inflation_does_not_create_a_false_crowding_block() {
-        let signal = json!({"symbol":"TESTUSDT","action":"BUY","plan":{"entryStyle":"market","entryMin":99.,"entryMax":101.,"stopLoss":95.,"takeProfit":110.}});
-        let market = json!({"symbol":"TESTUSDT","interval":"1m","klines":[{"close":100.}]});
-        let mut context = json!({"ticker24h":{"lastPrice":100.,"priceChangePercent":15.},"premium":{"lastFundingRate":0.0001},"oi":[{"sumOpenInterest":100.,"sumOpenInterestValue":10000.},{"sumOpenInterest":100.,"sumOpenInterestValue":13000.}]});
-        let report = opportunity_report(&signal, &market, &context, &json!({}), 0);
-        assert_eq!(report["current"]["oiChangePct"], 0.);
-        assert_eq!(report["canProceed"], true);
-        context["oi"][1]["sumOpenInterest"] = json!(130.);
+    fn historical_input_alias_never_adds_a_registered_or_executable_old_strategy() {
+        assert_eq!(defaults(RESEARCH_STRATEGY_ID), defaults(ACTIVE_STRATEGY_ID));
         assert_eq!(
-            opportunity_report(&signal, &market, &context, &json!({}), 0)["canProceed"],
-            false
+            definition(RESEARCH_STRATEGY_ID).unwrap()["researchOnly"],
+            true
+        );
+        assert_eq!(
+            analyze(RESEARCH_STRATEGY_ID, &json!({}), &json!({})).unwrap()["researchOnly"],
+            true
+        );
+        for id in [
+            "altcoin-trend-retest-v1",
+            "h4-trend-breakout-v1",
+            "enhanced-trend-v1",
+            "yao-coin-ambush-v1",
+            "crypto-quant-signal-v1",
+            "chronos-lightgbm-v1",
+        ] {
+            assert!(definition(id).is_none(), "{id}");
+            assert!(resolve_params(id, &json!({})).is_err(), "{id}");
+            assert!(analyze(id, &json!({}), &json!({})).is_err(), "{id}");
+        }
+    }
+    #[test]
+    fn shared_exit_defaults_and_frozen_order_overrides_survive_registry_cleanup() {
+        let base = exit_rules_for(&json!({}));
+        assert_eq!(base["trailing"]["triggerR"], 0.4);
+        assert_eq!(base["smartExit"]["maPeriod"], 20);
+        assert_eq!(base["partialTp"]["tp1ClosePct"], 0.4);
+        let frozen = exit_rules_for(&json!({"exitRules":{"smartExit":{"enabled":false},
+            "partialTp":{"enabled":false},"trailing":{"triggerR":1000000}}}));
+        assert_eq!(frozen["smartExit"]["enabled"], false);
+        assert_eq!(frozen["partialTp"]["enabled"], false);
+        assert_eq!(frozen["trailing"]["triggerR"], 1000000);
+        assert_eq!(
+            review("removed-historical-id", &json!({}), &json!({}), &json!({})).unwrap()["action"],
+            "HOLD"
         );
     }
 }

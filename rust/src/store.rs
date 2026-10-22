@@ -20,7 +20,6 @@ impl Store {
         };
         for (name, value) in [
             ("config", default_config()),
-            ("strategy", default_strategy()),
             (
                 "state",
                 json!({"running":false,"lastRunAt":null,"lastError":"","decisions":[]}),
@@ -78,15 +77,10 @@ pub fn default_config() -> Value {
     json!({
         "binance":{"apiKey":"","secretKey":"","demoApiKey":"","demoSecretKey":"","liveApiKey":"","liveSecretKey":"","demo":true,"testnet":true},
         "okx":{"apiKey":"","secretKey":"","passphrase":"","demo":true,"tdMode":"isolated"},
-        "model":{"enabled":false,"apiKey":"","baseUrl":"https://api.openai.com/v1","model":"gpt-4o-mini","maxConcurrentRequests":5},
-        "ml":{"mode":"research","scanBatchSize":20},
         "trader":{"exchange":"binance","enabled":false,"dryRun":true,"scanIntervalSeconds":900,"quoteAsset":"USDT","maxLeverage":5,"maxPositionNotionalPct":0.25,"maxTotalNotionalPct":1.25,"minOrderMargin":5,"minConfidence":0.45,"allowEntryOrders":false,"allowCloseOrders":false,"allowProtectionUpdates":true,"syncPaperOrdersToDemo":false,"syncPaperOrdersToLive":false,"entrySymbolsText":"","maxNewEntriesPerCycle":1,"maxPositionsToReview":10,"minProtectionMoveBps":25},
         "marketSync":{"enabled":true,"symbolsText":"ALL","interval":"15m","intervalSeconds":60,"limit":80},
-        "tradeSync":{"enabled":false,"symbolsText":"BTCUSDT, ETHUSDT","intervalSeconds":300,"limit":500,"initialLookbackDays":30},"analysis":{"engine":"local"}
+        "tradeSync":{"enabled":false,"symbolsText":"BTCUSDT, ETHUSDT","intervalSeconds":300,"limit":500,"initialLookbackDays":30}
     })
-}
-pub fn default_strategy() -> Value {
-    json!({"name":"Binance USDT perpetual contracts, 15-minute research","symbols":["ALL"],"interval":"15m","klineLimit":80,"systemPrompt":"You are a cautious crypto futures market analyst. Analyze every symbol independently and return strict JSON only. This is research, not an order.","rules":"Use the configured candle interval and supplied OHLCV data. Give BUY, SELL, or HOLD research suggestions with confidence, reasons, risks, and invalidation conditions. Prefer HOLD when evidence is weak. Never promise returns."})
 }
 pub fn merge(current: &Value, patch: &Value) -> Value {
     let mut next = current.clone();
@@ -131,11 +125,6 @@ pub fn merge(current: &Value, patch: &Value) -> Value {
         .unwrap_or(b["testnet"] != false);
     next["binance"]["demo"] = json!(demo);
     next["binance"]["testnet"] = json!(demo);
-    next["model"]["maxConcurrentRequests"] = json!(
-        crate::number(&next["model"]["maxConcurrentRequests"], 5.)
-            .floor()
-            .clamp(1., 20.)
-    );
     next
 }
 pub fn masked(config: &Value) -> Value {
@@ -186,10 +175,24 @@ mod tests {
         assert_eq!(n["binance"]["demo"], false);
         assert_ne!(masked(&n)["binance"]["apiKey"], n["binance"]["apiKey"]);
     }
+    #[test]
+    fn retired_model_defaults_are_absent_but_existing_secrets_stay_masked() {
+        let config = merge(&default_config(), &json!({"trader":{"enabled":true}}));
+        assert!(config.get("model").is_none());
+        assert!(config.get("ml").is_none());
+        let legacy = merge(&config, &json!({"model":{"apiKey":"legacy-model-secret"}}));
+        let masked = masked(&legacy);
+        assert_ne!(masked["model"]["apiKey"], legacy["model"]["apiKey"]);
+        assert_eq!(
+            merge(&legacy, &masked)["model"]["apiKey"],
+            "legacy-model-secret"
+        );
+    }
     #[tokio::test]
     async fn updates_are_serialized() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::new(dir.path().to_owned()).await.unwrap();
+        assert!(!dir.path().join("strategy.json").exists());
         let mut tasks = vec![];
         for _ in 0..20 {
             let s = store.clone();

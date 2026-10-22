@@ -16,9 +16,9 @@ import StrategiesView from './components/StrategiesView.vue';
 import StrategyStatsView from './components/StrategyStatsView.vue';
 import AutomationView from './components/AutomationView.vue';
 
-// 配置/策略/状态集中到 store（前端唯一可信源）
+// 配置与状态集中到 store（前端唯一可信源）
 const configStore = useConfigStore();
-const { config, strategy } = configStore;
+const { config } = configStore;
 const { tradingStatus, symbolStatus, syncStatus, savedMode, statusError } = storeToRefs(configStore);
 const binanceControl = reactive({
   account: null,
@@ -37,7 +37,7 @@ const AVAILABLE_VIEWS = ['workbench', 'trading', 'binance-orders', 'trading-simu
 const normalizeView = view => (AVAILABLE_VIEWS.includes(view) ? view : 'workbench');
 
 const activeView = ref('workbench');
-const activeSymbol = ref('BTCUSDT');
+const activeSymbol = ref('NEARUSDT');
 const chartDate = ref('');
 const search = ref('');
 const loading = ref(false);
@@ -56,7 +56,7 @@ const isBusy = computed(() => Object.values(loadingAreas).some((count) => count 
 const isMarketLoading = computed(() => loadingAreas.market > 0);
 const isKlineSyncLoading = computed(() => loadingAreas.klineSync > 0);
 const filteredSymbols = computed(() => state.symbols.filter(s => s.symbol.includes(search.value.trim().toUpperCase())));
-const scope = reactive({ engine: 'auto', interval: '1m', limit: 80, maxSymbols: 20, batchSize: 10, symbolsText: '' });
+const scope = reactive({ interval: '4h', limit: 200 });
 const chart = computed(() => buildChart(state.rows));
 
 onMounted(async () => {
@@ -159,7 +159,7 @@ async function fetchLatestKlines(interval = scope.interval) {
     await loadStatus();
   }
 }
-async function loadConfig() { await run(async () => { await configStore.load(); scope.interval = strategy.interval || scope.interval; scope.limit = strategy.klineLimit || scope.limit; }, 'settings'); }
+async function loadConfig() { await run(() => configStore.load(), 'settings'); }
 async function saveBinanceSettings() { await run(async () => { await configStore.saveBinance(); message.value = '币安交易配置已保存'; }, 'settings'); }
 async function testBinance() {
   const result = await run(() => configStore.test(), 'settings');

@@ -2,7 +2,7 @@
 use super::*;
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn constrain(
+pub fn constrain(
     sizing: &Value,
     plan: &Value,
     costs: &Value,
@@ -53,13 +53,32 @@ pub(super) fn constrain(
         bail!("策略风险仓位的成本或最长持仓时间无效。");
     }
     let side = if long { 1. } else { -1. };
-    let entry = n(plan, if long { "entryMax" } else { "entryMin" }, f64::NAN) * (1. + side * slip);
-    let exit = n(plan, "stopLoss", f64::NAN) * (1. - side * slip);
+    let anchored = plan["reanchorToFill"] == true;
+    let quote = if anchored {
+        n(plan, "entryReference", f64::NAN)
+    } else {
+        n(plan, if long { "entryMax" } else { "entryMin" }, f64::NAN)
+    };
+    let entry = quote * (1. + side * slip);
+    let stop = if anchored {
+        entry - side * n(plan, "riskUnit", f64::NAN)
+    } else {
+        n(plan, "stopLoss", f64::NAN)
+    };
+    let exit = stop * (1. - side * slip);
+    // An open-ended trailing strategy has no fixed liquidation horizon. Its
+    // funding reserve is an explicit sizing assumption, never a loss guarantee.
+    let reserve_hours = sizing
+        .get("fundingReserveHours")
+        .map(|value| number(value, f64::NAN));
+    if reserve_hours.is_some_and(|hours| !hours.is_finite() || !(0. ..=8760.).contains(&hours)) {
+        bail!("fundingReserveHours must be between 0 and 8760");
+    }
+    let funding_hours = reserve_hours.unwrap_or(hold * duration_ms as f64 / 3_600_000.);
     // Match the simulator: quantity = notional / slipped entry, both fees use
     // their actual fill notionals, and funding accrues over every held candle.
-    let fill_loss_fraction = side * (entry - exit) / entry
-        + fee * (1. + exit / entry)
-        + funding * hold * duration_ms as f64 / 28_800_000.;
+    let fill_loss_fraction =
+        side * (entry - exit) / entry + fee * (1. + exit / entry) + funding * funding_hours / 8.;
     // Exchange entry quantities use the unslipped quote as their denominator,
     // whereas the simulator divides by the slipped fill. A long exchange fill
     // can therefore carry (1 + slip) times the simulator quantity and entry
@@ -92,8 +111,8 @@ mod tests {
     }
 
     fn record(stop: f64) -> Value {
-        json!({"id":"martin-risk","strategyId":"martin-luk-pullback-v1","marketProvider":"binance","analyses":[{
-            "symbol":"BTCUSDT","strategyId":"martin-luk-pullback-v1","eligible":true,
+        json!({"id":"strategy-risk","strategyId":crate::strategies::ACTIVE_STRATEGY_ID,"marketProvider":"binance","analyses":[{
+            "symbol":"BTCUSDT","strategyId":crate::strategies::ACTIVE_STRATEGY_ID,"eligible":true,
             "interval":"15m","positionRecommendation":"OPEN_LONG","firstEntryAt":0,
             "plan":{"entryStyle":"market","entryMin":99.,"entryMax":100.,"stopLoss":stop,
                 "takeProfit":150.,"maxHoldBars":96,"riskSizing":sizing()}
@@ -324,5 +343,22 @@ mod tests {
         assert_eq!(order["margin"], 123.456);
         assert_eq!(order["leverage"], 10.);
         assert_eq!(order["notional"], 1234.56);
+    }
+
+    #[test]
+    fn fill_anchored_trailing_risk_uses_explicit_funding_reserve_not_timeout() {
+        let plan = json!({"entryStyle":"market","reanchorToFill":true,
+            "entryReference":100.,"entryMin":100.,"entryMax":100.,"stopLoss":95.,
+            "riskUnit":5.,"maxHoldBars":1_000_000});
+        let policy = json!({"riskFraction":0.003,"maxNotionalFraction":0.5,
+            "maxLeverage":1,"fundingReserveHours":24});
+        let costs = json!({"feeBps":6.,"slippageBps":5.,"fundingBpsPer8h":3.});
+        let (margin, leverage) =
+            constrain(&policy, &plan, &costs, 10000., 9000., 1., true, 3600000).unwrap();
+        assert_eq!(leverage, 1.);
+        assert!(margin > 500. && margin < 600.);
+        let invalid = json!({"riskFraction":0.003,"maxNotionalFraction":0.5,
+            "maxLeverage":1,"fundingReserveHours":-1});
+        assert!(constrain(&invalid, &plan, &costs, 10000., 9000., 1., true, 3600000).is_err());
     }
 }

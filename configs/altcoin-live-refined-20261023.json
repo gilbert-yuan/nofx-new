@@ -1,0 +1,49 @@
+{
+  "id": "altcoin-trend-breakout-live-v1",
+  "strategy": "altcoin-trend-breakout-live-v1",
+  "enabled": true,
+  "researchOnly": false,
+  "params": {
+    "emaFast": 25,
+    "emaSlow": 75,
+    "channelPeriod": 8,
+    "stopAtr": 1.0,
+    "trailAtr": 3.0,
+    "useEmaFilter": true,
+    "riskPerTrade": 0.003,
+    "maxNotionalPct": 0.5,
+    "maxPositions": 3
+  },
+  "portfolio_policy": {
+    "leverage": 1,
+    "max_active": 3,
+    "max_same_direction": 2,
+    "max_notional_fraction": 0.5,
+    "risk_fraction": 0.003
+  },
+  "runtime_policy": {
+    "execution_environment": "demo",
+    "http_proxy": "http://127.0.0.1:7890",
+    "pm2_config": "ecosystem.altcoin-live-20261023.json",
+    "preserve_existing_global_guards": true,
+    "max_entry_notional_usdt": 50,
+    "turnover_days": 30,
+    "turnover_top_n": 30,
+    "minimum_listing_days": 180,
+    "new_entry_signal_window_minutes": 15,
+    "disable_other_strategies": true,
+    "close_existing_positions": false,
+    "parameter_update": "API override persisted; next scan reads new parameters; existing orders keep frozen parameters"
+  },
+  "config_patch": {
+    "trader": {
+      "minConfidence": 0.6
+    }
+  },
+  "source_candidate": "A-7191f22c929c",
+  "source_report": "reports/altcoin-local-refinement-20261023.md",
+  "activation_report": "reports/altcoin-online-refined-20261023.md",
+  "replaces_source_candidate": "A-aadb2873715e",
+  "applied_at_utc": "2026-10-22T21:35:29.512Z",
+  "source_research_config_sha256": "b7f5ecc4405c022ea5f04bc4bcdab2b65c3a078009637e4175db13b20e7a5593"
+}

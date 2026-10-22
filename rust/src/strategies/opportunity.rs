@@ -4,6 +4,20 @@ use serde_json::{Value, json};
 pub fn is_market_plan(p: &Value) -> bool {
     p["entryStyle"] == "market" || number(&p["entryLimit"], 0.) <= 0.
 }
+fn next_open_trend(signal: &Value) -> bool {
+    let p = &signal["plan"];
+    signal["strategyId"] == "altcoin-trend-breakout-live-v1"
+        && p["altcoinTrend"].is_object()
+        && p["reanchorToFill"] == true
+        && p["entryExecution"] == "next_open"
+}
+fn trend_market_entry_block(p: &Value, price: f64, long: bool) -> Option<String> {
+    // These strategies freeze an ATR distance, not a price band. The execution
+    // gateway rechecks the short entry window and sizes against its fresh quote.
+    let risk = number(&p["riskUnit"], f64::NAN);
+    (!(price.is_finite() && price > 0. && risk.is_finite() && risk > 0. && (!long || price > risk)))
+        .then(|| "市价或 ATR 止损距离无效，等待重新分析。".into())
+}
 pub fn market_entry_block(p: &Value, price: f64, long: bool) -> Option<String> {
     let min = number(&p["entryMin"], f64::NAN);
     let max = number(&p["entryMax"], f64::NAN);
@@ -121,6 +135,7 @@ pub fn opportunity_report(
     };
     let p = &signal["plan"];
     let r = rows(market);
+    let trailing_only = next_open_trend(signal) && p["takeProfitEnabled"] == false;
     let Some(price) = r.last().and_then(|r| positive(&r["close"])) else {
         return Value::Null;
     };
@@ -128,7 +143,7 @@ pub fn opportunity_report(
         || !["entryMin", "entryMax", "stopLoss"]
             .iter()
             .all(|k| positive(&p[*k]).is_some())
-        || collect_targets(p, true).is_empty()
+        || (!trailing_only && collect_targets(p, true).is_empty())
         || n(p, "entryMin") > n(p, "entryMax")
     {
         return Value::Null;
@@ -144,7 +159,20 @@ pub fn opportunity_report(
         .or_else(|| positive(&ctx["markPrice"]))
         .unwrap_or(price);
     let optimal = if market_entry { Some(current) } else { limit };
-    let targets = collect_targets(p, long);
+    let targets = if trailing_only {
+        vec![]
+    } else {
+        collect_targets(p, long)
+    };
+    let target_summary = if trailing_only {
+        "ATR移动止损退出（无固定止盈）".to_owned()
+    } else {
+        targets
+            .iter()
+            .map(|x| x.to_string())
+            .collect::<Vec<_>>()
+            .join(" / ")
+    };
     let change = nullable(&ctx["change24hPct"]);
     let oi = nullable(&ctx["oiChangePct"]);
     let funding = nullable(&ctx["fundingRate"]);
@@ -155,8 +183,11 @@ pub fn opportunity_report(
     } else {
         current < limit.unwrap_or(e0) * 0.999
     };
-    let wait = extended || long && crowded;
-    let block = if market_entry {
+    let online_trend = next_open_trend(signal);
+    let wait = !online_trend && (extended || long && crowded);
+    let block = if online_trend {
+        trend_market_entry_block(p, current, long)
+    } else if market_entry {
         market_entry_block(p, current, long)
     } else {
         None
@@ -225,10 +256,13 @@ pub fn opportunity_report(
         .unwrap_or("");
     let indicators = crate::market_indicators::summarize(market_context, market, now);
     let evidence = crate::market_indicators::evidence(&indicators, long);
-    json!({"generatedAt":iso(now),"dataAsOf":if !signal["dataAsOf"].is_null(){&signal["dataAsOf"]}else{&market["dataAsOf"]},"symbol":symbol,"exchange":signal["exchange"].as_str().or_else(||market["exchange"].as_str()).unwrap_or("binance"),"marketProvider":signal["marketProvider"].as_str().or_else(||market["marketProvider"].as_str()).unwrap_or("binance"),"interval":signal["interval"].as_str().or_else(||market["interval"].as_str()),"strategyId":signal["strategyId"].as_str().or_else(||strategy["id"].as_str()),"strategyName":strategy["name"].as_str().or_else(||signal["strategyName"].as_str()),"action":action,"trend":if long{"LONG"}else{"SHORT"},"confidence":number(&signal["confidence"],0.),"recommendation":if proceed{action}else{"HOLD"},"canProceed":proceed,"decision":{"code":code,"label":label,"canProceed":proceed,"reason":reason},"current":{"price":current,"change24hPct":change,"oiChangePct":oi,"fundingRate":funding,"markPrice":ctx["markPrice"]},"levels":{"entryRange":{"min":e0,"max":e1},"optimalEntry":optimal,"entryMode":if market_entry{"MARKET_OR_NEXT_OPEN"}else{"LIMIT_PULLBACK"},"signalReference":reference,"stopLoss":positive(&p["stopLoss"]),"takeProfits":targets,"riskUnit":positive(&p["riskUnit"])},"warnings":warnings,"strategyReason":signal["reason"].as_str().unwrap_or(""),"risk":signal["risk"].as_str().unwrap_or(""),"summary":format!("{symbol} 初步判断{}；当前价 {current}；理想入场 {e0}～{e1}；止损 {}；止盈 {}；结论：{label}。",if long{"做多"}else{"做空"},n(p,"stopLoss"),targets.iter().map(|x|x.to_string()).collect::<Vec<_>>().join(" / ")),"contextErrors":ctx["errors"],"indicators":indicators,"evidence":evidence})
+    json!({"generatedAt":iso(now),"dataAsOf":if !signal["dataAsOf"].is_null(){&signal["dataAsOf"]}else{&market["dataAsOf"]},"symbol":symbol,"exchange":signal["exchange"].as_str().or_else(||market["exchange"].as_str()).unwrap_or("binance"),"marketProvider":signal["marketProvider"].as_str().or_else(||market["marketProvider"].as_str()).unwrap_or("binance"),"interval":signal["interval"].as_str().or_else(||market["interval"].as_str()),"strategyId":signal["strategyId"].as_str().or_else(||strategy["id"].as_str()),"strategyName":strategy["name"].as_str().or_else(||signal["strategyName"].as_str()),"action":action,"trend":if long{"LONG"}else{"SHORT"},"confidence":number(&signal["confidence"],0.),"recommendation":if proceed{action}else{"HOLD"},"canProceed":proceed,"decision":{"code":code,"label":label,"canProceed":proceed,"reason":reason},"current":{"price":current,"change24hPct":change,"oiChangePct":oi,"fundingRate":funding,"markPrice":ctx["markPrice"]},"levels":{"entryRange":{"min":e0,"max":e1},"optimalEntry":optimal,"entryMode":if market_entry{"MARKET_OR_NEXT_OPEN"}else{"LIMIT_PULLBACK"},"signalReference":reference,"stopLoss":positive(&p["stopLoss"]),"takeProfits":targets,"riskUnit":positive(&p["riskUnit"])},"warnings":warnings,"strategyReason":signal["reason"].as_str().unwrap_or(""),"risk":signal["risk"].as_str().unwrap_or(""),"summary":format!("{symbol} 初步判断{}；当前价 {current}；理想入场 {e0}～{e1}；止损 {}；止盈 {}；结论：{label}。",if long{"做多"}else{"做空"},n(p,"stopLoss"),target_summary),"contextErrors":ctx["errors"],"indicators":indicators,"evidence":evidence})
 }
 pub fn execution_plan(signal: &Value) -> Value {
     let p = &signal["plan"];
+    if next_open_trend(signal) {
+        return p.clone();
+    }
     let levels = &signal["opportunityReport"]["levels"];
     let Some(entry) = positive(&levels["optimalEntry"]) else {
         return Value::Null;
@@ -270,4 +304,34 @@ pub fn execution_plan(signal: &Value) -> Value {
         }
     }
     plan
+}
+
+#[cfg(test)]
+mod online_trend_tests {
+    use super::*;
+
+    #[test]
+    fn only_online_breakout_uses_frozen_distance_instead_of_pullback_filters() {
+        let plan = json!({"entryStyle":"market","entryExecution":"next_open","reanchorToFill":true,
+            "entryReference":100.,"entryMin":100.,"entryMax":100.,"stopLoss":98.,"riskUnit":2.,
+            "takeProfit":10000.,"takeProfitEnabled":false,"altcoinTrend":{"signalAt":0}});
+        let mut signal = json!({"symbol":"SOLUSDT","strategyId":"altcoin-trend-breakout-live-v1",
+            "action":"BUY","plan":plan});
+        let market = json!({"symbol":"SOLUSDT","klines":[{"close":100.}]});
+        let context = json!({"ticker24h":{"lastPrice":110.,"priceChangePercent":20.},
+            "premium":{"markPrice":110.,"lastFundingRate":0.001},
+            "oi":[{"sumOpenInterest":100.},{"sumOpenInterest":150.}]});
+        let report = opportunity_report(&signal, &market, &context, &json!({}), 0);
+        assert_eq!(report["canProceed"], true);
+        assert_eq!(report["levels"]["takeProfits"], json!([]));
+        assert!(report["summary"].as_str().unwrap().contains("无固定止盈"));
+        signal["opportunityReport"] = report;
+        assert_eq!(execution_plan(&signal), plan);
+        signal["strategyId"] = json!("altcoin-trend-breakout-v1");
+        assert_eq!(
+            opportunity_report(&signal, &market, &context, &json!({}), 0)["canProceed"],
+            false
+        );
+        assert!(market_entry_block(&plan, 110., true).is_some());
+    }
 }

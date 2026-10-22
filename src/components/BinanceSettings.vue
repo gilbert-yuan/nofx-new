@@ -118,7 +118,7 @@ function closePosition(position) {
         <div class="model-grid">
           <label>每轮最多开仓<input v-model.number="trader.maxNewEntriesPerCycle" type="number" min="1" max="5" /></label>
           <label>最大杠杆<input v-model.number="trader.maxLeverage" type="number" min="1" max="20" /></label>
-          <label>最低模型置信度<input v-model.number="trader.minConfidence" type="number" min="0" max="1" step="0.05" /></label>
+          <label>最低信号置信度<input v-model.number="trader.minConfidence" type="number" min="0" max="1" step="0.05" /></label>
           <label>单仓名义价值 / 权益<input v-model.number="trader.maxPositionNotionalPct" type="number" min="0.01" max="1" step="0.01" /></label>
           <label>总仓名义价值 / 权益<input v-model.number="trader.maxTotalNotionalPct" type="number" min="0.01" max="2" step="0.01" /></label>
           <label>保护价最小调整幅度（基点）<input v-model.number="trader.minProtectionMoveBps" type="number" min="0" step="5" /></label>

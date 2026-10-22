@@ -7,7 +7,8 @@ use std::str::FromStr;
 async fn exchange_info() -> Json<Value> {
     Json(
         json!({"symbols":(["LOWUSDT","NORMALUSDT","NEWUSDT","BROKENUSDT"].map(|symbol|json!({
-            "symbol":symbol,"status":"TRADING","contractType":"PERPETUAL",
+            "symbol":symbol,"status":"TRADING","contractType":"PERPETUAL","underlyingType":"COIN",
+            "onboardDate":if symbol=="NEWUSDT"{now_ms()-86_400_000}else{now_ms()-366*86_400_000_i64},
             "baseAsset":symbol.trim_end_matches("USDT"),"quoteAsset":"USDT","marginAsset":"USDT","filters":[]
         })))}),
     )
@@ -215,10 +216,17 @@ async fn run(db: &Db) -> Result<()> {
     assert_eq!(reports["analysisMeta"]["phase"], "ready");
     assert_eq!(reports["analysisMeta"]["readOnly"], true);
     assert!(reports["opportunitiesAt"].is_string());
-    assert!(reports["yaoCoinsAt"].is_string());
-    assert_eq!(reports["yaoCoins"][0]["symbol"], "NORMALUSDT");
-    assert_eq!(reports["yaoCoins"][0]["stage"], "TRIGGERED");
-    assert!(reports["yaoCoins"][0]["current"]["price"].as_f64().unwrap() > 0.);
+    assert_eq!(
+        reports["analysisMeta"]["altcoinUniverse"]["lookbackDays"],
+        30
+    );
+    assert!(
+        reports["analysisMeta"]["altcoinUniverse"]["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|symbol| symbol == "NORMALUSDT")
+    );
     assert_eq!(reports["stats"]["totalOrders"], 0.);
     assert!(
         db.account(true, None).await?["orders"]

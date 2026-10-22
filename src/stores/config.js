@@ -1,16 +1,15 @@
 /**
  * 配置与状态集中存储（前端唯一可信源）
- * - 持有 config / strategy / 各 status，消除 App.vue 里散落的 reactive
+ * - 持有 config / 各 status，消除 App.vue 里散落的 reactive
  * - 数据访问只通过契约客户端，业务编排仍留在视图层
  */
 import { defineStore } from 'pinia';
 import { reactive, ref } from 'vue';
-import { configApi, strategyApi, binanceApi, marketApi, historyApi } from '../api/client.js';
+import { configApi, binanceApi, marketApi, historyApi } from '../api/client.js';
 import { isBinanceDemo } from '../utils/binance.js';
 
 export const useConfigStore = defineStore('config', () => {
   const config = reactive({
-    model: { enabled: false, apiKey: '', baseUrl: '', model: '', maxConcurrentRequests: 5 },
     binance: {
       apiKey: '', secretKey: '', demoApiKey: '', demoSecretKey: '', liveApiKey: '', liveSecretKey: '',
       demo: true, testnet: true
@@ -23,7 +22,6 @@ export const useConfigStore = defineStore('config', () => {
       syncPaperOrdersToDemo: false, syncPaperOrdersToLive: false
     }
   });
-  const strategy = reactive({ name: '', interval: '1m', klineLimit: 80, systemPrompt: '', rules: '' });
 
   const tradingStatus = ref(null);
   const symbolStatus = ref(null);
@@ -42,8 +40,7 @@ export const useConfigStore = defineStore('config', () => {
   }
 
   async function load() {
-    const [savedConfig, savedStrategy] = await Promise.all([configApi.get(), strategyApi.get()]);
-    Object.assign(config.model, savedConfig.model || {});
+    const savedConfig = await configApi.get();
     const savedBinance = { ...savedConfig.binance };
     savedBinance.demo = isBinanceDemo(savedBinance);
     savedBinance.testnet = savedBinance.demo;
@@ -54,15 +51,7 @@ export const useConfigStore = defineStore('config', () => {
     Object.assign(config.binance, savedBinance);
     Object.assign(config.trader, savedConfig.trader || {});
     updateSavedMode(savedConfig);
-    Object.assign(strategy, savedStrategy || {});
-    return { savedConfig, savedStrategy };
-  }
-
-  async function saveAi() {
-    const savedConfig = await configApi.put({ model: { ...config.model } });
-    const savedStrategy = await strategyApi.put({ ...strategy, symbolsText: 'ALL' });
-    Object.assign(config.model, savedConfig.model || {});
-    Object.assign(strategy, savedStrategy || {});
+    return { savedConfig };
   }
 
   async function saveBinance() {
@@ -119,7 +108,7 @@ export const useConfigStore = defineStore('config', () => {
   }
 
   return {
-    config, strategy, tradingStatus, symbolStatus, syncStatus, savedMode, statusError,
-    load, saveAi, saveBinance, test, review, smoke, openOrders, positions, order, cancelOrder, loadStatus
+    config, tradingStatus, symbolStatus, syncStatus, savedMode, statusError,
+    load, saveBinance, test, review, smoke, openOrders, positions, order, cancelOrder, loadStatus
   };
 });

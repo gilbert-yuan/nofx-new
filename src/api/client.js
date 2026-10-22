@@ -2,7 +2,6 @@
  * 契约驱动的类型化 API 客户端（前端单一出口）
  * - 路径来自 JSON 接口契约，连接 Rust API
  * - 底层复用既有 api() 传输层（超时/取消/错误规范化）
- * - 研究类接口（/analyses、/market/analyze-*）暂未纳入契约，仍走 api() 原路径
  */
 import API from './contract.json';
 import { api } from '../api.js';
@@ -22,30 +21,12 @@ export const configApi = {
   put: (body) => api(API.config.put, { method: 'PUT', body })
 };
 
-/** 月度 Chronos + LightGBM 模型：只读分类和验证结果 */
-export const mlApi = {
-  health: () => api(API.ml.health),
-  models: () => api(API.ml.models),
-  signal: (symbol) => api(API.ml.signal, { method: 'POST', body: { symbol }, timeoutMs: 45000 }),
-  pipeline: (symbol, signal) => api(API.ml.pipeline, { method: 'POST', body: { symbol }, signal, timeoutMs: 45000 })
-};
-
-export const strategyApi = {
-  get: () => api(API.strategy.get),
-  put: (body) => api(API.strategy.put, { method: 'PUT', body })
-};
-
-/** 策略管理（多策略体系）：启用勾选 + 参数覆盖 + 恢复默认 */
+/** 当前策略：启用开关、参数覆盖与恢复默认。 */
 export const strategiesApi = {
   list: () => api(API.strategies.base),
   detail: (id) => api(`${API.strategies.base}/${encodeURIComponent(id)}`),
   update: (id, body) => api(`${API.strategies.base}/${encodeURIComponent(id)}`, { method: 'PUT', body }),
   reset: (id) => api(`${API.strategies.base}/${encodeURIComponent(id)}/reset`, { method: 'POST' })
-};
-
-export const researchApi = {
-  fetchIndicators: (body) => api(API.research.indicatorHistoryFetch, { method: 'POST', body, timeoutMs: 1800000 }),
-  backtest: (body) => api(API.research.backtest, { method: 'POST', body, timeoutMs: 1800000 })
 };
 
 /** 模拟账户：每日趋势（服务端单条 SQL 聚合；refresh=true 走 POST 强制刷新） */

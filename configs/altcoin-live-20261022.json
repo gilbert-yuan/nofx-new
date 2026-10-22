@@ -1,0 +1,44 @@
+{
+  "id": "altcoin-trend-breakout-live-v1",
+  "strategy": "altcoin-trend-breakout-live-v1",
+  "enabled": true,
+  "researchOnly": false,
+  "params": {
+    "emaFast": 30,
+    "emaSlow": 90,
+    "channelPeriod": 10,
+    "stopAtr": 1.5,
+    "trailAtr": 3,
+    "useEmaFilter": true,
+    "riskPerTrade": 0.003,
+    "maxNotionalPct": 0.5,
+    "maxPositions": 3
+  },
+  "portfolio_policy": {
+    "leverage": 1,
+    "max_active": 3,
+    "max_same_direction": 2,
+    "max_notional_fraction": 0.5,
+    "risk_fraction": 0.003
+  },
+  "runtime_policy": {
+    "execution_environment": "demo",
+    "http_proxy": "http://127.0.0.1:7890",
+    "pm2_config": "ecosystem.altcoin-live-20261023.json",
+    "preserve_existing_global_guards": true,
+    "max_entry_notional_usdt": 50,
+    "turnover_days": 30,
+    "turnover_top_n": 30,
+    "minimum_listing_days": 180,
+    "new_entry_signal_window_minutes": 15,
+    "disable_other_strategies": true,
+    "close_existing_positions": false
+  },
+  "config_patch": {
+    "trader": {
+      "minConfidence": 0.6
+    }
+  },
+  "source_candidate": "A-aadb2873715e",
+  "source_report": "reports/altcoin-parameter-search-20261022.md"
+}
