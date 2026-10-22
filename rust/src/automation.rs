@@ -633,7 +633,7 @@ impl Automation {
                     continue;
                 }
                 let config = self.store.read("config").await?;
-                let mut context = json!({"params":strategy["params"],"config":config,"state":state,"costs":research::costs(),"auxMarkets":{},"planInterval":strategy["planInterval"],"skillContext":{"requireFiveMinute":strategy["marketContext"]["requireFiveMinute"]}});
+                let mut context = json!({"params":strategy["params"],"config":config,"state":state,"costs":research::costs(),"auxMarkets":{},"planInterval":strategy["planInterval"]});
                 let mut incomplete = false;
                 for interval in strategy["needsAux"]
                     .as_array()
@@ -684,66 +684,6 @@ impl Automation {
                 }
                 if incomplete {
                     continue;
-                }
-                match crate::automation_guards::entry_filter(&self.store, &config, strategy).await {
-                    Ok(Some(filter)) => {
-                        let tf = filter["featureConfig"]["interval"].as_str().unwrap();
-                        let count = number(&filter["featureConfig"]["lookbackBars"], 72.) as usize;
-                        let cached = if tf == "1m" {
-                            Some(&market)
-                        } else {
-                            aux.get(tf)
-                        };
-                        let feature_market = if cached.is_some_and(|m| {
-                            m["klines"].as_array().is_some_and(|r| r.len() >= count)
-                        }) {
-                            cached.unwrap().clone()
-                        } else {
-                            match research::display_market(
-                                &self.db,
-                                &self.market,
-                                &symbol,
-                                tf,
-                                count,
-                                data_only,
-                            )
-                            .await
-                            {
-                                Ok(m) => m,
-                                Err(error) => {
-                                    record_market_error(
-                                        &mut errors,
-                                        &mut waiting_for_history,
-                                        &format!("{symbol}/{id} 特征数据"),
-                                        &error,
-                                    );
-                                    continue;
-                                }
-                            }
-                        };
-                        let features = strategies::kline_features(
-                            feature_market["klines"].as_array().unwrap(),
-                            &filter["featureConfig"],
-                        )
-                        .unwrap_or(Value::Null);
-                        match strategies::match_feature_rules(
-                            &features,
-                            &filter["rules"],
-                            filter["missing"].as_str().unwrap_or("reject"),
-                        ) {
-                            Ok(verdict) if verdict["passed"] == true => {}
-                            Ok(_) => continue,
-                            Err(error) => {
-                                errors.push(format!("{symbol}/{id} 特征筛选：{error}"));
-                                continue;
-                            }
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        errors.push(format!("{symbol}/{id} 特征配置：{error}"));
-                        continue;
-                    }
                 }
                 context["deferMarketFilters"] = json!(true);
                 let mut raw = match strategies::analyze(id, &market, &context) {
@@ -1235,8 +1175,6 @@ impl Automation {
             };
             let mut context = json!({"params":order["analysisContext"]["strategyParams"],"auxMarkets":{},"costs":order["costs"]});
             context["planInterval"] = def["planInterval"].clone();
-            context["skillContext"] =
-                json!({"requireFiveMinute":def["marketContext"]["requireFiveMinute"]});
             let mut incomplete = false;
             for aux in def["needsAux"]
                 .as_array()
@@ -1347,11 +1285,6 @@ impl Automation {
         s["stats"]["totalReviews"] =
             json!(number(&s["stats"]["totalReviews"], 0.) + reviewed as f64);
         Ok(json!({"reviewed":reviewed,"failed":errors.len(),"errors":errors}))
-    }
-}
-impl Automation {
-    pub(crate) fn token_matches(&self, token: u64) -> bool {
-        self.generation.load(Ordering::SeqCst) == token
     }
 }
 fn trading_mode_block(config: &Value) -> Option<&'static str> {

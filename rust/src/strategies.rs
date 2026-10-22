@@ -9,7 +9,7 @@ pub mod altcoin_breakout;
 pub mod indicators;
 #[path = "strategies/opportunity.rs"]
 mod opportunity;
-pub use indicators::{atr, ema, rsi};
+pub use indicators::{atr, ema};
 pub use opportunity::{execution_plan, is_market_plan, market_entry_block, opportunity_report};
 
 pub const ACTIVE_STRATEGY_ID: &str = "altcoin-trend-breakout-live-v1";
@@ -104,7 +104,7 @@ pub fn resolve_params(id: &str, overrides: &Value) -> Result<Value> {
     crate::market_filters::validate(&params)?;
     Ok(json!({"params":params,"rejected":rejected}))
 }
-pub fn list(config: &Value, state: &Value) -> Value {
+pub fn list(_config: &Value, state: &Value) -> Value {
     let default_id = ACTIVE_STRATEGY_ID;
     let initialized = state["initialized"].as_bool().unwrap_or_else(|| {
         state["strategies"]

@@ -1235,7 +1235,6 @@ async fn refresh_internal(db: &Db, store: &Store, manual_close_id: Option<&str>)
     let client = Exchange::public()?;
     let now = now_ms();
     let mut processed = 0;
-    let mut selected_ids = vec![];
     // Simulation results are applied in one account write. Writing per order made
     // every refresh take a full-account diff for each position and starved the
     // global write gate once the pool held more than a few dozen orders.
@@ -1248,7 +1247,6 @@ async fn refresh_internal(db: &Db, store: &Store, manual_close_id: Option<&str>)
             .as_str()
             .context("Order missing id")?
             .to_owned();
-        selected_ids.push(id.clone());
         let symbol = original["symbol"]
             .as_str()
             .context("Order missing symbol")?;
@@ -1316,13 +1314,7 @@ async fn refresh_internal(db: &Db, store: &Store, manual_close_id: Option<&str>)
     })
     .await?;
     if manual_close_id.is_none() {
-        if strategy.is_some() {
-            for id in selected_ids {
-                if let Err(error) = sync_entries(db, store, Some(&id)).await {
-                    tracing::warn!(%error,"Model exchange protection awaiting reconciliation");
-                }
-            }
-        } else if let Err(error) = sync_entries(db, store, None).await {
+        if let Err(error) = sync_entries(db, store, None).await {
             tracing::warn!(%error,"Exchange entries/protection awaiting reconciliation");
         }
     }

@@ -907,9 +907,6 @@ fn parse_search_grid(doc: &Value) -> Result<Vec<SearchCandidate>> {
             "channelPeriod",
             "stopAtr",
             "trailAtr",
-            // Ignored legacy A fields preserve frozen candidate hashes and audit provenance.
-            "retestBars",
-            "retestBandAtr",
             "useEmaFilter",
         ];
         ensure!(
@@ -2161,12 +2158,16 @@ mod tests {
         assert!(
             parse_search_grid(&json!({"strategy":"altcoin-trend-retest-v1","params":{}})).is_err()
         );
-        let legacy = candidate(
-            BREAKOUT,
-            json!({"emaFast":30,"emaSlow":90,"channelPeriod":10,
-            "stopAtr":1.5,"trailAtr":3.0,"retestBars":3,"retestBandAtr":0.25}),
-        );
-        assert_eq!(legacy.id, "A-aadb2873715e");
+        // The retired retest (B) parameters are rejected outright; frozen study
+        // grids carry explicit ids and no longer list them.
+        for legacy in ["retestBars", "retestBandAtr"] {
+            let mut params = json!({"emaFast":30});
+            params[legacy] = json!(3);
+            assert!(
+                parse_search_grid(&json!({"strategy":BREAKOUT,"params":params})).is_err(),
+                "{legacy}"
+            );
+        }
         let live = parse_search_grid(&json!({"strategy":LIVE,"params":baseline_params()})).unwrap();
         assert_eq!(live[0].strategy, LIVE);
     }

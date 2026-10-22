@@ -27,11 +27,11 @@
 
 ## Tasks
 
-- [ ] 保存变更前源码清单、当前参数与当前策略回放参考。
-- [ ] 精简策略注册、分派、配置缺省、专用实现与专用fixture；加入单策略注册及旧输入边界测试。
-- [ ] 删除旧ML/Yao/Martin/H4/CQS/结构/Regime策略工具和模块，保留当前回放、验证、数据归档与通用诊断工具；精简当前回测的旧B与专用搜索分支。
-- [ ] 清理自动化、API、执行层和前端中的旧策略专用分支、入口与脚本，保留共享账户/撮合/成本/风控。
-- [ ] 执行`cargo fmt --check`、`cargo check --all-targets`、`cargo test --all-targets`、Vue构建、当前策略回放及Rust经济等价验证。
-- [ ] 审核删除清单、统计代码减少、记录保留范围和验证结果，核对线上仍为既有Demo参数。
+- [x] 保存变更前源码清单、当前参数与当前策略回放参考。（`git show d460dcb` 为删除前快照；参考回放 = output/altcoin-new-window-full-winner-20261023）
+- [x] 精简策略注册、分派、配置缺省、专用实现与专用fixture；加入单策略注册及旧输入边界测试。
+- [x] 删除旧ML/Yao/Martin/H4/CQS/结构/Regime策略工具和模块，保留当前回放、验证、数据归档与通用诊断工具；精简当前回测的旧B与专用搜索分支。
+- [x] 清理自动化、API、执行层和前端中的旧策略专用分支、入口与脚本，保留共享账户/撮合/成本/风控。
+- [x] 执行`cargo fmt --check`、`cargo check --all-targets`、`cargo test --all-targets`、Vue构建、当前策略回放及Rust经济等价验证。
+- [x] 审核删除清单、统计代码减少、记录保留范围和验证结果，核对线上仍为既有Demo参数。（见 reports/current-strategy-cleanup-20261023.md）
 
 不创建提交，不在本轮重启或替换当前在线二进制。验证通过后交付本地代码与精简说明。

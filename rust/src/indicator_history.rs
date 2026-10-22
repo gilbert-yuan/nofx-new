@@ -185,7 +185,9 @@ fn advance_cached(rows: &[Value], index: &mut usize, mut cursor: i64, dt: i64, e
 /// The REST statistics window is bounded by Binance; older local history remains usable.
 pub async fn fetch(db: &Db, exchange: &Exchange, input: &Value) -> Result<Value> {
     let (symbol, start, end) = range(input)?;
-    let id = input["strategyId"].as_str().unwrap_or("enhanced-trend-v1");
+    let id = input["strategyId"]
+        .as_str()
+        .unwrap_or(crate::strategies::ACTIVE_STRATEGY_ID);
     let def = crate::strategies::definition(id).context("400: 未知策略")?;
     let mut intervals = BTreeMap::from([("1m".to_string(), 1520_usize)]);
     for tf in def["needsAux"]

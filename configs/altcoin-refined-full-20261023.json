@@ -5,8 +5,6 @@
     "channelPeriod": 8,
     "emaFast": 25,
     "emaSlow": 75,
-    "retestBandAtr": 0.25,
-    "retestBars": 3,
     "stopAtr": 1.0,
     "trailAtr": 3.0,
     "useEmaFilter": true

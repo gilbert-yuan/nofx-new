@@ -1,7 +1,7 @@
 //! Native entry profiles, liquidity checks and score-based sizing.
-use crate::{interval_ms, number, store::Store, strategies};
+use crate::number;
 use anyhow::{Context, Result, bail};
-use serde_json::{Value, json};
+use serde_json::Value;
 pub fn env_num(key: &str, default: f64, min: f64, max: f64) -> f64 {
     std::env::var(key)
         .ok()
@@ -15,68 +15,6 @@ pub fn enabled(key: &str, default: bool) -> bool {
         .filter(|s| !s.trim().is_empty())
         .map(|s| matches!(s.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(default)
-}
-pub async fn entry_filter(
-    store: &Store,
-    config: &Value,
-    strategy: &Value,
-) -> Result<Option<Value>> {
-    let setting = &config["analysis"]["backtestFeatureFilters"];
-    if setting["enabled"] == false {
-        return Ok(None);
-    }
-    let deployed = store.dir.join("backtest/production-profiles.json");
-    if setting["enabled"] != true && !deployed.exists() {
-        return Ok(None);
-    }
-    let file = if setting["enabled"] == true {
-        setting["file"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .map(std::path::PathBuf::from)
-    } else {
-        Some(deployed)
-    };
-    let profiles = if let Some(file) = file {
-        let file = if file.is_absolute() {
-            file
-        } else {
-            store.dir.parent().unwrap_or(&store.dir).join(file)
-        };
-        let data: Value = serde_json::from_str(&tokio::fs::read_to_string(file).await?)?;
-        data["strategies"].clone()
-    } else {
-        setting["profiles"].clone()
-    };
-    let mut p = profiles[strategy["id"].as_str().context("策略 ID 缺失")?].clone();
-    if p["enabled"] != true {
-        return Ok(None);
-    }
-    if p["params"]
-        .as_object()
-        .is_some_and(|m| m.iter().any(|(k, v)| strategy["params"][k] != *v))
-    {
-        return Ok(None);
-    }
-    let f = &p["featureConfig"];
-    let interval = f["interval"].as_str().context("筛选配置周期无效")?;
-    let count = f["lookbackBars"].as_u64().context("筛选配置窗口无效")?;
-    if interval_ms(interval).is_none()
-        || !(interval.ends_with('m') || interval.ends_with('h') || interval.ends_with('d'))
-        || !(2..=1000).contains(&count)
-    {
-        bail!("回测筛选配置的周期或窗口无效");
-    }
-    p["rules"].as_array().context("筛选规则必须为数组")?;
-    if p["missing"].is_null() {
-        p["missing"] = json!("reject");
-    }
-    strategies::match_feature_rules(
-        &json!({}),
-        &p["rules"],
-        p["missing"].as_str().unwrap_or("reject"),
-    )?;
-    Ok(Some(p))
 }
 fn optional(v: &Value) -> Option<f64> {
     v.as_f64()
@@ -297,6 +235,7 @@ pub fn book_check(book: &Value, order_book: &Value, notional: f64) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     #[test]
     fn minimum_margin_reduces_leverage_without_raising_exposure() {
         for requested in [3., 5.] {

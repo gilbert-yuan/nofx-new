@@ -243,6 +243,13 @@ mod tests {
             signal["plan"]["altcoinTrend"]["signalAt"],
             1181 * FOUR_HOURS
         );
-        assert_eq!(signal["plan"]["altcoinTrend"]["parameters"]["emaSlow"], 90);
+        // Frozen plan parameters are the current registry defaults, not a
+        // historical search winner's values.
+        let parameters = &signal["plan"]["altcoinTrend"]["parameters"];
+        assert_eq!(parameters["emaFast"], 25);
+        assert_eq!(parameters["emaSlow"], 75);
+        assert_eq!(parameters["channelPeriod"], 8);
+        assert_eq!(parameters["stopAtr"], 1.);
+        assert_eq!(parameters["trailAtr"], 3.);
     }
 }
